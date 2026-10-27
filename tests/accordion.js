@@ -1,0 +1,13 @@
+const items = $$("details.ui-accordion-item");
+if (items.length !== 5) return `expected 5 items, found ${items.length}`;
+const [a, b, c, d, e] = items;
+if (!a.open || b.open || c.open) return "only the first starts open";
+if (a.name !== "faq" || d.name !== "") return "group does not set the details' name";
+b.querySelector("summary").click(); await wait();
+if (!b.open || a.open) return "opening the second of a group did not close the first";
+c.querySelector("summary").click(); await wait();
+if (!c.open || b.open) return "opening the third did not close the second";
+d.querySelector("summary").click(); e.querySelector("summary").click(); await wait();
+if (!d.open || !e.open) return "items without a group do not stay open together";
+if (!c.querySelector(".ui-accordion-hint")) return "the hint is missing";
+d.querySelector("summary").click(); e.querySelector("summary").click(); await wait();

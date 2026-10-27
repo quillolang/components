@@ -1,0 +1,23 @@
+const qty = $("input[name=qty]");
+if (!qty || qty.type !== "number" || qty.inputMode !== "decimal") return "qty is not a number input with inputmode decimal";
+if (qty.labels.length !== 1 || !qty.labels[0].textContent.includes("Tickets")) return "the label is not tied to the input";
+const box = qty.parentElement;
+const [minus, plus] = box.querySelectorAll("button");
+if (minus.getAttribute("aria-label") !== "Decrease" || plus.getAttribute("aria-label") !== "Increase") return "the buttons have no names";
+const note = () => $(".demo-note").textContent;
+plus.click(); await wait();
+if (qty.value !== "3" || !note().includes("$54")) return `+ did not step and call on_change: ${qty.value} / ${note()}`;
+for (let i = 0; i < 5; i++) { plus.click(); await wait(60); }
+if (qty.value !== "6") return `+ went past max: ${qty.value}`;
+if (!plus.disabled || minus.disabled) return "+ is not disabled at max (or − is)";
+type(qty, "40"); await wait();
+if (qty.value !== "6" || !note().includes("$108")) return `typing past max was not clamped: ${qty.value} / ${note()}`;
+type(qty, "0"); await wait();
+if (qty.value !== "1" || !minus.disabled) return `typing under min was not clamped to it, or − is not disabled: ${qty.value}`;
+const w = $("input[name=weight]");
+const wplus = w.parentElement.querySelectorAll("button")[1];
+wplus.click(); await wait();
+if (w.value !== "3") return `a step of 0.5 from 2.5 gave ${w.value}`;
+const g = $("input[name=guests]");
+if (g.getAttribute("aria-invalid") !== "true" || !document.getElementById(g.getAttribute("aria-describedby"))?.textContent.includes("At least")) return "the error is not tied to its input";
+if (!$("input[name=locked]").disabled || !$("input[name=locked]").parentElement.querySelector("button").disabled) return "disabled does not disable the input and buttons";

@@ -1,0 +1,12 @@
+const stacks = $$(".ui-stack");
+const byText = (t) => stacks.find((s) => s.firstElementChild && s.firstElementChild.textContent.trim() === t);
+const col = byText("column"), g16 = byText("gap 16"), between = byText("row"), wrap = byText("wrap");
+if (!col || !g16 || !between || !wrap) return "the demo's stacks are missing";
+const cs = (el) => getComputedStyle(el);
+if (cs(col).flexDirection !== "column" || cs(col).rowGap !== "4px") return `gap="xs" column: ${cs(col).flexDirection} ${cs(col).rowGap}`;
+if (cs(g16).rowGap !== "16px" || cs(g16).alignItems !== "flex-start") return `gap={16} align="start": ${cs(g16).rowGap} ${cs(g16).alignItems}`;
+if (cs(between).flexDirection !== "row") return "direction=\"row\" is not a row";
+const s = between.getBoundingClientRect(), last = between.lastElementChild.getBoundingClientRect();
+if (Math.abs(s.right - last.right) > 1) return "justify=\"between\" does not push the last item to the end";
+if (cs(wrap).flexWrap !== "wrap") return "wrap={true} does not wrap";
+if (!wrap.classList.contains("ui-stack-collapse")) return "collapse={true} is missing its class";

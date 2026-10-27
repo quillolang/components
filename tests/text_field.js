@@ -1,0 +1,21 @@
+const email = $("input[name=email]");
+if (!email || email.type !== "email" || !email.required) return "the email field is not a required type=email input";
+const lab = $(`label[for="${email.id}"]`);
+if (!lab || !lab.textContent.includes("Email")) return "the label is not tied to the input by for/id";
+if (email.labels.length !== 1) return "the input has no label";
+const hint = document.getElementById(email.getAttribute("aria-describedby"));
+if (!hint || !hint.textContent.includes("never share")) return "the hint is not the input's aria-describedby";
+const site = $("input[name=site]");
+if (site.getAttribute("aria-invalid") !== "true") return "an error does not set aria-invalid";
+const ids = site.getAttribute("aria-describedby").split(" ");
+const err = ids.map((i) => document.getElementById(i)).find((e) => e && e.getAttribute("role") === "alert");
+if (!err || !err.textContent.includes("full address")) return "the error message is not described by the input";
+if (getComputedStyle(site.closest(".ui-text-field-box")).borderTopColor === getComputedStyle(email.closest(".ui-text-field-box")).borderTopColor)
+    return "the error field's border is not red";
+const handle = $("input[name=handle]");
+if (handle.maxLength !== 20) return "maxlength is not passed through";
+type(handle, "grace"); await wait();
+if (!$(".demo-note").textContent.includes("/grace")) return `on_input did not update the note: ${$(".demo-note").textContent}`;
+if (!$("input[name=plan]").disabled) return "disabled is not passed through";
+const w = $("input[name=weight]");
+if (w.type !== "number" || w.min !== "0" || w.max !== "500") return "min/max are not passed through";

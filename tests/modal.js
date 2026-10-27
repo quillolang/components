@@ -1,0 +1,13 @@
+const [open, fromState] = $$("button.ui-btn");
+open.click(); await wait();
+const dlg = $$("dialog")[0];
+if (!dlg.open) return "the trigger did not open the dialog";
+dlg.querySelector(".ui-modal-x").click(); await wait();
+if (dlg.open) return "the close button did not close it";
+fromState.click(); await wait();
+const second = $$("dialog")[1];
+if (!second.open) return "open={state} did not open it";
+second.close(); await wait();
+fromState.click(); await wait();
+if (!second.open) return "on_close did not set the state back, so it cannot open again";
+second.close();

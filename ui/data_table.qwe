@@ -1,0 +1,177 @@
+// DataTable: rows of data, sorted by clicking a column's header, with an optional
+// search box and pages.
+//
+//   <DataTable label="Invoices" search={true} page_size={10} order_by="due" rows={invoices}
+//              columns={[
+//                  { key: "number", label: "Invoice", sortable: true },
+//                  { key: "customer", label: "Customer", sortable: true },
+//                  { key: "due", label: "Due", format: "date", sortable: true },
+//                  { key: "total", label: "Total", format: "money", sortable: true },
+//              ]}/>
+//
+// columns: what to show, in order. Each is { key, label, align?, sortable?, format? }:
+// key is the field of each row; format "number" (1,234.5), "money" ($1,234.50, or
+// the column's currency: "€"), "percent" (0.125 is 12.5%) or "date" (an ISO date,
+// "2026-03-14", shown as Mar 14, 2026). Numbers line up on the right unless align
+// says "left"; align: "right" does it for any column. A null shows as a dash.
+// rows: a list of maps. order_by: the key it starts sorted by; descending: the other way.
+// Clicking a sortable header sorts by it (aria-sort says which way), again the
+// other way. search: a box above it that keeps the rows where any column's text
+// has what is typed, in any case. page_size: rows per page, with Previous and Next
+// and "21–40 of 132". empty: what it says when no row is left.
+// label: the table's name for screen readers. height: a CSS height past which it
+// scrolls inside, with its header kept in view. zebra: shades every other row.
+// On a narrow screen it scrolls sideways inside its own box.
+
+let data_table_css = css`
+.ui-dt { display: grid; gap: 10px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-dt-search { width: min(100%, 280px); height: 36px; padding: 0 12px 0 34px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface) no-repeat 11px 50% / 15px
+  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='M20 20l-4-4'/%3E%3C/svg%3E");
+  color: var(--ui-fg); font: inherit; }
+.ui-dt-search:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-dt-scroll { overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-dt-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-dt table { width: 100%; border-collapse: separate; border-spacing: 0; }
+.ui-dt th, .ui-dt td { padding: 9px 14px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--ui-border); }
+.ui-dt tbody tr:last-child td { border-bottom: 0; }
+.ui-dt th { position: sticky; top: 0; z-index: 1; background: var(--ui-subtle); color: var(--ui-muted);
+  font-size: 12px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+.ui-dt .ui-dt-right { text-align: right; font-variant-numeric: tabular-nums; }
+.ui-dt-sort { display: inline-flex; align-items: center; gap: 4px; margin: -4px -6px; padding: 4px 6px; border: 0;
+  border-radius: 4px; background: none; color: inherit; font: inherit; letter-spacing: inherit;
+  text-transform: inherit; cursor: pointer; }
+.ui-dt-sort:hover { color: var(--ui-fg); }
+.ui-dt-sort:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-dt-right .ui-dt-sort { flex-direction: row-reverse; }
+.ui-dt-arrow { width: 12px; height: 12px; opacity: .35; }
+[aria-sort] .ui-dt-sort { color: var(--ui-fg); }
+[aria-sort] .ui-dt-arrow { opacity: 1; color: var(--ui-accent); }
+.ui-dt tbody tr:hover td { background: color-mix(in srgb, var(--ui-subtle) 70%, transparent); }
+.ui-dt-zebra tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--ui-subtle) 55%, transparent); }
+.ui-dt-zebra tbody tr:hover td { background: var(--ui-subtle); }
+.ui-dt-empty td { padding: 28px 14px; text-align: center; color: var(--ui-muted); white-space: normal; }
+.ui-dt-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
+  color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-dt-pages { display: flex; gap: 6px; }
+.ui-dt-pages button { height: 30px; padding: 0 11px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-dt-pages button:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-dt-pages button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-dt-pages button:disabled { opacity: .5; cursor: not-allowed; }
+`
+
+let data_table_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+// n (a whole number, 0 or more) with at least `width` digits: data_table_pad(7, 2) is "07".
+fn data_table_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn data_table_group(n: int) -> str =
+    n < 1000 ? str(n) : data_table_group(floor(n / 1000)) + "," + data_table_pad(n % 1000, 3)
+
+// How a column shows a value. Worked out in whole numbers, so the server and the
+// browser write the same text.
+fn data_table_fmt(v, format: str?, currency: str = "$") -> str {
+    if v == null { return "—" }
+    if format == "date" {
+        let p = split(slice(str(v), 0, 10), "-")
+        let month = data_table_months[(int(p[1]) ?? 1) - 1]
+        return len(p) == 3 && month != null ? `${month} ${int(p[2]) ?? p[2]}, ${p[0]}` : str(v)
+    }
+    if type_of(v) != "int" && type_of(v) != "float" { return str(v) }
+    let sign = v < 0 ? "-" : ""
+    match format {
+        "money" => {
+            let cents = round(abs(v) * 100)
+            `${sign}${currency}${data_table_group(floor(cents / 100))}.${data_table_pad(cents % 100, 2)}`
+        }
+        "percent" => {
+            let tenths = round(abs(v) * 1000)
+            let dec = tenths % 10
+            `${sign}${data_table_group(floor(tenths / 10))}${dec != 0 ? `.${dec}` : ""}%`
+        }
+        _ => {
+            let cents = round(abs(v) * 100)
+            let frac = cents % 100
+            let tail = frac == 0 ? "" : (frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${data_table_pad(frac, 2)}`)
+            `${sign}${data_table_group(floor(cents / 100))}${tail}`
+        }
+    }
+}
+
+// Whether a column lines up on the right: numbers do, unless it says otherwise.
+fn data_table_right(c: map) -> bool =
+    c.align == "right" || (c.align == null && (c.format == "number" || c.format == "money" || c.format == "percent"))
+
+component DataTable(columns: list, rows: list, order_by: str? = null, descending: bool = false,
+                    search: bool = false, page_size: int? = null, empty: str = "Nothing to show.",
+                    label: str? = null, height: str? = null, zebra: bool = false, class: str? = null) {
+    state sort_key = order_by
+    state sort_desc = descending
+    state query = ""
+    state page = 0
+    let needle = lower(trim(query))
+    let found = needle == "" ? rows
+        : rows | filter((r) => any(columns, (c) => contains(lower(data_table_fmt(r[c.key], c.format, c.currency ?? "$")), needle)))
+    let ordered = sort_key == null ? found
+        : found | sort_by((r) => {
+            let v = r[sort_key]
+            type_of(v) == "str" ? lower(v) : v
+        })
+    let sorted = sort_desc ? reverse(ordered) : ordered
+    let total = len(sorted)
+    let size = page_size ?? (total > 0 ? total : 1)
+    let pages = total == 0 ? 1 : ceil(total / size)
+    let at = page >= pages ? pages - 1 : page
+    let shown = page_size == null ? sorted : slice(sorted, at * size, at * size + size)
+    let first_n = at * size + 1
+    let last_n = at * size + len(shown)
+    <div class={ui_cls(["ui-dt", zebra && "ui-dt-zebra", class])}>
+        {search && <input.ui-dt-search type="search" placeholder="Search" aria-label={label != null ? `Search ${lower(label)}` : "Search"}
+                          value={query} @input={(e) => { query = e.value; page = 0 }}/>}
+        <div.ui-dt-scroll style={height != null ? `max-height: ${height}` : null}>
+            <table aria-label={label}>
+                <thead>
+                    <tr>
+                        {for c in columns => <th scope="col" class={data_table_right(c) ? "ui-dt-right" : null}
+                                aria-sort={sort_key == c.key ? (sort_desc ? "descending" : "ascending") : null}>
+                            {c.sortable == true
+                                ? <button.ui-dt-sort type="button" @click={() => {
+                                      if sort_key == c.key { sort_desc = !sort_desc } else { sort_key = c.key; sort_desc = false }
+                                      page = 0
+                                  }}>
+                                      {c.label ?? c.key}
+                                      <svg.ui-dt-arrow viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6"
+                                           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                          <path d={sort_key != c.key ? "M3.5 4.5L6 2l2.5 2.5M3.5 7.5L6 10l2.5-2.5"
+                                                   : (sort_desc ? "M6 2v8M3 7l3 3 3-3" : "M6 10V2M3 5l3-3 3 3")}/>
+                                      </svg>
+                                  </button>
+                                : (c.label ?? c.key)}
+                        </th>}
+                    </tr>
+                </thead>
+                <tbody>
+                    {total == 0
+                        ? <tr.ui-dt-empty><td colspan={str(len(columns))}>{empty}</td></tr>
+                        : (for r in shown => <tr>
+                              {for c in columns => <td class={data_table_right(c) ? "ui-dt-right" : null}>
+                                  {data_table_fmt(r[c.key], c.format, c.currency ?? "$")}
+                              </td>}
+                          </tr>)}
+                </tbody>
+            </table>
+        </div>
+        {page_size != null && <div.ui-dt-foot>
+            <span aria-live="polite">{total == 0 ? "No rows" : `${first_n}–${last_n} of ${total}`}</span>
+            {pages > 1 && <div.ui-dt-pages>
+                <button type="button" disabled={at == 0} @click={() => { page = at - 1 }}>Previous</button>
+                <button type="button" disabled={at >= pages - 1} @click={() => { page = at + 1 }}>Next</button>
+            </div>}
+        </div>}
+    </div>
+}

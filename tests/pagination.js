@@ -1,0 +1,22 @@
+const navs = $$("nav.ui-pagination");
+const shown = (nav) => [...nav.querySelectorAll("li")].map((li) => li.textContent.replace(/\s+/g, " ").trim()).join(" ");
+if (shown(navs[0]) !== "Previous 1 … 4 5 6 … 20 Next") return `page 5 of 20 shows: ${shown(navs[0])}`;
+if (shown(navs[1]) !== "Previous 1 2 3 4 … 20 Next") return `page 1 of 20 shows: ${shown(navs[1])}`;
+if (shown(navs[2]) !== "Previous 1 … 17 18 19 20 Next") return `page 20 of 20 shows: ${shown(navs[2])}`;
+const cur = navs[0].querySelector("[aria-current=page]");
+if (cur.textContent.trim() !== "5" || cur.getAttribute("href") !== "/posts?page=5") return "the current page is not marked, or its href is wrong";
+if (navs[0].querySelector("[rel=prev]").getAttribute("href") !== "/posts?page=4") return "Previous does not link to page 4";
+if (navs[0].querySelector("[rel=next]").getAttribute("href") !== "/posts?page=6") return "Next does not link to page 6";
+if (navs[0].querySelector('a[aria-label="Page 20"]').getAttribute("href") !== "/posts?page=20") return "the last page's href is wrong";
+if (navs[1].querySelector(".ui-pagination-prev").tagName === "A" || navs[1].querySelector(".ui-pagination-prev").getAttribute("aria-disabled") !== "true")
+    return "Previous is not disabled on the first page";
+if (navs[2].querySelector(".ui-pagination-next").tagName === "A") return "Next is not disabled on the last page";
+if (!navs[1].classList.contains("ui-pagination-sm")) return "size=sm is not applied";
+const live = navs[3];
+const before = location.href;
+live.querySelector('a[aria-label="Page 4"]').click(); await wait();
+if (!live.parentElement.querySelector(".demo-note").textContent.includes("page 4 of 8")) return `on_change(4) did not update: ${live.parentElement.querySelector(".demo-note").textContent}`;
+if (location.href !== before) return "with on_change, the link was followed";
+live.querySelector("[rel=next]").click(); await wait();
+if (live.querySelector("[aria-current=page]").textContent.trim() !== "5") return "Next did not move to page 5";
+if (shown(live) !== "Previous 1 … 4 5 6 7 8 Next") return `page 5 of 8 shows: ${shown(live)}`;

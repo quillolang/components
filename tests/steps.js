@@ -1,0 +1,13 @@
+const [across, down] = $$("ol.ui-steps");
+const items = [...across.children];
+const states = items.map((li) => ["done", "current", "upcoming"].find((s) => li.classList.contains(`ui-steps-${s}`)));
+if (states.join(" ") !== "done done current upcoming") return `the states are ${states}`;
+if (items[2].getAttribute("aria-current") !== "step" || across.querySelectorAll("[aria-current]").length !== 1) return "the current step is not aria-current=step";
+if (!items[0].querySelector(".ui-steps-mark svg") || items[2].querySelector(".ui-steps-mark svg")) return "check marks are not on the done steps only";
+if (items[2].querySelector(".ui-steps-mark").textContent.trim() !== "3") return "the current step does not show its number";
+if (!items[0].textContent.includes("(done)")) return "screen readers are not told a step is done";
+if (items[3].getBoundingClientRect().width < 30) return "the last step has no room";
+if (!down.classList.contains("ui-steps-vertical")) return "vertical is not applied";
+const [a, b] = [...down.children].map((li) => li.getBoundingClientRect());
+if (b.top <= a.bottom - 1) return "vertical steps are not one under another";
+if (!down.querySelector(".ui-steps-hint")?.textContent.includes("May 2")) return "the hint is not shown";

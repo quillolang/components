@@ -1,0 +1,14 @@
+const lists = $$("dl.ui-dl");
+if (lists.length !== 3) return `expected 3 lists, found ${lists.length}`;
+const [cols, kids, plain] = lists;
+const pairs = [...cols.querySelectorAll(".ui-dl-item")].map((i) => [i.querySelector("dt").textContent, i.querySelector("dd").textContent]);
+if (pairs.length !== 4 || pairs[0][0] !== "Customer" || pairs[0][1] !== "Northwind Traders") return `items: ${JSON.stringify(pairs)}`;
+const row = (dl) => { const it = dl.querySelector(".ui-dl-item"); return [it.querySelector("dt").getBoundingClientRect(), it.querySelector("dd").getBoundingClientRect()]; };
+const [ct, cd] = row(cols);
+if (!(cd.left > ct.right && Math.abs(cd.top - ct.top) < 6)) return "columns: the detail is not to the right of the term";
+const [st, sd] = row(kids);
+if (!(sd.top >= st.bottom - 1)) return "stacked: the detail is not under the term";
+if (!kids.querySelector("dd .ui-badge")) return "HTML children do not reach the detail";
+if (kids.querySelectorAll("dd")[1].textContent !== "$1,204.50") return "detail as a prop is missing";
+const border = (dl) => getComputedStyle(dl.querySelectorAll(".ui-dl-item")[1]).borderTopStyle;
+if (border(cols) !== "solid" || border(plain) !== "none") return "dividers do not follow the prop";

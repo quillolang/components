@@ -1,0 +1,15 @@
+const badges = $$(".ui-badge");
+if (badges.length < 16) return `expected at least 16 badges, found ${badges.length}`;
+const byText = (t) => badges.find((b) => b.textContent.trim() === t);
+if (!byText("Paid").classList.contains("ui-badge-success")) return "tone is not applied";
+if (!byText("Online").classList.contains("ui-badge-dot")) return "dot is not applied";
+if (getComputedStyle(byText("Online"), "::before").content === "none") return "the dot is not drawn";
+const counts = $$(".ui-badge-count");
+if (counts.length !== 4) return `expected 4 count badges, found ${counts.length}`;
+const big = counts[2];
+const shown = big.querySelector("[aria-hidden]");
+if (!shown || shown.textContent !== "99+") return `count 128 shows "${big.textContent}", not 99+`;
+if (big.querySelector(".ui-sr")?.textContent !== "128 notifications") return `screen readers hear "${big.querySelector(".ui-sr")?.textContent}"`;
+if (counts[1].textContent.trim() !== "42") return `count 42 shows "${counts[1].textContent}"`;
+if (counts[1].querySelector(".ui-sr")) return "a count without a label has no hidden text";
+if (getComputedStyle(byText("Draft")).borderRadius !== "999px") return "a badge is a pill";

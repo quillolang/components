@@ -1,0 +1,13 @@
+const groups = $$(".ui-button-group");
+if (groups.length !== 5) return `expected 5 groups, found ${groups.length}`;
+if (groups.some((g) => g.getAttribute("role") !== "group" || !g.getAttribute("aria-label"))) return "each group is a labelled role=group";
+const [a, b, c] = groups[0].children;
+const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+if (rb.left - ra.right > 0.5) return "attached buttons are not edge to edge";
+const cs = (el) => getComputedStyle(el);
+if (cs(a).borderTopRightRadius !== "0px" || cs(b).borderTopLeftRadius !== "0px" || cs(b).borderTopRightRadius !== "0px") return "inner corners are not square";
+if (cs(a).borderTopLeftRadius === "0px" || cs(c).borderBottomRightRadius === "0px") return "outer corners lost their radius";
+const [s1, s2] = groups[3].children;
+if (s2.getBoundingClientRect().left - s1.getBoundingClientRect().right < 7.5) return "attached={false} does not space the buttons";
+const [v1, v2] = groups[4].children;
+if (v2.getBoundingClientRect().top < v1.getBoundingClientRect().bottom - 1.5) return "vertical={true} does not stack the buttons";

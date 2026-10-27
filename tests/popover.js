@@ -1,0 +1,24 @@
+const triggers = $$("button[popovertarget]").filter((b) => !b.classList.contains("ui-popover-x"));
+if (triggers.length !== 3) return `expected 3 triggers, found ${triggers.length}`;
+const panel = (t) => document.getElementById(t.getAttribute("popovertarget"));
+const [share, top, right] = triggers;
+const p = panel(share);
+if (p.getAttribute("role") !== "dialog" || p.getAttribute("aria-label") !== "Share this page") return "the panel is not a dialog named by its title";
+share.scrollIntoView({ block: "center" });
+share.click(); await wait();
+if (!p.matches(":popover-open")) return "the trigger does not open the panel";
+const anchored = CSS.supports("position-area: bottom");
+let b = share.getBoundingClientRect(), r = p.getBoundingClientRect();
+// Under the trigger, or above it when there is no room below.
+if (anchored && r.top < b.bottom && (r.bottom > b.top || innerHeight - b.bottom > r.height + 8)) return `placement bottom: the panel is not under the trigger (${r.top} < ${b.bottom})`;
+p.querySelector(".ui-popover-x").click(); await wait();
+if (p.matches(":popover-open")) return "the close button does not close it";
+top.click(); await wait();
+b = top.getBoundingClientRect(); r = panel(top).getBoundingClientRect();
+if (anchored && r.bottom > b.top && b.top > r.height + 8) return `placement top: the panel is not above the trigger (${r.bottom} > ${b.top})`;
+if (Math.round(r.width) !== 220) return `width={220} gives ${r.width}`;
+right.click(); await wait();
+if (panel(top).matches(":popover-open")) return "opening another does not close the first";
+b = right.getBoundingClientRect(); r = panel(right).getBoundingClientRect();
+if (anchored && r.left < b.right) return `placement right: the panel is not to the right (${r.left} < ${b.right})`;
+panel(right).hidePopover();

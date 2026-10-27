@@ -1,0 +1,13 @@
+const spinners = $$(".ui-spinner");
+if (spinners.length !== 8) return `expected 8 spinners, found ${spinners.length}`;
+if (spinners.some((s) => s.getAttribute("role") !== "status")) return "every spinner is role=status";
+const big = spinners[2];
+if (big.querySelector(".ui-sr")?.textContent !== "Loading the report") return "the label is not in hidden text";
+if (spinners[0].querySelector(".ui-sr").textContent !== "Loading") return "the default label is Loading";
+const shown = spinners[6].querySelector(".ui-spinner-label");
+if (!shown || shown.textContent !== "Loading invoices" || shown.offsetWidth === 0) return "show_label does not show it";
+const ring = spinners[1].querySelector(".ui-spinner-ring");
+if (ring.getAttribute("aria-hidden") !== "true") return "the ring is hidden from screen readers";
+if (getComputedStyle(ring).animationName !== "ui-spinner-turn") return `the ring does not turn: ${getComputedStyle(ring).animationName}`;
+const w = (s) => s.querySelector(".ui-spinner-ring").getBoundingClientRect().width;
+if (!(w(spinners[0]) < w(spinners[1]) && w(spinners[1]) < w(spinners[2]))) return "sizes do not grow sm < md < lg";

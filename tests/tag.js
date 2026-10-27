@@ -1,0 +1,18 @@
+const tags = $$(".ui-tag");
+if (tags.length < 12) return `expected at least 12 tags, found ${tags.length}`;
+const link = tags.find((t) => t.textContent.trim() === "docs");
+if (link.tagName !== "A" || !link.getAttribute("href")) return "href does not make a link";
+if (!tags.find((t) => t.textContent.trim() === "shipped").querySelector(".ui-tag-dot")) return "dot is missing";
+const xs = () => $$(".ui-tag-x");
+if (xs().length !== 4) return `expected 4 remove buttons, found ${xs().length}`;
+const x = xs().find((b) => b.getAttribute("aria-label") === "Remove frontend");
+if (!x) return `remove buttons are labelled ${xs().map((b) => b.getAttribute("aria-label"))}`;
+x.click(); await wait();
+const left = xs().map((b) => b.getAttribute("aria-label"));
+if (left.join() !== "Remove design,Remove accessibility,Remove v2") return `after removing frontend: ${left}`;
+if (!$$(".demo-note").some((n) => n.textContent.startsWith("3 tags"))) return "on_remove did not update the count";
+const toggle = $$("button.ui-tag").find((b) => b.textContent.includes("Open issues only"));
+if (!toggle || toggle.getAttribute("aria-pressed") !== "true") return "the selected toggle is not aria-pressed";
+toggle.click(); await wait();
+if (toggle.getAttribute("aria-pressed") !== "false" || toggle.classList.contains("ui-tag-selected")) return "on_click did not toggle it";
+if (!$$(".demo-note").some((n) => n.textContent.includes("showing all issues"))) return "on_click did not reach the state";

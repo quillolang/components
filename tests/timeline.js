@@ -1,0 +1,14 @@
+const lists = $$("ol.ui-timeline");
+if (lists.length !== 2) return `expected 2 timelines, found ${lists.length}`;
+const items = lists[0].querySelectorAll(":scope > li");
+if (items.length !== 5) return `expected 5 items, found ${items.length}`;
+const t = items[0].querySelector("time");
+if (!t || t.getAttribute("datetime") !== "2026-03-03T09:12" || t.textContent !== "Mar 3, 09:12") return "the <time> is wrong";
+if (lists[1].querySelector("time").hasAttribute("datetime")) return "no datetime should leave the attribute out";
+if (!items[1].classList.contains("ui-timeline-success")) return "tone is not applied";
+const dot = (i) => getComputedStyle(items[i].querySelector(".ui-timeline-dot")).borderTopColor;
+if (dot(1) === dot(0)) return "the success dot is the same colour as the neutral one";
+if (items[3].querySelector(".ui-timeline-body")?.textContent !== "Nobody was home. They will try again tomorrow.") return "the body is missing";
+if (items[1].querySelector(".ui-timeline-body")) return "an item without body has one";
+if (getComputedStyle(items[0], "::before").display === "none") return "no line between dots";
+if (getComputedStyle(items[4], "::before").display !== "none") return "the last item has a line after it";

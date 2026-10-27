@@ -1,0 +1,17 @@
+const vol = $("input[name=volume]");
+if (!vol || vol.type !== "range" || vol.value !== "60") return "volume is not a range at 60";
+if (vol.labels.length !== 1 || !vol.labels[0].textContent.includes("Volume")) return "the label is not tied to the range";
+const out = $(`output[for="${vol.id}"]`);
+if (!out || out.textContent !== "60%") return `the shown value is wrong: ${out?.textContent}`;
+if (vol.style.getPropertyValue("--ui-slider-fill").trim() !== "60%") return `the fill starts wrong: ${vol.style.getPropertyValue("--ui-slider-fill")}`;
+if (vol.getAttribute("aria-valuetext") !== "60%") return "aria-valuetext does not say the unit";
+type(vol, "25"); await wait();
+if (out.textContent !== "25%") return `the shown value did not follow: ${out.textContent}`;
+if (vol.style.getPropertyValue("--ui-slider-fill").trim() !== "25%") return "the fill did not follow the value";
+const r = $("input[name=radius]");
+if (!document.getElementById(r.getAttribute("aria-describedby"))?.textContent.includes("How far")) return "the hint is not tied to the range";
+const price = $("input[name=price]");
+if (price.min !== "10" || price.max !== "500" || price.step !== "10") return "min/max/step are not passed through";
+type(price, "200"); await wait();
+if (!$(".demo-note").textContent.includes("$200")) return `on_change did not update the note: ${$(".demo-note").textContent}`;
+if (!$("input[name=locked]").disabled) return "disabled is not passed through";

@@ -1,0 +1,12 @@
+const all = $$(".ui-empty");
+if (all.length !== 4) return `expected 4 empty states, found ${all.length}`;
+const [inbox, search, folder, chart] = all;
+if (inbox.querySelector(".ui-empty-title").textContent !== "No messages yet") return "the title is missing";
+if (!inbox.querySelector(".ui-empty-text").textContent.includes("When someone writes")) return "children are not shown";
+if (inbox.querySelectorAll(".ui-empty-actions button").length !== 2) return "the two actions are not shown";
+if (folder.querySelector(".ui-empty-actions")) return "no actions should leave the actions row out";
+const icons = all.map((e) => e.querySelector(".ui-empty-icon svg")?.innerHTML);
+if (icons.some((i) => !i)) return "an icon is missing";
+if (new Set(icons).size !== 4) return "the four icons are not different";
+if (!search.classList.contains("ui-empty-sm")) return "size=sm is not applied";
+if (chart.querySelector("svg").getAttribute("aria-hidden") !== "true") return "the icon is not hidden from screen readers";

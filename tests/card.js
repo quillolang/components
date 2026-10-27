@@ -1,0 +1,13 @@
+const cards = $$(".ui-card");
+if (cards.length !== 4) return `expected 4 cards, found ${cards.length}`;
+const link = $("a.ui-card[href]");
+if (!link || !link.querySelector("h3.ui-card-title")) return "the card with an href is not a link holding its title";
+if (!link.classList.contains("ui-card-elevated")) return "variant=\"elevated\" is missing";
+const first = cards[0];
+if (first.tagName !== "ARTICLE" || first.querySelector(".ui-card-title").textContent !== "Storage") return "the first card is not an <article> titled Storage";
+if (first.querySelector(".ui-card-sub").textContent !== "12 of 50 GB used") return "the subtitle is missing";
+const team = cards[2];
+if (!team.querySelector(".ui-card-head").textContent.includes("3 seats")) return "the header slot is not in the heading row";
+if (team.querySelectorAll(".ui-card-foot button").length !== 2) return "the footer slot does not hold its two buttons";
+if (cards[3].querySelector(".ui-card-head")) return "a card without a title still has a heading row";
+if (getComputedStyle(cards[3].querySelector(".ui-card-body")).paddingTop !== "12px") return "padding=\"sm\" is not 12px";
