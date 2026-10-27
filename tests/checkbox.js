@@ -17,9 +17,10 @@ if (!$("fieldset legend") || !$$("fieldset legend").some((l) => l.textContent ==
 if (new Set(days.map((d) => d.id)).size !== 5) return "the group's checkboxes do not have distinct ids";
 const topics = $$("input[name=topics]");
 const all = $$("input[type=checkbox]").find((i) => i.labels[0]?.textContent.includes("All topics"));
-if (!all.indeterminate) return "indeterminate is not set on the input inside a component";
+if (!all.labels[0].textContent.includes("partly selected")) return "an indeterminate checkbox does not say it is partly selected";
+if (!$("input[name=mixed]").labels[0].textContent.includes("partly selected")) return "the indeterminate checkbox in the page does not say so";
 topics[1].click(); await wait(); topics[2].click(); await wait();
 if (!$(".demo-note").textContent.includes("3 of 3")) return `on_change(value, checked) did not update the list: ${$(".demo-note").textContent}`;
-if (!all.checked) return "select all did not follow the group";
+if (!all.checked || all.labels[0].textContent.includes("partly selected")) return "select all did not follow the group";
 all.click(); await wait();
 if (!$(".demo-note").textContent.includes("0 of 3") || topics.some((t) => t.checked)) return "unchecking all did not clear the group";
