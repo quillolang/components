@@ -1,0 +1,284 @@
+// CommandPalette: a search box over the page, opened with Ctrl+K (⌘K on a Mac) or its
+// button, that finds a command or a page as it is typed. The match is fuzzy: the
+// letters typed in order, not side by side ("nwfl" finds "New file"), best first,
+// the letters matched marked. The arrow keys move, Enter runs, Escape closes. With
+// nothing typed it shows what was run last, then everything by group.
+//
+//   <CommandPalette id="cmdk" items={[
+//       { label: "Dashboard", group: "Pages", href: "/" },
+//       { label: "Invoices", group: "Pages", href: "/invoices", keywords: ["billing"] },
+//       { label: "New invoice", group: "Actions", href: "/invoices/new", hint: "Ctrl I" },
+//   ]}/>
+//   <CommandPalette id="ops" trigger={null} items={commands} on_select={(c) => { run(c.label) }}/>
+//
+// id (required): unique on the page; its list's ids start with it.
+// items: a list of { label, group?, href?, hint?, keywords? }: group is the heading it
+// is listed under, href where choosing it goes, hint a key to show beside it ("Ctrl N",
+// shown as keys), keywords more words that find it (["billing", "money"]).
+// trigger: the button's text ("Search…"); null for no button. shortcut: Ctrl+K and
+// ⌘K open it (true); give only one palette on a page the shortcut.
+// label: its name for screen readers ("Command palette"). placeholder: the box's
+// ("Type a command or search…"). empty: what it says when nothing matches ("No results.").
+// recent: how many of the last chosen to show first (3; 0 for none), remembered in
+// the browser. limit: the most results shown (50).
+// on_select(item): inside one of your components, called with the item chosen (then
+// its href, if it has one, is followed).
+
+let command_palette_css = css`
+.ui-cmdk-host { display: contents; }
+.ui-cmdk-trigger {
+  display: inline-flex; align-items: center; gap: 8px; width: min(100%, 280px); height: 38px; padding: 0 8px 0 11px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-muted); font: 14px/1 var(--ui-font); text-align: left; cursor: pointer; transition: border-color .15s, box-shadow .15s;
+}
+.ui-cmdk-trigger:hover { border-color: var(--ui-strong); }
+.ui-cmdk-trigger:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-cmdk-trigger svg { flex: none; width: 16px; height: 16px; }
+.ui-cmdk-trigger span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-cmdk kbd, .ui-cmdk-trigger kbd {
+  display: inline-block; min-width: 20px; padding: 2px 5px; border: 1px solid var(--ui-border); border-bottom-width: 2px;
+  border-radius: 4px; background: var(--ui-subtle); color: var(--ui-muted); font: 500 11px/1.3 var(--ui-font); text-align: center;
+}
+.ui-cmdk {
+  width: min(640px, calc(100vw - 24px)); max-height: min(560px, calc(100dvh - 24px)); margin: 12vh auto auto; padding: 0;
+  overflow: hidden; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface);
+  color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 14px/1.4 var(--ui-font);
+}
+.ui-cmdk[open] { display: flex; flex-direction: column; animation: ui-cmdk-in .14s ease-out; }
+.ui-cmdk::backdrop { background: var(--ui-overlay); }
+@keyframes ui-cmdk-in { from { opacity: 0; transform: scale(.98); } }
+.ui-cmdk-search { display: flex; align-items: center; gap: 10px; flex: none; padding: 0 14px; border-bottom: 1px solid var(--ui-border); }
+.ui-cmdk-search svg { flex: none; width: 18px; height: 18px; color: var(--ui-muted); }
+.ui-cmdk-input {
+  flex: 1; min-width: 0; height: 52px; padding: 0; border: 0; background: transparent; color: var(--ui-fg);
+  font: 16px/1 var(--ui-font); outline: none;
+}
+.ui-cmdk-input::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-cmdk-list { flex: 1; min-height: 0; margin: 0; padding: 6px; overflow: auto; list-style: none; overscroll-behavior: contain; }
+.ui-cmdk-list ul { margin: 0; padding: 0; list-style: none; }
+.ui-cmdk-group { padding: 10px 10px 4px; color: var(--ui-muted); font-size: 12px; font-weight: 600; letter-spacing: .03em; }
+.ui-cmdk-opt {
+  display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 8px 10px; border-radius: var(--ui-radius-sm);
+  color: var(--ui-fg); cursor: pointer; scroll-margin: 6px;
+}
+.ui-cmdk-opt[aria-selected="true"] { background: var(--ui-accent-soft); }
+.ui-cmdk-opt[aria-selected="true"] .ui-cmdk-go { opacity: 1; }
+.ui-cmdk-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-cmdk-label mark { background: none; color: var(--ui-accent); font-weight: 650; }
+.ui-cmdk-keys { display: inline-flex; flex: none; gap: 3px; }
+.ui-cmdk-go { flex: none; width: 14px; height: 14px; color: var(--ui-muted); opacity: 0; }
+.ui-cmdk-empty { margin: 0; padding: 28px 16px; color: var(--ui-muted); text-align: center; }
+.ui-cmdk-foot {
+  display: flex; flex-wrap: wrap; gap: 14px; flex: none; padding: 8px 14px; border-top: 1px solid var(--ui-border);
+  background: var(--ui-subtle); color: var(--ui-muted); font-size: 12px;
+}
+.ui-cmdk-foot span { display: inline-flex; align-items: center; gap: 5px; }
+@media (max-width: 520px) { .ui-cmdk { margin-top: 12px; } .ui-cmdk-foot { display: none; } }
+@media (prefers-reduced-motion: reduce) { .ui-cmdk[open] { animation: none; } .ui-cmdk-trigger { transition: none; } }
+`
+
+// Whether the character before a place starts a word there.
+fn command_palette_starts(cs: list, i: int) -> bool = i == 0 || contains(" -_/.:>(", cs[i - 1])
+
+// One pass of the fuzzy match over the letters cs: each letter of q at the first
+// place it is after the last, or (jump) at a later start of a word if there is one.
+fn command_palette_scan(cs: list, q: list, jump: bool) {
+    let n = len(cs)
+    let hits = []
+    let score = 0
+    let i = 0
+    let k = 0
+    let prev = -2
+    while i < n && k < len(q) {
+        if cs[i] == q[k] {
+            let j = i
+            if jump && i != prev + 1 && !command_palette_starts(cs, i) {
+                let m = i + 1
+                while m < n && j == i {
+                    if cs[m] == q[k] && command_palette_starts(cs, m) { j = m }
+                    m += 1
+                }
+            }
+            score += 1 + (j == prev + 1 ? 6 : 0) + (command_palette_starts(cs, j) ? 8 : 0)
+            hits = hits | push(j)
+            prev = j
+            k += 1
+            i = j
+        }
+        i += 1
+    }
+    if k < len(q) { return null }
+    { score: score * 4 - hits[0] - (prev - hits[0]) + (n == len(q) ? 20 : 0), hits }
+}
+
+// How well `query` matches `text`: null when its letters (spaces left out) are not
+// all in the text in order; else { score, hits }, hits the places of the letters
+// matched. Letters side by side, at the start of a word and early in the text count more.
+fn command_palette_fuzzy(text: str, query: str) {
+    let q = split(re.replace(lower(query), "\\s+", ""), "")
+    if len(q) == 0 { return { score: 0, hits: [] } }
+    let cs = split(lower(text), "")
+    let a = command_palette_scan(cs, q, true)
+    let b = command_palette_scan(cs, q, false)
+    a == null ? b : (b == null || a.score >= b.score ? a : b)
+}
+
+// How an item matches: by its label (letters marked), else by its keywords.
+fn command_palette_match(item: map, query: str) {
+    let by_label = command_palette_fuzzy(item.label, query)
+    if by_label != null { return by_label }
+    let words = get(item, "keywords") ?? []
+    let by_words = len(words) > 0 ? command_palette_fuzzy(join(words, " "), query) : null
+    by_words != null ? { score: floor(by_words.score / 2), hits: [] } : null
+}
+
+// What is shown, in order: [{ item, group, hits, i }], i the place in the list.
+fn command_palette_results(items: list, query: str, recents: list, limit: int) -> list {
+    let found = trim(query) == ""
+        ? (recents | map((l) => find(items, (it) => it.label == l)) | filter((it) => it != null)
+                   | map((it) => { item: it, group: "Recent", hits: [] }))
+            + (items | map((it) => { item: it, group: get(it, "group") ?? "", hits: [] }))
+        : items | map((it) => { item: it, m: command_palette_match(it, query) })
+                | filter((r) => r.m != null)
+                | sort_by((r) => 0 - r.m.score)
+                | map((r) => { item: r.item, group: get(r.item, "group") ?? "", hits: r.m.hits })
+    let groups = unique(found | map((r) => r.group))
+    let ordered = take(flatten(for g in groups => found | filter((r) => r.group == g)), limit)
+    for [i, r] in enumerate(ordered) => merge(r, { i: i })
+}
+
+// The label in pieces, [{ text, hit }], hit for the letters matched.
+fn command_palette_marks(text: str, hits: list) -> list {
+    let cs = split(text, "")
+    let parts = []
+    let run = ""
+    let run_hit = false
+    let h = 0
+    let i = 0
+    while i < len(cs) {
+        let hit = h < len(hits) && hits[h] == i
+        if hit { h += 1 }
+        if hit != run_hit && run != "" {
+            parts = parts | push({ text: run, hit: run_hit })
+            run = ""
+        }
+        run_hit = hit
+        run = run + cs[i]
+        i += 1
+    }
+    run == "" ? parts : parts | push({ text: run, hit: run_hit })
+}
+
+component CommandPalette(id: str, items: list = [], trigger: str? = "Search…", shortcut: bool = true,
+                         label: str = "Command palette", placeholder: str = "Type a command or search…",
+                         empty: str = "No results.", recent: int = 3, limit: int = 50, on_select = null,
+                         class: str? = null) {
+    state dlg = null
+    state query = ""
+    state active = 0
+    state recents = []
+    state mac = false
+    let results = command_palette_results(items, query, recent > 0 ? recents : [], limit)
+    let groups = unique(results | map((r) => r.group))
+    let n = len(results)
+    let at = active < n ? active : 0
+    let show = () => {
+        query = ""
+        active = 0
+        if !dlg.open { dlg.showModal() }
+        dlg.querySelector("input").focus()
+    }
+    let choose = (it) => {
+        if recent > 0 {
+            recents = take(unique([it.label] + recents), recent)
+            js("localStorage.setItem", `ui-cmdk-${id}`, json.stringify(recents))
+        }
+        dlg.close()
+        on_select && on_select(it)
+        if get(it, "href") != null { navigate(it.href) }
+    }
+    let reveal = (i: int) => {
+        let el = dlg.querySelector(`[data-i="${i}"]`)
+        el && el.scrollIntoView({ block: "nearest" })
+    }
+    <div class={ui_cls(["ui-cmdk-host", class])}>
+        {trigger != null && <button.ui-cmdk-trigger type="button" aria-haspopup="dialog"
+                                   aria-keyshortcuts={shortcut ? "Control+K Meta+K" : null} @click={show}>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                 aria-hidden="true"><circle cx="7" cy="7" r="4.75"/><path d="M10.5 10.5L14 14"/></svg>
+            <span>{trigger}</span>
+            {shortcut && <kbd aria-hidden="true">{mac ? "⌘K" : "Ctrl K"}</kbd>}
+        </button>}
+        <dialog.ui-cmdk aria-label={label}
+                @mount={(el) => {
+                    dlg = el
+                    mac = contains(str(js("navigator.platform") ?? ""), "Mac")
+                    let saved = recent > 0 ? js("localStorage.getItem", `ui-cmdk-${id}`) : null
+                    if saved != null { recents = json.parse(saved) ?? [] }
+                    let onkey = (e) => {
+                        if lower(e.key ?? "") == "k" && (e.metaKey || e.ctrlKey) && !e.altKey {
+                            e.preventDefault()
+                            if el.open { el.close() } else { show() }
+                        }
+                    }
+                    if shortcut { js("document.addEventListener", "keydown", onkey) }
+                    () => { if shortcut { js("document.removeEventListener", "keydown", onkey) } }
+                }}
+                @click={(e) => { if e.target.tagName == "DIALOG" { dlg.close() } }}>
+            <div.ui-cmdk-search>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                     aria-hidden="true"><circle cx="7" cy="7" r="4.75"/><path d="M10.5 10.5L14 14"/></svg>
+                <input.ui-cmdk-input type="text" id={`${id}-input`} role="combobox" value={query} placeholder={placeholder}
+                       aria-label={label} aria-expanded="true" aria-controls={`${id}-list`} aria-autocomplete="list"
+                       aria-activedescendant={n > 0 ? `${id}-opt-${at}` : null}
+                       autocomplete="off" spellcheck="false" autofocus
+                       @input={(e) => {
+                           query = e.value
+                           active = 0
+                       }}
+                       @keydown={(e) => {
+                           if (e.key == "ArrowDown" || e.key == "ArrowUp") && n > 0 {
+                               e.preventDefault()
+                               active = e.key == "ArrowDown" ? (at + 1) % n : (at + n - 1) % n
+                               reveal(active)
+                           }
+                           if e.key == "Enter" {
+                               e.preventDefault()
+                               if n > 0 { choose(results[at].item) }
+                           }
+                       }}/>
+                <kbd aria-hidden="true">Esc</kbd>
+            </div>
+            <ul.ui-cmdk-list id={`${id}-list`} role="listbox" aria-label={label} hidden={n == 0}>
+                {for g in groups => <li key={g} role="presentation">
+                    {g != "" && <div.ui-cmdk-group aria-hidden="true">{g}</div>}
+                    <ul role="group" aria-label={g != "" ? g : null}>
+                        {for r in results | filter((r) => r.group == g) =>
+                            <li.ui-cmdk-opt key={`${g}/${r.item.label}`} id={`${id}-opt-${r.i}`} data-i={r.i}
+                                role="option" aria-selected={r.i == at ? "true" : "false"}
+                                @mousemove={() => { if active != r.i { active = r.i } }}
+                                @mousedown={(e) => { e.preventDefault() }}
+                                @click={() => { choose(r.item) }}>
+                                <span.ui-cmdk-label>{for p in command_palette_marks(r.item.label, r.hits) =>
+                                    p.hit ? <mark>{p.text}</mark> : p.text}</span>
+                                {get(r.item, "hint") != null && <span.ui-cmdk-keys aria-label={r.item.hint}>
+                                    {for k in split(r.item.hint, " ") => <kbd aria-hidden="true">{k}</kbd>}
+                                </span>}
+                                <svg.ui-cmdk-go viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"
+                                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                    <path d={get(r.item, "href") != null ? "M3 8h10M9 4l4 4-4 4" : "M13 4v5H4M7 6L4 9l3 3"}/>
+                                </svg>
+                            </li>}
+                    </ul>
+                </li>}
+            </ul>
+            {n == 0 && <p.ui-cmdk-empty>{empty}</p>}
+            <p.ui-sr role="status" aria-live="polite">{trim(query) == "" ? "" : (n == 1 ? "1 result" : `${n} results`)}</p>
+            <div.ui-cmdk-foot aria-hidden="true">
+                <span><kbd>↑</kbd><kbd>↓</kbd> to move</span>
+                <span><kbd>Enter</kbd> to choose</span>
+                <span><kbd>Esc</kbd> to close</span>
+            </div>
+        </dialog>
+    </div>
+}

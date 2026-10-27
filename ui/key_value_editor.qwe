@@ -1,0 +1,149 @@
+// KeyValueEditor: rows of a key and its value to add, change and remove: headers,
+// environment variables, labels, metadata. A key used twice is pointed out. A
+// <form> gets them under `name`, as one JSON object or as name[key] fields.
+//
+//   <KeyValueEditor id="env" name="env" label="Environment" value={{ PORT: "8080", LOG: "info" }}/>
+//   <KeyValueEditor id="hdr" label="Headers" key_label="Header" value={headers}
+//                   on_change={(m) => { headers = m }}/>
+//
+// id: a prefix for its fields' ids, unique on the page. value: the pairs to start
+// with, a map (or a list of { key, value }). name: what a form gets them as;
+// format "json" (default): one field, a JSON object of { key: value }; "fields": a
+// field `name[key]` for each pair. Rows with no key are left out; of two with the
+// same key, the last one wins, and both say so. key_label ("Key"), value_label
+// ("Value"), key_placeholder, value_placeholder: the columns' names and hints.
+// label, hint: above and below it. add_label ("Add"): the button that adds a row.
+// max: at most this many rows. Enter in a key goes to its value; Enter in the last
+// value adds a row. on_change(pairs): inside one of your components, called with
+// the map of { key: value }.
+
+let key_value_editor_css = css`
+.ui-kv { display: grid; gap: 8px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-kv-label { margin: 0; font-size: 13px; font-weight: 500; }
+.ui-kv-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-kv-rows { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-kv-head, .ui-kv-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr) 34px; gap: 6px; align-items: start; }
+.ui-kv-head { font-size: 12px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; color: var(--ui-muted); }
+.ui-kv-head span { padding-left: 2px; }
+.ui-kv-input { box-sizing: border-box; width: 100%; height: 34px; margin: 0; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 13px/1 var(--ui-mono);
+  transition: border-color .15s, box-shadow .15s; }
+.ui-kv-input::placeholder { color: var(--ui-muted); opacity: 1; font-family: var(--ui-font); }
+.ui-kv-input:hover { border-color: var(--ui-strong); }
+.ui-kv-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-kv-input[aria-invalid="true"] { border-color: var(--ui-warning); background: color-mix(in srgb, var(--ui-warning) 7%, var(--ui-surface)); }
+.ui-kv-warn { grid-column: 1 / -1; margin: -2px 0 2px; font-size: 12px; color: var(--ui-warning); }
+.ui-kv-x { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; padding: 0;
+  border: 1px solid transparent; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: pointer; }
+.ui-kv-x:hover { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-kv-x:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-kv-x svg { width: 14px; height: 14px; }
+.ui-kv-add { justify-self: start; display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px;
+  border: 1px dashed var(--ui-strong); border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-accent);
+  font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-kv-add:hover:not(:disabled) { border-style: solid; border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-kv-add:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-kv-add:disabled { opacity: .55; cursor: not-allowed; }
+.ui-kv-add svg { width: 12px; height: 12px; }
+.ui-kv-empty { margin: 0; padding: 10px 12px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius-sm);
+  color: var(--ui-muted); font-size: 13px; }
+@media (max-width: 480px) { .ui-kv-head, .ui-kv-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 34px; } }
+@media (prefers-reduced-motion: reduce) { .ui-kv-input { transition: none; } }
+`
+
+// The starting rows, from a map or a list of { key, value }, each with an id.
+fn key_value_editor_rows(value) -> list {
+    let pairs = type_of(value) == "map" ? (for [k, v] in value => { key: k, value: v }) : (value ?? [])
+    for [i, p] in enumerate(pairs) => { id: i, key: str(p.key ?? ""), value: p.value == null ? "" : str(p.value) }
+}
+
+// The map the rows make: trimmed keys, empty ones left out, the last of a key winning.
+fn key_value_editor_map(rows: list) -> map =
+    reduce(rows, {}, (m, r) => trim(r.key) == "" ? m : set(m, trim(r.key), r.value))
+
+component KeyValueEditor(id: str, name: str? = null, value = {}, format: str = "json", label: str? = null,
+                         hint: str? = null, key_label: str = "Key", value_label: str = "Value",
+                         key_placeholder: str? = null, value_placeholder: str? = null, add_label: str = "Add",
+                         max: int? = null, on_change = null, class: str? = null) {
+    state rows = key_value_editor_rows(value)
+    state next_id = len(key_value_editor_rows(value))
+    state focus_id = null
+    let pairs = key_value_editor_map(rows)
+    let keys = rows | map((r) => trim(r.key))
+    let twice = (k: str) => k != "" && count(keys, (x) => x == k) > 1
+    let full = max != null && len(rows) >= max
+    let update = (next: list) => {
+        rows = next
+        on_change && on_change(key_value_editor_map(next))
+    }
+    let add = () => {
+        if !full {
+            focus_id = next_id
+            update(push(rows, { id: next_id, key: "", value: "" }))
+            next_id += 1
+        }
+    }
+    let field = (e, sel: str) => {
+        let el = e.target.closest(".ui-kv").querySelector(sel)
+        el && el.focus()
+    }
+    <div class={ui_cls(["ui-kv", class])} role="group" aria-labelledby={label != null ? `${id}-label` : null}
+         aria-describedby={hint != null ? `${id}-hint` : null}>
+        {label != null && <p.ui-kv-label id={`${id}-label`}>{label}</p>}
+        {len(rows) > 0
+            ? <div.ui-kv-head aria-hidden="true"><span>{key_label}</span><span>{value_label}</span><span></span></div>
+            : <p.ui-kv-empty>Nothing yet.</p>}
+        <ul.ui-kv-rows>
+            {for [i, r] in enumerate(rows) => <li.ui-kv-row key={r.id}>
+                <input.ui-kv-input type="text" id={`${id}-key-${r.id}`} value={r.key} placeholder={key_placeholder}
+                       autocomplete="off" spellcheck="false" aria-label={`${key_label} ${i + 1}`}
+                       aria-invalid={twice(trim(r.key)) ? "true" : null}
+                       aria-describedby={twice(trim(r.key)) ? `${id}-warn-${r.id}` : null}
+                       @mount={(el) => { if focus_id == r.id { el.focus() } }}
+                       @input={(e) => { update(rows | map((x) => x.id == r.id ? { id: x.id, key: e.value, value: x.value } : x)) }}
+                       @keydown={(e) => {
+                           if e.key == "Enter" {
+                               e.preventDefault()
+                               field(e, `#${id}-value-${r.id}`)
+                           }
+                       }}/>
+                <input.ui-kv-input type="text" id={`${id}-value-${r.id}`} value={r.value} placeholder={value_placeholder}
+                       autocomplete="off" spellcheck="false" aria-label={`${value_label} ${i + 1}`}
+                       @input={(e) => { update(rows | map((x) => x.id == r.id ? { id: x.id, key: x.key, value: e.value } : x)) }}
+                       @keydown={(e) => {
+                           if e.key == "Enter" {
+                               e.preventDefault()
+                               let at = index_of(rows | map((x) => x.id), r.id) ?? 0
+                               if at == len(rows) - 1 { add() } else { field(e, `#${id}-key-${rows[at + 1].id}`) }
+                           }
+                       }}/>
+                <button.ui-kv-x type="button" aria-label={trim(r.key) != "" ? `Remove ${trim(r.key)}` : `Remove row ${i + 1}`}
+                        @click={(e) => {
+                            let at = index_of(rows | map((x) => x.id), r.id) ?? 0
+                            let root = e.target.closest(".ui-kv")
+                            update(rows | filter((x) => x.id != r.id))
+                            js("queueMicrotask", () => {
+                                let rest = root.querySelectorAll(".ui-kv-row")
+                                let to = len(rest) == 0 ? root.querySelector(".ui-kv-add")
+                                    : rest[at < len(rest) ? at : len(rest) - 1].querySelector("input")
+                                to && to.focus()
+                            })
+                        }}>
+                    <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                         aria-hidden="true"><path d="M2 2l6 6M8 2L2 8"/></svg>
+                </button>
+                {twice(trim(r.key)) && <p.ui-kv-warn id={`${id}-warn-${r.id}`}>
+                    {`“${trim(r.key)}” is used more than once; the last one is kept.`}
+                </p>}
+            </li>}
+        </ul>
+        <button.ui-kv-add type="button" disabled={full} @click={add}>
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 aria-hidden="true"><path d="M6 1.5v9M1.5 6h9"/></svg>
+            {add_label}
+        </button>
+        {hint != null && <p.ui-kv-hint id={`${id}-hint`}>{hint}</p>}
+        {name != null && format == "json" && <input type="hidden" name={name} value={json.stringify(pairs)}/>}
+        {name != null && format != "json" && (for [k, v] in pairs => <input type="hidden" name={`${name}[${k}]`} value={v}/>)}
+    </div>
+}

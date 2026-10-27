@@ -1,0 +1,73 @@
+const sent = (n) => $(`input[type=hidden][name="${n}"]`).value;
+const trig = $("#date-range-picker-drp-demo-stay");
+const drp = trig.closest(".ui-date-range-picker");
+const dlg = drp.querySelector("[role=dialog]");
+const cell = (d) => drp.querySelector(`[aria-label='${d}']`);
+const heads = () => [...dlg.querySelectorAll("h2")].map((h) => h.textContent.trim()).join(" / ");
+const status = () => drp.querySelector(".ui-date-range-picker-foot [aria-live]").textContent;
+if (sent("drp-demo-stay_start") !== "2026-12-20" || sent("drp-demo-stay_end") !== "2026-12-27") return `starts sending ${sent("drp-demo-stay_start")} – ${sent("drp-demo-stay_end")}`;
+const name = trig.getAttribute("aria-labelledby").split(" ").map((i) => document.getElementById(i).textContent.trim()).join(" ");
+if (name !== "Your stay 20 Dec – 27 Dec 2026") return `the button is heard as "${name}"`;
+if (trig.getAttribute("aria-haspopup") !== "dialog" || !dlg.hidden) return "the button does not open a dialog, or it starts open";
+trig.click(); await wait();
+if (dlg.hidden || trig.getAttribute("aria-expanded") !== "true") return "the button did not open the calendars";
+if (heads() !== "December 2026 / January 2027") return `it shows ${heads()}`;
+if (document.activeElement !== cell("Sunday 20 December 2026")) return `the focus is on ${document.activeElement.getAttribute("aria-label")}`;
+if (drp.querySelector(".ui-date-range-picker-presets")) return "presets={[]} still shows presets";
+const sel = [...drp.querySelectorAll("[aria-selected=true]")].map((c) => c.dataset.day);
+if (sel.length !== 8) return `${sel.length} days are selected, not 8`;
+// A new range: first click, a preview while hovering, second click.
+cell("Sunday 3 January 2027").click(); await wait();
+if (!status().includes("now pick the last day")) return `after one click: ${status()}`;
+if (sent("drp-demo-stay_start") !== "2026-12-20") return "half a range replaced what is sent";
+cell("Thursday 7 January 2027").dispatchEvent(new PointerEvent("pointerenter")); await wait();
+if (!cell("Tuesday 5 January 2027").classList.contains("ui-date-range-picker-preview")) return "hovering does not preview the range";
+if (cell("Friday 8 January 2027").classList.contains("ui-date-range-picker-preview")) return "the preview goes past the hovered day";
+cell("Saturday 2 January 2027").click(); await wait();
+if (!status().includes("Saturday 2 January 2027")) return `a day before the first did not start over: ${status()}`;
+cell("Wednesday 6 January 2027").click(); await wait();
+if (!dlg.hidden || sent("drp-demo-stay_start") !== "2027-01-02" || sent("drp-demo-stay_end") !== "2027-01-06") return `the second click: ${sent("drp-demo-stay_start")} – ${sent("drp-demo-stay_end")}`;
+if (document.activeElement !== trig) return "the focus did not go back to the button";
+// The keyboard.
+trig.click(); await wait();
+const k = async (n) => { key(document.activeElement, n); await wait(80); };
+if (document.activeElement !== cell("Saturday 2 January 2027")) return "it did not open on the first day";
+await k("Enter");
+if (!status().includes("now pick the last day")) return `Enter did not start a range: ${status()}`;
+await k("ArrowDown"); await k("ArrowRight");
+if (document.activeElement !== cell("Sunday 10 January 2027")) return `the arrows: ${document.activeElement.getAttribute("aria-label")}`;
+if (!cell("Thursday 7 January 2027").classList.contains("ui-date-range-picker-preview")) return "the focus does not preview the range";
+await k("PageDown");
+if (document.activeElement !== cell("Wednesday 10 February 2027") || heads() !== "January 2027 / February 2027") return `PageDown: ${heads()}`;
+await k("Enter");
+if (sent("drp-demo-stay_end") !== "2027-02-10" || !dlg.hidden) return `Enter did not end the range: ${sent("drp-demo-stay_end")}`;
+// Limits: nothing before min.
+trig.click(); await wait();
+for (let i = 0; i < 4; i++) { dlg.querySelector("[aria-label='Previous month']").click(); await wait(60); }
+if (dlg.querySelector("[aria-label='Previous month']").getAttribute("aria-disabled") !== "true" || !heads().startsWith("November 2026")) return `it went before min: ${heads()}`;
+key(dlg.querySelector("[aria-label='Previous month']"), "Escape"); await wait();
+if (!dlg.hidden) return "Escape did not close";
+// Presets, counted from the browser's today; on_change; Clear.
+const rep = $("#date-range-picker-drp-demo-report").closest(".ui-date-range-picker");
+rep.querySelector(".ui-date-range-picker-trigger").click(); await wait();
+const presets = [...rep.querySelectorAll(".ui-date-range-picker-preset")].map((b) => b.textContent);
+if (presets.join() !== "Today,Last 7 days,Last 30 days,This month,Last month,This year") return `presets: ${presets}`;
+const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const now = new Date(), week = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6);
+rep.querySelectorAll(".ui-date-range-picker-preset")[1].click(); await wait();
+if (sent("drp-demo-report_start") !== iso(week) || sent("drp-demo-report_end") !== iso(now)) return `Last 7 days: ${sent("drp-demo-report_start")} – ${sent("drp-demo-report_end")}`;
+const note = rep.closest(".demo-stack").querySelector(".demo-note").textContent;
+if (note !== `The form sends ${iso(week)} to ${iso(now)}.`) return `on_change: ${note}`;
+if (!rep.querySelector("[aria-current=date]")) return "today is not marked";
+rep.querySelector(".ui-date-range-picker-trigger").click(); await wait();
+if (rep.querySelectorAll(".ui-date-range-picker-preset")[1].getAttribute("aria-pressed") !== "true") return "the preset chosen is not pressed";
+rep.querySelector(".ui-date-range-picker-clear").click(); await wait();
+if (sent("drp-demo-report_start") !== "" || rep.closest(".demo-stack").querySelector(".demo-note").textContent !== "Cleared.") return "Clear did not clear";
+rep.querySelector(".ui-date-range-picker-trigger").dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: document.body })); await wait();
+if (!rep.querySelector("[role=dialog]").hidden) return "leaving did not close";
+// Given names and presets.
+const q = $("#date-range-picker-drp-demo-q").closest(".ui-date-range-picker");
+q.querySelector(".ui-date-range-picker-trigger").click(); await wait();
+q.querySelector(".ui-date-range-picker-preset").click(); await wait();
+if (sent("period[start]") !== "2026-07-01" || sent("period[end]") !== "2026-09-30") return "names or presets are not used";
+if (q.querySelector("th").textContent !== "Su") return "week_start={0}";

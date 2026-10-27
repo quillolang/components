@@ -1,0 +1,448 @@
+// EditableTable: a grid of rows to edit in place, like a small spreadsheet: click
+// a cell (or press Enter, F2 or just type) to change it. Each column has a type:
+// text, number, select, checkbox or date; numbers and dates are checked, and a value
+// that is not right is shown so and not kept. Changed cells are marked.
+//
+//   <EditableTable id="stock" label="Stock" name="items" can_add={true} can_delete={true} rows={items}
+//                  columns={[
+//                      { key: "sku", label: "SKU", required: true, sortable: true },
+//                      { key: "name", label: "Product", sortable: true },
+//                      { key: "qty", label: "Qty", type: "number", min: 0, sortable: true },
+//                      { key: "size", label: "Size", type: "select", options: ["S", "M", "L"] },
+//                      { key: "active", label: "Active", type: "checkbox" },
+//                      { key: "restock", label: "Restock on", type: "date" },
+//                  ]}/>
+//
+// id: a prefix for its ids, unique on the page. rows: a list of maps. columns, in
+// order, each { key, label, type?, options?, required?, min?, max?, readonly?,
+// sortable?, width? }: type "text" (default), "number" (on the right; min and max
+// bound it; whole numbers stay whole), "select" (options: strings or { label,
+// value }), "checkbox" (true or false: a click, Space or Enter flips it) or
+// "date" ("2026-03-14"; min and max as dates). required: it cannot be left empty.
+// readonly: shown, not edited. sortable: its header sorts the rows (again: the
+// other way); edits do not move a row until it is sorted again. width: a CSS width.
+// label: the table's name. can_add: an "Add row" button (add_label), whose row
+// starts as new_row (a map), or empty. can_delete: a × at the end of each row.
+// name: a <form> gets the rows under it, as JSON. empty: what it says with no rows.
+// The keys, not editing: the arrows, Home and End (with Ctrl: the first and last
+// cell), Page Up and Page Down (the first and last row), Enter or F2 to edit, a
+// letter or digit to start over with it, Delete to empty a cell. Editing: Enter
+// keeps it and goes down, Tab and Shift+Tab keep it and go across, Escape puts it
+// back. Leaving a cell keeps a good value.
+// on_change(rows): inside one of your components, called with all the rows after
+// each change. on_cell(index, key, value): called with the row's place in `rows`
+// (new rows after them), the column's key and the new value.
+
+let editable_table_css = css`
+.ui-et { display: grid; gap: 10px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-et-scroll { overflow-x: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-et table { width: 100%; border-collapse: separate; border-spacing: 0; }
+.ui-et th, .ui-et td { box-sizing: border-box; height: 38px; padding: 0 12px; text-align: left; white-space: nowrap;
+  border-bottom: 1px solid var(--ui-border); }
+.ui-et td + td, .ui-et th + th { border-left: 1px solid var(--ui-border); }
+.ui-et tbody tr:last-child td { border-bottom: 0; }
+.ui-et th { background: var(--ui-subtle); color: var(--ui-muted); font-size: 12px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+.ui-et-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-et .ui-et-right { text-align: right; font-variant-numeric: tabular-nums; }
+.ui-et .ui-et-center { text-align: center; }
+.ui-et-sort { display: inline-flex; align-items: center; gap: 4px; margin: -4px -6px; padding: 4px 6px; border: 0; border-radius: 4px;
+  background: none; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; cursor: pointer; }
+.ui-et-sort:hover { color: var(--ui-fg); }
+.ui-et-sort:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-et-right .ui-et-sort { flex-direction: row-reverse; }
+.ui-et-arrow { width: 12px; height: 12px; opacity: .35; }
+[aria-sort] .ui-et-sort { color: var(--ui-fg); }
+[aria-sort] .ui-et-arrow { opacity: 1; color: var(--ui-accent); }
+.ui-et td { position: relative; cursor: cell; outline: none; }
+.ui-et td[aria-readonly="true"] { color: var(--ui-muted); cursor: default; }
+.ui-et td:focus { box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-et-dirty::after { content: ""; position: absolute; top: 0; right: 0; border: 5px solid transparent;
+  border-top-color: var(--ui-warning); border-right-color: var(--ui-warning); }
+.ui-et-new td:first-child { box-shadow: inset 3px 0 0 var(--ui-success); }
+.ui-et-new td:first-child:focus { box-shadow: inset 3px 0 0 var(--ui-success), inset 0 0 0 2px var(--ui-accent); }
+.ui-et-empty-val { color: var(--ui-muted); }
+.ui-et td.ui-et-editing { padding: 0; box-shadow: inset 0 0 0 2px var(--ui-accent); background: var(--ui-surface); }
+.ui-et td.ui-et-editing.ui-et-bad { box-shadow: inset 0 0 0 2px var(--ui-danger); }
+.ui-et-input { box-sizing: border-box; width: 100%; min-width: 80px; height: 36px; margin: 0; padding: 0 11px; border: 0; outline: none;
+  background: transparent; color: var(--ui-fg); font: inherit; }
+.ui-et-right .ui-et-input { text-align: right; }
+.ui-et-err { position: absolute; z-index: 3; top: 100%; left: -1px; margin-top: 2px; padding: 4px 8px; border-radius: 4px;
+  background: var(--ui-danger); color: #fff; font-size: 12px; font-weight: 500; white-space: nowrap; box-shadow: var(--ui-shadow); }
+.ui-et-err-up { top: auto; bottom: 100%; margin: 0 0 2px; }
+.ui-et-check { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; vertical-align: middle;
+  border: 1.5px solid var(--ui-strong); border-radius: 4px; background: var(--ui-surface); color: var(--ui-accent-fg); }
+.ui-et-check[aria-checked="true"] { border-color: var(--ui-accent); background: var(--ui-accent); }
+.ui-et-check svg { width: 10px; height: 10px; }
+.ui-et-act { width: 1%; text-align: center !important; }
+.ui-et-del { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 0;
+  border-radius: 4px; background: transparent; color: var(--ui-muted); cursor: pointer; }
+.ui-et-del:hover { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-et-del svg { width: 12px; height: 12px; }
+.ui-et-none td { height: 64px; color: var(--ui-muted); text-align: center; cursor: default; }
+.ui-et-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 14px;
+  color: var(--ui-muted); font-size: 13px; }
+.ui-et-add { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; border: 1px dashed var(--ui-strong);
+  border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-accent); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-et-add:hover { border-style: solid; border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-et-add:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-et-add svg { width: 12px; height: 12px; }
+`
+
+// A select column's options as maps of { label, value }.
+fn editable_table_options(c: map) -> list =
+    (c.options ?? []) | map((o) => type_of(o) == "map" ? { label: o.label ?? str(o.value), value: o.value ?? o.label } : { label: str(o), value: o })
+
+// How a cell shows its value (checkboxes aside).
+fn editable_table_show(c: map, v) -> str {
+    if v == null || v == "" { return "" }
+    if c.type == "select" { return (find(editable_table_options(c), (o) => o.value == v) ?? { label: str(v) }).label }
+    str(v)
+}
+
+// The text a cell's editor starts with.
+fn editable_table_text(c: map, v) -> str = v == null ? "" : str(v)
+
+// What a typed text means in a column: { ok: true, value } or { ok: false, error }.
+fn editable_table_check(c: map, text: str) -> map {
+    let t = trim(text)
+    let kind = c.type ?? "text"
+    if t == "" {
+        return c.required == true ? { ok: false, error: "Required" } : { ok: true, value: kind == "text" ? "" : null }
+    }
+    if kind == "number" {
+        let n = re.test(t, "^-?\\d+$") ? int(t) : (re.test(t, "^-?(\\d+\\.?\\d*|\\.\\d+)$") ? float(t) : null)
+        if n == null || is_err(n) { return { ok: false, error: "Not a number" } }
+        if c.min != null && n < c.min { return { ok: false, error: `At least ${c.min}` } }
+        if c.max != null && n > c.max { return { ok: false, error: `At most ${c.max}` } }
+        return { ok: true, value: n }
+    }
+    if kind == "date" {
+        if !re.test(t, "^\\d{4}-\\d{2}-\\d{2}$") { return { ok: false, error: "A date: YYYY-MM-DD" } }
+        if c.min != null && t < c.min { return { ok: false, error: `On or after ${c.min}` } }
+        if c.max != null && t > c.max { return { ok: false, error: `On or before ${c.max}` } }
+        return { ok: true, value: t }
+    }
+    if kind == "select" {
+        let o = find(editable_table_options(c), (o) => str(o.value) == t)
+        return o == null ? { ok: false, error: "Not one of the options" } : { ok: true, value: o.value }
+    }
+    { ok: true, value: text }
+}
+
+// A new row: new_row, or each column's empty value.
+fn editable_table_blank(columns: list, new_row: map?) -> map =
+    new_row ?? reduce(columns, {}, (m, c) => set(m, c.key, c.type == "checkbox" ? false : (c.type ?? "text") == "text" ? "" : null))
+
+fn editable_table_right(c: map) -> bool = c.type == "number" || c.align == "right"
+
+component EditableTable(id: str, columns: list = [], rows: list = [], label: str? = null, name: str? = null,
+                        can_add: bool = false, can_delete: bool = false, new_row: map? = null, add_label: str = "Add row",
+                        empty: str = "No rows yet", on_change = null, on_cell = null, class: str? = null) {
+    state data = for [i, r] in enumerate(rows) => { id: i, values: r, orig: r }
+    state order = range(0, len(rows))
+    state next_id = len(rows)
+    state sort_key = null
+    state sort_desc = false
+    state ar = 0               // the active cell: its row's place in `order`, and its column
+    state ac = 0
+    state editing = false
+    state draft = ""
+    state typed = false        // the edit began with a key typed, not Enter
+    state said = ""
+    let ncols = len(columns) + (can_delete ? 1 : 0)
+    let by_id = reduce(data, {}, (m, d) => set(m, str(d.id), d))
+    let shown = order | map((i) => by_id[str(i)]) | filter((d) => d != null)
+    let n = len(shown)
+    let r_at = n == 0 ? 0 : min([ar, n - 1])
+    let c_at = min([ac, ncols - 1])
+    let col = columns[c_at]
+    let check = editing && col != null ? editable_table_check(col, draft) : { ok: true }
+    let out = data | map((d) => d.values)
+    let changed = sum(data | map((d) => d.orig == null ? 0 : count(columns, (c) => d.values[c.key] != d.orig[c.key])))
+    let added = count(data, (d) => d.orig == null)
+    let dirty = (d: map, c: map) => d.orig == null || d.values[c.key] != d.orig[c.key]
+    let editable = (c: map?) => c != null && c.readonly != true
+    let cell_sel = (r: int, c: int) => `[data-cell="${r}-${c}"]`
+    let focus_cell = (root, r: int, c: int) => {
+        js("queueMicrotask", () => {
+            let el = root.querySelector(cell_sel(r, c))
+            el && el.focus()
+        })
+    }
+    let go = (e, r: int, c: int) => {
+        ar = max([0, min([r, n - 1])])
+        ac = max([0, min([c, ncols - 1])])
+        focus_cell(e.target.closest(".ui-et"), ar, ac)
+    }
+    // Sets one value of the row with this id, and tells the callbacks.
+    let put = (rid: int, key: str, v) => {
+        let place = index_of(data | map((d) => d.id), rid)
+        let d = data[place]
+        if d.values[key] != v {
+            data = for x in data => x.id == rid ? { id: x.id, values: set(x.values, key, v), orig: x.orig } : x
+            on_cell && on_cell(place, key, v)
+            on_change && on_change(data | map((x) => x.values))
+        }
+    }
+    let start = (c: map, d: map, text: str?) => {
+        if editable(c) && c.type != "checkbox" {
+            editing = true
+            typed = text != null
+            draft = text ?? editable_table_text(c, d.values[c.key])
+        }
+    }
+    // Keeps what is being edited if it is good; says what is wrong if not.
+    let keep = () => {
+        let res = editing ? editable_table_check(col, draft) : { ok: true }
+        if !res.ok {
+            said = `${col.label ?? col.key}: ${res.error}`
+        } else if editing {
+            editing = false
+            let d = shown[r_at]
+            if d != null { put(d.id, col.key, res.value) }
+        }
+        res.ok
+    }
+    let flip = (d: map, c: map) => { if editable(c) { put(d.id, c.key, d.values[c.key] != true) } }
+    let clear = (d: map, c: map) => {
+        if editable(c) {
+            let res = editable_table_check(c, "")
+            if res.ok { put(d.id, c.key, c.type == "checkbox" ? false : res.value) } else { said = `${c.label ?? c.key}: ${res.error}` }
+        }
+    }
+    let remove = (root, d: map) => {
+        let at = index_of(order, d.id) ?? 0
+        let left = n - 1          // taken before `n` follows the rows
+        editing = false
+        data = data | filter((x) => x.id != d.id)
+        order = order | filter((i) => i != d.id)
+        said = "Row deleted"
+        on_change && on_change(data | map((x) => x.values))
+        if left > 0 {
+            ar = min([at, left - 1])
+            focus_cell(root, ar, ac)
+        } else {
+            js("queueMicrotask", () => {
+                let b = root.querySelector(".ui-et-add")
+                b && b.focus()
+            })
+        }
+    }
+    let add = (e) => {
+        if keep() {
+            // `n` follows the rows, so the new row's place is taken before adding it.
+            let at = n
+            let nid = next_id
+            let first = index_of(columns | map((c) => editable(c) && c.type != "checkbox"), true) ?? 0
+            next_id += 1
+            data = push(data, { id: nid, values: editable_table_blank(columns, new_row), orig: null })
+            order = push(order, nid)
+            ar = at
+            ac = first
+            said = "Row added"
+            on_change && on_change(data | map((x) => x.values))
+            focus_cell(e.target.closest(".ui-et"), at, first)
+        }
+    }
+    let sort_on = (c: map) => {
+        if keep() {
+            let desc = sort_key == c.key ? !sort_desc : false
+            sort_key = c.key
+            sort_desc = desc
+            let blank = shown | filter((d) => d.values[c.key] == null || d.values[c.key] == "")
+            let full = shown | filter((d) => d.values[c.key] != null && d.values[c.key] != "") | sort_by((d) => {
+                let v = d.values[c.key]
+                type_of(v) == "str" ? lower(v) : v
+            })
+            // Empty cells go last, either way.
+            let ids = ((desc ? reverse(full) : full) + blank) | map((d) => d.id)
+            order = ids
+        }
+    }
+    <div class={ui_cls(["ui-et", class])}>
+        <div.ui-et-scroll>
+            <table role="grid" aria-label={label} aria-rowcount={n + 1} aria-colcount={ncols}
+                   @keydown={(e) => {
+                       let k = e.key
+                       let root = e.target.closest(".ui-et")
+                       let d = shown[r_at]
+                       let tag = e.target.tagName
+                       if editing {
+                           if k == "Escape" {
+                               e.preventDefault()
+                               editing = false
+                               said = "Edit cancelled"
+                               focus_cell(root, r_at, c_at)
+                           } else if k == "Enter" && tag != "SELECT" {
+                               e.preventDefault()
+                               if keep() { go(e, r_at + 1, c_at) }
+                           } else if k == "Tab" {
+                               e.preventDefault()
+                               if keep() {
+                                   let flat = r_at * ncols + c_at + (e.shiftKey ? -1 : 1)
+                                   let to = max([0, min([flat, n * ncols - 1])])
+                                   go(e, floor(to / ncols), to % ncols)
+                               }
+                           }
+                       } else if tag == "TD" && d != null {
+                           let c = columns[c_at]
+                           let ctrl = e.ctrlKey || e.metaKey
+                           let to = match k {
+                               "ArrowDown" => [r_at + 1, c_at]
+                               "ArrowUp" => [r_at - 1, c_at]
+                               "ArrowRight" => [r_at, c_at + 1]
+                               "ArrowLeft" => [r_at, c_at - 1]
+                               "Home" => ctrl ? [0, 0] : [r_at, 0]
+                               "End" => ctrl ? [n - 1, ncols - 1] : [r_at, ncols - 1]
+                               "PageDown" => [n - 1, c_at]
+                               "PageUp" => [0, c_at]
+                               _ => null
+                           }
+                           if to != null {
+                               e.preventDefault()
+                               go(e, to[0], to[1])
+                           } else if c == null {
+                               // The delete column.
+                               if k == "Enter" || k == " " || k == "Delete" {
+                                   e.preventDefault()
+                                   remove(root, d)
+                               }
+                           } else if c.type == "checkbox" && (k == " " || k == "Enter") {
+                               e.preventDefault()
+                               flip(d, c)
+                           } else if k == "Enter" || k == "F2" {
+                               e.preventDefault()
+                               start(c, d, null)
+                           } else if k == "Delete" || k == "Backspace" {
+                               e.preventDefault()
+                               clear(d, c)
+                           } else if len(k) == 1 && k != " " && !ctrl && !e.altKey && ((c.type ?? "text") == "text" || c.type == "number") {
+                               e.preventDefault()
+                               start(c, d, k)
+                           }
+                       }
+                   }}>
+                <colgroup>
+                    {for c in columns => <col style={c.width != null ? `width: ${c.width}` : null}/>}
+                    {can_delete && <col style="width: 44px"/>}
+                </colgroup>
+                <thead>
+                    <tr aria-rowindex="1">
+                        {for [ci, c] in enumerate(columns) => <th scope="col" aria-colindex={ci + 1}
+                                class={editable_table_right(c) ? "ui-et-right" : (c.type == "checkbox" ? "ui-et-center" : null)}
+                                aria-sort={sort_key == c.key ? (sort_desc ? "descending" : "ascending") : null}>
+                            {c.sortable == true
+                                ? <button.ui-et-sort type="button" @click={() => { sort_on(c) }}>
+                                      {c.label ?? c.key}{c.required == true && <span.ui-et-req aria-hidden="true">*</span>}
+                                      <svg.ui-et-arrow viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6"
+                                           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                          <path d={sort_key != c.key ? "M3.5 4.5L6 2l2.5 2.5M3.5 7.5L6 10l2.5-2.5"
+                                                   : (sort_desc ? "M6 2v8M3 7l3 3 3-3" : "M6 10V2M3 5l3-3 3 3")}/>
+                                      </svg>
+                                  </button>
+                                : [c.label ?? c.key, c.required == true && <span.ui-et-req aria-hidden="true">*</span>]}
+                            {c.required == true && <span.ui-sr> (required)</span>}
+                        </th>}
+                        {can_delete && <th scope="col" aria-colindex={ncols}><span.ui-sr>Delete</span></th>}
+                    </tr>
+                </thead>
+                <tbody>
+                    {n == 0 && <tr.ui-et-none><td colspan={str(ncols)}>{empty}</td></tr>}
+                    {for [ri, d] in enumerate(shown) => <tr key={d.id} aria-rowindex={ri + 2} class={d.orig == null ? "ui-et-new" : null}>
+                        {for [ci, c] in enumerate(columns) => {
+                            let here = ri == r_at && ci == c_at
+                            let v = d.values[c.key]
+                            let ed = here && editing
+                            <td role="gridcell" data-cell={`${ri}-${ci}`} aria-colindex={ci + 1}
+                                tabindex={here && !editing ? "0" : "-1"}
+                                aria-readonly={c.readonly == true ? "true" : null}
+                                class={ui_cls([editable_table_right(c) && "ui-et-right", c.type == "checkbox" && "ui-et-center",
+                                               dirty(d, c) && d.orig != null && "ui-et-dirty", ed && "ui-et-editing",
+                                               ed && !check.ok && "ui-et-bad"])}
+                                @focus={(e) => {
+                                    if !editing && e.target.tagName == "TD" {
+                                        ar = ri
+                                        ac = ci
+                                    }
+                                }}
+                                @click={(e) => {
+                                    if !ed {
+                                        if keep() {
+                                            ar = ri
+                                            ac = ci
+                                            if c.type == "checkbox" { flip(d, c) } else { start(c, d, null) }
+                                            if c.type == "checkbox" || !editable(c) { focus_cell(e.target.closest(".ui-et"), ri, ci) }
+                                        } else {
+                                            focus_cell(e.target.closest(".ui-et"), r_at, c_at)
+                                        }
+                                    }
+                                }}>
+                                {ed
+                                    ? (c.type == "select"
+                                        ? <select.ui-et-input aria-label={c.label ?? c.key} @mount={(el) => { el.focus() }}
+                                                  @change={(e) => {
+                                                      draft = e.value
+                                                      if keep() { focus_cell(e.target.closest(".ui-et"), ri, ci) }
+                                                  }}
+                                                  @blur={() => { if editing { if !keep() { editing = false } } }}>
+                                              {c.required != true && <option value="" selected={draft == ""}>—</option>}
+                                              {for o in editable_table_options(c) => <option value={str(o.value)} selected={str(o.value) == draft}>{o.label}</option>}
+                                          </select>
+                                        : <input.ui-et-input type={c.type == "date" ? "date" : "text"} value={draft}
+                                                 inputmode={c.type == "number" ? "decimal" : null}
+                                                 min={c.type == "date" ? c.min : null} max={c.type == "date" ? c.max : null}
+                                                 aria-label={c.label ?? c.key} aria-invalid={check.ok ? null : "true"}
+                                                 aria-describedby={check.ok ? null : `${id}-err`} required={c.required == true}
+                                                 @mount={(el) => {
+                                                     el.focus()
+                                                     if c.type != "date" {
+                                                         if typed { el.setSelectionRange(len(draft), len(draft)) } else { el.select() }
+                                                     }
+                                                 }}
+                                                 @input={(e) => { draft = e.value }}
+                                                 @blur={() => {
+                                                     // Leaving the cell keeps a good value and drops a bad one.
+                                                     if editing { if !keep() { editing = false } }
+                                                 }}/>)
+                                    : (c.type == "checkbox"
+                                        ? <span.ui-et-check role="checkbox" aria-checked={v == true ? "true" : "false"} aria-label={c.label ?? c.key}>
+                                              {v == true && <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8"
+                                                                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 5.2l2 2 4-4.4"/></svg>}
+                                          </span>
+                                        : (editable_table_show(c, v) == "" ? <span.ui-et-empty-val aria-label="empty">—</span> : editable_table_show(c, v)))}
+                                {dirty(d, c) && d.orig != null && <span.ui-sr>, changed</span>}
+                                {ed && !check.ok && <span id={`${id}-err`} class={ui_cls(["ui-et-err", ri == n - 1 && n > 1 && "ui-et-err-up"])}>{check.error}</span>}
+                            </td>
+                        }}
+                        {can_delete && <td role="gridcell" data-cell={`${ri}-${ncols - 1}`} aria-colindex={ncols} class="ui-et-act"
+                                @focus={() => {
+                                    if !editing {
+                                        ar = ri
+                                        ac = ncols - 1
+                                    }
+                                }}
+                                tabindex={ri == r_at && c_at == ncols - 1 && !editing ? "0" : "-1"}>
+                            <button.ui-et-del type="button" tabindex="-1" aria-label={`Delete row ${ri + 1}`}
+                                    @click={(e) => { remove(e.target.closest(".ui-et"), d) }}>
+                                <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                                     aria-hidden="true"><path d="M2 2l6 6M8 2L2 8"/></svg>
+                            </button>
+                        </td>}
+                    </tr>}
+                </tbody>
+            </table>
+        </div>
+        <div.ui-et-foot>
+            {can_add ? <button.ui-et-add type="button" @click={add}>
+                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                     aria-hidden="true"><path d="M6 1.5v9M1.5 6h9"/></svg>
+                {add_label}
+            </button> : <span></span>}
+            <span.ui-et-status>
+                {n} row{n == 1 ? "" : "s"}{changed > 0 ? ` · ${changed} changed` : ""}{added > 0 ? ` · ${added} new` : ""}
+            </span>
+        </div>
+        <span.ui-sr aria-live="polite">{said}</span>
+        {name != null && <input type="hidden" name={name} value={json.stringify(out)}/>}
+    </div>
+}

@@ -1,0 +1,17 @@
+const dots = $$(".ui-sd");
+if (dots.length !== 11) return `expected 11 status dots, found ${dots.length}`;
+const text = (d) => d.querySelector(".ui-sd-label")?.textContent;
+if (text(dots[0]) !== "Online" || text(dots[3]) !== "Offline") return `default labels: ${text(dots[0])}, ${text(dots[3])}`;
+if (text(dots[2]) !== "In a meeting") return "label is not shown";
+const color = (d) => getComputedStyle(d.querySelector(".ui-sd-dot")).backgroundColor;
+const [online, away, busy, offline, ok, warning, error, info, unknown, ada, alan] = dots;
+if (color(online) !== color(ok) || color(away) !== color(warning) || color(busy) !== color(error)) return "people and service states do not share colours";
+if (new Set([color(online), color(away), color(busy), color(info)]).size !== 4) return "the states are not distinct colours";
+if (color(offline) !== "rgba(0, 0, 0, 0)" || getComputedStyle(offline.querySelector(".ui-sd-dot")).boxShadow === "none") return "offline is not a hollow dot";
+if (getComputedStyle(error.querySelector(".ui-sd-dot"), "::after").animationName !== "ui-sd-pulse") return "pulse does not pulse";
+if (getComputedStyle(online.querySelector(".ui-sd-dot"), "::after").content !== "none") return "a dot without pulse has a ring";
+if (ada.getAttribute("role") !== "img" || ada.getAttribute("aria-label") !== "Online" || ada.querySelector(".ui-sd-label")) return "show_label={false} is not an image named Online";
+if (online.getAttribute("role") !== null) return "a dot with its word is an image";
+if (!online.querySelector(".ui-sd-dot").hasAttribute("aria-hidden")) return "the dot is not hidden from screen readers";
+const w = (d) => d.querySelector(".ui-sd-dot").getBoundingClientRect().width;
+if (!(w(warning) < w(ok) && w(ok) < w(info))) return "sizes sm, md and lg are not growing";

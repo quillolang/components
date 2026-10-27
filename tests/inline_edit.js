@@ -1,0 +1,42 @@
+const ed = $("input[name=ie-demo-title]").closest(".ui-inline-edit");
+const hidden = $("input[type=hidden][name=ie-demo-title]");
+const show = () => ed.querySelector(".ui-inline-edit-show");
+const box = () => ed.querySelector("input[type=text]");
+const note = () => ed.closest(".demo-stack").querySelector(".demo-note").textContent;
+if (hidden.value !== "Launch plan") return `starts as "${hidden.value}"`;
+if (box()) return "it starts as a text box";
+if (show().tagName !== "BUTTON" || !show().textContent.includes("Board title: ") || !show().textContent.includes("Launch plan"))
+    return `the text is not a named button: ${show().textContent}`;
+show().click(); await wait(100);
+if (!box() || box().value !== "Launch plan") return "a click did not turn it into a box with the text";
+if (document.activeElement !== box()) return "the box does not get the focus";
+if (box().getAttribute("aria-label") !== "Board title") return "the box is not labelled";
+type(box(), "Launch plan v2"); key(box(), "Escape"); await wait(100);
+if (box() || hidden.value !== "Launch plan" || note() !== "Nothing saved yet.") return `Escape did not put it back: "${hidden.value}"`;
+if (document.activeElement !== show()) return "after Escape the focus is not back on the text";
+show().click(); await wait(100);
+type(box(), "   "); key(box(), "Enter"); await wait(100);
+if (!box() || box().getAttribute("aria-invalid") !== "true" || !ed.querySelector("[role=alert]")?.textContent.includes("cannot be empty"))
+    return "an empty required text was saved";
+type(box(), "Launch plan v2 "); key(box(), "Enter"); await wait(100);
+if (box() || hidden.value !== "Launch plan v2") return `Enter did not save: "${hidden.value}"`;
+if (note() !== "Saved “Launch plan v2”.") return `on_change: ${note()}`;
+if (!ed.querySelector("[aria-live]").textContent.includes("saved")) return "saving is not announced";
+// Leaving the box saves; the buttons save and cancel.
+show().click(); await wait(100);
+type(box(), "Roadmap"); box().dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: document.body })); await wait(100);
+if (box() || hidden.value !== "Roadmap") return `leaving did not save: "${hidden.value}"`;
+show().click(); await wait(100);
+type(box(), "Nope"); ed.querySelector("button[aria-label=Cancel]").click(); await wait(100);
+if (hidden.value !== "Roadmap") return "Cancel saved";
+const owner = $("input[type=hidden][name=ie-demo-owner]").closest(".ui-inline-edit");
+owner.querySelector(".ui-inline-edit-show").click(); await wait(100);
+type(owner.querySelector("input[type=text]"), "Ada Lovelace"); owner.querySelector("button[aria-label=Save]").click(); await wait(100);
+if ($("input[type=hidden][name=ie-demo-owner]").value !== "Ada Lovelace") return "Save did not save";
+const emptyOne = $("input[type=hidden][name=ie-demo-note]").closest(".ui-inline-edit");
+if (!emptyOne.querySelector(".ui-inline-edit-empty")?.textContent.includes("Add a note")) return "an empty one does not show its placeholder";
+emptyOne.querySelector(".ui-inline-edit-show").click(); await wait(100);
+if (emptyOne.querySelector("input[type=text]").maxLength !== 80) return "maxlength is not passed";
+if (emptyOne.querySelector(".ui-inline-edit-btn")) return "buttons={false} still shows buttons";
+key(emptyOne.querySelector("input[type=text]"), "Escape"); await wait(100);
+if (!$("input[type=hidden][name=ie-demo-locked]").closest(".ui-inline-edit").querySelector("button").disabled) return "disabled is not passed";

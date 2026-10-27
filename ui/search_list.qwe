@@ -1,0 +1,167 @@
+// SearchList: a search box over a list that keeps what matches as it is typed, with
+// the words found marked, how many there are said to screen readers, and the
+// results reached with the arrow keys: Down from the box goes into them, Up and Down
+// move, Escape goes back to the box, Enter in the box opens the first. Needs
+// ui/match_highlight.qwe.
+//
+//   <SearchList id="docs" label="Search the docs" facets={true} items={[
+//       { title: "Routes", text: "Answer requests by method and path.", href: "/docs/routes", tags: ["Server"] },
+//       { title: "Components", text: "State that runs in the browser.", href: "/docs/components", tags: ["Browser"] },
+//   ]}/>
+//   <SearchList id="people" items={team} on_select={(p) => { open_profile(p.title) }}/>
+//
+// id (required): unique on the page; its parts' ids start with it.
+// items: a list of { title, text?, href?, tags? }. Every word typed must be in its
+// title, text or tags, in any case. An item with an href is a link; one without is a
+// button that, inside one of your components, calls on_select(item).
+// label: the box's name ("Search"); shown above it when show_label is true.
+// placeholder ("Search…"), name ("q", so a <form method="get"> can send it), query (the
+// text to start with). facets: chips of the items' tags, with how many match each,
+// that keep one tag (facet_label names them: "Tags"). limit: the most shown at once.
+// empty: what it says when nothing matches ("No results").
+
+let search_list_css = css`
+.ui-sl { display: grid; gap: 10px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-sl-label { font-size: 13px; font-weight: 500; }
+.ui-sl-box { position: relative; display: flex; align-items: center; }
+.ui-sl-box svg { position: absolute; left: 11px; width: 16px; height: 16px; color: var(--ui-muted); pointer-events: none; }
+.ui-sl-input {
+  box-sizing: border-box; width: 100%; height: 40px; margin: 0; padding: 0 12px 0 35px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 15px/1 var(--ui-font);
+  appearance: none; transition: border-color .15s, box-shadow .15s;
+}
+.ui-sl-input::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-sl-input:hover { border-color: var(--ui-strong); }
+.ui-sl-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-sl-facets { display: flex; flex-wrap: wrap; gap: 6px; }
+.ui-sl-chip {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer;
+}
+.ui-sl-chip:hover:not(:disabled) { border-color: var(--ui-strong); }
+.ui-sl-chip:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-sl-chip[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-sl-chip:disabled { opacity: .5; cursor: not-allowed; }
+.ui-sl-chip span { color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-sl-chip[aria-pressed="true"] span { color: inherit; }
+.ui-sl-count { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-sl-list { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.ui-sl-hit {
+  display: grid; gap: 2px; width: 100%; padding: 10px 12px; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-fg); font: inherit; text-align: left; text-decoration: none; cursor: pointer;
+}
+.ui-sl-hit:hover { background: var(--ui-subtle); }
+.ui-sl-hit:focus-visible { outline: none; background: var(--ui-subtle); box-shadow: var(--ui-focus); }
+.ui-sl-title { font-weight: 600; color: var(--ui-fg); }
+a.ui-sl-hit .ui-sl-title { color: var(--ui-accent); }
+.ui-sl-text { color: var(--ui-muted); font-size: 13px; overflow-wrap: anywhere; }
+.ui-sl-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.ui-sl-tag { padding: 1px 7px; border-radius: 999px; background: var(--ui-subtle); color: var(--ui-muted); font-size: 12px; }
+.ui-sl-hit:hover .ui-sl-tag, .ui-sl-hit:focus-visible .ui-sl-tag { background: var(--ui-bg); }
+.ui-sl-empty { padding: 26px 16px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius-sm); color: var(--ui-muted); text-align: center; }
+.ui-sl-empty b { color: var(--ui-fg); }
+@media (prefers-reduced-motion: reduce) { .ui-sl-input { transition: none; } }
+`
+
+// Whether an item has every word of the query (words in lower case).
+fn search_list_matches(item: map, words: list) -> bool {
+    let hay = lower(join([item.title, get(item, "text") ?? "", join(get(item, "tags") ?? [], " ")], " "))
+    all(words, (w) => contains(hay, w))
+}
+
+// A piece of a long text around the first word found, at most `width` characters.
+fn search_list_snippet(text: str, words: list, width: int = 160) -> str {
+    if len(text) <= width { return text }
+    let low = lower(text)
+    let at = min(words | map((w) => index_of(low, w)) | filter((i) => i != null)) ?? 0
+    let start = at > 50 ? at - 40 : 0
+    let end = start + width
+    `${start > 0 ? "…" : ""}${trim(slice(text, start, end))}${end < len(text) ? "…" : ""}`
+}
+
+component SearchList(id: str, items: list = [], label: str = "Search", show_label: bool = false,
+                     placeholder: str = "Search…", name: str = "q", query: str = "", facets: bool = false,
+                     facet_label: str = "Tags", limit: int? = null, empty: str = "No results", on_select = null,
+                     class: str? = null) {
+    state text = query
+    state tag = null
+    let words = match_highlight_words(text)
+    let found = items | filter((it) => search_list_matches(it, words))
+    let tags = unique(flatten(items | map((it) => get(it, "tags") ?? [])))
+    let tagged = tag == null ? found : found | filter((it) => contains(get(it, "tags") ?? [], tag))
+    let total = len(tagged)
+    let shown = limit == null ? tagged : take(tagged, limit)
+    let go = (e, i: int) => {
+        let el = e.target.closest(".ui-sl").querySelector(`[data-i="${i}"]`)
+        el && el.focus()
+    }
+    let pick = (it) => { on_select && on_select(it) }
+    <div class={ui_cls(["ui-sl", class])}>
+        {show_label && <label.ui-sl-label for={`${id}-q`}>{label}</label>}
+        <div.ui-sl-box role="search">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                 aria-hidden="true"><circle cx="7" cy="7" r="4.75"/><path d="M10.5 10.5L14 14"/></svg>
+            <input.ui-sl-input type="search" id={`${id}-q`} name={name} value={text} placeholder={placeholder}
+                   aria-label={show_label ? null : label} aria-controls={`${id}-list`}
+                   aria-describedby={`${id}-count`} autocomplete="off" spellcheck="false"
+                   @input={(e) => { text = e.value }}
+                   @keydown={(e) => {
+                       if e.key == "ArrowDown" && len(shown) > 0 {
+                           e.preventDefault()
+                           go(e, 0)
+                       }
+                       if e.key == "Escape" && text != "" {
+                           e.preventDefault()
+                           text = ""
+                       }
+                       if e.key == "Enter" && len(shown) > 0 {
+                           e.preventDefault()
+                           let first_hit = e.target.closest(".ui-sl").querySelector(`[data-i="0"]`)
+                           first_hit && first_hit.click()
+                       }
+                   }}/>
+        </div>
+        {facets && len(tags) > 0 && <div.ui-sl-facets role="group" aria-label={facet_label}>
+            <button.ui-sl-chip type="button" aria-pressed={tag == null ? "true" : "false"}
+                    @click={() => { tag = null }}>All <span>{len(found)}</span></button>
+            {for t in tags => <button.ui-sl-chip key={t} type="button" aria-pressed={tag == t ? "true" : "false"}
+                    disabled={tag != t && count(found, (it) => contains(get(it, "tags") ?? [], t)) == 0}
+                    @click={() => { tag = tag == t ? null : t }}>
+                {t} <span>{count(found, (it) => contains(get(it, "tags") ?? [], t))}</span>
+            </button>}
+        </div>}
+        <p.ui-sl-count id={`${id}-count`} role="status" aria-live="polite">
+            {total == 0 ? "No results" : total == 1 ? "1 result" : len(shown) < total ? `${len(shown)} of ${total} results` : `${total} results`}
+        </p>
+        <ul.ui-sl-list id={`${id}-list`} aria-label={`${label}: results`} hidden={total == 0}
+            @keydown={(e) => {
+                let i = int(e.target.dataset.i ?? "") ?? null
+                if i != null {
+                    let n = len(shown)
+                    if e.key == "ArrowDown" { e.preventDefault(); go(e, (i + 1) % n) }
+                    if e.key == "ArrowUp" {
+                        e.preventDefault()
+                        if i == 0 { e.target.closest(".ui-sl").querySelector("input").focus() } else { go(e, i - 1) }
+                    }
+                    if e.key == "Home" { e.preventDefault(); go(e, 0) }
+                    if e.key == "End" { e.preventDefault(); go(e, n - 1) }
+                    if e.key == "Escape" { e.preventDefault(); e.target.closest(".ui-sl").querySelector("input").focus() }
+                }
+            }}>
+            {for [i, it] in enumerate(shown) => <li key={`${it.title}/${get(it, "href") ?? i}`}>
+                {get(it, "href") != null
+                    ? <a.ui-sl-hit href={it.href} data-i={i} @click={() => { pick(it) }}>
+                          <span.ui-sl-title><MatchHighlight text={it.title} query={text}/></span>
+                          {get(it, "text") != null && <span.ui-sl-text><MatchHighlight text={search_list_snippet(it.text, words)} query={text}/></span>}
+                          {len(get(it, "tags") ?? []) > 0 && <span.ui-sl-tags>{for t in it.tags => <span.ui-sl-tag><MatchHighlight text={t} query={text}/></span>}</span>}
+                      </a>
+                    : <button.ui-sl-hit type="button" data-i={i} @click={() => { pick(it) }}>
+                          <span.ui-sl-title><MatchHighlight text={it.title} query={text}/></span>
+                          {get(it, "text") != null && <span.ui-sl-text><MatchHighlight text={search_list_snippet(it.text, words)} query={text}/></span>}
+                          {len(get(it, "tags") ?? []) > 0 && <span.ui-sl-tags>{for t in it.tags => <span.ui-sl-tag><MatchHighlight text={t} query={text}/></span>}</span>}
+                      </button>}
+            </li>}
+        </ul>
+        {total == 0 && <div.ui-sl-empty>{empty}{trim(text) != "" && <span> for <b>“{trim(text)}”</b></span>}{tag != null && <span> in {tag}</span>}.</div>}
+    </div>
+}

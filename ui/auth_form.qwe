@@ -1,0 +1,357 @@
+// AuthForm: one form for an account's four doors: sign in, sign up, forgot
+// password (ask for a reset link by email) and reset password (choose a new one,
+// from that link). Its links ("Forgot password?", "Create an account", "Back to
+// sign in") change it in place, without loading a page, keeping the email typed.
+// Each one is a plain <form method="post"> to its own action, with a hidden `mode`
+// field (and `token` when resetting), so the server reads it like any form; the
+// fields have the autocomplete the browser and password managers look for.
+// Before sending, it checks what it can (an email, a long enough password, the
+// two typed alike, the terms ticked) and says so beside each field.
+//
+//   <AuthForm mode="signin" providers={[{ label: "Continue with GitHub", href: "/auth/github" }]}/>
+//   <AuthForm mode="signup" terms_href="/terms" ask_name={false}/>
+//   <AuthForm mode="reset" token={token} error="That link has expired: ask for a new one."/>
+//
+// On the server, one route per action. A wrong password shows the form again with
+// `error` (and the email typed); a right one starts a session:
+//
+//   route GET /login = page(<AuthForm mode="signin"/>)
+//   route POST /login { form: { email: str, password: str, remember: str = "" } } {
+//       let user = db.one("select id, password_hash from users where email = ?", lower(email))
+//       if user == null || !crypto.verify_password(password, user.password_hash) {
+//           return page(<AuthForm mode="signin" error="Wrong email or password." values={{ email: email }}/>)
+//       }
+//       set_session({ user: user.id }, { max_age: remember != "" ? 30 * 86400 : 86400 })
+//       redirect("/")
+//   }
+//   route POST /forgot { form: { email: str } } {
+//       send_reset_link(email)       // yours: a token in the database, and an email with /reset?token=...
+//       page(<AuthForm mode="signin" notice="If that address has an account, a link is on its way."/>)
+//   }
+//   route GET /reset ? { token: str } = page(<AuthForm mode="reset" token={token}/>)
+//
+// mode: the form it starts as, "signin" (default), "signup", "forgot" or "reset".
+// actions: where each posts, { signin, signup, forgot, reset } (by default "/login",
+// "/signup", "/forgot" and "/reset"; give only those that differ).
+// error / notice: a message from the server above the fields, in red / in a calm
+// box ("Wrong email or password", "Check your inbox"). errors: messages for single
+// fields, { email: "...", password: "...", confirm, name, code, terms }. Both show
+// while the form is still in the mode it started in.
+// values: what to fill in again, { email, name }. token: sent with a reset.
+// reset_code: the reset form asks for a code from the email (autocomplete
+// "one-time-code", sent as `code`) instead of carrying a token in the link.
+// ask_name: sign-up asks for a name, optional (true). terms_href: sign-up asks to
+// accept the terms, a link to them (terms_label, "the terms of service"); sent as
+// `terms`. remember: sign-in offers "Keep me signed in", sent as `remember` (true).
+// sign_up: offer "Create an account" from sign-in (true). min_password: the least
+// length of a new password (8); a meter shows how strong it is as it is typed.
+// providers: other ways in, shown as buttons above the form: a list of { label,
+// href } ("Continue with GitHub", "/auth/github"), on sign-in and sign-up.
+// id: the start of the fields' ids, unique on the page ("auth"). card: draws it
+// on a bordered card (true).
+// It works placed straight in a page: every prop is data.
+
+let auth_form_css = css`
+.ui-auth-form { width: 100%; max-width: 400px; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-auth-form-card { padding: 28px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); box-shadow: var(--ui-shadow); }
+.ui-auth-form-title { margin: 0 0 4px; font-size: 22px; font-weight: 650; line-height: 1.25; outline: none; }
+.ui-auth-form-lead { margin: 0 0 18px; color: var(--ui-muted); }
+.ui-auth-form-head { margin-bottom: 18px; }
+.ui-auth-form-head .ui-auth-form-lead { margin: 0; }
+.ui-auth-form-msg { margin: 0 0 16px; padding: 10px 12px; border-radius: var(--ui-radius-sm); font-size: 13px; }
+.ui-auth-form-msg-error { background: var(--ui-danger-soft); color: var(--ui-danger); border: 1px solid color-mix(in srgb, var(--ui-danger) 30%, transparent); }
+.ui-auth-form-msg-notice { background: var(--ui-success-soft); color: var(--ui-success); border: 1px solid color-mix(in srgb, var(--ui-success) 30%, transparent); }
+.ui-auth-form-providers { display: grid; gap: 8px; }
+.ui-auth-form-provider {
+  display: flex; align-items: center; justify-content: center; height: 40px; padding: 0 14px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font-weight: 500; text-decoration: none; transition: border-color .15s, background .15s;
+}
+.ui-auth-form-provider:hover { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-auth-form-provider:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-auth-form-or { display: flex; align-items: center; gap: 12px; margin: 16px 0; color: var(--ui-muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+.ui-auth-form-or::before, .ui-auth-form-or::after { content: ""; flex: 1; height: 1px; background: var(--ui-border); }
+.ui-auth-form-form { display: grid; gap: 14px; margin: 0; }
+.ui-auth-form-field { display: grid; gap: 6px; }
+.ui-auth-form-labels { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.ui-auth-form-labels label { font-size: 13px; font-weight: 500; }
+.ui-auth-form-opt { margin-left: 4px; color: var(--ui-muted); font-weight: 400; }
+.ui-auth-form-input {
+  box-sizing: border-box; width: 100%; height: 40px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font);
+  transition: border-color .15s, box-shadow .15s;
+}
+.ui-auth-form-input::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-auth-form-input:hover { border-color: var(--ui-strong); }
+.ui-auth-form-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-auth-form-input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-auth-form-input[aria-invalid="true"]:focus { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-danger) 30%, transparent); }
+.ui-auth-form-code { font-family: var(--ui-mono); letter-spacing: .2em; }
+.ui-auth-form-pw { position: relative; display: flex; align-items: center; }
+.ui-auth-form-pw .ui-auth-form-input { padding-right: 44px; }
+.ui-auth-form-pw .ui-auth-form-input::-ms-reveal { display: none; }
+.ui-auth-form-eye {
+  position: absolute; right: 5px; display: inline-grid; place-items: center; width: 32px; height: 30px; padding: 0; border: 0;
+  border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: pointer;
+}
+.ui-auth-form-eye svg { width: 18px; height: 18px; }
+.ui-auth-form-eye:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+.ui-auth-form-eye:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-auth-form-hint, .ui-auth-form-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-auth-form-error { color: var(--ui-danger); }
+.ui-auth-form-meter { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 12px; color: var(--ui-muted); }
+.ui-auth-form-bars { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; flex: 1; max-width: 160px; }
+.ui-auth-form-bars span { height: 4px; border-radius: 2px; background: var(--ui-border); transition: background .2s; }
+.ui-auth-form-weak .ui-auth-form-bars span:nth-child(1) { background: var(--ui-danger); }
+.ui-auth-form-fair .ui-auth-form-bars span:nth-child(-n+2) { background: var(--ui-warning); }
+.ui-auth-form-strong .ui-auth-form-bars span { background: var(--ui-success); }
+.ui-auth-form-weak .ui-auth-form-word { color: var(--ui-danger); }
+.ui-auth-form-fair .ui-auth-form-word { color: var(--ui-warning); }
+.ui-auth-form-strong .ui-auth-form-word { color: var(--ui-success); }
+.ui-auth-form-check { display: flex; align-items: flex-start; gap: 9px; width: fit-content; cursor: pointer; font-size: 13px; }
+.ui-auth-form-check input { flex: none; width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--ui-accent); cursor: pointer; }
+.ui-auth-form-check input:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 3px; }
+.ui-auth-form-check input[aria-invalid="true"] { outline: 2px solid var(--ui-danger); outline-offset: 1px; border-radius: 3px; }
+.ui-auth-form-check a, .ui-auth-form-link {
+  padding: 0; border: 0; background: none; color: var(--ui-accent); font: inherit; font-weight: 500;
+  text-decoration: none; cursor: pointer; border-radius: 3px;
+}
+.ui-auth-form-check a:hover, .ui-auth-form-link:hover { text-decoration: underline; }
+.ui-auth-form-check a:focus-visible, .ui-auth-form-link:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-auth-form-labels .ui-auth-form-link { font-size: 13px; }
+.ui-auth-form-submit {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px; width: 100%; height: 42px; margin-top: 4px;
+  border: 0; border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg);
+  font: 600 14px var(--ui-font); cursor: pointer; transition: background .15s, box-shadow .15s;
+}
+.ui-auth-form-submit:hover { background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-auth-form-submit:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-auth-form-submit[aria-busy="true"] { opacity: .75; cursor: progress; }
+.ui-auth-form-spin { width: 1em; height: 1em; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: ui-auth-form-spin .7s linear infinite; }
+@keyframes ui-auth-form-spin { to { transform: rotate(360deg); } }
+.ui-auth-form-foot { margin: 18px 0 0; color: var(--ui-muted); text-align: center; }
+@media (max-width: 420px) { .ui-auth-form-card { padding: 20px 16px; } }
+@media (prefers-reduced-motion: reduce) { .ui-auth-form-input, .ui-auth-form-bars span { transition: none; } .ui-auth-form-spin { animation-duration: 2s; } }
+`
+
+let auth_form_actions = { signin: "/login", signup: "/signup", forgot: "/forgot", reset: "/reset" }
+
+// The fields in the order they show, to put the focus on the first that is wrong.
+let auth_form_fields = ["name", "email", "code", "password", "confirm", "terms"]
+
+// "weak", "fair" or "strong" ("" for nothing typed): length and the kinds of characters.
+fn auth_form_strength(text: str) -> str {
+    let n = len(text)
+    if n == 0 { return "" }
+    let kinds = ["[a-z]", "[A-Z]", "\\d", "[^A-Za-z0-9]"] | filter((p) => re.test(text, p)) | len
+    if (n >= 12 && kinds >= 3) || (n >= 16 && kinds >= 2) { return "strong" }
+    if n >= 8 && kinds >= 2 { return "fair" }
+    "weak"
+}
+
+// What is wrong with the fields of a form about to be sent, as { field: message }.
+fn auth_form_check(at: str, form: map, min_password: int, terms: bool, code: bool) -> map {
+    let errs = {}
+    let email = trim(form.email ?? "")
+    let pw = form.password ?? ""
+    if at != "reset" {
+        if email == "" { errs = set(errs, "email", "Enter your email address.") }
+        else if !re.test(email, "^[^\\s@]+@[^\\s@]+$") { errs = set(errs, "email", "Enter an email address such as ada@example.com.") }
+    }
+    if at == "signin" && pw == "" { errs = set(errs, "password", "Enter your password.") }
+    if at == "signup" || at == "reset" {
+        if len(pw) < min_password { errs = set(errs, "password", `Use at least ${min_password} characters.`) }
+        else if (form.confirm ?? "") != pw { errs = set(errs, "confirm", "The passwords do not match.") }
+    }
+    if at == "signup" && terms && form.terms == null { errs = set(errs, "terms", "Accept the terms to create an account.") }
+    if at == "reset" && code && trim(form.code ?? "") == "" { errs = set(errs, "code", "Enter the code from the email.") }
+    errs
+}
+
+// A field's label, its control (children) and its hint and error, by the ids the control points to.
+view AuthFormField(field: str, label: str, error: str? = null, hint: str? = null, optional: bool = false,
+                   aside = null, children) =
+    <div.ui-auth-form-field>
+        <div.ui-auth-form-labels>
+            <label for={field}>{label}{optional && <span.ui-auth-form-opt>(optional)</span>}</label>
+            {aside}
+        </div>
+        {children}
+        {hint != null && <p.ui-auth-form-hint id={`${field}-hint`}>{hint}</p>}
+        {error != null && <p.ui-auth-form-error id={`${field}-error`} role="alert">{error}</p>}
+    </div>
+
+component AuthForm(mode: str = "signin", actions: map = {}, error: str? = null, notice: str? = null,
+                   errors: map = {}, values: map = {}, token: str? = null, reset_code: bool = false,
+                   ask_name: bool = true, terms_href: str? = null, terms_label: str = "the terms of service",
+                   remember: bool = true, sign_up: bool = true, min_password: int = 8, providers: list = [],
+                   id: str = "auth", card: bool = true, class: str? = null) {
+    state at = mode
+    state email = values.email ?? ""
+    state pw = ""
+    state shown = false
+    state busy = false
+    state local = {}
+    state server = errors
+    let acts = merge(auth_form_actions, actions)
+    let started = at == mode
+    let msgs = started ? merge(server, local) : local
+    let new_pw = at == "signup" || at == "reset"
+    let strength = auth_form_strength(pw)
+    let title = match at {
+        "signup" => "Create an account"
+        "forgot" => "Reset your password"
+        "reset" => "Choose a new password"
+        _ => "Sign in"
+    }
+    let action_label = match at {
+        "signup" => busy ? "Creating your account…" : "Create account"
+        "forgot" => busy ? "Sending…" : "Send reset link"
+        "reset" => busy ? "Saving…" : "Save password"
+        _ => busy ? "Signing in…" : "Sign in"
+    }
+    let fid = (f: str) => `${id}-${f}`
+    let described = (f: str, hint: bool) => {
+        let d = ui_cls([hint && `${fid(f)}-hint`, f == "password" && new_pw && `${fid(f)}-meter`, msgs[f] != null && `${fid(f)}-error`])
+        d != "" ? d : null
+    }
+    let bad = (f: str) => msgs[f] != null ? "true" : null
+    let clear = (f: str) => {
+        if local[f] != null { local = remove(local, f) }
+        if server[f] != null { server = remove(server, f) }
+    }
+    let focus_on = (e, sel: str) => {
+        let root = e.target.closest(".ui-auth-form")
+        js("requestAnimationFrame", (t = null) => {
+            let el = root.querySelector(sel)
+            el && el.focus()
+        })
+    }
+    let go = (e, m: str) => {
+        at = m
+        local = {}
+        busy = false
+        shown = false
+        pw = ""
+        focus_on(e, `#${fid("title")}`)
+    }
+    let eye = <button.ui-auth-form-eye type="button" aria-controls={fid("password")} aria-pressed={shown ? "true" : "false"}
+                      aria-label={shown ? "Hide password" : "Show password"} title={shown ? "Hide password" : "Show password"}
+                      @click={() => { shown = !shown }}>
+        {shown
+            ? <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                   stroke-linejoin="round" aria-hidden="true"><path d="M3 3l14 14"/><path d="M8.2 4.6A8.6 8.6 0 0 1 10 4.4c4.4 0 7.4 3.9 8.2 5.6-.4.8-1.2 2-2.4 3.1M12.8 15a7.9 7.9 0 0 1-2.8.6c-4.4 0-7.4-3.9-8.2-5.6.5-1 1.6-2.6 3.2-3.8"/><path d="M8.4 8.4a2.3 2.3 0 0 0 3.2 3.2"/></svg>
+            : <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                   stroke-linejoin="round" aria-hidden="true"><path d="M1.8 10c.8-1.7 3.8-5.6 8.2-5.6s7.4 3.9 8.2 5.6c-.8 1.7-3.8 5.6-8.2 5.6S2.6 11.7 1.8 10z"/><circle cx="10" cy="10" r="2.6"/></svg>}
+    </button>
+    <section class={ui_cls(["ui-auth-form", card && "ui-auth-form-card", class])} aria-labelledby={fid("title")}>
+        <div.ui-auth-form-head>
+            <h2.ui-auth-form-title id={fid("title")} tabindex="-1">{title}</h2>
+            {at == "forgot" && <p.ui-auth-form-lead>Type your account's email: we will send you a link to choose a new password.</p>}
+            {at == "reset" && <p.ui-auth-form-lead>{reset_code ? "Type the code from the email, then your new password." : "Type it twice to be sure."}</p>}
+        </div>
+        {started && error != null && <p.ui-auth-form-msg.ui-auth-form-msg-error role="alert">{error}</p>}
+        {started && notice != null && <p.ui-auth-form-msg.ui-auth-form-msg-notice role="status">{notice}</p>}
+        {(at == "signin" || at == "signup") && len(providers) > 0 && <div>
+            <div.ui-auth-form-providers>
+                {for p in providers => <a.ui-auth-form-provider href={p.href}>{p.label}</a>}
+            </div>
+            <p.ui-auth-form-or>or</p>
+        </div>}
+        <form.ui-auth-form-form method="post" action={acts[at]}>
+            <input type="hidden" name="mode" value={at}/>
+            {at == "reset" && <input type="hidden" name="token" value={token ?? ""}/>}
+            {at == "reset" && email != "" && <input type="email" name="email" value={email} autocomplete="username" hidden={true}/>}
+            {at == "signup" && ask_name && <AuthFormField field={fid("name")} label="Name" optional={true} error={msgs.name}>
+                <input.ui-auth-form-input type="text" id={fid("name")} name="name" value={values.name ?? ""}
+                       autocomplete="name" aria-invalid={bad("name")} aria-describedby={described("name", false)}
+                       @input={() => clear("name")}/>
+            </AuthFormField>}
+            {at != "reset" && <AuthFormField field={fid("email")} label="Email" error={msgs.email}>
+                <input.ui-auth-form-input type="email" id={fid("email")} name="email" value={email} required={true}
+                       autocomplete={at == "forgot" ? "email" : "username"} autocapitalize="off" spellcheck="false"
+                       placeholder="you@example.com" aria-invalid={bad("email")} aria-describedby={described("email", false)}
+                       @input={(e) => {
+                           email = e.value
+                           clear("email")
+                       }}/>
+            </AuthFormField>}
+            {at == "reset" && reset_code && <AuthFormField field={fid("code")} label="Code from the email" error={msgs.code}>
+                <input.ui-auth-form-input.ui-auth-form-code type="text" id={fid("code")} name="code" required={true}
+                       autocomplete="one-time-code" inputmode="numeric" spellcheck="false"
+                       aria-invalid={bad("code")} aria-describedby={described("code", false)} @input={() => clear("code")}/>
+            </AuthFormField>}
+            {at != "forgot" && <AuthFormField field={fid("password")} label={new_pw ? "New password" : "Password"}
+                    error={msgs.password} hint={new_pw ? `At least ${min_password} characters.` : null}
+                    aside={at == "signin" && <button.ui-auth-form-link type="button" @click={(e) => go(e, "forgot")}>Forgot password?</button>}>
+                <div.ui-auth-form-pw>
+                    <input.ui-auth-form-input type={shown ? "text" : "password"} id={fid("password")} name="password"
+                           required={true} minlength={new_pw ? min_password : null}
+                           autocomplete={new_pw ? "new-password" : "current-password"} autocapitalize="off" spellcheck="false"
+                           aria-invalid={bad("password")}
+                           aria-describedby={described("password", new_pw) ?? (new_pw ? `${fid("password")}-meter` : null)}
+                           @input={(e) => {
+                               pw = e.value
+                               clear("password")
+                           }}/>
+                    {eye}
+                </div>
+                {new_pw && <p class={ui_cls(["ui-auth-form-meter", strength != "" && `ui-auth-form-${strength}`])}
+                              id={`${fid("password")}-meter`} aria-live="polite">
+                    <span.ui-auth-form-bars aria-hidden="true"><span></span><span></span><span></span></span>
+                    <span.ui-auth-form-word>{strength != "" ? `Strength: ${strength}` : "Strength: none yet"}</span>
+                </p>}
+            </AuthFormField>}
+            {new_pw && <AuthFormField field={fid("confirm")} label="Confirm password" error={msgs.confirm}>
+                <input.ui-auth-form-input type={shown ? "text" : "password"} id={fid("confirm")} name="confirm" required={true}
+                       autocomplete="new-password" autocapitalize="off" spellcheck="false"
+                       aria-invalid={bad("confirm")} aria-describedby={described("confirm", false)}
+                       @input={() => clear("confirm")}/>
+            </AuthFormField>}
+            {at == "signin" && remember && <label.ui-auth-form-check>
+                <input type="checkbox" name="remember" value="1"/>
+                <span>Keep me signed in</span>
+            </label>}
+            {at == "signup" && terms_href != null && <div.ui-auth-form-field>
+                <label.ui-auth-form-check for={fid("terms")}>
+                    <input type="checkbox" id={fid("terms")} name="terms" value="1" required={true}
+                           aria-invalid={bad("terms")} aria-describedby={described("terms", false)}
+                           @change={() => clear("terms")}/>
+                    <span>I accept <a href={terms_href} target="_blank" rel="noopener">{terms_label}</a></span>
+                </label>
+                {msgs.terms != null && <p.ui-auth-form-error id={`${fid("terms")}-error`} role="alert">{msgs.terms}</p>}
+            </div>}
+            <button.ui-auth-form-submit type="submit" aria-busy={busy ? "true" : null}
+                    @click={(e) => {
+                        if busy {
+                            e.preventDefault()
+                        } else {
+                            let errs = auth_form_check(at, e.form, min_password, terms_href != null, reset_code)
+                            if len(keys(errs)) > 0 {
+                                e.preventDefault()
+                                local = errs
+                                let first_bad = find(auth_form_fields, (f) => errs[f] != null)
+                                focus_on(e, `#${fid(first_bad)}`)
+                            } else {
+                                local = {}
+                                busy = true
+                            }
+                        }
+                    }}>
+                {busy && <span.ui-auth-form-spin aria-hidden="true"></span>}
+                {action_label}
+            </button>
+        </form>
+        <p.ui-auth-form-foot>
+            {at == "signin" && sign_up && [
+                "No account yet? ",
+                <button.ui-auth-form-link type="button" @click={(e) => go(e, "signup")}>Create an account</button>,
+            ]}
+            {at == "signup" && [
+                "Already have an account? ",
+                <button.ui-auth-form-link type="button" @click={(e) => go(e, "signin")}>Sign in</button>,
+            ]}
+            {(at == "forgot" || at == "reset") && <button.ui-auth-form-link type="button" @click={(e) => go(e, "signin")}>← Back to sign in</button>}
+        </p>
+    </section>
+}

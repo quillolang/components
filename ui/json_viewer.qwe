@@ -1,0 +1,202 @@
+// JsonViewer: a map or list (an API's answer, a config, a log entry) shown as JSON
+// whose objects and arrays open and close, with each kind of value in its own
+// colour and the size of what is closed. The item the keys are on has its path
+// (.users[0].email) in the bar above, with a button that copies it.
+//
+//   <JsonViewer id="resp" label="Response" value={json.parse(body)} expanded={2}/>
+//
+// id: a prefix for its ids, unique on the page. value: any map, list or value.
+// label: what screen readers call it. expanded: how many levels are open at first
+// (1: the top one). max_height: a CSS height past which it scrolls. root: what the
+// top is called in the bar (the path of the top itself is ".").
+// It is an ARIA tree: ↓ ↑ move, → opens and goes in, ← closes and goes out, Home,
+// End, Enter or Space opens and closes; a click on a row does too. Expand all and
+// Collapse all open and close everything. Paths are written as jq reads them:
+// .name, .items[2], .["odd key"].
+
+let json_viewer_css = css`
+.ui-json { min-width: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 14px/1.4 var(--ui-font); overflow: hidden; }
+.ui-json-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--ui-border);
+  background: var(--ui-subtle); }
+.ui-json-bar button { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 9px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 12px/1 var(--ui-font); cursor: pointer; }
+.ui-json-bar button:hover { border-color: var(--ui-strong); }
+.ui-json-bar button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-json-bar svg { width: 13px; height: 13px; }
+.ui-json-path { flex: 1 1 160px; min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.ui-json-path code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 3px 7px;
+  border-radius: 4px; background: var(--ui-surface); color: var(--ui-muted); font: 12px/1.4 var(--ui-mono); }
+.ui-json-copied { color: var(--ui-success) !important; }
+.ui-json-tree { margin: 0; padding: 6px 0; list-style: none; overflow: auto; font: 13px/1.5 var(--ui-mono); outline: none; }
+.ui-json-row { display: flex; align-items: baseline; gap: 4px; min-height: 22px; padding: 1px 12px 1px calc(var(--ui-json-depth) * 18px + 8px);
+  white-space: nowrap; outline: none; }
+.ui-json-row[role="treeitem"] { cursor: default; }
+.ui-json-row[aria-expanded] { cursor: pointer; }
+.ui-json-row[role="treeitem"]:hover { background: var(--ui-subtle); }
+.ui-json-row:focus-visible { box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-json-row.ui-json-on { background: var(--ui-accent-soft); }
+.ui-json-tog { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px;
+  align-self: center; color: var(--ui-muted); }
+.ui-json-tog svg { width: 10px; height: 10px; transition: transform .15s; }
+[aria-expanded="true"] > .ui-json-tog svg { transform: rotate(90deg); }
+.ui-json-key { color: var(--ui-accent); }
+.ui-json-idx { color: var(--ui-muted); }
+.ui-json-punct { color: var(--ui-muted); }
+.ui-json-comma { margin-left: -4px; }
+.ui-json-string { color: var(--ui-success); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-json-number { color: var(--ui-info); }
+.ui-json-boolean { color: var(--ui-warning); }
+.ui-json-null { color: var(--ui-muted); font-style: italic; }
+.ui-json-size { margin-left: 4px; padding: 0 6px; border-radius: 999px; background: var(--ui-subtle); color: var(--ui-muted);
+  font: 11px/1.6 var(--ui-font); }
+@media (prefers-reduced-motion: reduce) { .ui-json-tog svg { transition: none; } }
+`
+
+fn json_viewer_kind(v) -> str = match type_of(v) {
+    "map" => "object"
+    "list" => "array"
+    "str" => "string"
+    "bool" => "boolean"
+    "null" => "null"
+    _ => "number"
+}
+
+// The path of `key` inside `path`, as jq writes it.
+fn json_viewer_step(path: str, key) -> str {
+    let base = path == "." ? "" : path
+    type_of(key) == "int" ? `${base}[${key}]`
+        : re.test(key, "^[A-Za-z_][A-Za-z0-9_]*$") ? `${base}.${key}` : `${base}.[${json.stringify(key)}]`
+}
+
+// The entries of a map or list as [key, value] pairs.
+fn json_viewer_pairs(v) -> list =
+    type_of(v) == "map" ? (for [k, x] in v => [k, x]) : (for [i, x] in enumerate(v) => [i, x])
+
+// The paths of every object and array in it, the top included.
+fn json_viewer_containers(v, path: str = ".") -> list {
+    let kind = json_viewer_kind(v)
+    kind != "object" && kind != "array" ? []
+        : [path] + flatten(json_viewer_pairs(v) | map((p) => json_viewer_containers(p[1], json_viewer_step(path, p[0]))))
+}
+
+// The paths of the objects and arrays less than `depth` levels down.
+fn json_viewer_opened(v, depth: int, path: str = ".", level: int = 0) -> list {
+    let kind = json_viewer_kind(v)
+    kind != "object" && kind != "array" || level >= depth ? []
+        : [path] + flatten(json_viewer_pairs(v) | map((p) => json_viewer_opened(p[1], depth, json_viewer_step(path, p[0]), level + 1)))
+}
+
+// The rows showing: { path, key, kind, value, size, depth, parent, comma }, and a
+// { close, kind, depth, comma } row after each open object or array.
+fn json_viewer_rows(v, open: list, key = null, path: str = ".", depth: int = 0, parent = null, comma: bool = false) -> list {
+    let kind = json_viewer_kind(v)
+    let box = kind == "object" || kind == "array"
+    let pairs = box ? json_viewer_pairs(v) : []
+    let is_open = box && len(pairs) > 0 && index_of(open, path) != null
+    let row = { path, key, kind, value: box ? null : v, size: len(pairs), depth, parent, comma: comma && !is_open, open: is_open }
+    !is_open ? [row]
+        : [row] + flatten(for [i, p] in enumerate(pairs) => json_viewer_rows(p[1], open, p[0], json_viewer_step(path, p[0]), depth + 1, path, i < len(pairs) - 1))
+            + [{ close: true, path: `${path}/close`, kind, depth, comma }]
+}
+
+component JsonViewer(id: str, value = null, label: str? = null, expanded: int = 1, max_height: str? = null,
+                     root: str = "root", class: str? = null) {
+    state open = json_viewer_opened(value, expanded)
+    state active = "."
+    state result = ""    // "", "ok" or "bad"
+    if result != "" { every(1500, () => { result = "" }) }
+    let rows = json_viewer_rows(value, open)
+    let items = rows | filter((r) => r.close != true)
+    let at = index_of(items | map((r) => r.path), active) ?? 0
+    let current = items[at]
+    let shown_path = current.path == "." ? root : current.path
+    let toggle = (path: str) => { open = index_of(open, path) != null ? open | filter((p) => p != path) : push(open, path) }
+    let go = (e, path: str) => {
+        active = path
+        let tree = e.target.closest(".ui-json-tree")
+        js("queueMicrotask", () => {
+            let el = tree.querySelector(`[data-path="${url_encode(path)}"]`)
+            el && el.focus()
+        })
+    }
+    let chev = () => <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                    stroke-linejoin="round"><path d="M3.5 2L7 5 3.5 8"/></svg>
+    <div class={ui_cls(["ui-json", class])}>
+        <div.ui-json-bar>
+            <button type="button" @click={() => { open = json_viewer_containers(value) }}>Expand all</button>
+            <button type="button" @click={() => {
+                open = []
+                active = "."
+            }}>Collapse all</button>
+            <div.ui-json-path>
+                <code title={shown_path}><span.ui-sr>Path: </span>{shown_path}</code>
+                <button type="button" class={result == "ok" ? "ui-json-copied" : null} aria-label={`Copy path ${shown_path}`}
+                        @click={() => {
+                            if js("isSecureContext") != true { result = "bad" } else {
+                                js("navigator.clipboard.writeText", current.path).then((_ = null) => { result = "ok" }, (_ = null) => { result = "bad" })
+                            }
+                        }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                         stroke-linejoin="round" aria-hidden="true">
+                        <path d={result == "ok" ? "M20 6 9 17l-5-5"
+                                 : "M10 8h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2ZM4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2"}/>
+                    </svg>
+                    <span aria-hidden="true">{result == "ok" ? "Copied" : result == "bad" ? "Could not copy" : "Copy path"}</span>
+                </button>
+            </div>
+            <span.ui-sr role="status">{result == "ok" ? "Path copied" : result == "bad" ? "Could not copy" : ""}</span>
+        </div>
+        <ul.ui-json-tree role="tree" aria-label={label} style={max_height != null ? `max-height: ${max_height}` : null}
+            @keydown={(e) => {
+                let n = len(items)
+                let k = e.key
+                if k == "ArrowDown" || k == "ArrowUp" || k == "Home" || k == "End" {
+                    e.preventDefault()
+                    let to = match k {
+                        "ArrowDown" => at + 1 < n ? at + 1 : at
+                        "ArrowUp" => at > 0 ? at - 1 : 0
+                        "Home" => 0
+                        _ => n - 1
+                    }
+                    go(e, items[to].path)
+                } else if k == "ArrowRight" {
+                    e.preventDefault()
+                    if current.size > 0 {
+                        if !current.open { toggle(current.path) } else { go(e, items[at + 1].path) }
+                    }
+                } else if k == "ArrowLeft" {
+                    e.preventDefault()
+                    if current.open { toggle(current.path) } else if current.parent != null { go(e, current.parent) }
+                } else if (k == "Enter" || k == " ") && current.size > 0 {
+                    e.preventDefault()
+                    toggle(current.path)
+                }
+            }}>
+            {for r in rows => r.close == true
+                ? <li.ui-json-row key={r.path} role="none" aria-hidden="true" style={`--ui-json-depth: ${r.depth}`}>
+                    <span.ui-json-tog></span>
+                    <span.ui-json-punct>{r.kind == "object" ? "}" : "]"}{r.comma ? "," : ""}</span>
+                  </li>
+                : <li.ui-json-row key={r.path} role="treeitem" data-path={url_encode(r.path)}
+                      class={r.path == active ? "ui-json-on" : null} style={`--ui-json-depth: ${r.depth}`}
+                      tabindex={r.path == active ? "0" : "-1"} aria-level={r.depth + 1} aria-selected={r.path == active ? "true" : "false"}
+                      aria-expanded={r.size > 0 ? (r.open ? "true" : "false") : null}
+                      @click={() => {
+                          active = r.path
+                          if r.size > 0 { toggle(r.path) }
+                      }}>
+                    <span.ui-json-tog aria-hidden="true">{r.size > 0 && chev()}</span>
+                    {r.key != null && (type_of(r.key) == "int"
+                        ? <span.ui-json-idx>{r.key}<span.ui-json-punct>:</span></span>
+                        : <span.ui-json-key>{json.stringify(r.key)}<span.ui-json-punct>:</span></span>)}
+                    {r.kind == "object" || r.kind == "array"
+                        ? [<span.ui-json-punct>{r.kind == "object" ? "{" : "["}{!r.open && (r.size == 0 ? "" : "…")}{!r.open && (r.kind == "object" ? "}" : "]")}</span>,
+                           !r.open && r.size > 0 && <span.ui-json-size>{r.kind == "object" ? `${r.size} key${r.size == 1 ? "" : "s"}` : `${r.size} item${r.size == 1 ? "" : "s"}`}</span>,
+                           !r.open && r.comma && <span.ui-json-punct.ui-json-comma>,</span>]
+                        : <span class={`ui-json-${r.kind}`}>{r.kind == "string" ? json.stringify(r.value) : r.kind == "null" ? "null" : str(r.value)}<span.ui-json-punct>{r.comma ? "," : ""}</span></span>}
+                  </li>}
+        </ul>
+    </div>
+}
+

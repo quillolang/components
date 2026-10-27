@@ -1,0 +1,28 @@
+const nav = $("nav.ui-toc"), art = $("#toc-demo-article");
+if (!nav || nav.getAttribute("aria-labelledby") !== "toc-demo-title" || $("#toc-demo-title").textContent !== "On this page") return "the nav is not named by its title";
+const links = [...nav.querySelectorAll("a")];
+if (links.length !== 6 || links[1].getAttribute("href") !== "#toc-demo-macos") return "the links do not go to the headings";
+const cur = () => links.filter((a) => a.hasAttribute("aria-current")).map((a) => a.textContent);
+if (cur().join() !== "Install" || links[0].getAttribute("aria-current") !== "location") return `at first the current one is ${cur()}`;
+if (links[1].getBoundingClientRect().left <= links[0].getBoundingClientRect().left && parseFloat(getComputedStyle(links[1]).paddingLeft) <= parseFloat(getComputedStyle(links[0]).paddingLeft)) return "level 3 is not indented";
+const h = (id) => document.getElementById(id);
+art.scrollTop = art.scrollTop + (h("toc-demo-routes").getBoundingClientRect().top - art.getBoundingClientRect().top) - 4;
+await wait(300);
+if (cur().join() !== "Routes and views") return `scrolled to Routes, the current one is ${cur()}`;
+art.scrollTop = 0; await wait(300);
+if (cur().join() !== "Install") return `back at the top, the current one is ${cur()}`;
+art.scrollTop = art.scrollHeight; await wait(300);
+if (cur().join() !== "Deploy") return `at the bottom, the current one is ${cur()}`;
+art.scrollTop = 0; await wait(300);
+const hash = location.hash;
+links[4].click(); await wait(50);
+if (cur().join() !== "Routes and views") return "clicking did not mark the link at once";
+for (let i = 0; i < 30; i++) { await wait(100); if (Math.abs(h("toc-demo-routes").getBoundingClientRect().top - art.getBoundingClientRect().top - 16) < 2) break; }
+const off = h("toc-demo-routes").getBoundingClientRect().top - art.getBoundingClientRect().top;
+if (Math.abs(off - 16) > 2) return `clicking did not scroll the heading to the top: ${off}`;
+await wait(300);
+if (cur().join() !== "Routes and views") return `after the jump, the current one is ${cur()}`;
+if (location.hash !== "#toc-demo-routes") return `the address bar says ${location.hash}`;
+if (document.activeElement !== h("toc-demo-routes")) return "the focus did not move to the heading";
+history.replaceState(history.state, "", location.pathname + location.search + hash);
+art.scrollTop = 0; document.activeElement.blur();

@@ -1,0 +1,24 @@
+const meters = $$("[role=meter]");
+if (meters.length !== 6) return `expected 6 meters, found ${meters.length}`;
+const a = (el, n) => el.getAttribute(n);
+const mood = (el) => [...el.parentElement.classList].find((c) => /^ui-meter-(good|fair|poor|accent|info|neutral|success|warning|danger)$/.test(c));
+const [disk, full, battery, temp, pw, seats] = meters;
+if (a(disk, "aria-valuenow") !== "72" || a(disk, "aria-valuemin") !== "0" || a(disk, "aria-valuemax") !== "100" || a(disk, "aria-valuetext") !== "72 GB")
+    return `disk: ${a(disk, "aria-valuenow")} ${a(disk, "aria-valuetext")}`;
+if (a(disk, "aria-label") !== "Disk used") return "the label is not the meter's name";
+if (mood(disk) !== "ui-meter-good") return `72 under high=80 is ${mood(disk)}`;
+if (mood(full) !== "ui-meter-poor") return `91 over high, optimum low is ${mood(full)}`;
+if (mood(battery) !== "ui-meter-poor") return `18 under low, optimum high is ${mood(battery)}`;
+if (mood(temp) !== "ui-meter-good") return `21.5 in 18..24 is ${mood(temp)}`;
+if (mood(pw) !== "ui-meter-good" || mood(seats) !== "ui-meter-info") return `password ${mood(pw)}, seats ${mood(seats)}`;
+const fill = disk.querySelector(".ui-meter-fill");
+if (fill.style.width !== "72%" || Math.abs(fill.getBoundingClientRect().width - disk.getBoundingClientRect().width * 0.72) > 1) return `72 fills ${fill.style.width}`;
+const green = getComputedStyle(fill).backgroundColor, red = getComputedStyle(full.querySelector(".ui-meter-fill")).backgroundColor;
+if (green === red) return "good and poor have the same colour";
+if (getComputedStyle(battery.parentElement.querySelector(".ui-meter-value")).color !== getComputedStyle(battery.querySelector(".ui-meter-fill")).backgroundColor) return "the value is not in the meter's colour";
+if (full.querySelectorAll(".ui-meter-mark").length !== 2 || full.querySelectorAll(".ui-meter-mark")[0].style.left !== "60%") return "low and high are not marked";
+if (a(temp, "aria-valuemin") !== "10" || temp.querySelector(".ui-meter-fill").style.width !== "46%") return `21.5 in 10..35 fills ${temp.querySelector(".ui-meter-fill").style.width}`;
+const segs = [...pw.querySelectorAll(".ui-meter-fill")].map((f) => f.style.width);
+if (segs.join() !== "100%,100%,100%,0%") return `3 of 4 in four segments fills ${segs}`;
+if (a(pw, "aria-valuetext") !== "Good" || !pw.parentElement.textContent.includes("Good")) return "value_text is not shown and said";
+if (!seats.parentElement.classList.contains("ui-meter-sm") || seats.getBoundingClientRect().height !== 4) return "size=sm is not thinner";

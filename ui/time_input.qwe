@@ -1,0 +1,201 @@
+// TimeInput: a time of day typed in parts, hours and minutes (and AM/PM on a
+// 12-hour clock), each a small box of its own. ArrowUp / ArrowDown change the part
+// that has the focus, digits type it and move on when it is complete, ArrowLeft /
+// ArrowRight go between the parts, Backspace empties one. A plain <form> gets the
+// time as `name`, 24-hour "HH:MM" (empty until both parts are there).
+//
+//   <TimeInput name="start" label="Starts at" value="09:30"/>
+//   <TimeInput name="pickup" label="Pick-up" hour12={true} step={15} min="08:00" max="18:00"/>
+//
+// value: "HH:MM" to start with. hour12: a 12-hour clock with AM / PM (the form
+// still gets 24-hour time). step: minutes the arrows move by (1; 15 gives :00,
+// :15, :30, :45). min, max: "HH:MM", the earliest and latest it takes; a time
+// outside them is brought back to the nearest.
+// name, label, hint, error, required, disabled, field (the ids' start,
+// "time-input-" + name by default) and size ("sm" or "md") as for every field.
+// on_change(time): inside one of your components, given "HH:MM" (null when it is
+// not complete).
+
+let time_input_css = css`
+.ui-time-input { display: grid; gap: 6px; min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-time-input-label { padding: 0; font-size: 13px; font-weight: 500; color: var(--ui-fg); }
+.ui-time-input-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-time-input-box {
+  display: inline-flex; align-items: center; gap: 2px; width: fit-content; height: 38px; padding: 0 10px 0 6px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  transition: border-color .15s, box-shadow .15s;
+}
+.ui-time-input-box:hover { border-color: var(--ui-strong); }
+.ui-time-input-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-time-input-invalid .ui-time-input-box { border-color: var(--ui-danger); }
+.ui-time-input-seg {
+  width: 2.4ch; height: 28px; margin: 0; padding: 0 2px; border: 0; border-radius: 4px; background: transparent;
+  color: var(--ui-fg); font: 15px/1 var(--ui-mono); text-align: center; caret-color: transparent;
+}
+.ui-time-input-seg::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-time-input-seg:focus { outline: none; background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-time-input-seg:focus::placeholder { color: var(--ui-accent-fg); }
+.ui-time-input-seg:focus::selection { background: transparent; }
+.ui-time-input-ampm { width: 3.2ch; margin-left: 6px; }
+.ui-time-input-colon { color: var(--ui-muted); font: 15px/1 var(--ui-mono); }
+.ui-time-input-icon { width: 16px; height: 16px; margin: 0 4px 0 2px; color: var(--ui-muted); flex: none; }
+.ui-time-input-sm .ui-time-input-box { height: 30px; }
+.ui-time-input-sm .ui-time-input-seg { height: 22px; font-size: 13px; }
+.ui-time-input-hint, .ui-time-input-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-time-input-error { color: var(--ui-danger); }
+.ui-time-input:disabled .ui-time-input-box { opacity: .55; cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) { .ui-time-input-box { transition: none; } }
+`
+
+fn time_input_pad(n: int) -> str = n < 10 ? `0${n}` : str(n)
+
+// "HH:MM" as minutes after midnight, or null.
+fn time_input_parse(text: str?) {
+    if text == null || !re.test(text, "^\\d{1,2}:\\d{2}$") { return null }
+    let [h, m] = split(text, ":") | map((p) => int(p))
+    h <= 23 && m <= 59 ? h * 60 + m : null
+}
+
+// Typed digits as one part's number: { n, done }. The last two digits if they make a
+// number up to `hi`, else the last one; done when no further digit could follow.
+fn time_input_take(digits: str, lo: int, hi: int) {
+    let k = len(digits)
+    let two = k >= 2 ? int(slice(digits, k - 2, k)) : null
+    if two != null && two >= lo && two <= hi {
+        return { n: two, done: true }
+    }
+    let one = int(slice(digits, k - 1, k))
+    one * 10 > hi ? { n: one < lo ? lo : one, done: true } : { n: one < lo ? null : one, done: false }
+}
+
+component TimeInput(name: str? = null, label: str? = null, value: str? = null, hour12: bool = false,
+                    step: int = 1, min: str? = null, max: str? = null, hint: str? = null, error: str? = null,
+                    required: bool = false, disabled: bool = false, field: str? = null, size: str = "md",
+                    on_change = null, class: str? = null) {
+    let start = time_input_parse(value)
+    state h = start != null ? floor(start / 60) : null
+    state m = start != null ? start % 60 : null
+    state pm = start != null && start >= 720
+    let id = field ?? `time-input-${name ?? re.replace(lower(label ?? "time"), "[^a-z0-9]+", "-")}`
+    let lo = time_input_parse(min) ?? 0
+    let hi = time_input_parse(max) ?? 1439
+    let shown_h = h == null ? null : hour12 ? (h % 12 == 0 ? 12 : h % 12) : h
+    let out = h != null && m != null ? `${time_input_pad(h)}:${time_input_pad(m)}` : null
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
+    let set_time = (nh, nm) => {
+        let total = nh != null && nm != null ? nh * 60 + nm : null
+        let kept = total == null ? null : total < lo ? lo : total > hi ? hi : total
+        let fh = kept != null ? floor(kept / 60) : nh
+        let fm = kept != null ? kept % 60 : nm
+        let before = out
+        h = fh
+        m = fm
+        if fh != null { pm = fh >= 12 }
+        let after = fh != null && fm != null ? `${time_input_pad(fh)}:${time_input_pad(fm)}` : null
+        if after != before { on_change && on_change(after) }
+    }
+    let move = (e, by: int) => {
+        let to = e.target.closest(".ui-time-input-box").querySelector(`[data-i="${int(e.target.dataset.i) + by}"]`)
+        if to != null {
+            to.focus()
+            to.select()
+        }
+    }
+    // An hour as typed on the clock shown (1-12 on a 12-hour one) in 24 hours.
+    let hour_of = (n: int) => hour12 ? n % 12 + (pm ? 12 : 0) : n
+    let keys = (e, part: str) => {
+        let k = e.key
+        if k == "ArrowUp" || k == "ArrowDown" || k == "PageUp" || k == "PageDown" {
+            e.preventDefault()
+            let up = k == "ArrowUp" || k == "PageUp"
+            if part == "h" {
+                let by = (k == "PageUp" || k == "PageDown" ? 3 : 1) * (up ? 1 : -1)
+                let nh = h == null ? floor(lo / 60)
+                       : hour12 ? (h >= 12 ? 12 : 0) + ((h % 12) + by + 120) % 12 : (h + by + 240) % 24
+                set_time(nh, m)
+            } else if part == "m" {
+                let by = (k == "PageUp" || k == "PageDown" ? 10 : 1) * step
+                let snapped = m == null ? 0 : up ? floor(m / step) * step + by : ceil(m / step) * step - by
+                set_time(h, ((snapped % 60) + 60) % 60)
+            } else if h == null {
+                pm = !pm
+            } else {
+                set_time((h + 12) % 24, m)
+            }
+        }
+        if k == "Home" || k == "End" {
+            e.preventDefault()
+            let first = k == "Home"
+            if part == "h" { set_time(hour12 ? (first ? (pm ? 12 : 0) : (pm ? 23 : 11)) : (first ? 0 : 23), m) }
+            if part == "m" { set_time(h, first ? 0 : 60 - step) }
+        }
+        if k == "ArrowLeft" || k == "ArrowRight" {
+            e.preventDefault()
+            move(e, k == "ArrowLeft" ? -1 : 1)
+        }
+        if k == "Backspace" || k == "Delete" {
+            e.preventDefault()
+            if part == "h" && h != null { set_time(null, m) }
+            else if part == "m" && m != null { set_time(h, null) }
+            else if k == "Backspace" { move(e, -1) }
+        }
+        if part == "p" && (lower(k) == "a" || lower(k) == "p") {
+            e.preventDefault()
+            if h != null { set_time(h % 12 + (lower(k) == "p" ? 12 : 0), m) } else { pm = lower(k) == "p" }
+        }
+    }
+    let typed = (e, part: str) => {
+        let digits = re.replace(e.value, "[^0-9]", "")
+        if digits == "" {
+            e.target.value = part == "h" ? (shown_h == null ? "" : time_input_pad(shown_h)) : (m == null ? "" : time_input_pad(m))
+        } else {
+            let got = part == "h" ? time_input_take(digits, hour12 ? 1 : 0, hour12 ? 12 : 23) : time_input_take(digits, 0, 59)
+            if got.n != null {
+                if part == "h" { set_time(hour_of(got.n), m) } else { set_time(h, got.n) }
+                e.target.value = time_input_pad(got.n)
+            } else {
+                e.target.value = digits
+            }
+            if got.done { move(e, 1) }
+        }
+    }
+    <fieldset class={ui_cls(["ui-time-input", size == "sm" && "ui-time-input-sm", error != null && "ui-time-input-invalid", class])}
+              id={id} disabled={disabled} aria-describedby={described != "" ? described : null}>
+        {label != null && <legend.ui-time-input-label>
+            {label}{required && <span.ui-time-input-req aria-hidden="true">*</span>}
+        </legend>}
+        <div.ui-time-input-box>
+            <svg.ui-time-input-icon viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
+                 stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="6.2"/><path d="M8 4.6V8l2.3 1.5"/></svg>
+            <input.ui-time-input-seg type="text" id={`${id}-h`} data-i="0" role="spinbutton" inputmode="numeric" autocomplete="off"
+                   aria-label="Hours" placeholder="--" value={shown_h == null ? "" : time_input_pad(shown_h)}
+                   aria-valuemin={hour12 ? 1 : 0} aria-valuemax={hour12 ? 12 : 23} aria-valuenow={shown_h}
+                   aria-valuetext={shown_h == null ? "empty" : null} required={required}
+                   aria-invalid={error != null ? "true" : null}
+                   @focus={(e) => { e.target.select() }}
+                   @keydown={(e) => keys(e, "h")} @input={(e) => typed(e, "h")}/>
+            <span.ui-time-input-colon aria-hidden="true">:</span>
+            <input.ui-time-input-seg type="text" id={`${id}-m`} data-i="1" role="spinbutton" inputmode="numeric" autocomplete="off"
+                   aria-label="Minutes" placeholder="--" value={m == null ? "" : time_input_pad(m)}
+                   aria-valuemin="0" aria-valuemax="59" aria-valuenow={m}
+                   aria-valuetext={m == null ? "empty" : null} required={required}
+                   aria-invalid={error != null ? "true" : null}
+                   @focus={(e) => { e.target.select() }}
+                   @keydown={(e) => keys(e, "m")} @input={(e) => typed(e, "m")}/>
+            {hour12 && <input.ui-time-input-seg.ui-time-input-ampm type="text" id={`${id}-p`} data-i="2" role="spinbutton"
+                   autocomplete="off" aria-label="AM or PM" value={pm ? "PM" : "AM"} aria-valuetext={pm ? "PM" : "AM"}
+                   aria-valuemin="0" aria-valuemax="1" aria-valuenow={pm ? 1 : 0}
+                   @focus={(e) => { e.target.select() }}
+                   @keydown={(e) => keys(e, "p")}
+                   @input={(e) => {
+                       let t = lower(e.value)
+                       let want = contains(t, "p") ? true : contains(t, "a") ? false : pm
+                       if h != null && want != pm { set_time(h % 12 + (want ? 12 : 0), m) } else { pm = want }
+                       e.target.value = want ? "PM" : "AM"
+                   }}/>}
+        </div>
+        {name != null && <input type="hidden" name={name} value={out ?? ""}/>}
+        {hint != null && <p.ui-time-input-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-time-input-error id={`${id}-error`} role="alert">{error}</p>}
+    </fieldset>
+}

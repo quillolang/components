@@ -1,0 +1,38 @@
+const boxes = $$("#otp-input-otp-demo-live input.ui-otp-input-box");
+const hidden = $("input[type=hidden][name=otp-demo-live]");
+const note = () => $(".demo-note").textContent;
+if (boxes.length !== 6) return `expected 6 boxes, got ${boxes.length}`;
+if (boxes[0].getAttribute("autocomplete") !== "one-time-code" || boxes[1].getAttribute("autocomplete") !== "off") return "only the first box should ask for one-time-code";
+if (boxes[0].inputMode !== "numeric") return "digits do not bring up a number pad";
+if (boxes.some((b) => b.name)) return "a box has a name of its own: only the hidden input should be sent";
+if (boxes[2].getAttribute("aria-label") !== "Character 3 of 6") return `box 3 is named ${boxes[2].getAttribute("aria-label")}`;
+if (!$("#otp-input-otp-demo-live legend").textContent.includes("Verification code")) return "no legend";
+if ($$("#otp-input-otp-demo-live .ui-otp-input-sep").length !== 1) return "6 boxes are not split in two groups";
+type(boxes[0], "4"); await wait();
+if (hidden.value !== "4" || document.activeElement !== boxes[1]) return `typing did not move on: "${hidden.value}", focus on ${document.activeElement.dataset?.i}`;
+type(boxes[1], "x"); await wait();
+if (hidden.value !== "4" || boxes[1].value !== "") return `a letter got in: "${hidden.value}", box "${boxes[1].value}"`;
+type(boxes[1], "2"); await wait();
+if (hidden.value !== "42" || note() !== "2 of 6 typed.") return `on_change: ${note()}`;
+key(boxes[2], "Backspace"); await wait();
+if (hidden.value !== "4" || document.activeElement !== boxes[1]) return `Backspace in an empty box did not go back and clear: "${hidden.value}"`;
+key(boxes[1], "ArrowLeft"); await wait();
+if (document.activeElement !== boxes[0]) return "ArrowLeft did not move back";
+key(boxes[0], "End"); await wait();
+if (document.activeElement !== boxes[5]) return "End did not go to the last box";
+const dt = new DataTransfer(); dt.setData("text/plain", " 123-456 ");
+boxes[3].dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true })); await wait();
+if (hidden.value !== "123456" || boxes.map((b) => b.value).join("") !== "123456") return `pasting did not fill them all: "${hidden.value}"`;
+if (note() !== "Checking 123456…") return `on_complete was not called: ${note()}`;
+if (!$("#otp-input-otp-demo-live [aria-live]").textContent.includes("complete")) return "a full code is not announced";
+// Typing over a box keeps only the new character.
+type(boxes[2], "39"); await wait();
+if (hidden.value !== "129456") return `typing over a box: "${hidden.value}"`;
+// The recovery key takes letters (made upper case) in two groups of 4.
+const key8 = $$("#otp-input-otp-demo-key input.ui-otp-input-box");
+if (key8.length !== 8 || key8[0].inputMode !== "text") return "the 8-box key is not text";
+type(key8[0], "ab12cd34"); await wait();
+if ($("input[name=otp-demo-key]").value !== "AB12CD34") return `the key: ${$("input[name=otp-demo-key]").value}`;
+const pin = $$("#otp-input-otp-demo-pin input.ui-otp-input-box");
+if ($("input[name=otp-demo-pin]").value !== "12" || pin[1].value !== "2") return "value does not fill the boxes";
+if (pin[0].getAttribute("aria-invalid") !== "true" || !$("#otp-input-otp-demo-pin-error[role=alert]")) return "error does not mark the boxes";

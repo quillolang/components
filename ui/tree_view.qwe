@@ -1,0 +1,192 @@
+// TreeView: nested items that open and close: folders and files, categories, an
+// org chart. It is an ARIA tree: one Tab stop, the arrow keys move and open, and
+// typing a letter jumps to the next item starting with it. With checkboxes, a
+// parent is checked when all its items are, and half-checked when some are.
+//
+//   <TreeView id="files" label="Files" selected="src/main.qwe" items={[
+//       { label: "src", expanded: true, children: [
+//           { label: "main.qwe", value: "src/main.qwe" },
+//           { label: "ui", children: [{ label: "button.qwe", value: "src/ui/button.qwe" }] },
+//       ] },
+//       { label: "README.md", meta: "2 KB" },
+//   ]}/>
+//
+// id: a prefix for its ids, unique on the page. items: maps of { label, value?,
+// children?, expanded?, meta? }: value (the label by default) is what selecting it
+// gives, and must be unique; children nest; expanded opens it at first; meta is a
+// note on the right (a size, a count). label: the tree's name for screen readers.
+// selected: the value selected at first. checkboxes: a checkbox on every item;
+// checked: the values of the items checked at first (a parent's checks all of
+// its items). name: what a <form> gets: the checked items' values, one field
+// each (only those without children), or the selected value without checkboxes.
+// The keys: ↓ ↑ move; → opens, then goes into; ← closes, then goes to the parent;
+// Home and End; Enter selects; Space checks (or selects, without checkboxes);
+// * opens every item beside this one. A click selects an item and opens or closes it.
+// on_select(value): inside one of your components, called with the value selected.
+// on_check(values): called with the values of the checked items without children.
+
+let tree_view_css = css`
+.ui-tree { margin: 0; padding: 4px; list-style: none; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); outline: none; }
+.ui-tree-item { display: flex; align-items: center; gap: 6px; min-height: 32px; padding: 0 8px 0 calc(var(--ui-tree-level) * 18px - 10px);
+  border-radius: var(--ui-radius-sm); cursor: pointer; user-select: none; -webkit-user-select: none; outline: none; }
+.ui-tree-item:hover { background: var(--ui-subtle); }
+.ui-tree-item:focus-visible { box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-tree-item[aria-selected="true"] { background: var(--ui-accent-soft); color: var(--ui-accent); font-weight: 500; }
+.ui-tree-chev { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; color: var(--ui-muted); }
+.ui-tree-chev svg { width: 12px; height: 12px; transition: transform .15s; }
+[aria-expanded="true"] > .ui-tree-chev svg { transform: rotate(90deg); }
+.ui-tree-check { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px;
+  border: 1.5px solid var(--ui-strong); border-radius: 4px; background: var(--ui-surface); color: var(--ui-accent-fg); }
+.ui-tree-check svg { width: 10px; height: 10px; }
+[aria-checked="true"] > .ui-tree-check, [aria-checked="mixed"] > .ui-tree-check { border-color: var(--ui-accent); background: var(--ui-accent); }
+.ui-tree-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-tree-meta { flex: none; color: var(--ui-muted); font-size: 12px; font-weight: 400; font-variant-numeric: tabular-nums; }
+@media (prefers-reduced-motion: reduce) { .ui-tree-chev svg { transition: none; } }
+`
+
+fn tree_view_value(node: map) = node.value ?? node.label
+
+// Every item, nested ones too, in order: { node, value, path, level, pos, size, parent, kids }.
+fn tree_view_all(items: list, level: int = 1, parent = null, prefix: str = "") -> list =
+    flatten(for [i, n] in enumerate(items) => {
+        let path = prefix == "" ? str(i) : `${prefix}-${i}`
+        let kids = n.children ?? []
+        [{ node: n, value: tree_view_value(n), path, level, pos: i + 1, size: len(items), parent, kids: len(kids) > 0 }]
+            + tree_view_all(kids, level + 1, tree_view_value(n), path)
+    })
+
+// The items showing: those whose parents are all open.
+fn tree_view_shown(items: list, open: list, level: int = 1, parent = null, prefix: str = "") -> list =
+    flatten(for [i, n] in enumerate(items) => {
+        let path = prefix == "" ? str(i) : `${prefix}-${i}`
+        let kids = n.children ?? []
+        let v = tree_view_value(n)
+        [{ node: n, value: v, path, level, pos: i + 1, size: len(items), parent, kids: len(kids) > 0 }]
+            + (len(kids) > 0 && index_of(open, v) != null ? tree_view_shown(kids, open, level + 1, v, path) : [])
+    })
+
+// The values of the items without children at or under this one.
+fn tree_view_leaves(node: map) -> list {
+    let kids = node.children ?? []
+    len(kids) == 0 ? [tree_view_value(node)] : flatten(kids | map((k) => tree_view_leaves(k)))
+}
+
+// "true", "false" or "mixed": how checked an item is, from the checked leaves.
+fn tree_view_state(node: map, checked: list) -> str {
+    let leaves = tree_view_leaves(node)
+    let n = count(leaves, (v) => index_of(checked, v) != null)
+    n == 0 ? "false" : n == len(leaves) ? "true" : "mixed"
+}
+
+// The checked leaves to start with: those listed, and every leaf under a listed parent.
+fn tree_view_checked(items: list, checked: list) -> list =
+    unique(flatten(tree_view_all(items) | filter((e) => index_of(checked, e.value) != null) | map((e) => tree_view_leaves(e.node))))
+
+component TreeView(id: str, items: list = [], label: str? = null, selected = null, checkboxes: bool = false,
+                   checked: list = [], name: str? = null, on_select = null, on_check = null, class: str? = null) {
+    state open = tree_view_all(items) | filter((e) => e.kids && e.node.expanded == true) | map((e) => e.value)
+    state sel = selected
+    state ticks = tree_view_checked(items, checked)
+    state active = (find(tree_view_all(items), (e) => e.value == selected) ?? { path: "0" }).path
+    let shown = tree_view_shown(items, open)
+    let at = index_of(shown | map((e) => e.path), active) ?? 0
+    let go = (e, path: str) => {
+        active = path
+        let tree = e.target.closest(".ui-tree")
+        js("queueMicrotask", () => {
+            let el = tree.querySelector(`[data-path="${path}"]`)
+            el && el.focus()
+        })
+    }
+    let toggle = (v) => { open = index_of(open, v) != null ? open | filter((x) => x != v) : push(open, v) }
+    let choose = (v) => {
+        sel = v
+        on_select && on_select(v)
+    }
+    let check = (node: map) => {
+        let leaves = tree_view_leaves(node)
+        ticks = tree_view_state(node, ticks) == "true"
+            ? ticks | filter((v) => index_of(leaves, v) == null)
+            : unique(ticks + leaves)
+        on_check && on_check(ticks)
+    }
+    <div class={ui_cls(["ui-tree-wrap", class])}>
+        <ul.ui-tree role="tree" aria-label={label}
+            @keydown={(e) => {
+                let n = len(shown)
+                let cur = shown[at]
+                if cur != null {
+                    let k = e.key
+                    if k == "ArrowDown" || k == "ArrowUp" || k == "Home" || k == "End" {
+                        e.preventDefault()
+                        let to = match k {
+                            "ArrowDown" => at + 1 < n ? at + 1 : at
+                            "ArrowUp" => at > 0 ? at - 1 : 0
+                            "Home" => 0
+                            _ => n - 1
+                        }
+                        go(e, shown[to].path)
+                    } else if k == "ArrowRight" {
+                        e.preventDefault()
+                        if cur.kids {
+                            if index_of(open, cur.value) == null { toggle(cur.value) } else { go(e, shown[at + 1].path) }
+                        }
+                    } else if k == "ArrowLeft" {
+                        e.preventDefault()
+                        if cur.kids && index_of(open, cur.value) != null {
+                            toggle(cur.value)
+                        } else if cur.parent != null {
+                            go(e, (find(shown, (x) => x.value == cur.parent) ?? cur).path)
+                        }
+                    } else if k == "Enter" {
+                        e.preventDefault()
+                        choose(cur.value)
+                    } else if k == " " {
+                        e.preventDefault()
+                        if checkboxes { check(cur.node) } else { choose(cur.value) }
+                    } else if k == "*" {
+                        e.preventDefault()
+                        open = unique(open + (shown | filter((x) => x.parent == cur.parent && x.kids) | map((x) => x.value)))
+                    } else if len(k) == 1 && k != " " && !e.ctrlKey && !e.metaKey && !e.altKey {
+                        let rest = slice(shown, at + 1, n) + slice(shown, 0, at + 1)
+                        let hit = find(rest, (x) => starts_with(lower(x.node.label), lower(k)))
+                        if hit != null { go(e, hit.path) }
+                    }
+                }
+            }}>
+            {for [i, e] in enumerate(shown) => <li.ui-tree-item key={e.path} role="treeitem" data-path={e.path}
+                    id={`${id}-${e.path}`} style={`--ui-tree-level: ${e.level}`}
+                    tabindex={i == at ? "0" : "-1"} aria-level={e.level} aria-setsize={e.size} aria-posinset={e.pos}
+                    aria-expanded={e.kids ? (index_of(open, e.value) != null ? "true" : "false") : null}
+                    aria-selected={checkboxes ? null : (sel == e.value ? "true" : "false")}
+                    aria-checked={checkboxes ? tree_view_state(e.node, ticks) : null}
+                    aria-current={checkboxes && sel == e.value ? "true" : null}
+                    @click={(ev) => {
+                        active = e.path
+                        if checkboxes && ev.target.closest(".ui-tree-check") != null {
+                            check(e.node)
+                        } else {
+                            choose(e.value)
+                            if e.kids { toggle(e.value) }
+                        }
+                    }}>
+                <span.ui-tree-chev aria-hidden="true">
+                    {e.kids && <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6"
+                                    stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 2.5L8 6l-3.5 3.5"/></svg>}
+                </span>
+                {checkboxes && <span.ui-tree-check aria-hidden="true">
+                    {match tree_view_state(e.node, ticks) {
+                        "true" => <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                                       stroke-linejoin="round"><path d="M2 5.2l2 2 4-4.4"/></svg>
+                        "mixed" => <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2.5 5h5"/></svg>
+                        _ => null
+                    }}
+                </span>}
+                <span.ui-tree-label>{e.node.label}</span>
+                {e.node.meta != null && <span.ui-tree-meta>{e.node.meta}</span>}
+            </li>}
+        </ul>
+        {name != null && checkboxes && (for v in ticks => <input type="hidden" name={name} value={v}/>)}
+        {name != null && !checkboxes && sel != null && <input type="hidden" name={name} value={sel}/>}
+    </div>
+}

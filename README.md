@@ -1,7 +1,8 @@
 # Quillo UI
 
-Fifty UI components for [Quillo](https://quillolang.org), each one `.qwe` file you
-copy into your program: buttons, forms, dialogs, tabs, tables, toasts and more. They
+A hundred UI components for [Quillo](https://quillolang.org), each one `.qwe` file you
+copy into your program: buttons, forms, sign-in, date pickers, dialogs, tabs, editable
+and virtual tables, charts, toasts and more. They
 come with their styles, follow the system's light or dark theme, and work with the
 keyboard and screen readers. Most are views that need no JavaScript at all; the rest
 are components that run in the browser.
@@ -82,17 +83,19 @@ page's font, background and colour too.
 
 | Group | Components |
 |---|---|
-| Layout | Container, Stack, Grid, Card, Divider, Navbar, AppShell |
-| Actions | Button, IconButton, ButtonGroup, CopyButton, DropdownMenu |
-| Forms | TextField, TextArea, Select, Checkbox, RadioGroup, Switch, Slider, NumberInput, SearchInput, PasswordInput, FileDrop, TagInput, Combobox |
-| Feedback | Alert, Badge, Spinner, Progress, Skeleton, EmptyState, Tooltip, Notices |
-| Overlays | Modal, Drawer, Popover, ConfirmButton |
-| Navigation | Tabs, Breadcrumbs, Pagination, Steps, Accordion, SegmentedControl |
-| Data | Avatar, DataTable, Stat, Timeline, DescriptionList, Tag, Sparkline |
+| Layout | Container, Stack, Grid, Card, Divider, Navbar, AppShell, Splitter, Carousel, Toolbar |
+| Actions | Button, IconButton, ButtonGroup, CopyButton, DropdownMenu, SplitButton, ToggleButton |
+| Forms | TextField, TextArea, Select, Checkbox, RadioGroup, Switch, Slider, NumberInput, SearchInput, PasswordInput, FileDrop, TagInput, Combobox, AuthForm, DatePicker, DateRangePicker, TimeInput, ColorPicker, RangeSlider, Rating, OtpInput, MultiSelect, InlineEdit, ChipGroup, FileUpload, FilterBar, TransferList, KeyValueEditor |
+| Feedback | Alert, Badge, Spinner, Progress, Skeleton, EmptyState, Tooltip, Notices, Banner, Meter, ProgressRing, Countdown, StatusDot |
+| Overlays | Modal, Drawer, Popover, ConfirmButton, CommandPalette, Lightbox, Sheet, HoverCard |
+| Navigation | Tabs, Breadcrumbs, Pagination, Steps, Accordion, SegmentedControl, SideNav, TreeView, TableOfContents, ContextMenu, BackToTop |
+| Data | Avatar, DataTable, Stat, Timeline, DescriptionList, Tag, Sparkline, EditableTable, VirtualTable, VirtualList, SearchList, MatchHighlight, FileList, JsonViewer, KanbanBoard, DiffView, CodeBlock, ChatThread, AvatarStack, BarChart, LineChart, DonutChart, CalendarHeatmap |
 
-Some files bring a companion: `AccordionItem`, `AvatarGroup`, `CheckboxGroup`,
-`DescriptionItem`, `DismissibleAlert`, `SkeletonCard`, `Tab` and `TabBar`. Each file
-starts with what it takes and an example.
+Some files bring a companion: `AccordionItem`, `AvatarGroup`, `CarouselSlide`,
+`CheckboxGroup`, `DescriptionItem`, `DismissibleAlert`, `SkeletonCard`, `Tab`, `TabBar`,
+`ToggleButtonGroup`, `ToolbarGroup`, `ToolbarSeparator` and `ToolbarSpacer`. Each file
+starts with what it takes and an example. One file needs another: `search_list.qwe`
+uses `match_highlight.qwe`.
 
 ## How they work
 
@@ -144,7 +147,10 @@ A few things Quillo holds you to:
 - A function is called with exactly the arguments it declares: `on_click()` takes
   none, so call it with none, and document what each callback is given.
 - `for` is a keyword (use `field` for a label's `for`), and props cannot have dashes
-  (`label` becomes `aria-label`).
+  (`label` becomes `aria-label`). `view` is a keyword too.
+- A variable or prop named like a builtin hides it where it is seen: a `max` prop
+  hides `max()`, and `let int = ...` or `let any = ...` does not mean what it says
+  afterwards. Give them other names (`limit`, `count`).
 
 ## License
 

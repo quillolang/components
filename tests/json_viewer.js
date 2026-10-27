@@ -1,0 +1,62 @@
+const [ord, flags] = $$(".ui-json");
+const tree = ord.querySelector("[role=tree]");
+const items = () => [...tree.querySelectorAll("[role=treeitem]")];
+const text = (el) => el.textContent.replace(/\s+/g, " ").trim();
+const row = (start) => items().find((i) => text(i).startsWith(start));
+if (tree.getAttribute("aria-label") !== "Order") return "the tree is not named";
+if (items().length !== 11) return `expanded=1 shows ${items().length} items: ${items().map(text).join(" | ")}`;
+if (text(items()[0]) !== "{") return `the top row: ${text(items()[0])}`;
+if (!text(row('"customer"')).includes("3 keys") || row('"customer"').getAttribute("aria-expanded") !== "false") return `a closed object: ${text(row('"customer"'))}`;
+if (!text(row('"items"')).includes("2 items")) return "a closed array does not count its items";
+if (text(row('"tags"')) !== '"tags":[],') return `an empty array: ${text(row('"tags"'))}`;
+if (row('"tags"').hasAttribute("aria-expanded")) return "an empty array can be opened";
+if (row('"status"').querySelector(".ui-json-string")?.textContent !== '"paid",') return "a string is not quoted and coloured";
+if (!row('"total"').querySelector(".ui-json-number") || !row('"paid"').querySelector(".ui-json-boolean") || !row('"coupon"').querySelector(".ui-json-null")) return "numbers, booleans and null are not marked";
+const col = (sel) => getComputedStyle(ord.querySelector(sel)).color;
+if (new Set([col(".ui-json-string"), col(".ui-json-number"), col(".ui-json-boolean"), col(".ui-json-key")]).size !== 4) return "the kinds are not coloured apart";
+if (!tree.querySelector('li[aria-hidden="true"]')?.textContent.includes("}")) return "the closing brace is missing or read out";
+// keyboard
+items()[0].focus();
+key(items()[0], "ArrowDown"); await wait();
+if (document.activeElement !== row('"id"')) return "ArrowDown";
+const path = () => ord.querySelector(".ui-json-path code").textContent.replace("Path: ", "");
+if (path() !== ".id") return `the path of id: ${path()}`;
+key(document.activeElement, "End"); await wait();
+const ship = row('"shipping"');
+if (document.activeElement !== ship) return "End";
+key(ship, "ArrowRight"); await wait();
+if (ship.getAttribute("aria-expanded") !== "true") return "ArrowRight did not open";
+key(ship, "ArrowRight"); await wait();
+if (document.activeElement !== row('"method"')) return "ArrowRight on an open object did not go in";
+key(document.activeElement, "ArrowDown"); key(document.activeElement, "Enter"); await wait();
+if (row('"address"').getAttribute("aria-expanded") !== "true") return "Enter did not open";
+if (!row('"zip"') || row('"zip"').getAttribute("aria-level") !== "4") return "a nested key's level";
+row('"lines"').click(); await wait();
+if (path() !== ".shipping.address.lines") return `the path after a click: ${path()}`;
+key(row('"lines"'), "ArrowRight"); await wait(); key(document.activeElement, "ArrowRight"); await wait();
+if (path() !== ".shipping.address.lines[0]") return `an array item's path: ${path()}`;
+key(document.activeElement, "ArrowLeft"); await wait();
+if (document.activeElement !== row('"lines"')) return "ArrowLeft on a value did not go to its parent";
+// copy
+const copy = ord.querySelector(".ui-json-path button");
+if (!copy.getAttribute("aria-label").includes(".shipping.address.lines")) return "the copy button does not name the path";
+const real = navigator.clipboard.writeText; let copied = null;
+navigator.clipboard.writeText = async (t) => { copied = t; };
+try { copy.click(); await wait(150); } finally { navigator.clipboard.writeText = real; }
+if (copied !== ".shipping.address.lines") return `copied ${copied}`;
+if (ord.querySelector("[role=status]").textContent !== "Path copied") return "the copy is not announced";
+// key with a space
+row('"customer"').click(); await wait();
+row('"loyalty tier"').click(); await wait();
+if (path() !== '.customer.["loyalty tier"]') return `an odd key's path: ${path()}`;
+// expand / collapse all
+const [all, none] = ord.querySelectorAll(".ui-json-bar > button");
+all.click(); await wait();
+if (items().some((i) => i.getAttribute("aria-expanded") === "false")) return "Expand all left something closed";
+if (items().length !== 31) return `everything open shows ${items().length} items`;
+if (text(row('"tags"')) !== '"tags":[],') return `an empty array opened: ${text(row('"tags"'))}`;
+none.click(); await wait();
+if (items().length !== 1 || items()[0].getAttribute("aria-expanded") !== "false" || !text(items()[0]).includes("10 keys")) return "Collapse all";
+const ft = flags.querySelector("[role=tree]");
+if (ft.querySelectorAll("[role=treeitem]").length !== 9) return `expanded=2 on a list: ${ft.querySelectorAll("[role=treeitem]").length}`;
+if (!flags.querySelector(".ui-json-path code").textContent.includes("root")) return "the top's path is not called root";

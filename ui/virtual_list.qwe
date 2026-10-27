@@ -1,0 +1,126 @@
+// VirtualList: a long list (thousands of items) that stays fast, because only the
+// items in view, and a few around them, are on the page; the rest is empty space
+// of the right height. Each item is a title, with a line under it and a note on
+// the right if it has them. Pick one with a click, Enter or Space.
+//
+//   <VirtualList id="people" label="People" name="person" height={400}
+//                items={people | map((p) => { title: p.name, subtitle: p.email, meta: p.team, value: p.id })}/>
+//
+// id: a prefix for its ids, unique on the page. items: strings, or maps of
+// { title, subtitle?, meta?, value? } (value: what picking it gives; the title by
+// default). item_height: each item's height in pixels (56; every item is this
+// tall, and longer text is cut with …). height: the list's height in pixels (360).
+// overscan: items drawn beyond each edge (4). label: the list's name for screen
+// readers. selected: the value picked at first; name: a <form> gets the value
+// picked under it. empty: what it says with no items ("Nothing to show").
+// It is a listbox: ↓ ↑ move, Page Down and Page Up move a screen, Home and End go
+// to the ends, Enter or Space picks. Screen readers hear "12 of 10,000".
+// on_select(value): inside one of your components, called with the value picked.
+
+let virtual_list_css = css`
+.ui-vl { position: relative; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.35 var(--ui-font); outline: none; overscroll-behavior: contain; }
+.ui-vl:focus-visible { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-vl-space { position: relative; }
+.ui-vl-item { position: absolute; left: 0; right: 0; box-sizing: border-box; display: flex; align-items: center; gap: 12px;
+  padding: 0 14px; border-bottom: 1px solid var(--ui-border); cursor: pointer; }
+.ui-vl-item:hover { background: var(--ui-subtle); }
+.ui-vl-item[aria-selected="true"] { background: var(--ui-accent-soft); }
+.ui-vl-item[aria-selected="true"] .ui-vl-title { color: var(--ui-accent); }
+.ui-vl:focus-visible .ui-vl-active { box-shadow: inset 3px 0 0 var(--ui-accent); background: var(--ui-subtle); }
+.ui-vl:focus-visible .ui-vl-active[aria-selected="true"] { background: var(--ui-accent-soft); }
+.ui-vl-text { flex: 1; min-width: 0; display: grid; }
+.ui-vl-title, .ui-vl-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-vl-title { font-weight: 500; }
+.ui-vl-sub { color: var(--ui-muted); font-size: 13px; }
+.ui-vl-meta { flex: none; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-vl-empty { padding: 28px 14px; color: var(--ui-muted); text-align: center; }
+`
+
+// An item as { title, subtitle, meta, value }, from a string or such a map.
+fn virtual_list_item(it) -> map =
+    type_of(it) == "map"
+        ? { title: str(it.title ?? ""), subtitle: it.subtitle, meta: it.meta, value: it.value ?? it.title }
+        : { title: str(it), subtitle: null, meta: null, value: it }
+
+component VirtualList(id: str, items: list = [], item_height: int = 56, height: int = 360, overscan: int = 4,
+                      label: str? = null, selected = null, name: str? = null, empty: str = "Nothing to show",
+                      on_select = null, class: str? = null) {
+    state top = 0
+    state active = max([0, index_of(items | map((it) => virtual_list_item(it).value), selected) ?? 0])
+    state sel = selected
+    let n = len(items)
+    let from_i = max([0, floor(top / item_height) - overscan])
+    let last_i = min([n, ceil((top + height) / item_height) + overscan])
+    let window = range(from_i, last_i) | map((i) => { i, it: virtual_list_item(items[i]) })
+    let pick = (i: int) => {
+        let v = virtual_list_item(items[i]).value
+        sel = v
+        active = i
+        on_select && on_select(v)
+    }
+    // Moves the keys to item i, scrolling it into view.
+    let go = (e, i: int) => {
+        active = i
+        let box = e.target
+        let seen = box.clientHeight
+        let y = i * item_height
+        if y < box.scrollTop {
+            box.scrollTop = y
+            top = y
+        } else if y + item_height > box.scrollTop + seen {
+            box.scrollTop = y + item_height - seen
+            top = y + item_height - seen
+        }
+    }
+    <div class={ui_cls(["ui-vl-wrap", class])}>
+        <div.ui-vl id={id} role="listbox" tabindex="0" aria-label={label} style={`height: ${height}px`}
+             aria-activedescendant={n > 0 ? `${id}-item-${active}` : null}
+             @mount={(el) => {
+                 // Starts with the item picked in view.
+                 if (active + 1) * item_height > height {
+                     el.scrollTop = active * item_height - floor(height / 2)
+                     top = el.scrollTop
+                 }
+             }}
+             @scroll={(e) => { top = e.scrollTop }}
+             @keydown={(e) => {
+                 let page = max([1, floor(height / item_height) - 1])
+                 let to = match e.key {
+                     "ArrowDown" => min([n - 1, active + 1])
+                     "ArrowUp" => max([0, active - 1])
+                     "PageDown" => min([n - 1, active + page])
+                     "PageUp" => max([0, active - page])
+                     "Home" => 0
+                     "End" => n - 1
+                     _ => null
+                 }
+                 if to != null && n > 0 {
+                     e.preventDefault()
+                     go(e, to)
+                 } else if (e.key == "Enter" || e.key == " ") && n > 0 {
+                     e.preventDefault()
+                     pick(active)
+                 }
+             }}>
+            {n == 0
+                ? <div.ui-vl-empty role="presentation">{empty}</div>
+                : <div.ui-vl-space role="presentation" style={`height: ${n * item_height}px`}>
+                    {for w in window => <div.ui-vl-item key={w.i} id={`${id}-item-${w.i}`} role="option"
+                            class={w.i == active ? "ui-vl-active" : null}
+                            style={`top: ${w.i * item_height}px; height: ${item_height}px`}
+                            aria-setsize={n} aria-posinset={w.i + 1}
+                            aria-selected={sel != null && sel == w.it.value ? "true" : "false"}
+                            @mousedown={(e) => { e.preventDefault(); e.target.closest(".ui-vl").focus() }}
+                            @click={() => { pick(w.i) }}>
+                        <span.ui-vl-text>
+                            <span.ui-vl-title>{w.it.title}</span>
+                            {w.it.subtitle != null && <span.ui-vl-sub>{w.it.subtitle}</span>}
+                        </span>
+                        {w.it.meta != null && <span.ui-vl-meta>{w.it.meta}</span>}
+                    </div>}
+                  </div>}
+        </div>
+        {name != null && <input type="hidden" name={name} value={sel ?? ""}/>}
+    </div>
+}

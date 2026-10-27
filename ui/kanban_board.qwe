@@ -1,0 +1,252 @@
+// KanbanBoard: columns of cards (to do, doing, done) to move between columns and
+// up and down in them: by dragging, by keyboard, or with the arrows on each card.
+//
+//   <KanbanBoard id="sprint" label="Sprint 14" on_change={(cols) => { board = cols }} columns={[
+//       { id: "todo", title: "To do", cards: [{ id: "t1", title: "Write the docs", tags: ["docs"] }] },
+//       { id: "doing", title: "Doing", limit: 3, cards: [] },
+//       { id: "done", title: "Done", cards: [] },
+//   ]}/>
+//
+// id: a prefix for its ids, unique on the page. columns: maps of { id, title, cards,
+// limit? }: limit is how many cards it should hold, and the column shows when it
+// has more. cards: maps of { id, title, note?, tags? }, ids unique on the board.
+// label: the board's name for screen readers.
+// With the keyboard: Tab reaches each card; Space or Enter picks it up, the arrow
+// keys move it (← → to another column, ↑ ↓ in its column), Space or Enter puts it
+// down and Escape puts it back. Not carrying one, the arrow keys go from card to
+// card. Each move is announced. The ‹ › on a card (on hover, and always on touch
+// screens) move it to the column before or after.
+// on_change(columns): inside one of your components, called with the columns, as
+// given but with the cards where they are now, after each move.
+
+let kanban_board_css = css`
+.ui-kb { min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-kb-cols { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; padding-bottom: 4px;
+  scroll-snap-type: x proximity; }
+.ui-kb-col { flex: 1 0 220px; max-width: 360px; display: grid; gap: 8px; padding: 10px; border-radius: var(--ui-radius);
+  background: var(--ui-subtle); scroll-snap-align: start; }
+.ui-kb-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 4px; }
+.ui-kb .ui-kb-title { margin: 0; font-size: 13px; font-weight: 600; line-height: 1.4; }
+.ui-kb-count { min-width: 22px; padding: 1px 7px; border-radius: 999px; background: var(--ui-surface); color: var(--ui-muted);
+  font-size: 12px; text-align: center; font-variant-numeric: tabular-nums; }
+.ui-kb-over .ui-kb-count { background: var(--ui-warning-soft); color: var(--ui-warning); font-weight: 600; }
+.ui-kb-list { display: grid; gap: 8px; min-height: 64px; margin: 0; padding: 2px; list-style: none; border-radius: var(--ui-radius-sm);
+  transition: background .15s; }
+.ui-kb-target { background: color-mix(in srgb, var(--ui-accent) 8%, transparent); }
+.ui-kb-end { box-shadow: inset 0 -3px 0 var(--ui-accent); }
+.ui-kb-empty { display: grid; place-items: center; min-height: 60px; border: 1.5px dashed var(--ui-border); border-radius: var(--ui-radius-sm);
+  color: var(--ui-muted); font-size: 13px; }
+.ui-kb-card { position: relative; display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); box-shadow: 0 1px 2px color-mix(in srgb, var(--ui-fg) 6%, transparent);
+  cursor: grab; outline: none; transition: box-shadow .15s, transform .15s, opacity .15s; }
+.ui-kb-card:hover { border-color: var(--ui-strong); }
+.ui-kb-card:focus-visible { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-kb-dragging { opacity: .45; }
+.ui-kb-lifted { border-color: var(--ui-accent); box-shadow: var(--ui-focus), var(--ui-shadow); transform: rotate(-1deg) scale(1.02); cursor: grabbing; }
+.ui-kb-before::before { content: ""; position: absolute; left: 0; right: 0; top: -6px; height: 3px; border-radius: 2px; background: var(--ui-accent); }
+.ui-kb-card-title { margin: 0; padding-right: 48px; font-weight: 500; overflow-wrap: anywhere; }
+.ui-kb-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-kb-tags { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-kb-tags li { padding: 1px 7px; border-radius: 4px; background: var(--ui-accent-soft); color: var(--ui-accent); font-size: 11px; font-weight: 500; }
+.ui-kb-moves { position: absolute; top: 6px; right: 6px; display: flex; gap: 2px; opacity: 0; transition: opacity .15s; }
+.ui-kb-card:hover .ui-kb-moves, .ui-kb-card:focus-within .ui-kb-moves { opacity: 1; }
+.ui-kb-moves button { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0;
+  border: 0; border-radius: 4px; background: transparent; color: var(--ui-muted); font: 16px/1 var(--ui-font); cursor: pointer; }
+.ui-kb-moves button:hover:not(:disabled) { background: var(--ui-subtle); color: var(--ui-fg); }
+.ui-kb-moves button:disabled { visibility: hidden; }
+@media (hover: none) { .ui-kb-moves { opacity: 1; } .ui-kb-moves button { width: 30px; height: 30px; } .ui-kb-card-title { padding-right: 64px; } }
+@media (prefers-reduced-motion: reduce) { .ui-kb-card, .ui-kb-list, .ui-kb-moves { transition: none; } .ui-kb-lifted { transform: none; } }
+`
+
+// Where a card is: { c, i }, its column's and its own place; null if it is not there.
+fn kanban_board_find(cols: list, card) {
+    let c = index_of(cols | map((col) => any(col.cards ?? [], (x) => x.id == card)), true)
+    c == null ? null : { c, i: index_of(cols[c].cards | map((x) => x.id), card) }
+}
+
+// The columns with the card moved into column `to`, at place `at` (counted without it).
+fn kanban_board_move(cols: list, card, to: int, at: int) -> list {
+    let from = kanban_board_find(cols, card)
+    if from == null { return cols }
+    let it = cols[from.c].cards[from.i]
+    let without = for [k, col] in enumerate(cols) => set(col, "cards", col.cards | filter((x) => x.id != card))
+    for [k, col] in enumerate(without) => k != to ? col
+        : set(col, "cards", slice(col.cards, 0, at) + [it] + slice(col.cards, at, len(col.cards)))
+}
+
+component KanbanBoard(id: str, columns: list = [], label: str? = null, on_change = null, class: str? = null) {
+    state cols = columns | map((col) => set(col, "cards", col.cards ?? []))
+    state dragging = null     // the id of the card being dragged
+    state over = null         // where it would go: { c, at }
+    state lifted = null       // the id of the card carried by keyboard
+    state origin = null       // where it was picked up: the columns then
+    state said = ""
+    let help = `${id}-help`
+    let focus = (e, card) => {
+        let board = e.target.closest(".ui-kb")
+        js("queueMicrotask", () => {
+            let el = board.querySelector(`[data-card="${card}"]`)
+            el && el.focus()
+        })
+    }
+    let place = (next: list, card) => {
+        let p = kanban_board_find(next, card)
+        `${next[p.c].title}, position ${p.i + 1} of ${len(next[p.c].cards)}`
+    }
+    let title_of = (card) => {
+        let p = kanban_board_find(cols, card)
+        p == null ? "" : cols[p.c].cards[p.i].title
+    }
+    // Moves a card for good: from a drop, a button or a keyboard drop.
+    let commit = (next: list, card) => {
+        cols = next
+        said = `${title_of(card)} moved to ${place(next, card)}.`
+        on_change && on_change(next)
+    }
+    <div class={ui_cls(["ui-kb", class])} role="group" aria-label={label}>
+        <p.ui-sr id={help}>Press Space to pick up a card, the arrow keys to move it, Space to put it down or Escape to put it back.</p>
+        <div.ui-kb-cols>
+            {for [ci, col] in enumerate(cols) => <section key={col.id}
+                    class={ui_cls(["ui-kb-col", col.limit != null && len(col.cards) > col.limit && "ui-kb-over"])}
+                    aria-labelledby={`${id}-col-${ci}`}>
+                <div.ui-kb-head>
+                    <h3.ui-kb-title id={`${id}-col-${ci}`}>{col.title}</h3>
+                    <span.ui-kb-count>
+                        {col.limit != null ? `${len(col.cards)} / ${col.limit}` : `${len(col.cards)}`}
+                        <span.ui-sr>{col.limit != null && len(col.cards) > col.limit ? " cards, over the limit" : " cards"}</span>
+                    </span>
+                </div>
+                <ul class={ui_cls(["ui-kb-list", dragging != null && over != null && over.c == ci && "ui-kb-target",
+                                   dragging != null && over != null && over.c == ci && over.at == len(col.cards) && len(col.cards) > 0 && "ui-kb-end"])}
+                    @dragover={(e) => {
+                        if dragging != null {
+                            e.preventDefault()
+                            if e.target.closest(".ui-kb-card") == null {
+                                let at = len(col.cards)
+                                if over == null || over.c != ci || over.at != at { over = { c: ci, at } }
+                            }
+                        }
+                    }}
+                    @drop={(e) => {
+                        e.preventDefault()
+                        if dragging != null && over != null {
+                            let card = dragging
+                            let p = kanban_board_find(cols, card)
+                            // A place counted with the card still there, made one less below it in its own column.
+                            let at = p.c == over.c && p.i < over.at ? over.at - 1 : over.at
+                            let next = kanban_board_move(cols, card, over.c, at)
+                            dragging = null
+                            over = null
+                            if next != cols { commit(next, card) }
+                        }
+                    }}>
+                    {len(col.cards) == 0 && <li.ui-kb-empty role="presentation">{dragging != null || lifted != null ? "Drop here" : "No cards"}</li>}
+                    {for [i, card] in enumerate(col.cards) => <li key={card.id} data-card={card.id} tabindex="0" draggable="true"
+                            aria-describedby={help} aria-roledescription="card"
+                            aria-label={lifted == card.id ? `${card.title}, picked up` : null}
+                            class={ui_cls(["ui-kb-card", dragging == card.id && "ui-kb-dragging", lifted == card.id && "ui-kb-lifted",
+                                           dragging != null && over != null && over.c == ci && over.at == i && "ui-kb-before"])}
+                            @dragstart={(e) => {
+                                dragging = card.id
+                                lifted = null
+                                e.dataTransfer.effectAllowed = "move"
+                                e.dataTransfer.setData("text/plain", str(card.id))
+                            }}
+                            @dragend={() => {
+                                dragging = null
+                                over = null
+                            }}
+                            @dragover={(e) => {
+                                if dragging != null {
+                                    e.preventDefault()
+                                    let r = e.target.closest(".ui-kb-card").getBoundingClientRect()
+                                    let at = e.clientY < r.top + r.height / 2 ? i : i + 1
+                                    if over == null || over.c != ci || over.at != at { over = { c: ci, at } }
+                                }
+                            }}
+                            @keydown={(e) => {
+                                let k = e.key
+                                if e.target.tagName != "LI" {
+                                    null
+                                } else if lifted == card.id {
+                                    let p = kanban_board_find(cols, card.id)
+                                    let to = match k {
+                                        "ArrowUp" => p.i > 0 ? { c: p.c, at: p.i - 1 } : null
+                                        "ArrowDown" => p.i < len(cols[p.c].cards) - 1 ? { c: p.c, at: p.i + 1 } : null
+                                        "ArrowLeft" => p.c > 0 ? { c: p.c - 1, at: min([p.i, len(cols[p.c - 1].cards)]) } : null
+                                        "ArrowRight" => p.c < len(cols) - 1 ? { c: p.c + 1, at: min([p.i, len(cols[p.c + 1].cards)]) } : null
+                                        _ => null
+                                    }
+                                    if to != null {
+                                        e.preventDefault()
+                                        cols = kanban_board_move(cols, card.id, to.c, to.at)
+                                        said = place(cols, card.id)
+                                        focus(e, card.id)
+                                    } else if k == " " || k == "Enter" {
+                                        e.preventDefault()
+                                        lifted = null
+                                        if cols != origin { commit(cols, card.id) } else { said = `${card.title} put down where it was.` }
+                                    } else if k == "Escape" {
+                                        e.preventDefault()
+                                        cols = origin
+                                        lifted = null
+                                        said = `${card.title} put back in ${place(origin, card.id)}.`
+                                        focus(e, card.id)
+                                    } else if k == "Tab" {
+                                        e.preventDefault()
+                                    }
+                                } else if k == " " || k == "Enter" {
+                                    e.preventDefault()
+                                    lifted = card.id
+                                    origin = cols
+                                    said = `${card.title} picked up, in ${place(cols, card.id)}.`
+                                } else {
+                                    let to = match k {
+                                        "ArrowUp" => i > 0 ? cols[ci].cards[i - 1] : null
+                                        "ArrowDown" => cols[ci].cards[i + 1]
+                                        "ArrowLeft" => ci > 0 ? (cols[ci - 1].cards[min([i, len(cols[ci - 1].cards) - 1])]) : null
+                                        "ArrowRight" => ci < len(cols) - 1 ? (cols[ci + 1].cards[min([i, len(cols[ci + 1].cards) - 1])]) : null
+                                        _ => null
+                                    }
+                                    if to != null {
+                                        e.preventDefault()
+                                        focus(e, to.id)
+                                    }
+                                }
+                            }}
+                            @blur={(e) => {
+                                // Leaving a card carried puts it down, unless the focus came back to it
+                                // (moving it to another column makes its element again).
+                                let doc = e.target.ownerDocument
+                                js("queueMicrotask", () => {
+                                    let now = doc.activeElement
+                                    if lifted == card.id && (now == null || now.dataset == null || now.dataset.card != str(card.id)) {
+                                        lifted = null
+                                        if cols != origin { commit(cols, card.id) }
+                                    }
+                                })
+                            }}>
+                        <p.ui-kb-card-title>{card.title}</p>
+                        {card.note != null && <p.ui-kb-note>{card.note}</p>}
+                        {len(card.tags ?? []) > 0 && <ul.ui-kb-tags aria-label="Tags">{for t in card.tags => <li>{t}</li>}</ul>}
+                        <div.ui-kb-moves>
+                            <button type="button" tabindex="-1" disabled={ci == 0}
+                                    aria-label={ci > 0 ? `Move ${card.title} to ${cols[ci - 1].title}` : "Move back"}
+                                    @click={(e) => {
+                                        commit(kanban_board_move(cols, card.id, ci - 1, len(cols[ci - 1].cards)), card.id)
+                                        focus(e, card.id)
+                                    }}>‹</button>
+                            <button type="button" tabindex="-1" disabled={ci == len(cols) - 1}
+                                    aria-label={ci < len(cols) - 1 ? `Move ${card.title} to ${cols[ci + 1].title}` : "Move on"}
+                                    @click={(e) => {
+                                        commit(kanban_board_move(cols, card.id, ci + 1, len(cols[ci + 1].cards)), card.id)
+                                        focus(e, card.id)
+                                    }}>›</button>
+                        </div>
+                    </li>}
+                </ul>
+            </section>}
+        </div>
+        <p.ui-sr aria-live="assertive">{said}</p>
+    </div>
+}

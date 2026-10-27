@@ -1,0 +1,250 @@
+// FilterBar: a search box with filters beside it (each a menu of choices, or a row of
+// chips, with how many each finds), the filters in force shown as pills that a click
+// removes, and "Clear all". It is a <form method="get">: placed in a page it sends
+// the search and each filter as query parameters (?q=crash&status=open&status=closed),
+// at once when a chip is clicked or a menu closes (auto), or with its Apply button.
+// Inside one of your components, on_change hears every change and nothing is sent.
+//
+//   route GET /issues { query: { q: str = "", status: list = [] } } =
+//       <FilterBar query={q} values={{ status }} facets={[
+//           { name: "status", label: "Status", options: [
+//               { label: "Open", value: "open", count: 12 }, { label: "Closed", value: "closed", count: 40 }] },
+//           { name: "kind", label: "Kind", display: "chips", options: ["Bug", "Feature"] },
+//           { name: "sort", label: "Sort", multiple: false, options: ["Newest", "Oldest"] },
+//       ]}/>
+//
+// facets: a list of { name, label, options, multiple?, display? }: name is the query
+// parameter; options are strings or { label, value, count? } (count shown beside it);
+// multiple (true) takes several values, false one (with "Any", sent empty); display "menu" (the
+// default) or "chips". values: what is chosen to start with, by name: { status:
+// ["open"], sort: "Newest" }. query: the search text to start with; name: its
+// parameter ("q"); placeholder ("Search…"); label: the bar's name ("Filters").
+// action: where the form goes (this page). auto (true): a change is sent at once; with
+// false, the Apply button sends them (apply: its text, "Apply").
+// id: the start of its parts' ids ("filters"), unique on the page.
+// on_change(filters): inside one of your components, called with { query, values }
+// (values by name, each a list of values) whenever the text or a filter changes.
+
+let filter_bar_css = css`
+.ui-fb { display: grid; gap: 10px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-fb-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-fb-search { position: relative; display: flex; flex: 1 1 220px; align-items: center; min-width: 0; }
+.ui-fb-search svg { position: absolute; left: 11px; width: 16px; height: 16px; color: var(--ui-muted); pointer-events: none; }
+.ui-fb-search input {
+  box-sizing: border-box; width: 100%; height: 36px; margin: 0; padding: 0 12px 0 34px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1 var(--ui-font); appearance: none;
+}
+.ui-fb-search input::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-fb-search input:hover { border-color: var(--ui-strong); }
+.ui-fb-search input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-fb-btn {
+  display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font);
+  white-space: nowrap; cursor: pointer;
+}
+.ui-fb-btn:hover { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-fb-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-fb-btn svg { width: 14px; height: 14px; color: var(--ui-muted); }
+.ui-fb-on { border-color: var(--ui-accent); color: var(--ui-accent); }
+.ui-fb-n { min-width: 18px; padding: 2px 5px; border-radius: 999px; background: var(--ui-accent); color: var(--ui-accent-fg); font-size: 11px; text-align: center; }
+.ui-fb-apply { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-fb-apply:hover { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-fb-menu {
+  min-width: 200px; max-width: min(300px, calc(100vw - 16px)); max-height: min(360px, calc(100dvh - 16px)); margin: auto;
+  padding: 6px; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface);
+  color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 14px/1.4 var(--ui-font);
+}
+.ui-fb-menu fieldset { display: grid; gap: 1px; margin: 0; padding: 0; border: 0; }
+.ui-fb-opt { display: flex; align-items: center; gap: 9px; padding: 7px 8px; border-radius: var(--ui-radius-sm); cursor: pointer; }
+.ui-fb-opt:hover { background: var(--ui-subtle); }
+.ui-fb-opt:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-fb-opt input { width: 16px; height: 16px; margin: 0; accent-color: var(--ui-accent); }
+.ui-fb-opt span:first-of-type { flex: 1; }
+.ui-fb-count { color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+@supports (position-area: bottom) {
+  .ui-fb-menu { inset: auto; margin: 4px 0; position-area: bottom span-right; position-try-fallbacks: flip-block, flip-inline; }
+}
+@supports not (position-area: bottom) { .ui-fb-menu::backdrop { background: var(--ui-overlay); } }
+.ui-fb-chips { display: inline-flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; border: 0; }
+.ui-fb-chips legend { float: left; margin-right: 2px; padding: 0; color: var(--ui-muted); font-size: 13px; line-height: 30px; }
+.ui-fb-chip {
+  display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 11px; border: 1px solid var(--ui-border);
+  border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font-size: 13px; font-weight: 500; cursor: pointer;
+}
+.ui-fb-chip:hover { border-color: var(--ui-strong); }
+.ui-fb-chip:has(input:checked) { border-color: var(--ui-accent); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-fb-chip:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-fb-chip .ui-fb-count { color: inherit; opacity: .75; }
+.ui-fb-pills { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-fb-pill {
+  display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 4px 0 10px; border-radius: 999px;
+  background: var(--ui-subtle); color: var(--ui-fg); font-size: 13px;
+}
+.ui-fb-pill b { font-weight: 500; color: var(--ui-muted); }
+.ui-fb-pill button {
+  display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%;
+  background: transparent; color: var(--ui-muted); cursor: pointer;
+}
+.ui-fb-pill button:hover { background: var(--ui-strong); color: var(--ui-fg); }
+.ui-fb-pill button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-fb-pill svg { width: 12px; height: 12px; }
+.ui-fb-clear { height: 26px; padding: 0 8px; border: 0; border-radius: var(--ui-radius-sm); background: none; color: var(--ui-accent); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-fb-clear:hover { text-decoration: underline; }
+.ui-fb-clear:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+`
+
+// A facet's options as maps of { label, value, count }, the values as text.
+fn filter_bar_options(f: map) -> list =
+    (get(f, "options") ?? []) | map((o) => type_of(o) == "map"
+        ? { label: o.label ?? str(o.value), value: str(o.value ?? o.label), count: get(o, "count") }
+        : { label: str(o), value: str(o), count: null })
+
+// What is chosen of each facet, as lists of text: values may give one or a list.
+fn filter_bar_values(facets: list, values: map) -> map =
+    reduce(facets, {}, (m, f) => {
+        let v = get(values, f.name)
+        set(m, f.name, v == null ? [] : (type_of(v) == "list" ? v | map((x) => str(x)) : [str(v)]))
+    })
+
+// The label of a facet's value.
+fn filter_bar_label(f: map, v: str) -> str = (find(filter_bar_options(f), (o) => o.value == v) ?? { label: v }).label
+
+component FilterBar(facets: list = [], values: map = {}, query: str = "", name: str = "q", label: str = "Filters",
+                    placeholder: str = "Search…", action: str? = null, auto: bool = true, apply: str = "Apply",
+                    id: str = "filters", on_change = null, class: str? = null) {
+    state text = query
+    state sel = filter_bar_values(facets, values)
+    state dirty = false
+    let chosen = flatten(for [fi, f] in enumerate(facets) => (get(sel, f.name) ?? []) | map((v) => { fi, f, v }))
+    let multi = (f) => get(f, "multiple") != false
+    let send = (form) => {
+        if on_change != null {
+            on_change({ query: text, values: sel })
+        } else if auto {
+            form.requestSubmit()
+        } else {
+            dirty = true
+        }
+    }
+    let toggle = (f, v: str, on: bool) => {
+        let now = get(sel, f.name) ?? []
+        sel = set(sel, f.name, multi(f) ? (on ? unique(now + [v]) : now | filter((x) => x != v)) : (v == "" ? [] : [v]))
+    }
+    // The input of a facet's option, so the form sends what the state says before it renders again.
+    let field_of = (form, fi: int, v: str) => {
+        let opts = filter_bar_options(facets[fi])
+        let oi = index_of(opts | map((o) => o.value), v)
+        oi == null ? null : form.querySelector(`#${id}-${fi}-${oi}`)
+    }
+    let remove = (e, c) => {
+        let form = e.target.closest("form")
+        let el = field_of(form, c.fi, c.v)
+        if el != null { el.checked = false }
+        if !multi(c.f) {
+            let any_el = form.querySelector(`#${id}-${c.fi}-any`)
+            if any_el != null { any_el.checked = true }
+        }
+        toggle(c.f, c.v, false)
+        form.querySelector("input[type=search]").focus()
+        send(form)
+    }
+    <form class={ui_cls(["ui-fb", class])} method="get" action={action} role="search" aria-label={label}>
+        <div.ui-fb-row>
+            <div.ui-fb-search>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                     aria-hidden="true"><circle cx="7" cy="7" r="4.75"/><path d="M10.5 10.5L14 14"/></svg>
+                <input type="search" id={`${id}-q`} name={name} value={text} placeholder={placeholder}
+                       aria-label={placeholder != "" ? placeholder : "Search"} autocomplete="off"
+                       @input={(e) => {
+                           text = e.value
+                           on_change && on_change({ query: text, values: sel })
+                       }}
+                       @keydown={(e) => { if e.key == "Enter" && on_change != null { e.preventDefault() } }}/>
+            </div>
+            {for [fi, f] in enumerate(facets) => {
+                let opts = filter_bar_options(f)
+                let now = get(sel, f.name) ?? []
+                get(f, "display") == "chips"
+                    ? <fieldset.ui-fb-chips key={f.name}>
+                          <legend>{f.label}</legend>
+                          {for [oi, o] in enumerate(opts) => <label.ui-fb-chip key={o.value}>
+                              <input.ui-sr type={multi(f) ? "checkbox" : "radio"} id={`${id}-${fi}-${oi}`} name={f.name}
+                                     value={o.value} checked={contains(now, o.value)}
+                                     @click={(e) => {
+                                         // A chosen radio chip, clicked again, is let go.
+                                         if !multi(f) && contains(get(sel, f.name) ?? [], o.value) {
+                                             e.target.checked = false
+                                             toggle(f, "", true)
+                                             send(e.target.form)
+                                         }
+                                     }}
+                                     @change={(e) => {
+                                         toggle(f, o.value, e.target.checked)
+                                         send(e.target.form)
+                                     }}/>
+                              <span>{o.label}</span>
+                              {o.count != null && <span.ui-fb-count>{o.count}</span>}
+                          </label>}
+                      </fieldset>
+                    : <span key={f.name}>
+                          <button type="button" popovertarget={`${id}-${fi}`} style={`anchor-name: --${id}-${fi}`}
+                                  class={ui_cls(["ui-fb-btn", len(now) > 0 && "ui-fb-on"])}>
+                              {f.label}
+                              {len(now) > 0 && <span.ui-fb-n aria-label={`${len(now)} chosen`}>{len(now)}</span>}
+                              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"
+                                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+                          </button>
+                          <div.ui-fb-menu id={`${id}-${fi}`} popover="auto" style={`position-anchor: --${id}-${fi}`}
+                               @toggle={(e) => {
+                                   if e.newState == "closed" && dirty && on_change == null && auto { e.target.closest("form").requestSubmit() }
+                                   if e.newState == "open" { dirty = false }
+                               }}>
+                              <fieldset>
+                                  <legend.ui-sr>{f.label}</legend>
+                                  {!multi(f) && <label.ui-fb-opt>
+                                      <input type="radio" id={`${id}-${fi}-any`} name={f.name} value="" checked={len(now) == 0}
+                                             @change={(e) => { toggle(f, "", true); if on_change != null { send(e.target.form) } else { dirty = true } }}/>
+                                      <span>Any</span>
+                                  </label>}
+                                  {for [oi, o] in enumerate(opts) => <label.ui-fb-opt key={o.value}>
+                                      <input type={multi(f) ? "checkbox" : "radio"} id={`${id}-${fi}-${oi}`} name={f.name}
+                                             value={o.value} checked={contains(now, o.value)}
+                                             @change={(e) => {
+                                                 toggle(f, o.value, e.target.checked)
+                                                 if on_change != null { send(e.target.form) } else { dirty = true }
+                                             }}/>
+                                      <span>{o.label}</span>
+                                      {o.count != null && <span.ui-fb-count>{o.count}</span>}
+                                  </label>}
+                              </fieldset>
+                          </div>
+                      </span>
+            }}
+            {on_change == null && <button.ui-fb-btn.ui-fb-apply type="submit">{apply}</button>}
+        </div>
+        {len(chosen) > 0 ? <div.ui-fb-row>
+            <ul.ui-fb-pills aria-label="Filters in force">
+                {for c in chosen => <li.ui-fb-pill key={`${c.f.name}=${c.v}`}>
+                    <span><b>{c.f.label}:</b> {filter_bar_label(c.f, c.v)}</span>
+                    <button type="button" aria-label={`Remove ${c.f.label}: ${filter_bar_label(c.f, c.v)}`}
+                            @click={(e) => { remove(e, c) }}>
+                        <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                             aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6"/></svg>
+                    </button>
+                </li>}
+            </ul>
+            <button.ui-fb-clear type="button" @click={(e) => {
+                let form = e.target.closest("form")
+                for c in chosen => {
+                    let el = field_of(form, c.fi, c.v)
+                    if el != null { el.checked = false }
+                    let any_el = form.querySelector(`#${id}-${c.fi}-any`)
+                    if any_el != null { any_el.checked = true }
+                }
+                sel = filter_bar_values(facets, {})
+                form.querySelector("input[type=search]").focus()
+                send(form)
+            }}>Clear all</button>
+        </div> : null}
+    </form>
+}

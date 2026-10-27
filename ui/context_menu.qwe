@@ -1,0 +1,147 @@
+// ContextMenu: a menu of actions that opens where an area is right-clicked, held down
+// on a touch screen, or (with the area focused) where Shift+F10 or the Menu key is
+// pressed. It is the browser's `popover`, so a click elsewhere closes it. Inside it
+// the arrow keys, Home and End move, a letter jumps to the next item starting with it,
+// Enter chooses and Escape closes, putting focus back on the area.
+//
+//   <ContextMenu id="file-menu" label="File actions" items={[
+//       { label: "Open", href: "/files/7" },
+//       { label: "Rename", shortcut: "F2" },
+//       { label: "Duplicate", shortcut: "Ctrl D", disabled: true },
+//       { divider: true },
+//       { label: "Delete", shortcut: "Del", tone: "danger" },
+//   ]}>
+//       <FileCard file={f}/>
+//   </ContextMenu>
+//
+// id (required): the menu's id, unique on the page. children: the area it belongs to.
+// items: a list of { label, shortcut?, href?, disabled?, tone?: "danger" }, or
+// { divider: true } for a line between groups. shortcut is shown beside the label
+// ("Ctrl C"). An item with an href is a link; one without is a button that closes the
+// menu and, inside one of your components, calls on_select(item). disabled: shown,
+// but it does nothing. label: the menu's and the area's name ("Actions").
+// hint: what screen readers hear on the area about the menu (null for nothing).
+
+let context_menu_css = css`
+.ui-ctx-area { border-radius: var(--ui-radius-sm); -webkit-touch-callout: none; }
+.ui-ctx-area:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-ctx-menu {
+  position: fixed; inset: auto; box-sizing: border-box; min-width: 200px; max-width: min(300px, calc(100vw - 16px));
+  max-height: calc(100dvh - 16px); margin: 0; padding: 5px; overflow: auto; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg);
+  font: 14px/1.4 var(--ui-font);
+}
+.ui-ctx-menu:popover-open { animation: ui-ctx-in .1s ease-out; }
+@keyframes ui-ctx-in { from { opacity: 0; transform: scale(.97); } }
+.ui-ctx-item {
+  display: flex; align-items: center; gap: 16px; width: 100%; padding: 7px 10px; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-fg); font: inherit; text-align: left; text-decoration: none; cursor: pointer;
+}
+.ui-ctx-item span:first-child { flex: 1; }
+.ui-ctx-item:hover, .ui-ctx-item:focus { outline: none; background: var(--ui-subtle); }
+.ui-ctx-item:focus-visible { box-shadow: var(--ui-focus); }
+.ui-ctx-item[aria-disabled="true"] { opacity: .5; cursor: not-allowed; }
+.ui-ctx-item[aria-disabled="true"]:hover { background: transparent; }
+.ui-ctx-danger { color: var(--ui-danger); }
+.ui-ctx-danger:hover, .ui-ctx-danger:focus { background: var(--ui-danger-soft); }
+.ui-ctx-key { color: var(--ui-muted); font-size: 12px; letter-spacing: .02em; white-space: nowrap; }
+.ui-ctx-danger .ui-ctx-key { color: inherit; opacity: .8; }
+.ui-ctx-sep { height: 1px; margin: 4px 6px; background: var(--ui-border); }
+@media (prefers-reduced-motion: reduce) { .ui-ctx-menu:popover-open { animation: none; } }
+`
+
+component ContextMenu(id: str, items: list = [], label: str = "Actions",
+                      hint: str? = "Right-click, press and hold, or press Shift+F10 for actions.", on_select = null,
+                      class: str? = null, children) {
+    state menu = null
+    state px = 0
+    state py = 0
+    state press = null
+    // Opens the menu with its corner at x, y, moved in when it would go off the screen.
+    let open_at = (x: num, y: num) => {
+        press = null
+        if !menu.matches(":popover-open") { menu.showPopover() }
+        let w = menu.offsetWidth
+        let h = menu.offsetHeight
+        let vw = js("innerWidth")
+        let vh = js("innerHeight")
+        px = max([8, x + w > vw - 8 ? x - w : x])
+        py = max([8, y + h > vh - 8 ? y - h : y])
+        let first_item = menu.querySelector("[role=menuitem]")
+        first_item && first_item.focus()
+    }
+    let back = () => {
+        menu.hidePopover()
+        let area = menu.parentElement.querySelector(".ui-ctx-area")
+        area && area.focus()
+    }
+    let move = (e, step: int) => {
+        let all = menu.querySelectorAll("[role=menuitem]")
+        let n = all.length
+        let at = index_of(for i in range(0, n) => all[i] == e.target, true) ?? -1
+        let next = step == 0 ? 0 : (step == 99 ? n - 1 : (at + step + n) % n)
+        all[next].focus()
+    }
+    let jump = (e, ch: str) => {
+        let all = menu.querySelectorAll("[role=menuitem]")
+        let n = all.length
+        let at = index_of(for i in range(0, n) => all[i] == e.target, true) ?? -1
+        let order = for k in range(1, n + 1) => (at + k) % n
+        let hit = find(order, (i) => starts_with(lower(trim(all[i].textContent)), ch))
+        if hit != null { all[hit].focus() }
+    }
+    if press != null { every(550, () => { open_at(press.x, press.y) }) }
+    <div class={ui_cls(["ui-ctx", class])}>
+        <div.ui-ctx-area tabindex="0" role="group" aria-label={label} aria-describedby={hint != null ? `${id}-hint` : null}
+             @contextmenu={(e) => {
+                 e.preventDefault()
+                 open_at(e.clientX, e.clientY)
+             }}
+             @keydown={(e) => {
+                 if (e.key == "F10" && e.shiftKey) || e.key == "ContextMenu" {
+                     e.preventDefault()
+                     let r = e.target.closest(".ui-ctx-area").getBoundingClientRect()
+                     open_at(r.left + 12, r.top + 12)
+                 }
+             }}
+             @pointerdown={(e) => { if e.pointerType == "touch" { press = { x: e.clientX, y: e.clientY } } }}
+             @pointermove={(e) => { if press != null && abs(e.clientX - press.x) + abs(e.clientY - press.y) > 10 { press = null } }}
+             @pointerup={() => { press = null }}
+             @pointercancel={() => { press = null }}>{children}</div>
+        {hint != null && <span.ui-sr id={`${id}-hint`}>{hint}</span>}
+        <div.ui-ctx-menu id={id} popover="auto" role="menu" aria-label={label} style={`left: ${px}px; top: ${py}px`}
+             @mount={(el) => { menu = el }}
+             @keydown={(e) => {
+                 let k = e.key
+                 if k == "ArrowDown" { e.preventDefault(); move(e, 1) }
+                 if k == "ArrowUp" { e.preventDefault(); move(e, -1) }
+                 if k == "Home" { e.preventDefault(); move(e, 0) }
+                 if k == "End" { e.preventDefault(); move(e, 99) }
+                 if k == "Escape" || k == "Tab" { e.preventDefault(); back() }
+                 if len(k) == 1 && k != " " && !e.ctrlKey && !e.metaKey { jump(e, lower(k)) }
+             }}>
+            {for [i, it] in enumerate(items) => get(it, "divider") == true
+                ? <div.ui-ctx-sep key={i} role="separator"></div>
+                : get(it, "href") != null && get(it, "disabled") != true
+                ? <a key={i} role="menuitem" tabindex="-1" href={it.href}
+                     class={ui_cls(["ui-ctx-item", get(it, "tone") == "danger" && "ui-ctx-danger"])}
+                     @click={() => { menu.hidePopover() }}>
+                      <span>{it.label}</span>
+                      {get(it, "shortcut") != null && <span.ui-ctx-key>{it.shortcut}</span>}
+                  </a>
+                : <button key={i} type="button" role="menuitem" tabindex="-1"
+                          class={ui_cls(["ui-ctx-item", get(it, "tone") == "danger" && "ui-ctx-danger"])}
+                          aria-disabled={get(it, "disabled") == true ? "true" : null}
+                          aria-keyshortcuts={get(it, "shortcut") != null ? replace(it.shortcut, " ", "+") : null}
+                          @click={() => {
+                              if get(it, "disabled") != true {
+                                  back()
+                                  on_select && on_select(it)
+                              }
+                          }}>
+                      <span>{it.label}</span>
+                      {get(it, "shortcut") != null && <span.ui-ctx-key>{it.shortcut}</span>}
+                  </button>}
+        </div>
+    </div>
+}

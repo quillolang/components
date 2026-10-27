@@ -1,0 +1,15 @@
+const items = $$(".mh-demo-list li");
+const marks = (el) => [...el.querySelectorAll("mark")].map((m) => m.textContent);
+if (marks(items[0]).join("|") !== "Deploy|Quillo") return `"quillo deploy" marks: ${marks(items[0])}`;
+if (items[0].textContent !== "Deploying a Quillo app to Fly.io") return `the text changed: "${items[0].textContent}"`;
+if (marks(items[1]).join("|") !== "To|to") return `"to" in Toronto, Ontario marks: ${marks(items[1])}`;
+if (marks(items[2]).length !== 0) return "a query that is not there marks something";
+const out = $(".mh-demo-out");
+if (marks(out).join("|") !== "server|state|server") return `the live text marks: ${marks(out)}`;
+const box = $("input[type=search]");
+type(box, "  THE   brow "); await wait();
+if (marks(out).join("|") !== "the|the|the|the|brow|the|the") return `typing "THE brow" marks: ${marks(out)}`;
+type(box, ""); await wait();
+if (marks(out).length !== 0) return "an empty query still marks";
+if (!out.textContent.startsWith("Quillo renders components")) return "the text is not shown whole";
+type(box, "server state"); await wait();

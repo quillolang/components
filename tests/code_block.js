@@ -1,0 +1,42 @@
+const blocks = $$("figure.ui-cb");
+if (blocks.length !== 4) return `expected 4 code blocks, found ${blocks.length}`;
+const [main, sh, conf, sql] = blocks;
+if (main.querySelector(".ui-cb-file")?.textContent !== "main.qwe") return "the file name is not in the header";
+if (main.querySelector(".ui-cb-lang")?.textContent !== "quillo") return "the language label is missing";
+const lines = main.querySelectorAll(".ui-cb-line");
+if (lines.length !== 9) return `main.qwe shows ${lines.length} lines, not 9 (no empty line after the last)`;
+const nums = [...main.querySelectorAll(".ui-cb-num")].map((n) => n.textContent);
+if (nums.join() !== "1,2,3,4,5,6,7,8,9") return `line numbers: ${nums}`;
+if (main.querySelector(".ui-cb-num").getAttribute("aria-hidden") !== "true") return "line numbers are read out";
+if (getComputedStyle(main.querySelector(".ui-cb-num")).userSelect !== "none") return "line numbers would be copied";
+const hl = [...main.querySelectorAll("mark.ui-cb-hl")].map((m) => m.querySelector(".ui-cb-num").textContent);
+if (hl.join() !== "1,7") return `highlighted lines: ${hl}`;
+const pre = main.querySelector("pre");
+if (!sql.querySelector("pre").innerText.startsWith('SELECT id, title\n  FROM posts\n WHERE')) return `the code is not shown as it is: ${JSON.stringify(sql.querySelector("pre").innerText)}`;
+if (pre.tabIndex !== 0 || pre.getAttribute("aria-label") !== "main.qwe") return "the pre cannot be reached to scroll, or is not named";
+if (!pre.innerText.includes("            <Button")) return "indentation is lost";
+if (pre.querySelectorAll(".ui-cb-line")[1].getBoundingClientRect().height < 15) return "an empty line has no height";
+const cnums = [...conf.querySelectorAll(".ui-cb-num")].map((n) => n.textContent);
+if (cnums[0] !== "10" || conf.querySelector("mark .ui-cb-num")?.textContent !== "12") return `start / highlight list: ${cnums}`;
+if (getComputedStyle(conf.querySelector("code")).whiteSpace !== "pre-wrap") return "wrap does not wrap";
+if (conf.querySelector("pre").scrollWidth > conf.querySelector("pre").clientWidth + 1) return "a wrapped block still scrolls sideways";
+if (sql.querySelector("button")) return "copy={false} still has a button";
+if (sh.querySelector("figcaption")) return "no filename or language: there should be no header";
+if (sql.querySelector(".ui-cb-lang")?.textContent !== "sql" || sql.querySelector(".ui-cb-file")?.textContent) return "a language alone is not in the header";
+const btn = main.querySelector("button.ui-cb-copy");
+if (btn.getAttribute("aria-label") !== "Copy main.qwe") return `copy button name: ${btn.getAttribute("aria-label")}`;
+const real = navigator.clipboard.writeText;
+let copied = null;
+navigator.clipboard.writeText = async (t) => { copied = t; };
+try {
+    btn.click(); await wait(150);
+    if (!copied?.startsWith('use "quillo-ui.qwe"\n\nroute GET / =')) return `copied ${JSON.stringify(copied)}`;
+    if (copied.includes("\n1") || !copied.endsWith("</html>\n")) return "the copy is not the code as given";
+    if (main.querySelector('[role="status"]').textContent !== "Copied" || !btn.textContent.includes("Copied")) return "it does not say Copied";
+    sh.querySelector("button").click(); await wait(150);
+    if (copied !== "curl -O https://quillolang.org/components/quillo-ui.qwe") return `the floating button copied ${copied}`;
+    await wait(1600);
+    if (btn.textContent.includes("Copied")) return "it does not go back to Copy";
+} finally {
+    navigator.clipboard.writeText = real;
+}

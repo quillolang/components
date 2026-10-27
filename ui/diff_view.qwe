@@ -1,0 +1,190 @@
+// DiffView: what changed between two texts, line by line: removed lines in red,
+// added ones in green, with both files' line numbers. Worked out on the server
+// (the longest common subsequence of the lines), so it needs no JavaScript.
+//
+//   <DiffView before={old_config} after={new_config} before_name="v1/app.toml" after_name="v2/app.toml"/>
+//   <DiffView before={a} after={b} mode="split" context={3}/>
+//
+// before, after: the two texts. mode: "unified" (default; one column, - and + lines)
+// or "split" (before on the left, after on the right, changed lines side by side).
+// before_name, after_name: the files' names, in a header with the count of lines
+// added and removed. context: show only this many unchanged lines around each
+// change, and say how many were left out in between (all of them by default).
+// label: what screen readers call the table ("Changes", or "Changes to" the name).
+// empty: what it says when the texts are the same ("No changes").
+// Lines are <del> and <ins>, so screen readers say which is which. Made for texts
+// of up to a few hundred changed lines; lines the same at both ends cost nothing.
+
+let diff_view_css = css`
+.ui-diff { min-width: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 14px/1.4 var(--ui-font); overflow: hidden; }
+.ui-diff-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 14px;
+  border-bottom: 1px solid var(--ui-border); background: var(--ui-subtle); }
+.ui-diff-names { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
+  font: 500 13px/1.4 var(--ui-mono); overflow-wrap: anywhere; }
+.ui-diff-names span[aria-hidden] { color: var(--ui-muted); }
+.ui-diff-stat { display: flex; gap: 8px; font: 600 13px/1 var(--ui-mono); font-variant-numeric: tabular-nums; }
+.ui-diff-stat-add { color: var(--ui-success); }
+.ui-diff-stat-del { color: var(--ui-danger); }
+.ui-diff-scroll { overflow: auto; }
+.ui-diff-scroll:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-diff table { width: 100%; border-collapse: collapse; font: 13px/1.6 var(--ui-mono); }
+.ui-diff td { padding: 0 10px; vertical-align: top; white-space: pre; }
+.ui-diff .ui-diff-n { width: 1%; min-width: 3ch; padding: 0 8px; text-align: right; color: var(--ui-muted);
+  user-select: none; -webkit-user-select: none; font-variant-numeric: tabular-nums; }
+.ui-diff .ui-diff-sign { width: 1%; padding: 0 2px 0 6px; color: var(--ui-muted); user-select: none; -webkit-user-select: none; }
+.ui-diff ins, .ui-diff del { text-decoration: none; color: inherit; }
+.ui-diff-add { background: color-mix(in srgb, var(--ui-success) 12%, transparent); }
+.ui-diff-add .ui-diff-n, .ui-diff-add .ui-diff-sign { background: color-mix(in srgb, var(--ui-success) 18%, transparent); color: var(--ui-success); }
+.ui-diff-del { background: color-mix(in srgb, var(--ui-danger) 11%, transparent); }
+.ui-diff-del .ui-diff-n, .ui-diff-del .ui-diff-sign { background: color-mix(in srgb, var(--ui-danger) 17%, transparent); color: var(--ui-danger); }
+.ui-diff-none { background: var(--ui-subtle); }
+.ui-diff-split td.ui-diff-n:nth-child(3) { border-left: 1px solid var(--ui-border); }
+.ui-diff-split .ui-diff-text { width: 50%; }
+.ui-diff-fold td { padding: 3px 12px; background: var(--ui-subtle); color: var(--ui-muted); font: 12px/1.6 var(--ui-font);
+  border-block: 1px solid var(--ui-border); }
+.ui-diff-empty { padding: 18px 14px; color: var(--ui-muted); text-align: center; }
+`
+
+// The text's lines, without the empty one after a final line break.
+fn diff_view_lines(text: str) -> list {
+    if text == "" { return [] }
+    let ls = split(replace(text, "\r\n", "\n"), "\n")
+    len(ls) > 1 && last(ls) == "" ? take(ls, len(ls) - 1) : ls
+}
+
+// The steps from `a` to `b`: maps of { kind: "same" | "del" | "add", text, a, b }, where
+// a and b are the line's numbers in each text (null where it is not there).
+fn diff_view_ops(a: list, b: list) -> list {
+    let n = len(a)
+    let m = len(b)
+    let p = 0
+    while p < n && p < m && a[p] == b[p] { p += 1 }
+    let s = 0
+    while s < n - p && s < m - p && a[n - 1 - s] == b[m - 1 - s] { s += 1 }
+    let mid_a = slice(a, p, n - s)
+    let mid_b = slice(b, p, m - s)
+    let ma = len(mid_a)
+    let mb = len(mid_b)
+    // lengths[i][j]: the longest common subsequence of mid_a from i and mid_b from j.
+    let zero = for j in range(0, mb + 1) => 0
+    let lengths = [zero]
+    let next = zero
+    let i = ma - 1
+    while i >= 0 {
+        let ai = mid_a[i]
+        let row = reverse(reduce(range(0, mb), [0], (acc, k) => {
+            let j = mb - 1 - k
+            push(acc, ai == mid_b[j] ? next[j + 1] + 1 : max([next[j], last(acc)]))
+        }))
+        lengths = push(lengths, row)
+        next = row
+        i -= 1
+    }
+    let table = reverse(lengths)
+    let ops = for k in range(0, p) => { kind: "same", text: a[k], a: k + 1, b: k + 1 }
+    let x = 0
+    let y = 0
+    while x < ma || y < mb {
+        if x < ma && y < mb && mid_a[x] == mid_b[y] {
+            ops = push(ops, { kind: "same", text: mid_a[x], a: p + x + 1, b: p + y + 1 })
+            x += 1
+            y += 1
+        } else if y >= mb || (x < ma && table[x + 1][y] >= table[x][y + 1]) {
+            ops = push(ops, { kind: "del", text: mid_a[x], a: p + x + 1, b: null })
+            x += 1
+        } else {
+            ops = push(ops, { kind: "add", text: mid_b[y], a: null, b: p + y + 1 })
+            y += 1
+        }
+    }
+    ops + (for k in range(0, s) => { kind: "same", text: a[n - s + k], a: n - s + k + 1, b: m - s + k + 1 })
+}
+
+// The ops with long runs of unchanged lines folded to `context` lines around each
+// change: a fold is { kind: "fold", count }.
+fn diff_view_fold(ops: list, context: int?) -> list {
+    if context == null { return ops }
+    let marks = range(0, len(ops)) | filter((i) => ops[i].kind != "same")
+    let near = (i: int) => any(marks, (c) => abs(c - i) <= context)
+    let acc = reduce(range(0, len(ops)), { out: [], hidden: 0 }, (acc, i) =>
+        ops[i].kind != "same" || near(i)
+            ? { out: (acc.hidden > 0 ? push(acc.out, { kind: "fold", count: acc.hidden }) : acc.out) + [ops[i]], hidden: 0 }
+            : { out: acc.out, hidden: acc.hidden + 1 })
+    acc.hidden > 0 ? push(acc.out, { kind: "fold", count: acc.hidden }) : acc.out
+}
+
+// Rows for the split mode: { left, right } (an op or null), runs of removed and
+// added lines paired side by side; a fold is { fold: count }.
+fn diff_view_pairs(ops: list) -> list {
+    let flush = (acc: map) => acc.rows + (for k in range(0, max([len(acc.dels), len(acc.adds)])) => { left: acc.dels[k], right: acc.adds[k] })
+    let acc = reduce(ops, { rows: [], dels: [], adds: [] }, (acc, o) =>
+        o.kind == "del"
+            ? (len(acc.adds) > 0 ? { rows: flush(acc), dels: [o], adds: [] } : { rows: acc.rows, dels: push(acc.dels, o), adds: acc.adds })
+            : o.kind == "add"
+                ? { rows: acc.rows, dels: acc.dels, adds: push(acc.adds, o) }
+                : { rows: push(flush(acc), o.kind == "fold" ? { fold: o.count } : { left: o, right: o }), dels: [], adds: [] })
+    flush(acc)
+}
+
+fn diff_view_fold_text(count: int) -> str = `⋯ ${count} unchanged line${count == 1 ? "" : "s"}`
+
+// One side's text: <del>, <ins> or plain, with what screen readers say first.
+fn diff_view_text(o: map?) =
+    o == null ? null
+    : o.kind == "del" ? <del><span.ui-sr>Removed: </span>{o.text}</del>
+    : o.kind == "add" ? <ins><span.ui-sr>Added: </span>{o.text}</ins>
+    : o.text
+
+view DiffView(before: str, after: str, mode: str = "unified", before_name: str? = null, after_name: str? = null,
+              context: int? = null, label: str? = null, empty: str = "No changes", class: str? = null) {
+    let ops = diff_view_ops(diff_view_lines(before), diff_view_lines(after))
+    let added = count(ops, (o) => o.kind == "add")
+    let removed = count(ops, (o) => o.kind == "del")
+    let shown = diff_view_fold(ops, context)
+    let name = after_name ?? before_name
+    let split_mode = mode == "split"
+    <div class={ui_cls(["ui-diff", split_mode && "ui-diff-split", class])}>
+        <div.ui-diff-head>
+            <div.ui-diff-names>
+                {before_name != null && <span>{before_name}</span>}
+                {before_name != null && after_name != null && after_name != before_name && <span aria-hidden="true">→</span>}
+                {after_name != null && after_name != before_name && <span>{after_name}</span>}
+            </div>
+            <div.ui-diff-stat>
+                <span.ui-diff-stat-add>+{added}<span.ui-sr> added</span></span>
+                <span.ui-diff-stat-del>−{removed}<span.ui-sr> removed</span></span>
+            </div>
+        </div>
+        {added + removed == 0
+            ? <p.ui-diff-empty style="margin: 0">{empty}</p>
+            : <div.ui-diff-scroll tabindex="0" role="region" aria-label={label ?? (name != null ? `Changes to ${name}` : "Changes")}>
+                <table aria-label={label ?? (name != null ? `Changes to ${name}` : "Changes")}>
+                    <thead class="ui-sr">
+                        {split_mode
+                            ? <tr><th scope="col">Line before</th><th scope="col">Before</th><th scope="col">Line after</th><th scope="col">After</th></tr>
+                            : <tr><th scope="col">Line before</th><th scope="col">Line after</th><th scope="col">Change</th><th scope="col">Text</th></tr>}
+                    </thead>
+                    <tbody>
+                        {split_mode
+                            ? (for r in diff_view_pairs(shown) => r.fold != null
+                                ? <tr.ui-diff-fold><td colspan="4">{diff_view_fold_text(r.fold)}</td></tr>
+                                : <tr>
+                                    <td class={ui_cls(["ui-diff-n", r.left == null ? "ui-diff-none" : r.left.kind == "del" && "ui-diff-del"])}>{r.left.a}</td>
+                                    <td class={ui_cls(["ui-diff-text", r.left == null ? "ui-diff-none" : r.left.kind == "del" && "ui-diff-del"])}>{diff_view_text(r.left)}</td>
+                                    <td class={ui_cls(["ui-diff-n", r.right == null ? "ui-diff-none" : r.right.kind == "add" && "ui-diff-add"])}>{r.right.b}</td>
+                                    <td class={ui_cls(["ui-diff-text", r.right == null ? "ui-diff-none" : r.right.kind == "add" && "ui-diff-add"])}>{diff_view_text(r.right)}</td>
+                                </tr>)
+                            : (for o in shown => o.kind == "fold"
+                                ? <tr.ui-diff-fold><td colspan="4">{diff_view_fold_text(o.count)}</td></tr>
+                                : <tr class={o.kind == "same" ? null : `ui-diff-${o.kind}`}>
+                                    <td.ui-diff-n>{o.a}</td>
+                                    <td.ui-diff-n>{o.b}</td>
+                                    <td.ui-diff-sign aria-hidden="true">{o.kind == "add" ? "+" : o.kind == "del" ? "−" : " "}</td>
+                                    <td.ui-diff-text>{diff_view_text(o)}</td>
+                                </tr>)}
+                    </tbody>
+                </table>
+            </div>}
+    </div>
+}

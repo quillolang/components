@@ -1,0 +1,45 @@
+const charts = $$("figure.ui-lc");
+if (charts.length !== 3) return `expected 3 line charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test($(".demo-stack").innerHTML)) return "a chart has NaN, Infinity or undefined in it";
+const [visits, resp, rev] = charts;
+const line = visits.querySelector(".ui-lc-line");
+const pts = line.getAttribute("d").split(/ ?[ML]/).filter(Boolean).map((p) => p.split(",").map(Number));
+if (pts.length !== 14) return `14 values made ${pts.length} points`;
+if (pts[0][0] !== 0 || pts[13][0] !== 100) return "the line does not span the width";
+if (line.getAttribute("vector-effect") !== "non-scaling-stroke") return "the line's stroke scales";
+if (getComputedStyle(line).strokeWidth !== "2px") return "the line is not 2px";
+const area = visits.querySelector(".ui-lc-area");
+if (!area || !area.getAttribute("d").endsWith("Z")) return "area={true} has no fill";
+const ticks = [...visits.querySelectorAll(".ui-lc-y span")].map((s) => s.textContent);
+if (ticks.join() !== "0,500,1k,1.5k,2k") return `the area chart's ticks: ${ticks}`;
+// The highest value, 1615, of an axis to 2000.
+if (Math.abs(pts[13][1] - (100 - 1615 / 20)) > 0.01) return `1615 is drawn at ${pts[13][1]}`;
+const labels = [...visits.querySelectorAll(".ui-lc-x span")];
+if (labels.length !== 7 || labels[0].textContent !== "Oct 15") return `14 labels show ${labels.length}: thinned to every other`;
+const cols = visits.querySelectorAll(".ui-lc-col");
+if (cols.length !== 14) return "not a hover column per label";
+const plot = visits.querySelector(".ui-lc-plot").getBoundingClientRect();
+const c0 = cols[0].getBoundingClientRect(), c13 = cols[13].getBoundingClientRect();
+if (Math.abs(c0.left + c0.width / 2 - plot.left) > 1 || Math.abs(c13.left + c13.width / 2 - plot.right) > 1) return "hover columns are not centred on the points";
+const tip = cols[10].querySelector(".ui-lc-tip");
+if (getComputedStyle(tip).display !== "none") return "the tooltip shows before hover";
+if (tip.querySelector("strong").textContent !== "Oct 25" || tip.querySelector("b").textContent !== "1,402") return `tooltip: ${tip.textContent}`;
+if (!cols[10].classList.contains("ui-lc-flip") || cols[2].classList.contains("ui-lc-flip")) return "tooltips on the right half do not open to the left";
+if (visits.querySelector(".ui-lc-legend")) return "one series has a legend";
+
+if (resp.querySelectorAll(".ui-lc-legend li").length !== 3) return "three series have no legend";
+if (resp.querySelectorAll(".ui-lc-line").length !== 3) return "not a line per series";
+if (resp.querySelectorAll(".ui-lc-pt").length !== 18) return `points={true} drew ${resp.querySelectorAll(".ui-lc-pt").length} dots, not 18`;
+const ctip = resp.querySelectorAll(".ui-lc-col")[3].querySelector(".ui-lc-tip").textContent;
+if (ctip !== "12:00p50146 msp95421 msp99812 ms") return `the tooltip lists ${ctip}`;
+if (resp.querySelectorAll(".ui-lc-col")[3].querySelectorAll(".ui-lc-dot").length !== 3) return "the crosshair has no dot per series";
+const colors = [...resp.querySelectorAll(".ui-lc-line")].map((l) => getComputedStyle(l).stroke);
+if (new Set(colors).size !== 3) return "the series share a colour";
+
+const gap = rev.querySelectorAll(".ui-lc-line")[1].getAttribute("d");
+if ((gap.match(/M/g) || []).length !== 2) return `a null does not break the line: ${gap}`;
+if (rev.querySelectorAll(".ui-lc-col")[3].querySelectorAll(".ui-lc-dot").length !== 1) return "the missing value has a dot";
+if (!rev.querySelectorAll(".ui-lc-col")[3].querySelector(".ui-lc-tip").textContent.includes("2026—")) return "the missing value is not a dash";
+if (rev.querySelector(".ui-lc-y span").textContent !== "$0") return "zero={true} does not start at $0";
+if (rev.querySelectorAll("tbody tr").length !== 7 || rev.querySelectorAll("thead th").length !== 3) return "the screen reader table";
+if (rev.querySelector("tbody td").textContent !== "$41,200") return "the table's values are not formatted";
