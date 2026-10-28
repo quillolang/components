@@ -1,6 +1,6 @@
 #!/bin/sh
-# Checks the kit: the made files are up to date, `quillo check` finds nothing
-# wrong in the gallery, and every component works in headless Chrome
+# Checks the kit: the made files are up to date, no two files style the same
+# class (tests/classes.mjs), `quillo check` finds nothing wrong in the gallery, and every component works in headless Chrome
 # (tests/browser.mjs runs tests/<slug>.js against the gallery).
 #
 #   scripts/test.sh [slug...]      QUILLO, CHROME and PORT can be set
@@ -12,6 +12,7 @@ port=${PORT:-8795}
 cdp=$((port + 1))
 
 scripts/build.sh --check
+node tests/classes.mjs
 "$quillo" check gallery.qwe
 
 "$quillo" run gallery.qwe --port "$port" --log off &

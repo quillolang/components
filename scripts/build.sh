@@ -8,7 +8,7 @@
 #   demos.qwe       the gallery's examples (demos/_demo.qwe first)
 #
 # and stops if two files declare the same name, since `use` puts every file in
-# one scope and the last would win. With --check, it only says whether the
+# one scope and the last would win, or if a demo's gallery entry has no `tags`. With --check, it only says whether the
 # files are up to date.
 set -eu
 cd "$(dirname "$0")/.."
@@ -17,6 +17,12 @@ dupes=$(grep -hoE '^(let|fn|view|component|type|server fn) [A-Za-z_][A-Za-z0-9_]
     | awk '{print $NF}' | sort | uniq -d)
 if [ -n "$dupes" ]; then
     echo "build: declared in more than one file:" $dupes >&2
+    exit 1
+fi
+
+untagged=$(grep -L 'tags: \[' $(ls demos/*.qwe | grep -v '^demos/_demo.qwe$') || true)
+if [ -n "$untagged" ]; then
+    echo "build: no tags in the gallery entry of:" $untagged >&2
     exit 1
 fi
 

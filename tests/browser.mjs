@@ -7,6 +7,10 @@
 //   type(el, text)         sets an input's value and sends `input` and `change`
 //   key(el, k)             sends a keydown (and keyup) of key `k` ("Enter", "ArrowDown", ...)
 //
+// A test whose first line is `// alone` runs on a gallery showing only its component
+// (/?only=<slug>), after the others: for what listens to the whole page, such as a
+// keyboard shortcut or an idle timer, which another component could answer first.
+//
 //   node tests/browser.mjs <gallery url> <chrome debugging port> [slug...]
 //
 // Prints one line per component and the page's errors; exits 1 on any failure.
@@ -65,10 +69,31 @@ await sleep(600);
 const all = await ev(`[...document.querySelectorAll("section[data-slug]")].map((s) => s.dataset.slug)`);
 if (page.length) { console.log("errors loading the page:", page); failed++; }
 errors = [];
+const wake = async () => {
+    await ev(`(async () => {
+        for (const i of document.querySelectorAll("quillo-island")) i.dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+        for (let n = 0; n < 50 && !window.__quillo_booted; n++) await new Promise((r) => setTimeout(r, 100));
+        for (const i of document.querySelectorAll("quillo-island")) i.firstElementChild?.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    })()`);
+    await sleep(600);
+};
+const alone = [];
 for (const slug of all) {
     if (slugs && !slugs.includes(slug)) continue;
     let test;
     try { test = readFileSync(`${dir}${slug}.js`, "utf8"); } catch { test = null; }
+    if (test && test.startsWith("// alone")) { alone.push(slug); continue; }
+    await runOne(slug, test);
+}
+for (const slug of alone) {
+    errors = [];
+    await send("Page.navigate", { url: `${base}?only=${slug}` });
+    await sleep(1200);
+    await wake();
+    errors = [];
+    await runOne(slug, readFileSync(`${dir}${slug}.js`, "utf8"));
+}
+async function runOne(slug, test) {
     let res = null;
     if (test) {
         res = await ev(`(async () => {

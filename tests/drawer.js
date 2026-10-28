@@ -15,6 +15,8 @@ dialogs[1].close(); await wait();
 fromState.click(); await wait(350);
 const s = dialogs[2];
 if (!s.open) return "open={state} did not open it";
+// On a busy page the slide may still be running: measure where it ends.
+await Promise.all(s.getAnimations({ subtree: true }).map((a) => a.finished.catch(() => null)));
 r = s.getBoundingClientRect();
 if (r.left !== 0 || r.width > 321) return `side="left" size="sm" is not along the left: ${JSON.stringify(r)}`;
 s.close(); await wait();
