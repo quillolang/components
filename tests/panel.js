@@ -1,0 +1,18 @@
+const members = $("#panel-demo-members"), danger = $("#panel-demo-danger"), subtle = $("#panel-demo-subtle");
+if (!members || members.tagName !== "SECTION") return "the panel is not a <section> with its id";
+const h = members.querySelector("header.ui-panel-head h3.ui-panel-title");
+if (!h || h.textContent !== "Members" || members.getAttribute("aria-labelledby") !== h.id) return "the title is not an <h3> in the header that names the panel";
+if (members.querySelector(".ui-panel-sub")?.textContent !== "3 of 5 seats used") return "the subtitle is missing";
+const tools = members.querySelector(".ui-panel-tools");
+if (!tools || !tools.querySelector("input") || !tools.querySelector("#panel-demo-invite")) return "the header slot is missing its controls";
+if (members.querySelector(".ui-panel-head").getBoundingClientRect().right - tools.getBoundingClientRect().right > 20) return "the header controls are not at the right end";
+const foot = members.querySelector("footer.ui-panel-foot");
+if (!foot || foot.querySelectorAll(".ui-btn").length !== 2) return "the footer slot is missing its buttons";
+if (Math.abs(foot.getBoundingClientRect().right - foot.lastElementChild.getBoundingClientRect().right - 16) > 1) return "the footer's actions are not at its right end";
+if (getComputedStyle(members.querySelector(".ui-panel-body")).padding !== "20px") return "the body's default padding is not 20px";
+if (members.querySelectorAll(".ui-panel-body > div").length !== 3) return "the children are not in the body";
+if (getComputedStyle(danger.querySelector(".ui-panel-body")).padding !== "0px") return "padding=\"none\" still pads the body";
+if (!danger.classList.contains("ui-panel-danger") || getComputedStyle(danger.querySelector(".ui-panel-head")).color !== getComputedStyle(danger.querySelector(".ui-panel-head")).color) return "tone=\"danger\" is missing";
+const df = danger.querySelector(".ui-panel-foot");
+if (!df.classList.contains("ui-panel-foot-start") || Math.abs(df.firstElementChild.getBoundingClientRect().left - df.getBoundingClientRect().left - 16) > 1) return "footer_align=\"start\" does not put the footer's content at the left";
+if (subtle.querySelector(".ui-panel-foot") || !subtle.querySelector(".ui-panel-tools .ui-badge")) return "the subtle panel has a footer, or no badge in its header";

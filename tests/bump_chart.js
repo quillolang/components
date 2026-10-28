@@ -1,0 +1,41 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-bump");
+if (charts.length !== 2) return `expected 2 bump charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a bump chart has NaN, Infinity or undefined in it";
+const [league, langs] = charts;
+if (league.getAttribute("aria-label") !== "League table after each round") return "the label does not name the chart";
+const items = [...league.querySelectorAll(".ui-bump-item")];
+if (items.length !== 6) return `6 series made ${items.length} lines`;
+const heads = [...league.querySelectorAll(".ui-bump-heads span")].map((s) => s.textContent);
+if (heads.length !== 8 || heads[0] !== "R1") return "the moments are not written above";
+const plot = league.querySelector(".ui-bump-plot").getBoundingClientRect();
+if (Math.abs(plot.height - 6 * 34) > 0.5) return `6 places of 34px make a plot ${plot.height}px high`;
+const lions = items[0];
+const pts = [...lions.querySelectorAll(".ui-bump-pt")];
+if (pts.length !== 8) return "not a point per moment";
+if (pts.map((p) => p.firstChild.textContent).join("") !== "32111221") return `Lions' places: ${pts.map((p) => p.firstChild.textContent)}`;
+// Place 1 sits in the top row, place 6 in the bottom one.
+const centre = (el) => { const r = el.getBoundingClientRect(); return r.top + r.height / 2 - plot.top; };
+if (Math.abs(centre(pts[2]) - 17) > 1 || Math.abs(centre(pts[0]) - (2.5 * 34)) > 1) return "places are not drawn in their rows";
+const d = lions.querySelector(".ui-bump-line").getAttribute("d");
+if ((d.match(/C/g) || []).length !== 7) return `the line is not 7 curves: ${d}`;
+if (getComputedStyle(lions.querySelector(".ui-bump-hit")).pointerEvents !== "stroke") return "the line cannot be hovered";
+if (lions.querySelector(".ui-bump-l").textContent !== "Lions" || lions.querySelector(".ui-bump-r").textContent !== "Lions") return "the item is not named at both ends";
+const endName = lions.querySelector(".ui-bump-r");
+if (Math.abs(centre(endName) - centre(pts[7])) > 1) return "the end name is not beside its last point";
+if (new Set(items.map((i) => getComputedStyle(i.querySelector(".ui-bump-line")).stroke)).size !== 6) return "series share a colour";
+if (getComputedStyle(pts[0].querySelector("i")).display !== "none") return "a point's label shows before hover";
+if (pts[0].querySelector("i").textContent !== "Lions · R1") return `a point's label: ${pts[0].querySelector("i").textContent}`;
+if (league.querySelector("tbody tr").textContent !== "Lions32111221") return "the screen reader table";
+
+// ranked={false}: places worked out from values, highest first.
+const li = [...langs.querySelectorAll(".ui-bump-item")];
+const place = (i, k) => li[i].querySelectorAll(".ui-bump-pt")[k].firstChild.textContent;
+if (place(0, 0) !== "2" || place(1, 0) !== "1" || place(0, 4) !== "1") return "values are not ranked highest first";
+const quillo = li[4];
+if (quillo.querySelectorAll(".ui-bump-pt").length !== 3) return "nulls are not left out";
+if (quillo.querySelector(".ui-bump-l")) return "an item that starts late is named on the left";
+if (!quillo.querySelector(".ui-bump-line").getAttribute("d").startsWith("M50,")) return "a late line does not start at its first moment";
+if (quillo.querySelector(".ui-bump-pt i").textContent !== "Quillo · 2023: 12k") return "the values are not on hover";
+if (langs.querySelectorAll("tbody tr")[4].textContent !== "Quillo——5 (12k)5 (48k)4 (96k)") return `the table: ${langs.querySelectorAll("tbody tr")[4].textContent}`;
+if (!langs.querySelector(".ui-bump-wrap").hasAttribute("aria-hidden")) return "the drawing is not hidden from screen readers";

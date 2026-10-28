@@ -1,0 +1,16 @@
+const all = $$("aside.ui-callout");
+if (all.length !== 5) return `expected 5 callouts, found ${all.length}`;
+const note = $("#callout-demo-note"), tip = $("#callout-demo-tip"), warn = $("#callout-demo-warning"), bare = $("#callout-demo-noicon");
+if (note.getAttribute("role") !== "note" || note.getAttribute("aria-label") !== "Note") return "a callout is not a named note";
+if (note.querySelector(".ui-callout-title")?.textContent !== "Note" || tip.querySelector(".ui-callout-title")?.textContent !== "Tip") return "the kind is not the default title";
+if (warn.querySelector(".ui-callout-title")?.textContent !== "Breaking change in 0.9" || warn.getAttribute("aria-label") !== "Breaking change in 0.9") return "title= is not shown or used as the name";
+const cs = (el) => getComputedStyle(el);
+if (cs(note).borderLeftWidth !== "4px") return "no bar at the left";
+if (cs(note).borderLeftColor === cs(tip).borderLeftColor || cs(tip).borderLeftColor === cs(warn).borderLeftColor) return "the kinds share a colour";
+if (!note.querySelector("svg.ui-callout-icon") || note.querySelector("svg").getAttribute("aria-hidden") !== "true") return "the icon is missing or read out";
+if (note.querySelector("svg").innerHTML === tip.querySelector("svg").innerHTML) return "note and tip share an icon";
+if (bare.querySelector("svg")) return "icon={false} still shows an icon";
+if (!tip.querySelector(".ui-callout-body kbd")) return "HTML children do not reach the body";
+if (warn.querySelectorAll(".ui-callout-body p").length !== 2 || cs(warn.querySelector(".ui-callout-body p:last-child")).marginBottom !== "0px") return "paragraphs in the body keep their last margin";
+const ib = note.querySelector("svg").getBoundingClientRect(), tb = note.querySelector(".ui-callout-title").getBoundingClientRect();
+if (!(ib.right <= tb.left)) return "the icon is not beside the title";

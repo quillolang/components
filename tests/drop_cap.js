@@ -1,0 +1,13 @@
+const three = $("#drop-cap-demo-three"), two = $("#drop-cap-demo-two"), four = $("#drop-cap-demo-four");
+if (!three || three.tagName !== "P" || !three.textContent.startsWith("Once upon a time")) return "a DropCap is not a <p> with its text";
+const first = (el) => getComputedStyle(el, "::first-letter");
+const size = (el) => parseFloat(first(el).fontSize);
+if (first(three).float !== "left") return "the first letter does not float";
+if (!(size(three) > 2.5 * parseFloat(getComputedStyle(three).fontSize))) return "the first letter is not large";
+if (!(size(two) < size(three) && size(three) < size(four))) return "lines 2, 3 and 4 do not step up";
+if (first(two).color !== first(three).color && getComputedStyle(two).color !== getComputedStyle(three).color) return "the accent should colour only the letter";
+if (first(two).color === first(three).color) return "tone=accent does not colour the letter";
+if (!/Georgia|Times|serif/i.test(first(two).fontFamily)) return "serif={true} is not a serif";
+if (two.textContent !== three.textContent) return "children and text give different paragraphs";
+const r = (el) => el.getBoundingClientRect();
+if (!(r(three).height > 3 * parseFloat(getComputedStyle(three).lineHeight))) return "the paragraph is shorter than three lines";

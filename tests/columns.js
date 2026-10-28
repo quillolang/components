@@ -1,0 +1,14 @@
+const equal = $(".columns-demo-equal"), weighted = $(".columns-demo-weighted"), narrow = $(".columns-demo-narrow");
+if (!equal || !weighted || !narrow) return "the three column sets are missing";
+const cells = (c) => [...c.querySelector(".ui-columns-in").children].map((e) => e.getBoundingClientRect());
+const e = cells(equal);
+if (e.length !== 3) return "expected three equal columns";
+if (Math.abs(e[0].width - e[1].width) > 1 || Math.abs(e[1].width - e[2].width) > 1) return `equal columns are ${e.map((r) => r.width)}`;
+if (Math.abs(e[0].top - e[2].top) > 1 || e[1].left <= e[0].right) return "the columns are not side by side";
+const w = cells(weighted);
+if (Math.abs(w[0].width / w[1].width - 2) > 0.05) return `widths={[2, 1]} gives ${w[0].width} and ${w[1].width}`;
+if (Math.round(w[1].left - w[0].right) !== 24) return `gap="lg" is ${w[1].left - w[0].right}px`;
+const n = cells(narrow);
+if (n[0].top < n[1].bottom - 1) return "in a 400px box the columns did not stack";
+if (n[1].top > n[0].top) return "reverse={true} did not put the last column first";
+if (Math.abs(n[0].width - n[1].width) > 1 || n[0].width < 380) return `stacked columns are ${n[0].width} and ${n[1].width} wide`;

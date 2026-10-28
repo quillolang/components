@@ -1,0 +1,32 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-funnelc");
+if (charts.length !== 2) return `expected 2 funnel charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a chart has NaN, Infinity or undefined in it";
+const [shop, hiring] = charts;
+const shapes = [...shop.querySelectorAll(".ui-funnelc-shape")];
+if (shapes.length !== 5) return `5 stages made ${shapes.length} shapes`;
+const s1 = shapes[1].style;
+// Viewed: 7820 of 12400 wide at the top, narrowing to 3100 of 12400 at the bottom.
+const top = parseFloat(s1.getPropertyValue("--r1")) - parseFloat(s1.getPropertyValue("--l1"));
+const bottom = parseFloat(s1.getPropertyValue("--r2")) - parseFloat(s1.getPropertyValue("--l2"));
+if (Math.abs(top - 7820 * 100 / 12400) > 0.02 || Math.abs(bottom - 3100 * 100 / 12400) > 0.02) return `the second stage runs ${top}% to ${bottom}%`;
+if (Math.abs(parseFloat(s1.getPropertyValue("--l1")) + top / 2 - 50) > 0.02) return "the stage is not centred";
+if (!getComputedStyle(shapes[1]).clipPath.startsWith("polygon")) return "the stage is not cut to a trapezoid";
+const last = shapes[4].style;
+if (last.getPropertyValue("--l1") !== last.getPropertyValue("--l2")) return "the last stage narrows to nothing";
+const nums = [...shop.querySelectorAll(".ui-funnelc-num")].map((n) => n.textContent);
+if (nums[0] !== "12,400100%" || nums[2] !== "3,10025%") return `the counts: ${nums}`;
+const conv = [...shop.querySelectorAll(".ui-funnelc-conv")].map((c) => c.textContent);
+if (conv.length !== 4 || conv[1] !== "↓ 39.6% went on") return `the conversions: ${conv}`;
+const name = shop.querySelectorAll(".ui-funnelc-name")[2].getBoundingClientRect(), cell = shop.querySelectorAll(".ui-funnelc-cell")[2].getBoundingClientRect();
+if (Math.abs((name.top + name.bottom) / 2 - (cell.top + cell.bottom) / 2) > 2) return "a stage's name is not beside it";
+if (Math.round(cell.height) !== 40) return "a stage is not 40px high";
+const tip = shop.querySelectorAll(".ui-funnelc-tip")[4];
+if (getComputedStyle(tip).display !== "none") return "the tooltip shows before hover";
+if (tip.textContent !== "PaidCount980Of the first7.9%Of the one before79%") return `tooltip: ${tip.textContent}`;
+if (shop.querySelectorAll("tbody tr")[3].textContent !== "Checked out1,24010%40%") return `the table: ${shop.querySelectorAll("tbody tr")[3].textContent}`;
+
+if (hiring.querySelector(".ui-funnelc-conv")) return "conversion={false} still writes conversions";
+const hs = hiring.querySelectorAll(".ui-funnelc-shape")[0].style;
+if (hs.getPropertyValue("--l1") !== hs.getPropertyValue("--l2")) return "tapered={false} still tapers";
+if (Math.round(hiring.querySelector(".ui-funnelc-cell").getBoundingClientRect().height) !== 30) return "height={30}";

@@ -1,0 +1,13 @@
+const e = $("#eyebrow-demo-new"), title = $("#eyebrow-demo-title"), beta = $("#eyebrow-demo-beta");
+if (!e || e.tagName !== "P" || e.textContent !== "New in 0.9") return "an Eyebrow is not a <p> with its text";
+const cs = (el, p) => getComputedStyle(el, p);
+if (cs(e).textTransform !== "uppercase" || parseFloat(cs(e).fontSize) > 13 || parseFloat(cs(e).letterSpacing) <= 0) return "it is not small, uppercase and letter-spaced";
+if (e.getBoundingClientRect().bottom > title.getBoundingClientRect().top + 1) return "the eyebrow is not above the heading";
+if (cs(e).color === cs(title).color) return "the eyebrow is not muted";
+if (cs(beta).color === cs(e).color) return "tone=accent is not coloured";
+if (cs(beta, "::before").content !== '""' || cs(beta, "::before").borderRadius !== "50%") return "dot={true} has no dot";
+if (cs(e, "::before").content !== "none") return "a dot shows without dot={true}";
+const spans = $$("span.ui-eyebrow");
+if (spans.length !== 4 || spans.some((s) => s.tagName !== "SPAN")) return "tag=span does not write spans";
+if (spans[0].getBoundingClientRect().top !== spans[3].getBoundingClientRect().top) return "spans are not inline";
+if (cs($("#eyebrow-demo-center")).textAlign !== "center") return "align=center is not applied";

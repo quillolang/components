@@ -1,0 +1,13 @@
+const plain = $("#new-badge-demo-plain");
+if (!plain || plain.textContent !== "NewNew: Reports") return `the text and its label: "${plain?.textContent}"`;
+if (plain.querySelector("[aria-hidden=true]")?.textContent !== "New" || plain.querySelector(".ui-sr")?.textContent !== "New: Reports") return "the label is not for screen readers only";
+if (!plain.classList.contains("ui-newb-accent") || !plain.classList.contains("ui-newb-solid")) return "the defaults are accent and solid";
+if (getComputedStyle(plain).textTransform !== "uppercase") return "not uppercase";
+const beta = $("#new-badge-demo-beta");
+if (beta.textContent !== "Beta" || !beta.classList.contains("ui-newb-info") || !beta.classList.contains("ui-newb-soft")) return "text, tone and variant";
+if (getComputedStyle(beta).backgroundColor === getComputedStyle(plain).backgroundColor) return "soft and solid look the same";
+const small = $$(".ui-newb").find((b) => b.classList.contains("ui-newb-sm"));
+if (!small || small.offsetHeight >= plain.offsetHeight || !small.classList.contains("ui-newb-outline")) return "sm and outline";
+if (!$("#new-badge-demo-future .ui-newb")) return "a badge with a date to come does not show";
+if ($("#new-badge-demo-past .ui-newb")) return "a badge past its date still shows";
+if ($("#new-badge-demo-later .ui-newb")) return "a badge before its from date shows";

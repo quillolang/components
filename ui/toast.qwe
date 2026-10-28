@@ -1,0 +1,156 @@
+// Toast: short messages that pile up in a corner of the screen and go by themselves.
+// Put one ToastHost on the page; then any of your components shows a toast with
+// toast_show(message, options). Each says its tone with an icon and a colour, can
+// carry one action button ("Undo"), and has a close button. Hovering or focusing the
+// stack holds the timers; the newest is announced to screen readers (an error at once,
+// the others politely). With no ToastHost on the page, toast_show falls back to the
+// builtin notify().
+//
+//   <ToastHost/>                                     (once, anywhere in the page)
+//   toast_show("Saved", { tone: "success" })
+//   toast_show("Message deleted", { action: "Undo", on_action: () => { restore(id) }, seconds: 8 })
+//   toast_show("Could not reach the server", { title: "Offline", tone: "danger", seconds: 0 })
+//
+// toast_show(message, options): options is a map of title, tone ("neutral" (default),
+// "info", "success", "warning" or "danger"), seconds (how long it stays, 5; 0 keeps it
+// until closed), action (an action button's text) and on_action() (what it does; the
+// toast closes after).
+// ToastHost: placement "bottom-right" (default), "bottom-left", "bottom-center",
+// "top-right", "top-left" or "top-center". limit: the most shown at once (5; the
+// oldest goes). label: the stack's name for screen readers ("Notifications").
+// inline: in its container (positioned) instead of the window's corner.
+// Toast is one toast as markup, which ToastHost draws: message (children), title, tone,
+// action, and on_action() and on_close() inside one of your components.
+
+let toast_css = css`
+.ui-toast-host {
+  position: fixed; z-index: 1100; display: flex; flex-direction: column; gap: 10px; width: min(380px, calc(100vw - 32px));
+  margin: 0; padding: 0; list-style: none; pointer-events: none; font: 14px/1.45 var(--ui-font);
+}
+.ui-toast-host > li { pointer-events: auto; }
+.ui-toast-bottom-right { right: 16px; bottom: 16px; flex-direction: column-reverse; }
+.ui-toast-bottom-left { left: 16px; bottom: 16px; flex-direction: column-reverse; }
+.ui-toast-bottom-center { left: 50%; bottom: 16px; translate: -50% 0; flex-direction: column-reverse; }
+.ui-toast-top-right { right: 16px; top: 16px; }
+.ui-toast-top-left { left: 16px; top: 16px; }
+.ui-toast-top-center { left: 50%; top: 16px; translate: -50% 0; }
+.ui-toast-inline { position: absolute; z-index: 5; }
+.ui-toast {
+  display: flex; align-items: flex-start; gap: 10px; padding: 12px 10px 12px 14px; border: 1px solid var(--ui-border);
+  border-left: 3px solid var(--t); border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg);
+  box-shadow: var(--ui-shadow-lg); animation: ui-toast-in .2s ease-out;
+  --t: var(--ui-strong);
+}
+.ui-toast-info { --t: var(--ui-info); }
+.ui-toast-success { --t: var(--ui-success); }
+.ui-toast-warning { --t: var(--ui-warning); }
+.ui-toast-danger { --t: var(--ui-danger); }
+@keyframes ui-toast-in { from { opacity: 0; transform: translateY(8px) scale(.98); } }
+.ui-toast-icon { flex: none; width: 18px; height: 18px; margin-top: 1px; color: var(--t); }
+.ui-toast-neutral .ui-toast-icon { color: var(--ui-muted); }
+.ui-toast-body { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ui-toast-title { display: block; font-weight: 600; }
+.ui-toast-msg { color: var(--ui-fg); }
+.ui-toast-title + .ui-toast-msg { display: block; color: var(--ui-muted); }
+.ui-toast-action {
+  flex: none; align-self: center; height: 28px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-accent); font: 600 13px/1 var(--ui-font); cursor: pointer;
+}
+.ui-toast-action:hover { background: var(--ui-accent-soft); }
+.ui-toast-x {
+  display: grid; place-items: center; flex: none; width: 26px; height: 26px; margin: -3px 0 -3px -2px; padding: 0; border: 0;
+  border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: pointer;
+}
+.ui-toast-x:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+.ui-toast-x svg { width: 16px; height: 16px; }
+.ui-toast-action:focus-visible, .ui-toast-x:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (max-width: 520px) {
+  .ui-toast-host:not(.ui-toast-inline) { left: 12px; right: 12px; width: auto; translate: none; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-toast { animation: none; } }
+`
+
+fn toast_icon(tone: str) =
+    match tone {
+        "success" => "M22 11.1V12a10 10 0 1 1-5.9-9.1M22 4 12 14l-3-3"
+        "warning" => "M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"
+        "danger" => "M12 8v4M12 16h.01M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z"
+        "info" => "M12 16v-4M12 8h.01M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z"
+        _ => "M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"
+    }
+
+// Shows a toast in the page's ToastHost (or with notify() when there is none).
+fn toast_show(message: str, options: map = {}) {
+    let detail = { ...options, message }
+    let ev = js_new("CustomEvent", "ui-toast", { detail, cancelable: true })
+    let taken = js("document.dispatchEvent", ev) == false
+    if !taken {
+        notify(message, { title: get(options, "title"), tone: get(options, "tone") ?? "neutral", seconds: get(options, "seconds") ?? 5 })
+    }
+    null
+}
+
+view Toast(title: str? = null, tone: str = "neutral", action: str? = null, on_action = null, on_close = null,
+           class: str? = null, children) {
+    style global toast_css
+    <div class={ui_cls(["ui-toast", `ui-toast-${tone}`, class])}>
+        <svg.ui-toast-icon viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true"><path d={toast_icon(tone)}/></svg>
+        <div.ui-toast-body>
+            {title != null && <strong.ui-toast-title>{title}</strong>}
+            <span.ui-toast-msg>{children}</span>
+        </div>
+        {action != null && <button.ui-toast-action type="button" @click={() => { on_action && on_action() }}>{action}</button>}
+        <button.ui-toast-x type="button" aria-label="Dismiss" @click={() => { on_close && on_close() }}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+    </div>
+}
+
+component ToastHost(placement: str = "bottom-right", limit: int = 5, label: str = "Notifications", inline: bool = false,
+                    class: str? = null) {
+    style global toast_css
+    state items = []        // { n, message, title, tone, action, on_action, until }
+    state count = 0
+    state held = false
+    let dismiss = (n: int) => { items = items | filter((t) => t.n != n) }
+    if len(items) > 0 && !held {
+        every(200, () => {
+            let at = now()
+            items = items | filter((t) => t.until == null || t.until > at)
+        })
+    }
+    <ol class={ui_cls(["ui-toast-host", `ui-toast-${placement}`, inline && "ui-toast-inline", class])} aria-label={label}
+        @mount={(el) => {
+            let heard = (e) => {
+                e.preventDefault()
+                let d = e.detail
+                let secs = d.seconds ?? 5
+                count += 1
+                let all = items | push({ n: count, message: str(d.message), title: d.title, tone: d.tone ?? "neutral",
+                                         action: d.action, on_action: d.on_action,
+                                         until: secs > 0 ? now() + secs * 1000 : null })
+                items = len(all) > limit ? drop(all, len(all) - limit) : all
+            }
+            js("document.addEventListener", "ui-toast", heard)
+            () => js("document.removeEventListener", "ui-toast", heard)
+        }}
+        @pointerenter={() => { held = true }}
+        @pointerleave={() => {
+            held = false
+            let at = now()
+            items = items | map((t) => t.until != null && t.until < at + 2000 ? { ...t, until: at + 2000 } : t)
+        }}
+        @focusin={(e) => { held = e.target.closest(".ui-toast-host").matches(":focus-within") }}
+        @focusout={(e) => { if e.relatedTarget == null || !e.target.closest(".ui-toast-host").contains(e.relatedTarget) { held = false } }}>
+        {for t in items => <li key={t.n} role={t.tone == "danger" ? "alert" : "status"}
+                               aria-live={t.tone == "danger" ? "assertive" : "polite"} aria-atomic="true">
+            <Toast title={t.title} tone={t.tone} action={t.action}
+                   on_action={() => {
+                       dismiss(t.n)
+                       if t.on_action != null { t.on_action() }
+                   }}
+                   on_close={() => { dismiss(t.n) }}>{t.message}</Toast>
+        </li>}
+    </ol>
+}

@@ -1,0 +1,229 @@
+// DepthChart: an order book's depth: bids (to buy) and asks (to sell) as stepped
+// areas of the size waiting at each price or better, green below the mid price and
+// red above it, with the mid price and the spread marked. CSS only: hovering a level
+// shows its price, the size there and in total up to it, and what that total is
+// worth; screen readers get the levels as a table.
+//
+//   <DepthChart label="BTC-USD depth" bids={book.bids} asks={book.asks} unit=" BTC" decimals={1}/>
+//   <DepthChart label="ACME depth" bids={bids} asks={asks} prefix="$" spread={2}/>
+//
+// bids and asks: lists of { price, size }, in any order. The x axis is price, centred
+// on the mid price (halfway between the best bid and the best ask) and as wide each
+// way as the farther side's last level; spread: shows only that many percent either
+// side of the mid instead. The y axis is the size waiting at that price or better.
+// prefix and suffix: around every price shown ("$"); decimals: digits after the point
+// of prices (2). unit: after every size (" BTC"); size_decimals: digits after the
+// point of sizes (up to 4, as needed). height: the plot's height in pixels (260).
+// label: what the chart shows; it names it for screen readers and captions their
+// table. show_label also writes it above the chart.
+
+let depth_chart_css = css`
+.ui-dc { display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-dc-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-dc-bid { --k: var(--ui-success); } .ui-dc-ask { --k: var(--ui-danger); }
+.ui-dc-head { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-dc-head li { display: inline-flex; align-items: center; gap: 6px; }
+.ui-dc-head b { color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-dc-key { width: 10px; height: 10px; border-radius: 3px; background: var(--k); }
+.ui-dc-frame { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; padding-top: 20px; }
+.ui-dc-plot { position: relative; height: var(--h); border-bottom: 1px solid var(--ui-strong); }
+.ui-dc-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-dc-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.ui-dc-area { fill: var(--k); opacity: .16; }
+.ui-dc-edge { fill: none; stroke: var(--k); stroke-width: 2; stroke-linejoin: round; }
+.ui-dc-mid { position: absolute; z-index: 1; top: 0; bottom: 0; border-left: 1px dashed var(--ui-strong); pointer-events: none; }
+.ui-dc-mid span { position: absolute; top: 0; left: 50%; transform: translate(-50%, -100%); padding: 1px 5px; border-radius: 3px;
+  background: var(--ui-subtle); color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-dc-zone { position: absolute; top: 0; bottom: 0; }
+.ui-dc-zone::before { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: var(--y); border-top: 2px solid var(--k);
+  background: color-mix(in srgb, var(--k) 22%, transparent); opacity: 0; }
+.ui-dc-zone:hover::before { opacity: 1; }
+.ui-dc-tip { position: absolute; z-index: 20; bottom: calc(var(--y) + 8px); display: none; min-width: 170px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-dc-bid .ui-dc-tip { left: 0; } .ui-dc-ask .ui-dc-tip { right: 0; }
+.ui-dc-zone:hover .ui-dc-tip { display: block; }
+.ui-dc-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; color: var(--k); }
+.ui-dc-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-dc-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-dc-y { position: relative; height: var(--h); }
+.ui-dc-y span { position: absolute; left: 0; transform: translateY(50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-dc-x { position: relative; height: 16px; margin-top: 6px; }
+.ui-dc-x span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-dc-x .ui-dc-first { transform: none; }
+.ui-dc-x .ui-dc-end { transform: translateX(-100%); }
+.ui-dc-empty { display: grid; place-items: center; height: var(--h); border: 1px dashed var(--ui-border); border-radius: var(--ui-radius-sm); color: var(--ui-muted); }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn depth_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn depth_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : depth_chart_group(floor(n / 1000)) + "," + depth_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn depth_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${depth_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${depth_chart_group(floor(units / scale))}${tail}`
+}
+
+// A large number, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn depth_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? depth_chart_num(v)
+        : `${v < 0 ? "-" : ""}${depth_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A change in percent, signed, to two decimals: "+1.25%", "-0.40%".
+fn depth_chart_signed(p: num) -> str = `${p > 0 ? "+" : (p < 0 && round(abs(p) * 100) > 0 ? "-" : "")}${depth_chart_num(abs(p), 2)}%`
+
+// A coordinate out of 100 (or a length), to two decimals.
+fn depth_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The axis from lo to hi, widened to round ticks: about `steps` steps of 1, 2, 2.5 or 5 x 10^n.
+fn depth_chart_scale(lo: num, hi: num, steps: int = 5) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo) / 10) : hi - lo
+    let raw = span / steps
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+// One side of the book, best first (bids high to low, asks low to high), each level
+// with `total`: its size and every better one's, and `worth`: their price times size.
+fn depth_chart_side(levels: list, bids: bool) -> list {
+    let sorted = levels | filter((l) => l.size > 0) | sort_by((l) => bids ? 0 - l.price : l.price)
+    let total = 0
+    let worth = 0
+    let out = []
+    for l in sorted {
+        total += l.size
+        worth += l.size * l.price
+        out = out | push({ price: l.price, size: l.size, total, worth })
+    }
+    out
+}
+
+view DepthChart(bids: list, asks: list, spread: num? = null, height: int = 260, prefix: str = "", suffix: str = "",
+                decimals: int = 2, unit: str = "", size_decimals: int? = null, label: str = "Depth chart",
+                show_label: bool = false, class: str? = null) {
+    style global depth_chart_css
+    let all_bids = depth_chart_side(bids, true)
+    let all_asks = depth_chart_side(asks, false)
+    let ready = len(all_bids) > 0 && len(all_asks) > 0
+    let mid = ready ? (all_bids[0].price + all_asks[0].price) / 2 : 0
+    let reach = ready ? max([mid - all_bids[-1].price, all_asks[-1].price - mid]) : 1
+    let half0 = spread != null && spread > 0 ? mid * spread / 100 : reach * 1.04
+    let half = half0 > 0 ? half0 : 1
+    let lo = mid - half
+    let hi = mid + half
+    let side_b = all_bids | filter((l) => l.price >= lo)
+    let side_a = all_asks | filter((l) => l.price <= hi)
+    let top = max([0] + (side_b | map((l) => l.total)) + (side_a | map((l) => l.total)))
+    let ys = depth_chart_scale(0, top > 0 ? top : 1, 4)
+    let xs = depth_chart_scale(lo, hi, 6).ticks | filter((t) => t >= lo && t <= hi)
+    let px = (p) => (p - lo) * 100 / (hi - lo)
+    let py = (v) => (ys.hi - v) * 100 / ys.hi
+    let pct = (v) => depth_chart_pct(v)
+    let price = (v) => `${v < 0 ? "-" : ""}${prefix}${depth_chart_num(abs(v), decimals)}${suffix}`
+    let size = (v) => `${depth_chart_num(v, size_decimals ?? (v >= 1000 ? 0 : null))}${unit}`
+    let gap = ready ? all_asks[0].price - all_bids[0].price : 0
+    // A side's stepped edge, from the best level outward to the plot's end.
+    let edge = (levels: list, end: num) => len(levels) == 0 ? "" : "M" + join(range(len(levels)) | map((k) =>
+        `${pct(px(levels[k].price))},${pct(k == 0 ? 100 : py(levels[k - 1].total))} L${pct(px(levels[k].price))},${pct(py(levels[k].total))}`), " L")
+        + ` L${pct(end)},${pct(py(levels[-1].total))}`
+    let fill = (levels: list, end: num) => len(levels) == 0 ? "" : `${edge(levels, end)} L${pct(end)},100 Z`
+    // A level's hover zone: from its price out to the next level's (or the plot's end).
+    let zone = (levels: list, k: int, end: num) => {
+        let a = px(levels[k].price)
+        let b = k + 1 < len(levels) ? px(levels[k + 1].price) : end
+        { left: a < b ? a : b, width: abs(b - a) }
+    }
+    let axis_width = max([3] + (ys.ticks | map((t) => len(depth_chart_short(t)))))
+    <figure class={ui_cls(["ui-dc", class])} aria-label={label} style={`--h: ${height}px`}>
+        {show_label && <figcaption.ui-dc-title>{label}</figcaption>}
+        {ready && <ul.ui-dc-head>
+            <li class="ui-dc-bid"><span.ui-dc-key aria-hidden="true"></span>Best bid <b>{price(all_bids[0].price)}</b></li>
+            <li class="ui-dc-ask"><span.ui-dc-key aria-hidden="true"></span>Best ask <b>{price(all_asks[0].price)}</b></li>
+            <li>Spread <b>{price(gap)}</b> ({depth_chart_num(mid != 0 ? gap * 100 / mid : 0, 3)}%)</li>
+        </ul>}
+        {!ready ? <div.ui-dc-empty>No bids or no asks.</div> : <div.ui-dc-frame aria-hidden="true">
+            <div.ui-dc-plot>
+                {for t in ys.ticks => <span.ui-dc-grid style={`top: ${pct(py(t))}%`}></span>}
+                <svg.ui-dc-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                    <g class="ui-dc-bid">
+                        <path.ui-dc-area d={fill(side_b, 0)}/>
+                        <path.ui-dc-edge d={edge(side_b, 0)} vector-effect="non-scaling-stroke"/>
+                    </g>
+                    <g class="ui-dc-ask">
+                        <path.ui-dc-area d={fill(side_a, 100)}/>
+                        <path.ui-dc-edge d={edge(side_a, 100)} vector-effect="non-scaling-stroke"/>
+                    </g>
+                </svg>
+                <span.ui-dc-mid style={`left: ${pct(px(mid))}%`}><span>Mid {price(mid)}</span></span>
+                {for [k, l] in enumerate(side_b) => {
+                    let z = zone(side_b, k, 0)
+                    <div class="ui-dc-zone ui-dc-bid" style={`left: ${pct(z.left)}%; width: ${pct(z.width)}%; --y: ${pct(100 - py(l.total))}%`}>
+                        <span.ui-dc-tip>
+                            <strong>Bids at {price(l.price)} or more</strong>
+                            <p>Size here<b>{size(l.size)}</b></p>
+                            <p>Total<b>{size(l.total)}</b></p>
+                            <p>Worth<b>{prefix}{depth_chart_num(l.worth, 0)}</b></p>
+                            <p>From mid<b>{depth_chart_signed((l.price - mid) * 100 / mid)}</b></p>
+                        </span>
+                    </div>
+                }}
+                {for [k, l] in enumerate(side_a) => {
+                    let z = zone(side_a, k, 100)
+                    <div class="ui-dc-zone ui-dc-ask" style={`left: ${pct(z.left)}%; width: ${pct(z.width)}%; --y: ${pct(100 - py(l.total))}%`}>
+                        <span.ui-dc-tip>
+                            <strong>Asks at {price(l.price)} or less</strong>
+                            <p>Size here<b>{size(l.size)}</b></p>
+                            <p>Total<b>{size(l.total)}</b></p>
+                            <p>Worth<b>{prefix}{depth_chart_num(l.worth, 0)}</b></p>
+                            <p>From mid<b>{depth_chart_signed((l.price - mid) * 100 / mid)}</b></p>
+                        </span>
+                    </div>
+                }}
+            </div>
+            <div.ui-dc-y style={`width: ${axis_width}ch`}>
+                {for t in ys.ticks => <span style={`bottom: ${pct(100 - py(t))}%`}>{depth_chart_short(t)}</span>}
+            </div>
+            <div.ui-dc-x>
+                {for t in xs => <span class={ui_cls([px(t) < 5 && "ui-dc-first", px(t) > 95 && "ui-dc-end"])} style={`left: ${pct(px(t))}%`}>{prefix}{depth_chart_num(t)}</span>}
+            </div>
+            <span></span>
+        </div>}
+        <table.ui-sr>
+            <caption>{label}: mid {price(mid)}, spread {price(gap)}</caption>
+            <thead><tr><th scope="col">Side</th><th scope="col">Price</th><th scope="col">Size</th><th scope="col">Total</th></tr></thead>
+            <tbody>
+                {for l in reverse(all_asks) => <tr><td>Ask</td><th scope="row">{price(l.price)}</th><td>{size(l.size)}</td><td>{size(l.total)}</td></tr>}
+                {for l in all_bids => <tr><td>Bid</td><th scope="row">{price(l.price)}</th><td>{size(l.size)}</td><td>{size(l.total)}</td></tr>}
+            </tbody>
+        </table>
+    </figure>
+}

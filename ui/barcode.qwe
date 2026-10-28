@@ -1,0 +1,102 @@
+// Barcode: a Code 128 barcode as SVG from text: an order number, a parcel's label,
+// a ticket's code. The encoder is written here in Quillo (no library), so it draws
+// the same on the server and in the browser. It uses code set B for text and
+// switches to code set C (two digits a bar pattern) for runs of four digits or
+// more, so long numbers stay short; the check symbol is the standard's (mod 103).
+//
+//   <Barcode text="QA204-LHR-OPO"/>
+//   <Barcode text="0012345678905" bar={1.5} height={48} show_text={false}/>
+//
+// text: what it encodes: printable ASCII (space to ~); another character is
+// written as "?". bar: the width of the narrowest bar in px (2). height: the bars'
+// height in px (64). show_text: the text written under it (true). label: what
+// screen readers hear ("Barcode: " and the text by default). quiet: the light
+// margin at each end, in narrow bars (10, as the standard asks). themed: false
+// (default) keeps it dark on light whatever the page's theme; true follows it.
+// barcode_values(text) gives the symbols' values (start, data, check, stop) and
+// barcode_modules(text) the bars as a string of 1 (bar) and 0 (space).
+
+let barcode_css = css`
+.ui-barcode { display: inline-grid; justify-items: center; gap: 4px; max-width: 100%; margin: 0; padding: 6px 0 4px;
+  background: var(--ui-surface); color: var(--ui-fg); border-radius: 4px; font: 13px/1.2 var(--ui-mono); }
+.ui-barcode svg { display: block; max-width: 100%; }
+.ui-barcode figcaption { letter-spacing: .12em; white-space: pre; }
+`
+
+// The patterns of values 0 to 105 (11 modules each, 1 a bar), and the stop's (13).
+let barcode_patterns = [
+    "11011001100", "11001101100", "11001100110", "10010011000", "10010001100", "10001001100", "10011001000", "10011000100",
+    "10001100100", "11001001000", "11001000100", "11000100100", "10110011100", "10011011100", "10011001110", "10111001100",
+    "10011101100", "10011100110", "11001110010", "11001011100", "11001001110", "11011100100", "11001110100", "11101101110",
+    "11101001100", "11100101100", "11100100110", "11101100100", "11100110100", "11100110010", "11011011000", "11011000110",
+    "11000110110", "10100011000", "10001011000", "10001000110", "10110001000", "10001101000", "10001100010", "11010001000",
+    "11000101000", "11000100010", "10110111000", "10110001110", "10001101110", "10111011000", "10111000110", "10001110110",
+    "11101110110", "11010001110", "11000101110", "11011101000", "11011100010", "11011101110", "11101011000", "11101000110",
+    "11100010110", "11101101000", "11101100010", "11100011010", "11101111010", "11001000010", "11110001010", "10100110000",
+    "10100001100", "10010110000", "10010000110", "10000101100", "10000100110", "10110010000", "10110000100", "10011010000",
+    "10011000010", "10000110100", "10000110010", "11000010010", "11001010000", "11110111010", "11000010100", "10001111010",
+    "10100111100", "10010111100", "10010011110", "10111100100", "10011110100", "10011110010", "11110100100", "11110010100",
+    "11110010010", "11011011110", "11011110110", "11110110110", "10101111000", "10100011110", "10001011110", "10111101000",
+    "10111100010", "11110101000", "11110100010", "10111011110", "10111101110", "11101011110", "11110101110", "11010000100",
+    "11010010000", "11010011100", "1100011101011",
+]
+
+let barcode_ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+// How many digits run from place i.
+fn barcode_digits(chars: list, i: int) -> int {
+    let n = 0
+    while i + n < len(chars) && contains("0123456789", chars[i + n]) { n = n + 1 }
+    n
+}
+
+// The values of the symbols: start, data (in set B or C), check symbol, stop.
+fn barcode_values(text: str) -> list {
+    let chars = split(text, "") | map((c) => index_of(barcode_ascii, c) != null ? c : "?")
+    let lead = barcode_digits(chars, 0)
+    let c_first = len(chars) >= 2 && lead % 2 == 0 && (lead >= 4 || lead == len(chars))
+    let out = [c_first ? 105 : 104]
+    let in_c = c_first
+    let i = 0
+    while i < len(chars) {
+        let run = barcode_digits(chars, i)
+        if in_c {
+            if run >= 2 {
+                out = push(out, int(chars[i] + chars[i + 1]))
+                i = i + 2
+            } else {
+                out = push(out, 100)
+                in_c = false
+            }
+        } else if run >= 4 && run % 2 == 0 {
+            out = push(out, 99)
+            in_c = true
+        } else {
+            out = push(out, index_of(barcode_ascii, chars[i]))
+            i = i + 1
+        }
+    }
+    let check = (out[0] + sum(for [k, v] in enumerate(drop(out, 1)) => (k + 1) * v)) % 103
+    push(push(out, check), 106)
+}
+
+// The bars and spaces of a text, as a string of 1 and 0.
+fn barcode_modules(text: str) -> str = join(barcode_values(text) | map((v) => barcode_patterns[v]), "")
+
+view Barcode(text: str, bar: num = 2, height: int = 64, show_text: bool = true, label: str? = null, quiet: int = 10,
+             themed: bool = false, id: str? = null, class: str? = null) {
+    style global barcode_css
+    let mods = barcode_modules(text)
+    let total = len(mods) + 2 * quiet
+    // Written as the browser would: 396, not 396.0.
+    let w = round(total * bar * 10) / 10
+    let width = w == floor(w) ? str(floor(w)) : str(w)
+    let d = join(re.find_all(mods, "1+") | map((m) => `M${m.start + quiet} 0h${len(m.text)}v1h-${len(m.text)}z`), "")
+    <figure class={ui_cls(["ui-barcode", !themed && "ui-light", class])} id={id}>
+        <svg width={width} height={height} viewBox={`0 0 ${total} 1`} preserveAspectRatio="none" role="img"
+             aria-label={label ?? `Barcode: ${text}`} shape-rendering="crispEdges">
+            <path fill="currentColor" d={d}/>
+        </svg>
+        {show_text && <figcaption aria-hidden="true">{text}</figcaption>}
+    </figure>
+}

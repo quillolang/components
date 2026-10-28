@@ -1,0 +1,162 @@
+// NetworkGraph: things and the links between them (people and who works with whom,
+// services and their calls), laid out on the server by a force simulation run a
+// fixed number of steps: linked nodes pull together, all nodes push apart, so
+// clusters show. The same data always gives the same picture. CSS only: hovering a
+// node or link names it; screen readers get each node's links as a table.
+//
+//   <NetworkGraph label="Team" nodes={[{ id: "ana", label: "Ana", group: "Design" }, { id: "rui", label: "Rui" }]}
+//                 links={[{ from: "ana", to: "rui", value: 3 }]}/>
+//
+// nodes: a list of { id, label, group } (label defaults to the id); nodes in the
+// same group share a colour (eight, then they repeat), with a legend. links: a
+// list of { from, to, value }, naming nodes by id; value (1 by default) makes a
+// link thicker and pulls harder. A node is as big as its number of links. steps:
+// how many steps the simulation runs (300; more settles further, and takes longer
+// on the server). aspect: the drawing's width over its height (1.6). labels: each
+// node's label under it (true; otherwise on hover only). Dragging nodes is not
+// offered: the layout is the server's. label: what the chart shows; it names it for
+// screen readers and captions their table. show_label also writes it above.
+
+let network_graph_css = css`
+.ui-network {
+  --ui-network-1: light-dark(#2a78d6, #3987e5); --ui-network-2: light-dark(#eb6834, #d95926);
+  --ui-network-3: light-dark(#1baf7a, #199e70); --ui-network-4: light-dark(#eda100, #c98500);
+  --ui-network-5: light-dark(#e87ba4, #d55181); --ui-network-6: light-dark(#008300, #008300);
+  --ui-network-7: light-dark(#6250d6, #9085e9); --ui-network-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-network-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-network-s1 { --c: var(--ui-network-1); } .ui-network-s2 { --c: var(--ui-network-2); } .ui-network-s3 { --c: var(--ui-network-3); }
+.ui-network-s4 { --c: var(--ui-network-4); } .ui-network-s5 { --c: var(--ui-network-5); } .ui-network-s6 { --c: var(--ui-network-6); }
+.ui-network-s7 { --c: var(--ui-network-7); } .ui-network-s8 { --c: var(--ui-network-8); }
+.ui-network-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-network-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.ui-network-key { width: 10px; height: 10px; border-radius: 50%; background: var(--c); flex: none; }
+.ui-network-svg { display: block; width: 100%; height: auto; overflow: visible; }
+.ui-network-link { stroke: var(--ui-strong); stroke-linecap: round; stroke-opacity: .8; }
+.ui-network-link:hover { stroke: var(--ui-fg); stroke-opacity: 1; }
+.ui-network-node circle { fill: var(--c); stroke: var(--ui-bg); stroke-width: .6; }
+.ui-network-node text { fill: var(--ui-fg); font-family: var(--ui-font); font-size: 2.3px; text-anchor: middle;
+  paint-order: stroke; stroke: var(--ui-bg); stroke-width: .6px; pointer-events: none; }
+.ui-network-node:hover circle { stroke: var(--ui-fg); stroke-width: .8; }
+.ui-network-node:hover text { font-weight: 700; }
+.ui-network-nolabels .ui-network-node text { visibility: hidden; }
+.ui-network-nolabels .ui-network-node:hover text { visibility: visible; }
+.ui-network-plain { --c: var(--ui-network-1); }
+`
+
+// A number for SVG, to two decimals.
+fn network_graph_num(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// Positions { xs, ys } for n nodes joined by links ({ s, t, w } by index), in a box w by h:
+// Fruchterman and Reingold's forces run `steps` times from a spiral start, then fitted
+// to the box. Deterministic, so the server draws the same picture each time.
+fn network_graph_layout(n: int, links: list, w: num, h: num, steps: int) -> map {
+    if n == 0 { return { xs: [], ys: [] } }
+    let k = sqrt(w * h / n) * 0.6
+    let xs = for i in range(n) => w / 2 + 4 * sqrt(i + 0.5) * math.cos(i * 2.39996)
+    let ys = for i in range(n) => h / 2 + 4 * sqrt(i + 0.5) * math.sin(i * 2.39996)
+    let step = 0
+    while step < steps {
+        let heat = w / 10 * (1 - step / steps) + 0.05
+        let dx = for i in range(n) => 0
+        let dy = for i in range(n) => 0
+        for i in range(n) {
+            for j in range(i + 1, n) {
+                let ex = xs[i] - xs[j]
+                let ey = ys[i] - ys[j]
+                let d = sqrt(ex * ex + ey * ey)
+                let dist = d < 0.01 ? 0.01 : d
+                let f = k * k / dist / dist
+                dx = set(dx, i, dx[i] + ex * f)
+                dy = set(dy, i, dy[i] + ey * f)
+                dx = set(dx, j, dx[j] - ex * f)
+                dy = set(dy, j, dy[j] - ey * f)
+            }
+        }
+        for l in links {
+            let ex = xs[l.s] - xs[l.t]
+            let ey = ys[l.s] - ys[l.t]
+            let d = sqrt(ex * ex + ey * ey)
+            let f = d * l.w / k
+            dx = set(dx, l.s, dx[l.s] - ex * f)
+            dy = set(dy, l.s, dy[l.s] - ey * f)
+            dx = set(dx, l.t, dx[l.t] + ex * f)
+            dy = set(dy, l.t, dy[l.t] + ey * f)
+        }
+        for i in range(n) {
+            // A little pull to the middle keeps parts that are not linked from drifting off.
+            let gx = dx[i] - (xs[i] - w / 2) * 0.08 * k
+            let gy = dy[i] - (ys[i] - h / 2) * 0.08 * k
+            let len0 = sqrt(gx * gx + gy * gy)
+            let move = len0 < heat ? 1 : heat / len0
+            xs = set(xs, i, xs[i] + gx * move)
+            ys = set(ys, i, ys[i] + gy * move)
+        }
+        step += 1
+    }
+    // Fit what came out into the box, keeping its shape, with a margin.
+    let x0 = min(xs)
+    let x1 = max(xs)
+    let y0 = min(ys)
+    let y1 = max(ys)
+    let margin = 8
+    let sx = x1 - x0 > 0 ? (w - 2 * margin) / (x1 - x0) : 1
+    let sy = y1 - y0 > 0 ? (h - 2 * margin) / (y1 - y0) : 1
+    let s = sx < sy ? sx : sy
+    let ox = (w - (x1 - x0) * s) / 2
+    let oy = (h - (y1 - y0) * s) / 2
+    { xs: xs | map((x) => ox + (x - x0) * s), ys: ys | map((y) => oy + (y - y0) * s) }
+}
+
+view NetworkGraph(nodes: list, links: list, steps: int = 300, aspect: num = 1.6, labels: bool = true,
+                  label: str = "Network graph", show_label: bool = false, class: str? = null) {
+    style global network_graph_css
+    let n = len(nodes)
+    let ids = nodes | map((nd) => str(nd.id))
+    let name = (i) => str(nodes[i].label ?? nodes[i].id)
+    let flows = links
+        | filter((l) => index_of(ids, str(l.from)) != null && index_of(ids, str(l.to)) != null && str(l.from) != str(l.to))
+        | map((l) => { s: index_of(ids, str(l.from)), t: index_of(ids, str(l.to)), w: l.value != null && l.value > 0 ? l.value : 1 })
+    let w = 100 * (aspect > 0.2 ? aspect : 1.6)
+    let h = 100
+    let pos = network_graph_layout(n, flows, w, h, steps)
+    let degree = for i in range(n) => len(flows | filter((l) => l.s == i || l.t == i))
+    let groups = unique(nodes | filter((nd) => nd.group != null) | map((nd) => str(nd.group)))
+    let tone = (i) => nodes[i].group == null ? "ui-network-plain" : `ui-network-s${(index_of(groups, str(nodes[i].group)) ?? 0) % 8 + 1}`
+    let radius = (i) => 1.4 + sqrt(degree[i]) * 0.65
+    let top = max([1] + (flows | map((l) => l.w)))
+    let near = (i) => flows | filter((l) => l.s == i || l.t == i) | map((l) => name(l.s == i ? l.t : l.s))
+    <figure class={ui_cls(["ui-network", !labels && "ui-network-nolabels", class])} aria-label={label}>
+        {show_label && <figcaption.ui-network-title>{label}</figcaption>}
+        {len(groups) > 0 && <ul.ui-network-legend aria-hidden="true">
+            {for [g, nm] in enumerate(groups) => <li><span class={`ui-network-key ui-network-s${g % 8 + 1}`}></span>{nm}</li>}
+        </ul>}
+        <svg.ui-network-svg viewBox={`0 0 ${network_graph_num(w)} ${h}`} aria-hidden="true">
+            {for l in flows => <line.ui-network-link x1={network_graph_num(pos.xs[l.s])} y1={network_graph_num(pos.ys[l.s])}
+                    x2={network_graph_num(pos.xs[l.t])} y2={network_graph_num(pos.ys[l.t])}
+                    stroke-width={network_graph_num(0.3 + 0.9 * l.w / top)}>
+                <title>{name(l.s)} – {name(l.t)}{l.w != 1 ? `: ${l.w}` : ""}</title>
+            </line>}
+            {for i in range(n) => <g class={`ui-network-node ${tone(i)}`} data-id={ids[i]}>
+                <circle cx={network_graph_num(pos.xs[i])} cy={network_graph_num(pos.ys[i])} r={network_graph_num(radius(i))}>
+                    <title>{name(i)}{nodes[i].group != null ? ` (${nodes[i].group})` : ""}: {degree[i]} link{degree[i] == 1 ? "" : "s"}</title>
+                </circle>
+                <text x={network_graph_num(pos.xs[i])} y={network_graph_num(pos.ys[i] + radius(i) + 2.5)}>{name(i)}</text>
+            </g>}
+        </svg>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col">Node</th>{len(groups) > 0 && <th scope="col">Group</th>}<th scope="col">Linked to</th></tr></thead>
+            <tbody>
+                {for i in range(n) => <tr>
+                    <th scope="row">{name(i)}</th>
+                    {len(groups) > 0 && <td>{nodes[i].group ?? ""}</td>}
+                    <td>{len(near(i)) > 0 ? join(near(i), ", ") : "None"}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

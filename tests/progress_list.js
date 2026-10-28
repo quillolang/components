@@ -1,0 +1,18 @@
+const b = $("#progress-list-demo-budget");
+if (!b || b.tagName !== "UL" || b.getAttribute("aria-label") !== "Budget by category") return "the list is not a named <ul>";
+const items = [...b.querySelectorAll(".ui-progresslist-item")];
+if (items.length !== 4) return `expected 4 items, found ${items.length}`;
+const bar = (i) => items[i].querySelector("[role=progressbar]");
+if (bar(0).getAttribute("aria-label") !== "Travel" || bar(0).getAttribute("aria-valuenow") !== "1840" || bar(0).getAttribute("aria-valuemax") !== "2500") return `the first bar: ${bar(0).getAttribute("aria-valuenow")} of ${bar(0).getAttribute("aria-valuemax")}`;
+if (bar(0).getAttribute("aria-valuetext") !== "$1,840 of $2,500") return "the note is not the bar's value text";
+if (items[0].querySelector(".ui-progresslist-fill").style.width !== "73.6%") return `the travel bar is ${items[0].querySelector(".ui-progresslist-fill").style.width}`;
+if (!items[1].classList.contains("ui-progresslist-over") || !items[1].classList.contains("ui-progresslist-danger") || items[1].querySelector(".ui-progresslist-fill").style.width !== "100%") return "over the limit is not full and red";
+if (items[1].querySelector(".ui-progresslist-desc")?.textContent !== "Annual licences renewed in March") return "the description is missing";
+if (!items[2].classList.contains("ui-progresslist-success")) return "tone";
+if (items[3].querySelector(".ui-progresslist-fill").style.width !== "0%" || items[3].querySelector(".ui-progresslist-note").textContent !== "Not started") return "a zero item";
+const p = $("#progress-list-demo-poll");
+const names = [...p.querySelectorAll(".ui-progresslist-label")].map((l) => l.textContent);
+if (names.join() !== "Yes,Maybe,No") return `order="desc" gives ${names}`;
+const notes = [...p.querySelectorAll(".ui-progresslist-note")].map((n) => n.textContent);
+if (notes.join() !== "64%,21%,15%") return `show="percent" gives ${notes}`;
+if (!p.classList.contains("ui-progresslist-sm") || getComputedStyle(p.querySelector(".ui-progresslist-track")).height !== "5px") return "size sm";

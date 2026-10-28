@@ -1,0 +1,16 @@
+const [cloud, plain] = $$(".ui-logo-cloud");
+if (!cloud || !plain) return "expected two logo clouds";
+if (cloud.getAttribute("aria-label") !== "Trusted by teams at" || cloud.querySelector(".ui-logo-cloud-title")?.textContent !== "Trusted by teams at") return "the label is missing";
+const items = [...cloud.querySelectorAll(".ui-logo-cloud-item")];
+if (items.length !== 5) return `expected 5 logos, found ${items.length}`;
+if (items[0].tagName !== "A" || items[0].getAttribute("href") !== "https://example.com/acme" || items[0].getAttribute("aria-label") !== "Acme") return "a logo with href is not a named link";
+if (items[1].tagName === "A" || items[1].querySelector("img").alt !== "Globex") return "a logo without href is a link, or has no alt";
+if (items[0].querySelector("img").alt !== "") return "a linked logo's image repeats the name";
+const img = items[1].querySelector("img");
+if (getComputedStyle(img).filter !== "grayscale(1)" || +getComputedStyle(img).opacity > 0.6) return `a logo is not greyed: ${getComputedStyle(img).filter}`;
+if (Math.round(img.getBoundingClientRect().height) !== 32) return `md logos are ${img.getBoundingClientRect().height}px tall`;
+if (plain.querySelector(".ui-logo-cloud-title")) return "label null still shows a title";
+const small = plain.querySelector("img");
+if (Math.round(small.getBoundingClientRect().height) !== 24) return "sm logos are not 24px tall";
+if (getComputedStyle(small).filter !== "none" || getComputedStyle(small).opacity !== "1") return "color true still greys the logos";
+if (getComputedStyle(plain.querySelector(".ui-logo-cloud-list")).justifyContent !== "flex-start") return "align left is not applied";

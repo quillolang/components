@@ -1,0 +1,30 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-polarc");
+if (charts.length !== 2) return `expected 2 polar area charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a chart has NaN, Infinity or undefined in it";
+const [orders, incidents] = charts;
+const slices = [...orders.querySelectorAll(".ui-polarc-slice")];
+if (slices.length !== 7) return `7 parts made ${slices.length} slices`;
+// Mon, 132 on rings to 250: a wedge of radius 52.8 from the top, a seventh of a turn.
+const d = slices[0].getAttribute("d");
+const want = `M0,0 L0,-52.8 A52.8,52.8 0 0 1 ${Math.round(52.8 * Math.sin(2 * Math.PI / 7) * 100) / 100},${Math.round(-52.8 * Math.cos(2 * Math.PI / 7) * 100) / 100} Z`;
+if (d !== want) return `Mon's slice is ${d}, not ${want}`;
+const rings = [...orders.querySelectorAll(".ui-polarc-tick")].map((t) => t.textContent);
+if (rings.join() !== "50,100,150,200,250") return `ring labels: ${rings}`;
+const radii = [...orders.querySelectorAll(".ui-polarc-ring")].map((c) => Number(c.getAttribute("r")));
+if (radii.join() !== "20,40,60,80,100") return `rings at ${radii}`;
+if (new Set(slices.map((s) => getComputedStyle(s).fill)).size !== 7) return "slices share a colour";
+const names = [...orders.querySelectorAll(".ui-polarc-name")].map((t) => t.textContent);
+if (names.join() !== "Mon,Tue,Wed,Thu,Fri,Sat,Sun") return `labels: ${names}`;
+if (slices[4].querySelector("title").textContent !== "Fri: 224") return "slices have no title";
+const svg = orders.querySelector("svg").getBoundingClientRect();
+if (orders.querySelectorAll(".ui-polarc-name").length && [...orders.querySelectorAll(".ui-polarc-name")].some((t) => { const r = t.getBoundingClientRect(); return r.left < svg.left - 1 || r.right > svg.right + 1; })) return "a label is cut off";
+if (orders.querySelectorAll("tbody tr").length !== 7) return "the screen reader table";
+
+if (incidents.querySelector(".ui-polarc-name")) return "labels={false} still writes labels";
+if ([...incidents.querySelectorAll(".ui-polarc-tick")].map((t) => t.textContent).join() !== "2,4,6,8,10,12") return "11 is not ringed to 12";
+const li = [...incidents.querySelectorAll(".ui-polarc-legend li")];
+if (li.length !== 5 || li[1].textContent !== "Slow11") return `the legend: ${li.map((l) => l.textContent)}`;
+if (getComputedStyle(li[1].querySelector(".ui-polarc-key")).backgroundColor === getComputedStyle(li[0].querySelector(".ui-polarc-key")).backgroundColor) return "legend keys share a colour";
+const top = incidents.querySelectorAll(".ui-polarc-slice")[1].getAttribute("d");
+if (!top.includes("A") || !/L[\d.]+,-[\d.]+ A/.test(top)) return `a slice: ${top}`;

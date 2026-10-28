@@ -1,0 +1,14 @@
+const links = $$("a.ui-download-button");
+if (links.length !== 6) return `expected 6 links, found ${links.length}`;
+const report = $("#dl-demo-report");
+if (!report || report.getAttribute("download") !== "report.pdf") return "filename is not the download name";
+if (report.querySelector(".ui-download-button-meta").textContent !== "PDF, 1.8 MB") return `report says "${report.querySelector(".ui-download-button-meta").textContent}"`;
+if (!report.querySelector("svg")) return "no icon";
+const metas = links.map((l) => l.querySelector(".ui-download-button-meta")?.textContent ?? "");
+if (metas[1] !== "CSV, 51 KB") return `orders.csv says "${metas[1]}"`;
+if (metas[2] !== "ZIP, 2.1 GB") return `kind=ZIP with 2.25 GB says "${metas[2]}"`;
+if (metas[3] !== "JPG, 820 B") return `photo.jpg (820 bytes) says "${metas[3]}"`;
+if (metas[4] !== "TXT") return `notes.txt without bytes says "${metas[4]}"`;
+if (metas[5] !== "CSV") return `an export URL with filename says "${metas[5]}"`;
+if (!links[3].hasAttribute("download") || links[3].getAttribute("download") !== "") return "without filename the link is not a bare download";
+if (!links[1].classList.contains("ui-btn-solid") || !links[5].classList.contains("ui-btn-danger") || !links[3].classList.contains("ui-btn-sm")) return "variant, tone or size is not passed on";

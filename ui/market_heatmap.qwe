@@ -1,0 +1,221 @@
+// MarketHeatmap: a market at a glance: each stock a rectangle sized by its market
+// value and coloured by its change, green up and red down, deeper the further it moved,
+// grouped by sector (a squarified treemap, worked out on the server). CSS only:
+// hovering a stock shows its name, price, change and size, and screen readers get
+// the stocks as a table.
+//
+//   <MarketHeatmap label="S&P sectors today" items={stocks}/>
+//   <MarketHeatmap label="Crypto" items={coins} limit={8} ratio={1.6} prefix="$"/>
+//
+// items: a list of { symbol, name, sector, cap, change, price }: cap the market value
+// (or any size), change the day's change in percent (+1.2 for 1.2% up); sector groups
+// them (left out of all, no groups; of some, those are "Other"); name and price are
+// for the details. limit: the change, in percent, of the deepest colour (3); further
+// moves are as deep. ratio: the map's width over its height (2). prefix and suffix: around prices and market values ("$");
+// decimals: digits after the point of prices (2). label: what the map shows; it names
+// it for screen readers and captions their table. show_label also writes it above.
+
+let market_heatmap_css = css`
+.ui-mkthm { --ui-mkthm-up: light-dark(#1f8a4c, #2b9a59); --ui-mkthm-down: light-dark(#cf3a3a, #c43c3c);
+  --ui-mkthm-zero: light-dark(#7a788c, #46445a);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.25 var(--ui-font); color: var(--ui-fg); }
+.ui-mkthm-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-mkthm-up { --k: var(--ui-mkthm-up); } .ui-mkthm-down { --k: var(--ui-mkthm-down); } .ui-mkthm-flat { --k: var(--ui-mkthm-zero); }
+.ui-mkthm-map { position: relative; width: 100%; border-radius: var(--ui-radius-sm); background: var(--ui-bg); }
+.ui-mkthm-sector { position: absolute; box-shadow: inset 0 0 0 1px var(--ui-bg); }
+.ui-mkthm-head { position: absolute; left: 0; right: 0; top: 0; display: flex; align-items: center; padding: 0 6px; overflow: hidden;
+  background: var(--ui-subtle); color: var(--ui-muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+  white-space: nowrap; text-overflow: ellipsis; box-shadow: inset 0 0 0 1px var(--ui-bg); }
+.ui-mkthm-tile { position: absolute; display: grid; place-content: center; justify-items: center; gap: 2px; overflow: visible;
+  background: color-mix(in srgb, var(--k) var(--p), var(--ui-mkthm-zero)); box-shadow: inset 0 0 0 1px var(--ui-bg);
+  color: #fff; text-align: center; text-shadow: 0 1px 1px rgba(0, 0, 0, .25); cursor: default; }
+.ui-mkthm-tile:hover { z-index: 5; box-shadow: inset 0 0 0 2px var(--ui-fg); }
+.ui-mkthm-sym, .ui-mkthm-chg { display: none; max-width: 100%; overflow: hidden; white-space: nowrap; }
+.ui-mkthm-sym { font-weight: 700; }
+.ui-mkthm-chg { font-variant-numeric: tabular-nums; opacity: .92; }
+.ui-mkthm-l .ui-mkthm-sym { display: block; font-size: 20px; } .ui-mkthm-l .ui-mkthm-chg { display: block; font-size: 13px; }
+.ui-mkthm-m .ui-mkthm-sym { display: block; font-size: 13px; } .ui-mkthm-m .ui-mkthm-chg { display: block; font-size: 11px; }
+.ui-mkthm-s .ui-mkthm-sym { display: block; font-size: 10px; }
+.ui-mkthm-tip { position: absolute; z-index: 20; top: calc(100% + 6px); left: 0; display: none; min-width: 170px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); box-shadow: var(--ui-shadow);
+  color: var(--ui-fg); font-size: 12px; text-align: left; text-shadow: none; pointer-events: none; }
+.ui-mkthm-right .ui-mkthm-tip { left: auto; right: 0; }
+.ui-mkthm-low .ui-mkthm-tip { top: auto; bottom: calc(100% + 6px); }
+.ui-mkthm-tile:hover .ui-mkthm-tip { display: block; }
+.ui-mkthm-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-mkthm-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-mkthm-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-mkthm-tip .ui-mkthm-c b { color: color-mix(in srgb, var(--k) 80%, var(--ui-fg)); }
+.ui-mkthm-legend { display: flex; align-items: center; gap: 8px; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-mkthm-scale { display: flex; gap: 1px; }
+.ui-mkthm-scale span { display: grid; place-items: center; min-width: 46px; height: 20px; padding: 0 4px;
+  background: color-mix(in srgb, var(--k) var(--p), var(--ui-mkthm-zero)); color: #fff; font-size: 11px; }
+.ui-mkthm-scale span:first-child { border-radius: 3px 0 0 3px; } .ui-mkthm-scale span:last-child { border-radius: 0 3px 3px 0; }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn market_heatmap_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn market_heatmap_group(n: int) -> str =
+    n < 1000 ? str(n) : market_heatmap_group(floor(n / 1000)) + "," + market_heatmap_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn market_heatmap_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${market_heatmap_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${market_heatmap_group(floor(units / scale))}${tail}`
+}
+
+// A large number, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn market_heatmap_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? market_heatmap_num(v)
+        : `${v < 0 ? "-" : ""}${market_heatmap_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A change in percent, signed, to two decimals: "+1.25%", "-0.40%".
+fn market_heatmap_signed(p: num) -> str = `${p > 0 ? "+" : (p < 0 && round(abs(p) * 100) > 0 ? "-" : "")}${market_heatmap_num(abs(p), 2)}%`
+
+// A coordinate out of 100 (or a length), to two decimals.
+fn market_heatmap_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// How far from square the worst rectangle of a row of areas is, laid along a side `side` long.
+fn market_heatmap_worst(row: list, side: num) -> num {
+    let s = sum(row)
+    max([side * side * max(row) / (s * s), s * s / (side * side * min(row))])
+}
+
+// A squarified treemap (Bruls, Huizing and van Wijk): rectangles { x, y, w, h } in the box
+// from (x0, y0), w0 by h0, one per value, in the order given (largest first lays out best),
+// each with an area in proportion to its value.
+fn market_heatmap_squarify(values: list, x0: num, y0: num, w0: num, h0: num) -> list {
+    let total = sum(values)
+    let out = []
+    if len(values) == 0 || total <= 0 || w0 <= 0 || h0 <= 0 { return out }
+    let areas = values | map((v) => v * w0 * h0 / total)
+    let x = x0
+    let y = y0
+    let w = w0
+    let h = h0
+    let k = 0
+    while k < len(areas) {
+        let side = min([w, h])
+        let row = [areas[k]]
+        let j = k + 1
+        while j < len(areas) && market_heatmap_worst(row + [areas[j]], side) <= market_heatmap_worst(row, side) {
+            row = row + [areas[j]]
+            j += 1
+        }
+        let s = sum(row)
+        if w >= h {
+            let cw = s / h
+            let at = y
+            for a in row {
+                out = out | push({ x, y: at, w: cw, h: a / cw })
+                at += a / cw
+            }
+            x += cw
+            w -= cw
+        } else {
+            let rh = s / w
+            let at = x
+            for a in row {
+                out = out | push({ x: at, y, w: a / rh, h: rh })
+                at += a / rh
+            }
+            y += rh
+            h -= rh
+        }
+        k = j
+    }
+    out
+}
+
+view MarketHeatmap(items: list, limit: num = 3, ratio: num = 2, prefix: str = "", suffix: str = "", decimals: int = 2,
+                   label: str = "Market heatmap", show_label: bool = false, class: str? = null) {
+    style global market_heatmap_css
+    let shown = items | filter((it) => (it.cap ?? 0) > 0)
+    let sector_of = (it) => it.sector ?? "Other"
+    let names = unique(shown | map(sector_of))
+    let grouped = any(shown, (it) => it.sector != null)
+    let groups = names | map((s) => {
+        let members = shown | filter((it) => sector_of(it) == s) | sort_by((it) => 0 - it.cap)
+        { name: s, members, cap: sum(members | map((it) => it.cap)) }
+    }) | sort_by((g) => 0 - g.cap)
+    let wide = (ratio > 0 ? ratio : 2) * 100
+    let boxes = market_heatmap_squarify(groups | map((g) => g.cap), 0, 0, wide, 100)
+    let cut = (v) => v > limit ? limit : (v < 0 - limit ? 0 - limit : v)
+    let side = (c) => c == null || c == 0 ? "ui-mkthm-flat" : (c > 0 ? "ui-mkthm-up" : "ui-mkthm-down")
+    let depth = (c) => c == null ? 0 : round(abs(cut(c)) * 100 / limit)
+    let px = (v) => market_heatmap_pct(v * 100 / wide)
+    let py = (v) => market_heatmap_pct(v)
+    let money = (v) => v == null ? "—" : `${prefix}${market_heatmap_num(v, decimals)}${suffix}`
+    let big = (v) => `${prefix}${market_heatmap_short(v)}${suffix}`
+    let size = (r) => r.w * 100 / wide >= 11 && r.h >= 16 ? "ui-mkthm-l" : (r.w * 100 / wide >= 5.5 && r.h >= 9 ? "ui-mkthm-m"
+        : (r.w * 100 / wide >= 3.2 && r.h >= 5 ? "ui-mkthm-s" : null))
+    let steps = [0 - limit, 0 - limit * 2 / 3, 0 - limit / 3, 0, limit / 3, limit * 2 / 3, limit]
+    <figure class={ui_cls(["ui-mkthm", class])} aria-label={label}>
+        {show_label && <figcaption.ui-mkthm-title>{label}</figcaption>}
+        <div.ui-mkthm-map style={`aspect-ratio: ${market_heatmap_pct(wide / 100)}`} aria-hidden="true">
+            {for [gi, g] in enumerate(groups) => {
+                let b = boxes[gi]
+                let head = grouped && b.h >= 14 && b.w * 100 / wide >= 9 ? (b.h * 0.15 < 5 ? b.h * 0.15 : 5) : 0
+                let tiles = market_heatmap_squarify(g.members | map((it) => it.cap), b.x, b.y + head, b.w, b.h - head)
+                [
+                    <div.ui-mkthm-sector data-sector={g.name} style={`left: ${px(b.x)}%; top: ${py(b.y)}%; width: ${px(b.w)}%; height: ${py(b.h)}%`}>
+                        {head > 0 && <span.ui-mkthm-head style={`height: ${market_heatmap_pct(head * 100 / b.h)}%`}>{g.name}</span>}
+                    </div>,
+                    for [k, it] in enumerate(g.members) => {
+                        let r = tiles[k]
+                        <div class={ui_cls(["ui-mkthm-tile", side(it.change), size(r), r.x + r.w / 2 > wide / 2 && "ui-mkthm-right", r.y + r.h / 2 > 50 && "ui-mkthm-low"])}
+                             data-symbol={it.symbol}
+                             style={`left: ${px(r.x)}%; top: ${py(r.y)}%; width: ${px(r.w)}%; height: ${py(r.h)}%; --p: ${depth(it.change)}%`}>
+                            <span.ui-mkthm-sym>{it.symbol}</span>
+                            <span.ui-mkthm-chg>{it.change == null ? "—" : market_heatmap_signed(it.change)}</span>
+                            <span.ui-mkthm-tip>
+                                <strong>{it.symbol}{it.name != null ? ` · ${it.name}` : ""}</strong>
+                                <p>Sector<b>{g.name}</b></p>
+                                {it.price != null && <p>Price<b>{money(it.price)}</b></p>}
+                                <p class={`ui-mkthm-c ${side(it.change)}`}>Change<b>{it.change == null ? "—" : market_heatmap_signed(it.change)}</b></p>
+                                <p>Market value<b>{big(it.cap)}</b></p>
+                            </span>
+                        </div>
+                    },
+                ]
+            }}
+        </div>
+        <div.ui-mkthm-legend aria-hidden="true">
+            <span.ui-mkthm-scale>
+                {for v in steps => <span class={side(v)} style={`--p: ${depth(v)}%`}>{v > 0 ? "+" : (v < 0 ? "-" : "")}{market_heatmap_num(abs(v), 1)}%</span>}
+            </span>
+            <span>change today; area is market value</span>
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col">Symbol</th><th scope="col">Name</th><th scope="col">Sector</th><th scope="col">Price</th>
+                <th scope="col">Change</th><th scope="col">Market value</th></tr></thead>
+            <tbody>
+                {for g in groups => for it in g.members => <tr>
+                    <th scope="row">{it.symbol}</th><td>{it.name ?? ""}</td><td>{g.name}</td><td>{money(it.price)}</td>
+                    <td>{it.change == null ? "—" : market_heatmap_signed(it.change)}</td><td>{big(it.cap)}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

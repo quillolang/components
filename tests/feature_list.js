@@ -1,0 +1,18 @@
+const list = $("ul#feature-list-demo.ui-feature-list");
+if (!list) return "the list with its id is missing";
+const rows = list.querySelectorAll("li.ui-feature-row");
+if (rows.length !== 3) return `expected 3 rows, found ${rows.length}`;
+const [a, b, c] = rows;
+if (a.querySelector("h3.ui-feature-row-title")?.textContent !== "The page is the program") return "the title is not an h3";
+if (a.querySelector(".ui-feature-row-eyebrow")?.textContent !== "Write") return "the eyebrow is missing";
+if (a.querySelectorAll(".ui-feature-row-points li").length !== 3) return "the points are not listed";
+const link = a.querySelector("a.ui-feature-row-link");
+if (!link || link.getAttribute("href") !== "#feature_list" || !link.textContent.startsWith("About views")) return `the link: ${link?.outerHTML}`;
+if (b.querySelector("a.ui-feature-row-link")) return "a row without href has a link";
+if (a.querySelector(".ui-feature-row-side img")?.getAttribute("alt") !== "A page sketched as grey blocks") return "image_alt is not the picture's alt";
+if (!c.querySelector(".ui-feature-row-side .ui-cb")) return "side does not show the code block";
+const words = (r) => r.querySelector(".ui-feature-row-words").getBoundingClientRect().left;
+const side = (r) => r.querySelector(".ui-feature-row-side").getBoundingClientRect().left;
+if (!(words(a) < side(a))) return "the first row's words are not before its picture";
+if (!(side(b) < words(b))) return "the second row is not the other way round";
+if (!(words(c) < side(c))) return "the third row is not like the first";

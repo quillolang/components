@@ -1,0 +1,14 @@
+const heroes = $$("section.ui-hero");
+if (heroes.length !== 2) return `expected 2 heroes, found ${heroes.length}`;
+const [center, split] = heroes;
+if (!center.querySelector("h1.ui-hero-title") || center.querySelector("h1").textContent !== "Ship the whole app in one file") return "the title is not an h1";
+if (center.querySelector(".ui-hero-eyebrow")?.textContent !== "Now in beta") return "the eyebrow is missing";
+if (!center.classList.contains("ui-hero-center") || center.querySelector(".ui-hero-side")) return "without a side it is centred and has no side";
+const words = center.querySelector(".ui-hero-words").getBoundingClientRect(), box = center.getBoundingClientRect();
+if (Math.abs((words.left + words.right) / 2 - (box.left + box.right) / 2) > 2) return "the words are not centred";
+if (center.querySelectorAll(".ui-hero-actions a.ui-btn").length !== 2) return "the buttons are not in the actions row";
+if (!split.querySelector("h2.ui-hero-title")) return "level={2} does not make an h2";
+if (!split.classList.contains("ui-hero-split") || !split.classList.contains("ui-hero-start")) return "a side does not split it";
+const side = split.querySelector(".ui-hero-side");
+if (!side || !side.querySelector(".ui-cb")) return "the side slot does not show the code block";
+if (side.getBoundingClientRect().left <= split.querySelector(".ui-hero-words").getBoundingClientRect().right) return "the side is not to the right of the words";

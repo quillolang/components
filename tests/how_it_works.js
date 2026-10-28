@@ -1,0 +1,18 @@
+const [row, column] = $$("section.ui-hiw");
+if (!row || !column) return "two sections are missing";
+if (row.id !== "how-it-works-demo" || !row.classList.contains("ui-hiw-row") || row.querySelector("h2.ui-hiw-title")?.textContent !== "How it works") return "the id, direction or heading is missing";
+const steps = row.querySelectorAll("ol.ui-hiw-steps > li.ui-hiw-step");
+if (steps.length !== 4) return `4 steps in an ol, found ${steps.length}`;
+const mark = (s) => s.querySelector(".ui-hiw-mark").textContent.trim();
+if (mark(steps[0]) !== "1" || mark(steps[3]) !== "4" || steps[0].querySelector(".ui-hiw-mark").getAttribute("aria-hidden") !== "true") return `the numbers are ${mark(steps[0])} and ${mark(steps[3])}`;
+if (steps[1].querySelector("h3.ui-hiw-step-title")?.textContent !== "Step 2: Write a route") return `the title is ${steps[1].querySelector("h3")?.textContent}`;
+if (steps[1].querySelector(".ui-hiw-step-text")?.textContent !== "A function that returns HTML. Views and components for the rest.") return "the text is missing";
+if (new Set([...steps].map((s) => Math.round(s.getBoundingClientRect().top))).size !== 1) return "a row is not side by side";
+if (getComputedStyle(steps[0], "::before").content === "none" || getComputedStyle(steps[3], "::before").content !== "none") return "the joining line is not between steps only";
+const cs = column.querySelectorAll(".ui-hiw-step");
+if (cs.length !== 3 || !column.classList.contains("ui-hiw-column")) return "the column is missing";
+if (mark(cs[0]) !== "💳") return "an icon does not replace the number";
+if (!cs[2].querySelector(".ui-hiw-mark svg")) return "an SVG icon is not drawn";
+if (cs[0].querySelector(".ui-sr")?.textContent !== "Step 1: ") return "the number is not said with an icon";
+if (!(cs[0].getBoundingClientRect().bottom <= cs[1].getBoundingClientRect().top)) return "a column is not one under another";
+if (cs[0].querySelector(".ui-hiw-mark").getBoundingClientRect().right > cs[0].querySelector(".ui-hiw-step-title").getBoundingClientRect().left) return "in a column the circle is not beside the title";

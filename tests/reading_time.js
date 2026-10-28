@@ -1,0 +1,10 @@
+const t = $("#reading-time-demo-text");
+if (!t || t.textContent.trim() !== "4 min read") return `800 words at 200 wpm: "${t.textContent.trim()}"`;
+if (t.getAttribute("title") !== "800 words") return `the title says ${t.getAttribute("title")}`;
+if (!t.querySelector("svg") || t.querySelector("svg").getAttribute("aria-hidden") !== "true") return "no clock icon, or it is read aloud";
+const w = $("#reading-time-demo-words");
+if (w.textContent.trim() !== "7 min read" || w.querySelector("svg")) return `1850 words at 250: "${w.textContent.trim()}" (icon={false})`;
+const s = $("#reading-time-demo-short");
+if (s.textContent.trim() !== "Under a minute" || !s.classList.contains("ui-readtime-sm")) return `less: "${s.textContent.trim()}"`;
+if ($("#reading-time-demo-format").textContent.trim() !== "12 minutes to read") return "format";
+if (!$(".demo-note").textContent.includes("800 words")) return "reading_time_words";

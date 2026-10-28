@@ -1,0 +1,18 @@
+const box = $("#lazy-load-demo-box");
+const lazy = box.querySelector(".ui-lazy");
+if (!lazy) return "no LazyLoad in the box";
+const wait0 = lazy.querySelector(".ui-lazy-wait");
+if (!wait0 || wait0.getAttribute("role") !== "status" || wait0.getAttribute("aria-label") !== "Content loading") return "no placeholder status";
+if (wait0.offsetHeight < 120) return `the placeholder is ${wait0.offsetHeight}px tall, not 120`;
+if ($("#lazy-load-demo-content")) return "the content is on the page before it is scrolled to";
+if (!$(".demo-note").textContent.startsWith("Not loaded")) return "the note";
+box.scrollTop = box.scrollHeight; box.dispatchEvent(new Event("scroll")); await wait(500);
+if (!$("#lazy-load-demo-content") || $("#lazy-load-demo-content").querySelectorAll("div").length !== 3) return "scrolling near did not put the content on the page";
+if (lazy.querySelector(".ui-lazy-wait")) return "the placeholder stays";
+if (!lazy.classList.contains("ui-lazy-shown")) return "ui-lazy-shown";
+if ($(".demo-note").textContent !== "Loaded once it came near.") return `on_show: ${$(".demo-note").textContent}`;
+box.scrollTop = 0;
+const page = $$(".ui-lazy")[1];
+if (!page) return "no page-level LazyLoad";
+page.scrollIntoView(); await wait(500);
+if (!page.textContent.includes("was made when the gallery scrolled near it")) return "the page-level one did not load when scrolled into view";

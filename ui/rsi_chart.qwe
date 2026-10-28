@@ -1,0 +1,282 @@
+// RsiChart: the relative strength index of closing prices over a period (14 by
+// default, with Wilder's smoothing), from 0 to 100, with the overbought (70) and
+// oversold (30) lines and the band between them; the line turns red above the one
+// and green below the other. Under a price chart by default, or on its own. CSS only:
+// hovering shows the close and the RSI at that time, and screen readers get the
+// numbers as a table.
+//
+//   <RsiChart label="ACME, RSI 14" candles={bars} prefix="$"/>
+//   <RsiChart label="RSI 9" candles={bars} period={9} overbought={80} oversold={20} price={false}/>
+//   <RsiChart label="Index" closes={[4012.5, 4020.1, 4031.8]} labels={["Mon", "Tue", "Wed"]}/>
+//
+// candles: a list of { time, close } (OHLC candles do), oldest first, time a date or a
+// date-time; or closes: the numbers alone, with labels for the axis if wanted.
+// period: the RSI's (14); nothing shows until there are period + 1 closes.
+// overbought and oversold: where its lines are drawn (70 and 30). price: the price
+// chart above the RSI (true); height: its height in pixels (200); rsi_height: the RSI
+// pane's (110). prefix and suffix: around every price shown ("$"); decimals: digits
+// after the point of prices (2). label: what the chart shows; it names it for screen
+// readers and captions their table. show_label also writes it above the chart.
+
+let rsi_chart_css = css`
+.ui-rsi { --ui-rsi-line: light-dark(#6250d6, #9085e9); --ui-rsi-price: light-dark(#2a78d6, #3987e5);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-rsi-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-rsi-frame { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; padding-top: 8px; }
+.ui-rsi-plot { position: relative; }
+.ui-rsi-pane, .ui-rsi-yp { position: relative; height: var(--h); }
+.ui-rsi-ipane, .ui-rsi-yi { position: relative; height: var(--ih); }
+.ui-rsi-pane + .ui-rsi-ipane, .ui-rsi-yp + .ui-rsi-yi { margin-top: 18px; }
+.ui-rsi-name { position: absolute; z-index: 1; top: 2px; left: 4px; color: var(--ui-muted); font-size: 11px; font-weight: 600; pointer-events: none; }
+.ui-rsi-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-rsi-band { position: absolute; left: 0; right: 0; background: color-mix(in srgb, var(--ui-rsi-line) 8%, transparent); }
+.ui-rsi-level { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--ui-strong); }
+.ui-rsi-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.ui-rsi-svg path { fill: none; stroke-width: 1.75; stroke-linejoin: round; stroke-linecap: round; }
+.ui-rsi-price { stroke: var(--ui-rsi-price); }
+.ui-rsi-fill { fill: var(--ui-rsi-price) !important; stroke: none; opacity: .08; }
+.ui-rsi-line { stroke: var(--ui-rsi-line); }
+.ui-rsi-hot path { stroke: var(--ui-danger); }
+.ui-rsi-cold path { stroke: var(--ui-success); }
+.ui-rsi-cols { position: absolute; inset: 0; display: flex; }
+.ui-rsi-col { position: relative; flex: 1; min-width: 0; }
+.ui-rsi-col::before { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: var(--ui-strong); opacity: 0; }
+.ui-rsi-col:hover::before { opacity: .9; }
+.ui-rsi-dot { position: absolute; left: 50%; display: none; width: 7px; height: 7px; margin: -3.5px 0 0 -3.5px; border-radius: 50%;
+  background: var(--c); box-shadow: 0 0 0 2px var(--ui-bg); }
+.ui-rsi-dp { --c: var(--ui-rsi-price); } .ui-rsi-di { --c: var(--ui-rsi-line); }
+.ui-rsi-col:hover .ui-rsi-dot { display: block; }
+.ui-rsi-tip { position: absolute; z-index: 20; top: 0; left: calc(50% + 10px); display: none; min-width: 140px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-rsi-flip .ui-rsi-tip { left: auto; right: calc(50% + 10px); }
+.ui-rsi-col:hover .ui-rsi-tip { display: block; }
+.ui-rsi-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-rsi-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-rsi-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-rsi-tip .ui-rsi-state { color: var(--ui-muted); font-size: 11px; }
+.ui-rsi-tip .ui-rsi-over { color: var(--ui-danger); } .ui-rsi-tip .ui-rsi-under { color: var(--ui-success); }
+.ui-rsi-y span { position: absolute; left: 0; transform: translateY(-50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-rsi-y .ui-rsi-tag { z-index: 1; left: -4px; padding: 1px 4px; border-radius: 3px; background: var(--c); color: var(--ui-bg); font-weight: 600; }
+.ui-rsi-x { position: relative; height: 16px; margin-top: 6px; }
+.ui-rsi-x span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); white-space: nowrap; }
+.ui-rsi-x .ui-rsi-first { transform: none; }
+.ui-rsi-x .ui-rsi-end { transform: translateX(-100%); }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn rsi_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn rsi_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : rsi_chart_group(floor(n / 1000)) + "," + rsi_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn rsi_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${rsi_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${rsi_chart_group(floor(units / scale))}${tail}`
+}
+
+// A large number, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn rsi_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? rsi_chart_num(v)
+        : `${v < 0 ? "-" : ""}${rsi_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A change in percent, signed, to two decimals: "+1.25%", "-0.40%".
+fn rsi_chart_signed(p: num) -> str = `${p > 0 ? "+" : (p < 0 && round(abs(p) * 100) > 0 ? "-" : "")}${rsi_chart_num(abs(p), 2)}%`
+
+// A coordinate out of 100 (or a length), to two decimals.
+fn rsi_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The axis from lo to hi, widened to round ticks: about `steps` steps of 1, 2, 2.5 or 5 x 10^n.
+fn rsi_chart_scale(lo: num, hi: num, steps: int = 5) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo) / 10) : hi - lo
+    let raw = span / steps
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+// A candle's time as it reads: "Mar 2, 2026" for a date, "Mar 2, 14:30" for a date-time.
+fn rsi_chart_when(t) -> str =
+    type_of(t) != "str" || !date.valid(t) ? str(t) : (len(t) > 10 ? date.format(t, "MMM D, HH:mm") : date.format(t, "MMM D, YYYY"))
+
+// Where the time axis is labelled: about `limit` of { i, text }, at the starts of years,
+// months or days when the times cross them ("2026", "Mar", "Mar 2"), else every few
+// candles ("14:30", "Mar 2").
+fn rsi_chart_ticks(times: list, limit: int) -> list {
+    let n = len(times)
+    let thin = (idx: list) => {
+        let step = ceil(len(idx) / limit)
+        range(len(idx)) | filter((k) => k % step == 0) | map((k) => idx[k])
+    }
+    let spaced = (fmt_at) => {
+        let step = ceil(n / limit)
+        range(n) | filter((i) => i % step == floor(step / 2)) | map((i) => { i, text: fmt_at(i) })
+    }
+    if n == 0 { return [] }
+    if !all(times, (t) => type_of(t) == "str" && date.valid(t)) { return spaced((i) => str(times[i])) }
+    let days = times | map((t) => slice(t, 0, 10))
+    let changes = (keys: list) => range(1, n) | filter((i) => keys[i] != keys[i - 1])
+    let day_starts = changes(days)
+    let month_starts = changes(days | map((d) => slice(d, 0, 7)))
+    let year_starts = changes(days | map((d) => slice(d, 0, 4)))
+    let picked = if any(times, (t) => len(t) > 10) {
+        len(day_starts) >= 3
+            ? thin(day_starts) | map((i) => { i, text: date.format(days[i], "MMM D") })
+            : spaced((i) => index_of(day_starts, i) != null ? date.format(days[i], "MMM D") : date.format(times[i], "HH:mm"))
+    } else if len(year_starts) >= 3 && len(month_starts) > limit * 2 {
+        thin(year_starts) | map((i) => { i, text: slice(days[i], 0, 4) })
+    } else if len(month_starts) >= 2 {
+        thin(month_starts) | map((i) => { i, text: index_of(year_starts, i) != null ? slice(days[i], 0, 4) : date.format(days[i], "MMM") })
+    } else {
+        spaced((i) => date.format(days[i], "MMM D"))
+    }
+    // Starts that fall close together (a short month) keep the first.
+    let gap = n / (limit * 1.5)
+    reduce(picked, [], (kept, t) => len(kept) == 0 || t.i - kept[-1].i >= gap ? kept + [t] : kept)
+}
+
+// The RSI of each close (Wilder's): null for the first `period`, then 100 - 100 / (1 + the
+// average gain / the average loss), the averages smoothed as (last * (period - 1) + now) / period.
+fn rsi_chart_rsi(xs: list, period: int) -> list {
+    let out = []
+    let gain = 0
+    let loss = 0
+    for i in range(len(xs)) {
+        let d = i == 0 ? 0 : xs[i] - xs[i - 1]
+        let up = d > 0 ? d : 0
+        let down = d < 0 ? 0 - d : 0
+        if i > 0 && i <= period {
+            gain += up / period
+            loss += down / period
+        } else if i > period {
+            gain = (gain * (period - 1) + up) / period
+            loss = (loss * (period - 1) + down) / period
+        }
+        out = out | push(i < period || period < 1 ? null : (loss == 0 ? (gain == 0 ? 50 : 100) : 100 - 100 / (1 + gain / loss)))
+    }
+    out
+}
+
+view RsiChart(candles: list = [], closes: list? = null, labels: list? = null, period: int = 14, overbought: num = 70,
+              oversold: num = 30, price: bool = true, height: int = 200, rsi_height: int = 110, prefix: str = "",
+              suffix: str = "", decimals: int = 2, label: str = "RSI chart", show_label: bool = false, class: str? = null) {
+    style global rsi_chart_css
+    let vals = closes ?? (candles | map((c) => c.close))
+    let times = closes != null ? (labels ?? []) : (candles | map((c) => c.time))
+    let n = len(vals)
+    let rsi = rsi_chart_rsi(vals, period)
+    let sc = rsi_chart_scale(n == 0 ? 0 : min(vals), n == 0 ? 1 : max(vals), 4)
+    let y = (v) => (sc.hi - v) * 100 / (sc.hi - sc.lo)
+    let ri = (v) => 100 - v
+    let x = (i) => (i + 0.5) * 100 / n
+    let pct = (v) => rsi_chart_pct(v)
+    let money = (v) => `${v < 0 ? "-" : ""}${prefix}${rsi_chart_num(abs(v), decimals)}${suffix}`
+    let tick = (t) => `${t < 0 ? "-" : ""}${prefix}${rsi_chart_num(abs(t))}`
+    let path = (list_vals: list, at) => {
+        let idx = range(n) | filter((i) => list_vals[i] != null)
+        len(idx) == 0 ? "" : "M" + join(idx | map((i) => `${pct(x(i))},${pct(at(list_vals[i]))}`), " L")
+    }
+    let rline = path(rsi, ri)
+    let pline = path(vals, y)
+    let last_rsi = n > 0 ? rsi[-1] : null
+    let state = (v) => v == null ? "" : (v >= overbought ? "Overbought" : (v <= oversold ? "Oversold" : ""))
+    let when = (i) => i < len(times) ? rsi_chart_when(times[i]) : `${i + 1}`
+    let axis_width = max([4] + (sc.ticks | map((t) => len(tick(t)))) + [n > 0 ? len(money(vals[-1])) + 1 : 0])
+    let near = (t) => price && n > 0 && abs(y(t) - y(vals[-1])) * height < 1400
+    <figure class={ui_cls(["ui-rsi", class])} aria-label={label} style={`--h: ${height}px; --ih: ${rsi_height}px`}>
+        {show_label && <figcaption.ui-rsi-title>{label}</figcaption>}
+        <div.ui-rsi-frame aria-hidden="true">
+            <div.ui-rsi-plot>
+                {price && <div.ui-rsi-pane>
+                    {for t in sc.ticks => <span.ui-rsi-grid style={`top: ${pct(y(t))}%`}></span>}
+                    <svg.ui-rsi-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                        {n > 0 && <path.ui-rsi-fill d={`${pline} L${pct(x(n - 1))},100 L${pct(x(0))},100 Z`}/>}
+                        <path.ui-rsi-price d={pline} vector-effect="non-scaling-stroke"/>
+                    </svg>
+                </div>}
+                <div.ui-rsi-ipane>
+                    <span.ui-rsi-name>RSI {period}</span>
+                    <span.ui-rsi-band style={`top: ${pct(ri(overbought))}%; height: ${pct(overbought - oversold)}%`}></span>
+                    <span.ui-rsi-grid style="top: 50%"></span>
+                    <span.ui-rsi-level style={`top: ${pct(ri(overbought))}%`}></span>
+                    <span.ui-rsi-level style={`top: ${pct(ri(oversold))}%`}></span>
+                    <svg.ui-rsi-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                        <path.ui-rsi-line d={rline} vector-effect="non-scaling-stroke"/>
+                    </svg>
+                    <svg.ui-rsi-svg.ui-rsi-hot viewBox="0 0 100 100" preserveAspectRatio="none"
+                         style={`clip-path: inset(0 0 ${pct(100 - ri(overbought))}% 0)`}>
+                        <path d={rline} vector-effect="non-scaling-stroke"/>
+                    </svg>
+                    <svg.ui-rsi-svg.ui-rsi-cold viewBox="0 0 100 100" preserveAspectRatio="none"
+                         style={`clip-path: inset(${pct(ri(oversold))}% 0 0 0)`}>
+                        <path d={rline} vector-effect="non-scaling-stroke"/>
+                    </svg>
+                </div>
+                <div.ui-rsi-cols>
+                    {for i in range(n) => <div class={ui_cls(["ui-rsi-col", n > 1 && i >= n / 2 && "ui-rsi-flip"])}>
+                        {price && <div.ui-rsi-pane><span.ui-rsi-dot.ui-rsi-dp style={`top: ${pct(y(vals[i]))}%`}></span></div>}
+                        <div.ui-rsi-ipane>{rsi[i] != null && <span.ui-rsi-dot.ui-rsi-di style={`top: ${pct(ri(rsi[i]))}%`}></span>}</div>
+                        <span.ui-rsi-tip>
+                            <strong>{when(i)}</strong>
+                            <p>Close<b>{money(vals[i])}</b></p>
+                            <p>RSI {period}<b>{rsi[i] == null ? "—" : rsi_chart_num(rsi[i], 1)}</b></p>
+                            {state(rsi[i]) != "" && <p class={`ui-rsi-state ${rsi[i] >= overbought ? "ui-rsi-over" : "ui-rsi-under"}`}>{state(rsi[i])}</p>}
+                        </span>
+                    </div>}
+                </div>
+            </div>
+            <div.ui-rsi-y style={`width: ${axis_width}ch`}>
+                {price && <div.ui-rsi-yp>
+                    {for t in sc.ticks => !near(t) && <span style={`top: ${pct(y(t))}%`}>{tick(t)}</span>}
+                    {n > 0 && <span.ui-rsi-tag.ui-rsi-dp style={`top: ${pct(y(vals[-1]))}%`}>{money(vals[-1])}</span>}
+                </div>}
+                <div.ui-rsi-yi>
+                    {for t in [overbought, 50, oversold] => !(last_rsi != null && abs(ri(t) - ri(last_rsi)) * rsi_height < 1300) &&
+                        <span style={`top: ${pct(ri(t))}%`}>{rsi_chart_num(t)}</span>}
+                    {last_rsi != null && <span.ui-rsi-tag.ui-rsi-di style={`top: ${pct(ri(last_rsi))}%`}>{rsi_chart_num(last_rsi, 1)}</span>}
+                </div>
+            </div>
+            <div.ui-rsi-x>
+                {len(times) == n && (for t in rsi_chart_ticks(times, 7) => <span
+                    class={ui_cls([x(t.i) < 4 && "ui-rsi-first", x(t.i) > 96 && "ui-rsi-end"])} style={`left: ${pct(x(t.i))}%`}>{t.text}</span>)}
+            </div>
+            <span></span>
+        </div>
+        <table.ui-sr>
+            <caption>{label}: close and RSI {period}</caption>
+            <thead><tr><th scope="col">Time</th><th scope="col">Close</th><th scope="col">RSI</th></tr></thead>
+            <tbody>
+                {for i in range(n) => <tr>
+                    <th scope="row">{when(i)}</th><td>{money(vals[i])}</td>
+                    <td>{rsi[i] == null ? "—" : rsi_chart_num(rsi[i], 1)}{state(rsi[i]) != "" ? `, ${lower(state(rsi[i]))}` : ""}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

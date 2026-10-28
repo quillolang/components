@@ -1,0 +1,190 @@
+// SortableList: a list to put in order by dragging its items, or with the
+// keyboard: Space (or Enter) picks an item up, the arrow keys move it, Space puts
+// it down and Escape puts it back; Alt with an arrow moves the item at once.
+// Each move is announced. A plain <form> gets the values in their order, one
+// hidden input named `name` each.
+//
+//   <SortableList id="priorities" name="order" label="Your priorities"
+//                 items={["Price", "Speed", "Support", "Design"]}/>
+//   <SortableList id="steps" items={[{ label: "Write", value: "w" }, { label: "Review", value: "r" }]}
+//                 on_change={(values) => { order = values }}/>
+//
+// id: a prefix for its ids, unique on the page. items: strings, or maps of
+// { label, value, hint? } in their starting order. name: what a form gets the
+// values as. label: the list's name. numbered (true): each item shows its place.
+// hint: a line under the list.
+// on_change(values): inside one of your components, called with the values in
+// their new order after each move (once an item is put down, with the keyboard).
+
+let sortable_list_css = css`
+.ui-sortable-list { display: grid; gap: 8px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-sortable-list-label { margin: 0; font-size: 13px; font-weight: 500; }
+.ui-sortable-list-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-sortable-list-item {
+  position: relative; display: flex; align-items: center; gap: 10px; padding: 9px 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); cursor: grab; user-select: none; -webkit-user-select: none;
+  transition: border-color .15s, box-shadow .15s, transform .15s, opacity .15s;
+}
+.ui-sortable-list-item:hover { border-color: var(--ui-strong); }
+.ui-sortable-list-item:focus-visible { outline: none; box-shadow: var(--ui-focus); border-color: var(--ui-accent); }
+.ui-sortable-list-lifted { border-color: var(--ui-accent); box-shadow: var(--ui-shadow), 0 0 0 2px var(--ui-accent); transform: scale(1.01); cursor: grabbing; }
+.ui-sortable-list-dragging { opacity: .4; }
+.ui-sortable-list-before::before, .ui-sortable-list-after::after {
+  content: ""; position: absolute; left: 6px; right: 6px; height: 3px; border-radius: 2px; background: var(--ui-accent);
+}
+.ui-sortable-list-before::before { top: -5px; }
+.ui-sortable-list-after::after { bottom: -5px; }
+.ui-sortable-list-grip { flex: none; display: grid; grid-template-columns: repeat(2, 3px); gap: 3px; color: var(--ui-muted); }
+.ui-sortable-list-grip i { width: 3px; height: 3px; border-radius: 50%; background: currentColor; }
+.ui-sortable-list-num { flex: none; min-width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%;
+  background: var(--ui-subtle); color: var(--ui-muted); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-sortable-list-text { display: grid; gap: 1px; min-width: 0; }
+.ui-sortable-list-hint-item { font-size: 13px; color: var(--ui-muted); }
+.ui-sortable-list-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+@media (prefers-reduced-motion: reduce) { .ui-sortable-list-item { transition: none; } .ui-sortable-list-lifted { transform: none; } }
+`
+
+fn sortable_list_item(it) = type_of(it) == "map" ? { label: it.label ?? str(it.value), value: str(it.value ?? it.label), hint: it.hint }
+                                                 : { label: str(it), value: str(it), hint: null }
+
+// The values with `v` moved to place `to`.
+fn sortable_list_move(order: list, v: str, to: int) -> list {
+    let rest = order | filter((x) => x != v)
+    slice(rest, 0, to) + [v] + slice(rest, to, len(rest))
+}
+
+component SortableList(id: str, items: list = [], name: str? = null, label: str? = null, numbered: bool = true,
+                       hint: str? = null, on_change = null, class: str? = null) {
+    style global sortable_list_css
+    let all = items | map(sortable_list_item)
+    state order = all | map((it) => it.value)
+    state lifted = null      // the value carried by keyboard
+    state origin = null      // the order when it was picked up
+    state dragging = null    // the value being dragged
+    state over = null        // where it would go: { at, after }
+    state said = ""
+    let by_value = (v: str) => find(all, (it) => it.value == v)
+    let n = len(order)
+    let place = (o: list, v: str) => `position ${(index_of(o, v) ?? 0) + 1} of ${len(o)}`
+    let commit = (next: list, v: str) => {
+        order = next
+        said = `${by_value(v).label} moved to ${place(next, v)}.`
+        on_change && on_change(next)
+    }
+    let refocus = (e, v: str) => {
+        let list = e.target.closest(".ui-sortable-list-list")
+        js("queueMicrotask", () => {
+            let el = list.querySelector(`[data-value="${v}"]`)
+            el && el.focus()
+        })
+    }
+    <div class={ui_cls(["ui-sortable-list", class])}>
+        {label != null && <p.ui-sortable-list-label id={`${id}-label`}>{label}</p>}
+        <p.ui-sr id={`${id}-help`}>Press Space to pick up an item, the arrow keys to move it, Space to put it down or Escape to put it back.</p>
+        <ul.ui-sortable-list-list id={id} aria-labelledby={label != null ? `${id}-label` : null} aria-describedby={`${id}-help`}
+            @dragover={(e) => { if dragging != null { e.preventDefault() } }}
+            @drop={(e) => {
+                e.preventDefault()
+                if dragging != null && over != null {
+                    let v = dragging
+                    let target = over.at + (over.after ? 1 : 0)
+                    let from = index_of(order, v) ?? 0
+                    let to = from < target ? target - 1 : target
+                    dragging = null
+                    over = null
+                    if to != from { commit(sortable_list_move(order, v, to), v) }
+                }
+            }}>
+            {for [i, v] in enumerate(order) => {
+                let it = by_value(v)
+                <li key={v} data-value={v} tabindex="0" draggable="true" aria-roledescription="sortable item"
+                    aria-label={lifted == v ? `${it.label}, picked up, ${place(order, v)}` : null}
+                    class={ui_cls(["ui-sortable-list-item", lifted == v && "ui-sortable-list-lifted", dragging == v && "ui-sortable-list-dragging",
+                                   dragging != null && over != null && over.at == i && !over.after && "ui-sortable-list-before",
+                                   dragging != null && over != null && over.at == i && over.after && "ui-sortable-list-after"])}
+                    @dragstart={(e) => {
+                        dragging = v
+                        lifted = null
+                        e.dataTransfer.effectAllowed = "move"
+                        e.dataTransfer.setData("text/plain", v)
+                    }}
+                    @dragend={() => {
+                        dragging = null
+                        over = null
+                    }}
+                    @dragover={(e) => {
+                        if dragging != null {
+                            e.preventDefault()
+                            let r = e.target.closest(".ui-sortable-list-item").getBoundingClientRect()
+                            let after = e.clientY > r.top + r.height / 2
+                            if over == null || over.at != i || over.after != after { over = { at: i, after } }
+                        }
+                    }}
+                    @keydown={(e) => {
+                        let k = e.key
+                        let at = index_of(order, v) ?? 0
+                        let step = k == "ArrowUp" ? -1 : k == "ArrowDown" ? 1 : k == "Home" ? 0 - at : k == "End" ? n - 1 - at : 0
+                        if e.target.tagName != "LI" {
+                            null
+                        } else if lifted == v {
+                            if step != 0 && at + step >= 0 && at + step < n {
+                                e.preventDefault()
+                                order = sortable_list_move(order, v, at + step)
+                                said = place(order, v)
+                                refocus(e, v)
+                            } else if step != 0 {
+                                e.preventDefault()
+                            } else if k == " " || k == "Enter" {
+                                e.preventDefault()
+                                lifted = null
+                                if order != origin { commit(order, v) } else { said = `${it.label} put down where it was.` }
+                            } else if k == "Escape" {
+                                e.preventDefault()
+                                order = origin
+                                lifted = null
+                                said = `${it.label} put back in ${place(origin, v)}.`
+                                refocus(e, v)
+                            }
+                        } else if k == " " || k == "Enter" {
+                            e.preventDefault()
+                            lifted = v
+                            origin = order
+                            said = `${it.label} picked up, ${place(order, v)}.`
+                        } else if e.altKey && (k == "ArrowUp" || k == "ArrowDown") {
+                            e.preventDefault()
+                            if at + step >= 0 && at + step < n {
+                                commit(sortable_list_move(order, v, at + step), v)
+                                refocus(e, v)
+                            }
+                        } else if step != 0 {
+                            let to = order[at + step]
+                            if to != null && at + step >= 0 {
+                                e.preventDefault()
+                                refocus(e, to)
+                            }
+                        }
+                    }}
+                    @blur={(e) => {
+                        let list = e.target.closest(".ui-sortable-list-list")
+                        js("queueMicrotask", () => {
+                            let now = list.ownerDocument.activeElement
+                            if lifted == v && (now == null || now.dataset == null || now.dataset.value != v) {
+                                lifted = null
+                                if order != origin { commit(order, v) }
+                            }
+                        })
+                    }}>
+                    <span.ui-sortable-list-grip aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></span>
+                    {numbered && <span.ui-sortable-list-num aria-hidden="true">{i + 1}</span>}
+                    <span.ui-sortable-list-text>
+                        <span>{it.label}</span>
+                        {it.hint != null && <span.ui-sortable-list-hint-item>{it.hint}</span>}
+                    </span>
+                </li>
+            }}
+        </ul>
+        {name != null && <div hidden>{for v in order => <input key={v} type="hidden" name={name} value={v}/>}</div>}
+        <p.ui-sr aria-live="assertive">{said}</p>
+        {hint != null && <p.ui-sortable-list-hint>{hint}</p>}
+    </div>
+}

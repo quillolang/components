@@ -1,0 +1,18 @@
+const [news, live, status] = $$(".ui-ticker");
+if (!news || !live || !status) return "expected three tickers";
+if (news.getAttribute("role") !== "marquee" || news.getAttribute("aria-label") !== "Breaking") return "the ticker has no role or label";
+if (news.querySelector(".ui-ticker-label")?.textContent !== "Breaking") return "the label is not shown";
+const lists = news.querySelectorAll(".ui-ticker-list");
+if (lists.length !== 2 || lists[1].getAttribute("aria-hidden") !== "true") return "the items are not drawn twice with the copy hidden";
+const items = [...lists[0].querySelectorAll("li")];
+if (items.length !== 5 || items[1].textContent !== "Rain expected along the coast tonight") return `the items: ${items.map((i) => i.textContent)}`;
+const a = items[0].querySelector("a");
+if (!a || a.getAttribute("href") !== "https://quillolang.org/blog/0.5") return "an item with href is not a link";
+if (items[1].querySelector("a")) return "a plain item is a link";
+if (lists[1].querySelector("a").tabIndex !== -1) return "links in the hidden copy can take focus";
+const cs = getComputedStyle(news.querySelector(".ui-ticker-track"));
+if (cs.animationName !== "ui-ticker" || cs.animationDuration !== "28s") return `the animation is ${cs.animationName} ${cs.animationDuration}`;
+const x1 = news.querySelector(".ui-ticker-track").getBoundingClientRect().left; await wait(400);
+if (news.querySelector(".ui-ticker-track").getBoundingClientRect().left >= x1) return "the headlines do not move";
+if (!live.classList.contains("ui-ticker-danger") || getComputedStyle(live.querySelector(".ui-ticker-label")).backgroundColor === getComputedStyle(news.querySelector(".ui-ticker-label")).backgroundColor) return "tone danger does not colour the label";
+if (status.getAttribute("aria-label") !== "Service status") return "name does not set the screen-reader label";

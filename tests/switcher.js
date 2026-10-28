@@ -1,0 +1,12 @@
+const rects = (id) => [...$(id).children].map((c) => c.getBoundingClientRect());
+const three = rects("#switcher-demo-three");
+if (three.length !== 3) return "expected three items";
+if (new Set(three.map((r) => Math.round(r.top))).size !== 1) return "wide, the three are not on one line";
+if (Math.abs(three[0].width - three[2].width) > 1) return `wide, the items are ${three.map((r) => r.width)} wide`;
+const narrow = rects("#switcher-demo-narrow");
+if (narrow[1].top < narrow[0].bottom - 1 || narrow[2].top < narrow[1].bottom - 1) return "in a 400px box the items did not stack";
+if (narrow[0].width < 390) return "stacked, an item is not as wide as the box";
+const many = rects("#switcher-demo-many");
+if (many.length !== 5) return "expected five items";
+if (new Set(many.map((r) => Math.round(r.top))).size !== 5) return "limit={4} did not stack five items";
+if (getComputedStyle($("#switcher-demo-many")).columnGap !== "8px") return "gap=\"sm\" is not applied";

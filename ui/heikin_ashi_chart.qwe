@@ -1,0 +1,320 @@
+// HeikinAshiChart: Heikin-Ashi candles, worked out from OHLC candles: each one's close
+// is the average of the period's open, high, low and close, and its open the middle of
+// the candle before, so runs of one colour show a trend and its noise is smoothed
+// away. With a volume pane, a date axis, moving averages and the last close's line.
+// CSS only: hovering a candle shows its Heikin-Ashi open, high, low and close beside
+// the real close and change, and screen readers get the numbers as a table.
+//
+//   <HeikinAshiChart label="ACME, Heikin-Ashi" candles={bars}/>
+//   <HeikinAshiChart label="ETH-USD" candles={hourly} volume={false} decimals={1} ema={[21]}/>
+//
+// candles: the real candles, a list of { time, open, high, low, close, volume },
+// oldest first. time is a date ("2026-03-02") or a date-time ("2026-03-02T14:00:00Z",
+// shown as written); volume may be left out. Heikin-Ashi: close = (open + high + low +
+// close) / 4; open = (the last one's open + close) / 2, the first one's (open + close)
+// / 2; high and low the highest and lowest of the real high or low and these two.
+// sma and ema: periods of simple and exponential moving averages of the real close,
+// each a line of its own colour, named in a legend. volume: the volume pane (true);
+// volume_height: its height in pixels (64). height: the price pane's (300).
+// last_line: a dashed line at the real last close, with its price on the axis (true).
+// prefix and suffix: around every price shown ("$"); decimals: digits after the point
+// of prices (2). label: what the chart shows; it names it for screen readers and
+// captions their table. show_label also writes it above the chart.
+
+let heikin_ashi_chart_css = css`
+.ui-ha { --ui-ha-1: light-dark(#2a78d6, #3987e5); --ui-ha-2: light-dark(#eb6834, #d95926);
+  --ui-ha-3: light-dark(#1baf7a, #199e70); --ui-ha-4: light-dark(#eda100, #c98500);
+  --ui-ha-5: light-dark(#e87ba4, #d55181); --ui-ha-6: light-dark(#008300, #008300);
+  --ui-ha-7: light-dark(#6250d6, #9085e9); --ui-ha-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-ha-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-ha-s1 { --c: var(--ui-ha-1); } .ui-ha-s2 { --c: var(--ui-ha-2); } .ui-ha-s3 { --c: var(--ui-ha-3); }
+.ui-ha-s4 { --c: var(--ui-ha-4); } .ui-ha-s5 { --c: var(--ui-ha-5); } .ui-ha-s6 { --c: var(--ui-ha-6); }
+.ui-ha-s7 { --c: var(--ui-ha-7); } .ui-ha-s8 { --c: var(--ui-ha-8); }
+.ui-ha-up { --k: var(--ui-success); } .ui-ha-down { --k: var(--ui-danger); }
+.ui-ha-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-ha-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.ui-ha-key { width: 14px; height: 3px; border-radius: 2px; background: var(--c); flex: none; }
+.ui-ha-frame { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; padding-top: 8px; }
+.ui-ha-plot { position: relative; }
+.ui-ha-pane, .ui-ha-cp { position: relative; height: var(--h); }
+.ui-ha-vpane, .ui-ha-cv { position: relative; height: var(--vh); margin-top: 16px; }
+.ui-ha-vpane { border-top: 1px solid color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-ha-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-ha-svg { position: absolute; z-index: 2; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.ui-ha-ma { fill: none; stroke: var(--c); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.ui-ha-last { position: absolute; z-index: 1; left: 0; right: 0; border-top: 1px dashed var(--k); opacity: .75; pointer-events: none; }
+.ui-ha-cols { position: absolute; inset: 0; display: flex; }
+.ui-ha-col { position: relative; flex: 1; min-width: 0; }
+.ui-ha-col::before { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: var(--ui-strong); opacity: 0; }
+.ui-ha-col:hover { background: color-mix(in srgb, var(--ui-subtle) 70%, transparent); }
+.ui-ha-col:hover::before { opacity: .8; }
+.ui-ha-wick { position: absolute; left: 50%; width: 1px; margin-left: -.5px; background: var(--k); }
+.ui-ha-body { position: absolute; left: 16%; right: 16%; min-height: 1px; border-radius: 1px; background: var(--k); }
+.ui-ha-vol { position: absolute; bottom: 0; left: 16%; right: 16%; min-height: 1px; border-radius: 1px 1px 0 0; background: var(--k); opacity: .35; }
+.ui-ha-col:hover .ui-ha-vol { opacity: .7; }
+.ui-ha-tip { position: absolute; z-index: 20; top: 0; left: calc(50% + 10px); display: none; min-width: 150px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-ha-flip .ui-ha-tip { left: auto; right: calc(50% + 10px); }
+.ui-ha-col:hover .ui-ha-tip { display: block; }
+.ui-ha-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-ha-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-ha-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-ha-tip .ui-ha-chg b { color: var(--k); }
+.ui-ha-y { position: relative; }
+.ui-ha-y > div { position: relative; }
+.ui-ha-y span { position: absolute; left: 0; transform: translateY(-50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-ha-y .ui-ha-tag { z-index: 1; left: -4px; padding: 1px 4px; border-radius: 3px; background: var(--k); color: var(--ui-bg); font-weight: 600; }
+.ui-ha-x { position: relative; height: 16px; margin-top: 6px; }
+.ui-ha-x span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); white-space: nowrap; }
+.ui-ha-x .ui-ha-first { transform: none; }
+.ui-ha-x .ui-ha-end { transform: translateX(-100%); }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn heikin_ashi_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn heikin_ashi_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : heikin_ashi_chart_group(floor(n / 1000)) + "," + heikin_ashi_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn heikin_ashi_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${heikin_ashi_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${heikin_ashi_chart_group(floor(units / scale))}${tail}`
+}
+
+// A large number, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn heikin_ashi_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? heikin_ashi_chart_num(v)
+        : `${v < 0 ? "-" : ""}${heikin_ashi_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A change in percent, signed, to two decimals: "+1.25%", "-0.40%".
+fn heikin_ashi_chart_signed(p: num) -> str = `${p > 0 ? "+" : (p < 0 && round(abs(p) * 100) > 0 ? "-" : "")}${heikin_ashi_chart_num(abs(p), 2)}%`
+
+// A coordinate out of 100 (or a length), to two decimals.
+fn heikin_ashi_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The axis from lo to hi, widened to round ticks: about `steps` steps of 1, 2, 2.5 or 5 x 10^n.
+fn heikin_ashi_chart_scale(lo: num, hi: num, steps: int = 5) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo) / 10) : hi - lo
+    let raw = span / steps
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+// A candle's time as it reads: "Mar 2, 2026" for a date, "Mar 2, 14:30" for a date-time.
+fn heikin_ashi_chart_when(t) -> str =
+    type_of(t) != "str" || !date.valid(t) ? str(t) : (len(t) > 10 ? date.format(t, "MMM D, HH:mm") : date.format(t, "MMM D, YYYY"))
+
+// Where the time axis is labelled: about `limit` of { i, text }, at the starts of years,
+// months or days when the times cross them ("2026", "Mar", "Mar 2"), else every few
+// candles ("14:30", "Mar 2").
+fn heikin_ashi_chart_ticks(times: list, limit: int) -> list {
+    let n = len(times)
+    let thin = (idx: list) => {
+        let step = ceil(len(idx) / limit)
+        range(len(idx)) | filter((k) => k % step == 0) | map((k) => idx[k])
+    }
+    let spaced = (fmt_at) => {
+        let step = ceil(n / limit)
+        range(n) | filter((i) => i % step == floor(step / 2)) | map((i) => { i, text: fmt_at(i) })
+    }
+    if n == 0 { return [] }
+    if !all(times, (t) => type_of(t) == "str" && date.valid(t)) { return spaced((i) => str(times[i])) }
+    let days = times | map((t) => slice(t, 0, 10))
+    let changes = (keys: list) => range(1, n) | filter((i) => keys[i] != keys[i - 1])
+    let day_starts = changes(days)
+    let month_starts = changes(days | map((d) => slice(d, 0, 7)))
+    let year_starts = changes(days | map((d) => slice(d, 0, 4)))
+    let picked = if any(times, (t) => len(t) > 10) {
+        len(day_starts) >= 3
+            ? thin(day_starts) | map((i) => { i, text: date.format(days[i], "MMM D") })
+            : spaced((i) => index_of(day_starts, i) != null ? date.format(days[i], "MMM D") : date.format(times[i], "HH:mm"))
+    } else if len(year_starts) >= 3 && len(month_starts) > limit * 2 {
+        thin(year_starts) | map((i) => { i, text: slice(days[i], 0, 4) })
+    } else if len(month_starts) >= 2 {
+        thin(month_starts) | map((i) => { i, text: index_of(year_starts, i) != null ? slice(days[i], 0, 4) : date.format(days[i], "MMM") })
+    } else {
+        spaced((i) => date.format(days[i], "MMM D"))
+    }
+    // Starts that fall close together (a short month) keep the first.
+    let gap = n / (limit * 1.5)
+    reduce(picked, [], (kept, t) => len(kept) == 0 || t.i - kept[-1].i >= gap ? kept + [t] : kept)
+}
+
+// The simple moving average of `period` values, null until there are that many.
+fn heikin_ashi_chart_sma(xs: list, period: int) -> list {
+    let out = []
+    let total = 0
+    for i in range(len(xs)) {
+        total += xs[i]
+        if i >= period { total -= xs[i - period] }
+        out = out | push(i + 1 >= period ? total / period : null)
+    }
+    out
+}
+
+// The exponential moving average of `period` values (k = 2 / (period + 1)), started
+// from the simple average of the first `period`; null before that.
+fn heikin_ashi_chart_ema(xs: list, period: int) -> list {
+    let k = 2 / (period + 1)
+    let out = []
+    let prev = null
+    for i in range(len(xs)) {
+        if i + 1 == period {
+            prev = sum(take(xs, period)) / period
+        } else if i + 1 > period {
+            prev = xs[i] * k + prev * (1 - k)
+        }
+        out = out | push(prev)
+    }
+    out
+}
+
+// Heikin-Ashi candles from real ones, each keeping the real close as `real`.
+fn heikin_ashi_chart_candles(candles: list) -> list {
+    let out = []
+    for c in candles {
+        let close = (c.open + c.high + c.low + c.close) / 4
+        let open = len(out) == 0 ? (c.open + c.close) / 2 : (out[-1].open + out[-1].close) / 2
+        out = out | push({ time: c.time, open, high: max([c.high, open, close]), low: min([c.low, open, close]), close,
+                           volume: c.volume, real: c.close })
+    }
+    out
+}
+
+view HeikinAshiChart(candles: list, sma: list = [], ema: list = [], volume: bool = true, height: int = 300,
+                      volume_height: int = 64, last_line: bool = true, prefix: str = "", suffix: str = "",
+                      decimals: int = 2, label: str = "Heikin-Ashi chart", show_label: bool = false,
+                      class: str? = null) {
+    style global heikin_ashi_chart_css
+    let bars = heikin_ashi_chart_candles(candles)
+    let n = len(bars)
+    let closes = bars | map((c) => c.real)
+    let lines = (sma | map((p) => { name: `SMA ${p}`, values: heikin_ashi_chart_sma(closes, p) }))
+        + (ema | map((p) => { name: `EMA ${p}`, values: heikin_ashi_chart_ema(closes, p) }))
+    let hues = [1, 2, 7, 4, 5, 3, 6, 8]
+    let known = flatten(bars | map((c) => [c.low, c.high])) + flatten(lines | map((l) => l.values | filter((v) => v != null)))
+    let sc = heikin_ashi_chart_scale(n == 0 ? 0 : min(known), n == 0 ? 1 : max(known), 5)
+    let y = (v) => (sc.hi - v) * 100 / (sc.hi - sc.lo)
+    let x = (i) => (i + 0.5) * 100 / n
+    let pct = (v) => heikin_ashi_chart_pct(v)
+    let vols = bars | map((c) => c.volume ?? 0)
+    let vtop = max([0] + vols)
+    let price = (v) => v == null ? "—" : `${v < 0 ? "-" : ""}${prefix}${heikin_ashi_chart_num(abs(v), decimals)}${suffix}`
+    let tick = (t) => `${t < 0 ? "-" : ""}${prefix}${heikin_ashi_chart_num(abs(t))}`
+    let change = (i) => {
+        let before = i > 0 ? bars[i - 1].real : candles[i].open
+        before != 0 ? (bars[i].real - before) * 100 / before : 0
+    }
+    let side = (up) => up ? "ui-ha-up" : "ui-ha-down"
+    let last = n > 0 ? bars[-1] : null
+    let axis_width = max([4] + (sc.ticks | map((t) => len(tick(t)))) + [last != null ? len(price(last.real)) + 1 : 0])
+    let line_path = (vals: list) => {
+        let at = range(n) | filter((i) => vals[i] != null)
+        len(at) == 0 ? "" : "M" + join(at | map((i) => `${pct(x(i))},${pct(y(vals[i]))}`), " L")
+    }
+    <figure class={ui_cls(["ui-ha", class])} aria-label={label}
+            style={`--h: ${height}px; --vh: ${volume ? volume_height : 0}px`}>
+        {show_label && <figcaption.ui-ha-title>{label}</figcaption>}
+        {len(lines) > 0 && <ul.ui-ha-legend aria-hidden="true">
+            {for [j, l] in enumerate(lines) => <li><span class={`ui-ha-key ui-ha-s${hues[j % 8]}`}></span>{l.name}</li>}
+        </ul>}
+        <div.ui-ha-frame aria-hidden="true">
+            <div.ui-ha-plot>
+                <div.ui-ha-pane>
+                    {for t in sc.ticks => <span.ui-ha-grid style={`top: ${pct(y(t))}%`}></span>}
+                    {last_line && last != null && <span class={`ui-ha-last ${side(change(n - 1) >= 0)}`}
+                                                        style={`top: ${pct(y(last.real))}%`}></span>}
+                    {len(lines) > 0 && <svg.ui-ha-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                        {for [j, l] in enumerate(lines) => <path class={`ui-ha-ma ui-ha-s${hues[j % 8]}`} d={line_path(l.values)}
+                                                                 vector-effect="non-scaling-stroke"/>}
+                    </svg>}
+                </div>
+                {volume && <div.ui-ha-vpane></div>}
+                <div.ui-ha-cols>
+                    {for [i, c] in enumerate(bars) => <div class={ui_cls(["ui-ha-col", side(c.close >= c.open), n > 1 && i >= n / 2 && "ui-ha-flip"])}>
+                        <div.ui-ha-cp>
+                            <span.ui-ha-wick style={`top: ${pct(y(c.high))}%; height: ${pct(y(c.low) - y(c.high))}%`}></span>
+                            <span.ui-ha-body style={`top: ${pct(y(max([c.open, c.close])))}%; height: ${pct(abs(y(c.open) - y(c.close)))}%`}></span>
+                        </div>
+                        {volume && <div.ui-ha-cv>
+                            <span.ui-ha-vol style={`height: ${vtop > 0 ? pct(vols[i] * 100 / vtop) : 0}%`}></span>
+                        </div>}
+                        <span.ui-ha-tip>
+                            <strong>{heikin_ashi_chart_when(c.time)}</strong>
+                            <p>HA open<b>{price(c.open)}</b></p>
+                            <p>HA high<b>{price(c.high)}</b></p>
+                            <p>HA low<b>{price(c.low)}</b></p>
+                            <p>HA close<b>{price(c.close)}</b></p>
+                            <p>Close<b>{price(c.real)}</b></p>
+                            <p class={`ui-ha-chg ${side(change(i) >= 0)}`}>Change<b>{heikin_ashi_chart_signed(change(i))}</b></p>
+                            {volume && <p>Volume<b>{heikin_ashi_chart_num(vols[i], 0)}</b></p>}
+                            {for [j, l] in enumerate(lines) => <p>
+                                <span class={`ui-ha-key ui-ha-s${hues[j % 8]}`}></span>{l.name}<b>{price(l.values[i])}</b>
+                            </p>}
+                        </span>
+                    </div>}
+                </div>
+            </div>
+            <div.ui-ha-y style={`width: ${axis_width}ch`}>
+                <div style="height: var(--h)">
+                    {for t in sc.ticks => !(last_line && last != null && abs(y(t) - y(last.real)) * height < 1400) &&
+                        <span style={`top: ${pct(y(t))}%`}>{tick(t)}</span>}
+                    {last_line && last != null && <span class={`ui-ha-tag ${side(change(n - 1) >= 0)}`}
+                                                        style={`top: ${pct(y(last.real))}%`}>{price(last.real)}</span>}
+                </div>
+                {volume && <div style="height: var(--vh); margin-top: 16px">
+                    {vtop > 0 && <span style="top: 2px; transform: none">{heikin_ashi_chart_short(vtop)}</span>}
+                </div>}
+            </div>
+            <div.ui-ha-x>
+                {for t in heikin_ashi_chart_ticks(bars | map((c) => c.time), 7) => <span class={ui_cls([x(t.i) < 4 && "ui-ha-first", x(t.i) > 96 && "ui-ha-end"])}
+                                                                               style={`left: ${pct(x(t.i))}%`}>{t.text}</span>}
+            </div>
+            <span></span>
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr>
+                <th scope="col">Time</th><th scope="col">HA open</th><th scope="col">HA high</th>
+                <th scope="col">HA low</th><th scope="col">HA close</th><th scope="col">Close</th>
+                {volume && <th scope="col">Volume</th>}
+            </tr></thead>
+            <tbody>
+                {for [i, c] in enumerate(bars) => <tr>
+                    <th scope="row">{heikin_ashi_chart_when(c.time)}</th>
+                    <td>{price(c.open)}</td><td>{price(c.high)}</td><td>{price(c.low)}</td><td>{price(c.close)}</td><td>{price(c.real)}</td>
+                    {volume && <td>{heikin_ashi_chart_num(vols[i], 0)}</td>}
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

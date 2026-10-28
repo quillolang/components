@@ -1,0 +1,18 @@
+const g = $("#stat-group-demo-sales");
+if (!g || g.getAttribute("role") !== "group" || g.getAttribute("aria-label") !== "This month") return "the group is not named";
+const items = [...g.querySelectorAll(".ui-statgroup-item")];
+if (items.length !== 4) return `expected 4 stats, found ${items.length}`;
+if (items[0].querySelector(".ui-statgroup-label").textContent !== "Revenue" || items[0].querySelector(".ui-statgroup-value").textContent !== "$48,210") return "label and value";
+const delta = (i) => items[i].querySelector(".ui-statgroup-delta");
+if (!items[0].classList.contains("ui-statgroup-good") || delta(0).textContent.replace(/\s+/g, "") !== "↑up+12.5%") return `the first delta reads "${delta(0).textContent.trim()}"`;
+if (!items[1].classList.contains("ui-statgroup-bad") || !delta(1).textContent.includes("-3.2%")) return "a fall is not bad";
+if (!items[2].classList.contains("ui-statgroup-bad") || !delta(2).textContent.includes("+8%")) return 'good="down" does not make a rise bad';
+if (!items[3].classList.contains("ui-statgroup-flat") || !delta(3).textContent.includes("→")) return "zero is not flat";
+if (items[0].querySelector(".ui-statgroup-foot > span:last-child").textContent !== "vs last month") return "the hint is missing";
+const cs = getComputedStyle(items[0]);
+if (!/\d/.test(cs.borderLeftWidth) || cs.gridColumnStart === "span 2") return "a stat is not laid out";
+const tracks = (el) => getComputedStyle(el).gridTemplateColumns.split(" ").filter((t) => t !== "0px");
+if (tracks(g).length !== 4) return `the four stats are not in one row: ${getComputedStyle(g).gridTemplateColumns}`;
+const s = $("#stat-group-demo-site");
+if (tracks(s).length !== 3) return "columns={3}";
+if (s.querySelectorAll(".ui-statgroup-delta").length !== 1 || !s.querySelector(".ui-statgroup-good")) return "a lower bounce rate with good=down is not good";

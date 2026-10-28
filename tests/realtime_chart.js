@@ -1,0 +1,42 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const fig = $("figure.ui-realtime");
+if (!fig) return "no realtime chart";
+if (/NaN|Infinity|undefined/.test(fig.innerHTML)) return "the chart has NaN, Infinity or undefined in it";
+const note = () => $(".demo-note").textContent;
+const count = () => Number(note().match(/^(\d+)/)[1]);
+const pts = () => fig.querySelector(".ui-realtime-line").getAttribute("d").slice(1).split(" L").map((p) => p.split(",").map(Number));
+const n0 = count(), p0 = pts();
+if (p0.length !== Math.min(n0, 60)) return `${n0} values drew ${p0.length} points`;
+// The newest point is at the right; the window of 60 fills from the right.
+if (p0[p0.length - 1][0] !== 100 || Math.abs(p0[0][0] - (60 - p0.length) * 100 / 59) > 0.01) return `points run from ${p0[0][0]} to ${p0[p0.length - 1][0]}`;
+const ticks = [...fig.querySelectorAll(".ui-realtime-y span")].map((s) => s.textContent).join();
+if (ticks !== "0,25,50,75,100") return `low={0} high={100}: ${ticks}`;
+const rows = [...fig.querySelectorAll("tbody tr")];
+if (fig.querySelector(".ui-realtime-now").textContent !== rows[rows.length - 1].querySelector("td").textContent) return "the latest value is not written above";
+if (!/^\d+\.\d%$/.test(fig.querySelector(".ui-realtime-now").textContent)) return "decimals={1} and the suffix";
+// New values come every second and the line moves on.
+await wait(2300);
+const n1 = count(), p1 = pts();
+if (n1 < n0 + 2) return `the demo did not add values: ${n0} then ${n1}`;
+if (p1.length !== Math.min(n1, 60)) return "the chart does not follow its values";
+if (p1[p1.length - 1][0] !== 100) return "the newest point is not at the right";
+if (p0.length < 60 ? p1[0][0] >= p0[0][0] : p1[p1.length - 1 - (n1 - n0)][1] !== p0[p0.length - 1][1]) return "the line does not scroll left";
+// Pause holds the picture while values keep coming.
+const btn = fig.querySelector(".ui-realtime-pause");
+if (btn.getAttribute("aria-pressed") !== "false" || btn.textContent !== "Pause") return "the pause button";
+btn.click(); await wait();
+if (btn.getAttribute("aria-pressed") !== "true" || btn.textContent !== "Resume") return "Pause is not pressed";
+if (!note().includes("paused")) return "on_pause did not reach the note";
+if (!fig.classList.contains("ui-realtime-paused") || !fig.querySelector(".ui-realtime-live").textContent.includes("Paused")) return "it does not say it is paused";
+const held = fig.querySelector(".ui-realtime-line").getAttribute("d");
+await wait(1300);
+if (count() <= n1) return "values stopped coming while paused";
+if (fig.querySelector(".ui-realtime-line").getAttribute("d") !== held) return "the line moved while paused";
+btn.click(); await wait();
+if (fig.querySelector(".ui-realtime-line").getAttribute("d") === held) return "Resume does not catch up";
+if (note().includes("paused")) return "on_pause(false) did not reach the note";
+const cols = fig.querySelectorAll(".ui-realtime-col");
+if (cols.length !== pts().length) return "not a hover column per point";
+const tip = cols[cols.length - 1].querySelector(".ui-realtime-tip");
+if (getComputedStyle(tip).display !== "none" || !tip.textContent.startsWith("0")) return `the newest point's tooltip: ${tip.textContent}`;
+if (!fig.querySelector(".ui-realtime-frame").hasAttribute("aria-hidden")) return "the drawing is not hidden from screen readers";

@@ -1,0 +1,187 @@
+// StreamGraph: several series stacked as flowing layers around a centre line, so
+// the whole's size and each part's share can be followed over time (listening by
+// genre, traffic by source). CSS only: hovering a moment shows every layer's value
+// there, and screen readers get the numbers as a table.
+//
+//   <StreamGraph label="Plays by genre" labels={weeks} series={[
+//       { name: "Pop", values: pop }, { name: "Rock", values: rock }, { name: "Jazz", values: jazz }]}/>
+//   <StreamGraph label="Visits by source" labels={days} series={sources} offset="wiggle" height={180}/>
+//
+// labels: the moments, in order (when there are many, only some are written under
+// it). series: a list of { name, values }, one value per label (up to eight, each
+// in a colour of its own, with a legend); a null or negative value counts as 0.
+// offset: "center" (default), the layers piled evenly either side of the centre
+// line; "wiggle", moved up and down to keep the layers as flat as can be (Byron and
+// Wattenberg's streamgraph), with no centre line; or "zero", stacked up from a
+// baseline. prefix and suffix: around every value shown ("$", " GB"); decimals:
+// digits after the point, always, instead of up to two as needed. height: the
+// plot's height in pixels (220). label: what the chart shows; it names it for screen
+// readers and captions their table. show_label also writes it above.
+
+let stream_graph_css = css`
+.ui-stream {
+  --ui-stream-1: light-dark(#2a78d6, #3987e5); --ui-stream-2: light-dark(#eb6834, #d95926);
+  --ui-stream-3: light-dark(#1baf7a, #199e70); --ui-stream-4: light-dark(#eda100, #c98500);
+  --ui-stream-5: light-dark(#e87ba4, #d55181); --ui-stream-6: light-dark(#008300, #008300);
+  --ui-stream-7: light-dark(#6250d6, #9085e9); --ui-stream-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg);
+  container-type: inline-size; }
+.ui-stream-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-stream-s1 { --c: var(--ui-stream-1); } .ui-stream-s2 { --c: var(--ui-stream-2); } .ui-stream-s3 { --c: var(--ui-stream-3); }
+.ui-stream-s4 { --c: var(--ui-stream-4); } .ui-stream-s5 { --c: var(--ui-stream-5); } .ui-stream-s6 { --c: var(--ui-stream-6); }
+.ui-stream-s7 { --c: var(--ui-stream-7); } .ui-stream-s8 { --c: var(--ui-stream-8); }
+.ui-stream-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-stream-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.ui-stream-key { width: 10px; height: 10px; border-radius: 3px; background: var(--c); flex: none; }
+.ui-stream-plot { position: relative; margin-top: 4px; }
+.ui-stream-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.ui-stream-layer { fill: var(--c); fill-opacity: .85; stroke: var(--ui-bg); stroke-width: .75; transition: fill-opacity .15s ease; }
+.ui-stream-centre { position: absolute; left: 0; right: 0; height: 0; border-top: 1px dashed var(--ui-bg); opacity: .7; }
+.ui-stream-cols { position: absolute; inset: 0; display: flex; }
+.ui-stream-col { position: relative; flex: 1; min-width: 0; }
+.ui-stream-col::before { content: ""; position: absolute; top: 0; bottom: 0; left: var(--x, 50%); width: 1px; background: var(--ui-fg); opacity: 0; }
+.ui-stream-col:first-child:not(:last-child) { flex: .5; --x: 0%; }
+.ui-stream-col:last-child:not(:first-child) { flex: .5; --x: 100%; }
+.ui-stream-col:hover::before { opacity: .5; }
+.ui-stream-col:hover .ui-stream-tip { display: block; }
+.ui-stream-tip { position: absolute; z-index: 20; display: none; min-width: 120px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-stream-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-stream-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-stream-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-stream-tip { top: 0; left: calc(var(--x, 50%) + 10px); }
+.ui-stream-flip .ui-stream-tip { left: auto; right: calc(100% - var(--x, 50%) + 10px); }
+.ui-stream-tip .ui-stream-key { width: 8px; height: 8px; }
+.ui-stream-tip .ui-stream-sum { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--ui-border); }
+.ui-stream-x { position: relative; height: 16px; margin-top: 6px; }
+.ui-stream-x span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); white-space: nowrap; }
+.ui-stream-x .ui-stream-first { transform: none; }
+.ui-stream-x .ui-stream-last { transform: translateX(-100%); }
+@container (max-width: 520px) { .ui-stream-x .ui-stream-alt { display: none; } }
+@media (prefers-reduced-motion: reduce) { .ui-stream-layer { transition: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn stream_graph_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn stream_graph_group(n: int) -> str =
+    n < 1000 ? str(n) : stream_graph_group(floor(n / 1000)) + "," + stream_graph_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn stream_graph_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${stream_graph_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${stream_graph_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate or a percentage for CSS and SVG, to two decimals.
+fn stream_graph_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The bottom of the pile at each moment, for values[j][i] (series j, moment i):
+// "center" puts the middle of the pile on 0; "wiggle" moves it so the layers'
+// slopes are least (d3's stackOffsetWiggle); "zero" starts every pile at 0.
+fn stream_graph_base(values: list, m: int, offset: str) -> list {
+    let k = len(values)
+    let totals = for i in range(m) => sum(for j in range(k) => values[j][i])
+    if offset == "zero" { return for i in range(m) => 0 }
+    if offset != "wiggle" { return for t in totals => -t / 2 }
+    let base = [0]
+    let y = 0
+    for i in range(1, m) {
+        let s1 = 0
+        let s2 = 0
+        let below = 0
+        for j in range(k) {
+            let d = values[j][i] - values[j][i - 1]
+            s1 += values[j][i]
+            s2 += values[j][i] * (d / 2 + below)
+            below += d
+        }
+        if s1 > 0 { y -= s2 / s1 }
+        base = push(base, y)
+    }
+    base
+}
+
+view StreamGraph(labels: list, series: list, offset: str = "center", prefix: str = "", suffix: str = "",
+                 decimals: int? = null, height: int = 220, label: str = "Stream graph", show_label: bool = false,
+                 class: str? = null) {
+    style global stream_graph_css
+    let m = len(labels)
+    let k = len(series)
+    let fmt = (v) => v == null ? "—" : `${v < 0 ? "-" : ""}${prefix}${stream_graph_num(abs(v), decimals)}${suffix}`
+    let vals = for s in series => for i in range(m) => (s.values[i] != null && s.values[i] > 0 ? s.values[i] : 0)
+    let base = stream_graph_base(vals, m, offset)
+    // bottoms[j][i], tops[j][i]: series j's layer at moment i.
+    let bottoms = for j in range(k) => for i in range(m) => base[i] + sum(for q in range(j) => vals[q][i])
+    let tops = for j in range(k) => for i in range(m) => bottoms[j][i] + vals[j][i]
+    let hi0 = max((for i in range(m) => base[i] + sum(for j in range(k) => vals[j][i])) + [0])
+    let lo = offset == "zero" ? 0 : min(base)
+    let hi = hi0 == lo ? lo + 1 : hi0
+    let y = (v) => (hi - v) * 100 / (hi - lo)
+    let x = (i) => m == 1 ? 50 : i * 100 / (m - 1)
+    let pt = (i, v) => `${stream_graph_pct(x(i))},${stream_graph_pct(y(v))}`
+    // A smooth edge through the points of `row` at moments `idx`, level at each point.
+    let edge = (row, idx) => join(for q in range(1, len(idx)) => {
+        let mid = stream_graph_pct((x(idx[q - 1]) + x(idx[q])) / 2)
+        ` C${mid},${stream_graph_pct(y(row[idx[q - 1]]))} ${mid},${stream_graph_pct(y(row[idx[q]]))} ${pt(idx[q], row[idx[q]])}`
+    }, "")
+    let layer = (j) => m == 0 ? "" : (m == 1
+        ? `M45,${stream_graph_pct(y(tops[j][0]))} L55,${stream_graph_pct(y(tops[j][0]))} L55,${stream_graph_pct(y(bottoms[j][0]))} L45,${stream_graph_pct(y(bottoms[j][0]))} Z`
+        : `M${pt(0, tops[j][0])}${edge(tops[j], range(m))} L${pt(m - 1, bottoms[j][m - 1])}${edge(bottoms[j], reverse(range(m)))} Z`)
+    let every_nth = ceil(m / 8)
+    <figure class={ui_cls(["ui-stream", class])} aria-label={label}>
+        {show_label && <figcaption.ui-stream-title>{label}</figcaption>}
+        <ul.ui-stream-legend aria-hidden="true">
+            {for [j, s] in enumerate(series) => <li><span class={`ui-stream-key ui-stream-s${j % 8 + 1}`}></span>{s.name}</li>}
+        </ul>
+        <div aria-hidden="true">
+            <div.ui-stream-plot style={`height: ${height}px`}>
+                <svg.ui-stream-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                    {for j in range(k) => <path class={`ui-stream-layer ui-stream-s${j % 8 + 1}`} d={layer(j)} vector-effect="non-scaling-stroke"/>}
+                </svg>
+                {offset == "center" && <span.ui-stream-centre style={`top: ${stream_graph_pct(y(0))}%`}></span>}
+                <div.ui-stream-cols>
+                    {for i in range(m) => <div class={ui_cls(["ui-stream-col", m > 1 && i > (m - 1) / 2 && "ui-stream-flip"])}>
+                        <span.ui-stream-tip>
+                            <strong>{labels[i]}</strong>
+                            {for j in reverse(range(k)) => <p><span class={`ui-stream-key ui-stream-s${j % 8 + 1}`}></span>{series[j].name}<b>{fmt(series[j].values[i])}</b></p>}
+                            <p.ui-stream-sum>Total<b>{fmt(sum(for j in range(k) => vals[j][i]))}</b></p>
+                        </span>
+                    </div>}
+                </div>
+            </div>
+            <div.ui-stream-x>
+                {for i in range(m) => i % every_nth == 0 && <span
+                    class={ui_cls([m > 1 && i == 0 && "ui-stream-first", m > 1 && i == m - 1 && "ui-stream-last",
+                                   floor(i / every_nth) % 2 == 1 && "ui-stream-alt"])}
+                    style={`left: ${stream_graph_pct(x(i))}%`}>{labels[i]}</span>}
+            </div>
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col"></th>{for s in series => <th scope="col">{s.name}</th>}<th scope="col">Total</th></tr></thead>
+            <tbody>
+                {for i in range(m) => <tr>
+                    <th scope="row">{labels[i]}</th>
+                    {for s in series => <td>{fmt(s.values[i])}</td>}
+                    <td>{fmt(sum(for j in range(k) => vals[j][i]))}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

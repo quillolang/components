@@ -1,0 +1,36 @@
+const box = $("#resizable-box-demo-live"), wide = $("#resizable-box-demo-wide");
+const size = (b) => { const r = b.getBoundingClientRect(); return [Math.round(r.width), Math.round(r.height)]; };
+if (size(box).join() !== "320,200") return `it starts at ${size(box)}`;
+const handle = box.querySelector("button.ui-resizable-handle");
+if (!handle || handle.getAttribute("aria-label") !== "Resize the preview" || !handle.classList.contains("ui-resizable-corner")) return "the corner handle is not a labelled button";
+const sr = box.querySelector(".ui-sr"), note = () => box.closest(".demo-stack").querySelector(".demo-note").textContent;
+if (sr.textContent !== "320 by 200 pixels" || handle.getAttribute("aria-describedby") !== sr.id) return `screen readers hear "${sr.textContent}"`;
+handle.focus(); key(handle, "ArrowRight"); await wait();
+if (size(box).join() !== "330,200" || note() !== "330 × 200 pixels.") return `ArrowRight: ${size(box)} / ${note()}`;
+key(handle, "ArrowDown"); await wait();
+if (size(box).join() !== "330,210") return `ArrowDown: ${size(box)}`;
+for (const t of ["keydown", "keyup"]) handle.dispatchEvent(new KeyboardEvent(t, { key: "ArrowRight", shiftKey: true, bubbles: true, cancelable: true })); await wait();
+if (size(box).join() !== "430,210") return `Shift+ArrowRight: ${size(box)}`;
+key(handle, "End"); await wait();
+if (size(box).join() !== "600,400") return `End did not go to the limits: ${size(box)}`;
+key(handle, "ArrowRight"); await wait();
+if (size(box)[0] !== 600) return "it grew past max_width";
+key(handle, "Home"); await wait();
+if (size(box).join() !== "160,100" || sr.textContent !== "160 by 100 pixels") return `Home: ${size(box)} / ${sr.textContent}`;
+// Drag.
+handle.setPointerCapture = () => {};
+box.scrollIntoView({ block: "center" });
+const h = handle.getBoundingClientRect();
+const pe = (t, x, y) => handle.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, pointerId: 1, button: 0, isPrimary: true, clientX: x, clientY: y }));
+const x0 = h.left + h.width / 2, y0 = h.top + h.height / 2;
+pe("pointerdown", x0, y0);
+pe("pointermove", x0 + 100, y0 + 50); await wait(50);
+if (!box.classList.contains("ui-resizable-dragging") || size(box).join() !== "260,150") return `while dragging: ${size(box)}`;
+pe("pointerup", x0 + 100, y0 + 50); await wait();
+if (box.classList.contains("ui-resizable-dragging") || note() !== "260 × 150 pixels.") return `after dragging: ${note()}`;
+// Width only.
+const wh = wide.querySelector(".ui-resizable-handle");
+if (!wh.classList.contains("ui-resizable-right") || size(wide)[0] !== 420) return "axis=\"x\" has no right-edge handle at 420px";
+const was = size(wide)[1];
+key(wh, "ArrowDown"); key(wh, "ArrowLeft"); await wait();
+if (size(wide)[0] !== 410 || size(wide)[1] !== was) return `axis="x" keys: ${size(wide)}`;

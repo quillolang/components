@@ -1,0 +1,15 @@
+const figs = $$("figure.ui-figure");
+if (figs.length !== 4) return `expected 4 figures, found ${figs.length}`;
+const main = figs[0];
+const img = main.querySelector("img");
+if (!img || img.alt !== "Green hills under a blue sky" || img.getAttribute("width") !== "800" || img.getAttribute("loading") !== "lazy") return "the image, its alt, width or lazy loading is missing";
+const cap = main.querySelector("figcaption");
+if (!cap || !cap.textContent.includes("The valley at noon")) return "the caption is not a figcaption";
+const credit = cap.querySelector(".ui-figure-credit a");
+if (!credit || credit.textContent !== "Photo: Ana Reis" || credit.getAttribute("href") !== "https://example.com/ana") return "the credit is not a link";
+if (main.getBoundingClientRect().width > 561) return `md is ${main.getBoundingClientRect().width}px wide`;
+if (figs[1].getBoundingClientRect().width > 321) return "sm is wider than 320px";
+if (!figs[2].querySelector(".ui-figure-credit") || figs[2].querySelector(".ui-figure-credit a")) return "a credit without a link is a link";
+if (getComputedStyle(figs[2]).textAlign !== "center") return "align center does not centre the caption";
+if (!figs[3].querySelector(".ui-figure-body table") || figs[3].querySelector("img")) return "a figure without src does not show its children";
+if (getComputedStyle(figs[3]).textAlign !== "right") return "align right does not align the caption right";

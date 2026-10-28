@@ -1,0 +1,136 @@
+// ImageGallery: a grid of thumbnails that opens a viewer over the page, with
+// the picture, its caption, "3 / 12", previous and next buttons, the arrow keys,
+// and a strip of thumbnails to jump with. It can show only the first few in the
+// grid, the last one veiled "+N" for the rest, which all the viewer shows.
+// The viewer is the browser's own <dialog>: Escape closes it, and focus goes
+// back to the thumbnail of the picture last seen.
+//
+//   <ImageGallery label="The flat" images={[
+//       { src: "/img/1.jpg", thumb: "/img/1-sm.jpg", alt: "The living room", caption: "Living room" },
+//       { src: "/img/2.jpg", alt: "The kitchen" },
+//   ]}/>
+//   <ImageGallery images={photos} limit={5} columns={3} ratio="4/3" on_open={(i) => { seen = i }}/>
+//
+// images: a list of { src, alt, thumb?, caption? } (thumb: a smaller picture for
+// the grid and the strip; caption: a line under the picture, its alt when none).
+// label: the gallery's name ("Gallery"). limit: how many thumbnails the grid
+// shows (all); past it, the last shown says "+N". columns: the grid's columns
+// (4; 2 on narrow screens). ratio: the thumbnails' shape ("1").
+// on_open(index): inside one of your components, called with the picture the
+// viewer opens on. The viewer goes round: next from the last is the first.
+// (Lightbox is the full-screen one; this is a framed viewer with a strip.)
+
+let image_gallery_css = css`
+.ui-image-gallery-grid { display: grid; grid-template-columns: repeat(var(--c, 4), minmax(0, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+@media (max-width: 520px) { .ui-image-gallery-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.ui-image-gallery-thumb {
+  position: relative; display: block; width: 100%; padding: 0; overflow: hidden; border: 0; border-radius: var(--ui-radius-sm);
+  background: var(--ui-subtle); aspect-ratio: var(--r, 1); cursor: zoom-in;
+}
+.ui-image-gallery-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform .25s; }
+.ui-image-gallery-thumb:hover img { transform: scale(1.04); }
+.ui-image-gallery-thumb:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--ui-bg), 0 0 0 5px var(--ui-accent); }
+.ui-image-gallery-more { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(0, 0, 0, .5); color: #fff; font: 600 22px/1 var(--ui-font); }
+.ui-image-gallery-dlg {
+  width: min(960px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; overflow: hidden; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 14px/1.4 var(--ui-font);
+}
+.ui-image-gallery-dlg[open] { display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; animation: ui-image-gallery-in .18s ease-out; }
+.ui-image-gallery-dlg::backdrop { background: var(--ui-overlay); }
+@keyframes ui-image-gallery-in { from { opacity: 0; transform: scale(.98); } }
+.ui-image-gallery-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 8px 8px 16px; border-bottom: 1px solid var(--ui-border); }
+.ui-image-gallery-count { margin: 0; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-image-gallery-stage { position: relative; display: grid; place-items: center; min-height: 0; height: min(62dvh, 560px); background: var(--ui-subtle); }
+.ui-image-gallery-stage img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; }
+.ui-image-gallery-cap { margin: 0; padding: 10px 16px; text-align: center; }
+.ui-image-gallery-btn {
+  display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border: 1px solid var(--ui-border); border-radius: 50%;
+  background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow); cursor: pointer;
+}
+.ui-image-gallery-btn:hover { background: var(--ui-subtle); }
+.ui-image-gallery-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-image-gallery-btn svg { width: 18px; height: 18px; }
+.ui-image-gallery-x { box-shadow: none; border-color: transparent; }
+.ui-image-gallery-prev, .ui-image-gallery-next { position: absolute; top: 50%; transform: translateY(-50%); }
+.ui-image-gallery-prev { left: 12px; }
+.ui-image-gallery-next { right: 12px; }
+.ui-image-gallery-strip { display: flex; gap: 6px; margin: 0; padding: 8px 12px 12px; overflow-x: auto; list-style: none; }
+.ui-image-gallery-strip button { flex: none; width: 64px; height: 48px; padding: 0; overflow: hidden; border: 2px solid transparent; border-radius: 6px; background: var(--ui-subtle); cursor: pointer; opacity: .65; }
+.ui-image-gallery-strip button[aria-current="true"] { border-color: var(--ui-accent); opacity: 1; }
+.ui-image-gallery-strip button:hover { opacity: 1; }
+.ui-image-gallery-strip button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-image-gallery-strip img { display: block; width: 100%; height: 100%; object-fit: cover; }
+@media (prefers-reduced-motion: reduce) { .ui-image-gallery-dlg[open] { animation: none; } .ui-image-gallery-thumb img { transition: none; } }
+`
+
+component ImageGallery(images: list = [], label: str = "Gallery", limit: int? = null, columns: int = 4, ratio: str = "1",
+                       on_open = null, class: str? = null) {
+    style global image_gallery_css
+    state dlg = null
+    state at = 0
+    let n = len(images)
+    let shown = limit != null && limit < n ? take(images, limit) : images
+    let rest = n - len(shown)
+    let cur = images[at] ?? { src: "", alt: "" }
+    let go = (i: int) => { if n > 0 { at = (i % n + n) % n } }
+    let open = (i: int) => {
+        at = i
+        dlg.showModal()
+        on_open && on_open(i)
+    }
+    let thumb_of = (im) => get(im, "thumb") ?? im.src
+    <div class={class}>
+        <ul.ui-image-gallery-grid aria-label={label} style={`--c: ${columns}; --r: ${ratio}`}>
+            {for [i, im] in enumerate(shown) => <li key={i}>
+                <button.ui-image-gallery-thumb type="button" data-i={i} aria-haspopup="dialog"
+                        aria-label={rest > 0 && i == len(shown) - 1 ? `${im.alt}, and ${rest} more` : im.alt}
+                        @click={() => { open(i) }}>
+                    <img src={thumb_of(im)} alt="" loading="lazy"/>
+                    {rest > 0 && i == len(shown) - 1 && <span.ui-image-gallery-more aria-hidden="true">+{rest}</span>}
+                </button>
+            </li>}
+        </ul>
+        <dialog.ui-image-gallery-dlg aria-label={label}
+                @mount={(el) => { dlg = el }}
+                @close={(e) => {
+                    let i = at < len(shown) ? at : len(shown) - 1
+                    let t = e.target.parentElement.querySelector(`.ui-image-gallery-thumb[data-i="${i}"]`)
+                    t && t.focus()
+                }}
+                @click={(e) => { if e.target.tagName == "DIALOG" { dlg.close() } }}
+                @keydown={(e) => {
+                    if e.key == "ArrowRight" { e.preventDefault(); go(at + 1) }
+                    if e.key == "ArrowLeft" { e.preventDefault(); go(at - 1) }
+                    if e.key == "Home" { e.preventDefault(); go(0) }
+                    if e.key == "End" { e.preventDefault(); go(n - 1) }
+                }}>
+            <div.ui-image-gallery-top>
+                <p.ui-image-gallery-count aria-live="polite" aria-atomic="true">{at + 1} / {n}</p>
+                <button.ui-image-gallery-btn.ui-image-gallery-x type="button" aria-label="Close" @click={() => dlg.close()}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                         aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div.ui-image-gallery-stage>
+                <img src={cur.src} alt={cur.alt}/>
+                {n > 1 && [
+                    <button.ui-image-gallery-btn.ui-image-gallery-prev type="button" aria-label="Previous picture" @click={() => { go(at - 1) }}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                             stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+                    </button>,
+                    <button.ui-image-gallery-btn.ui-image-gallery-next type="button" aria-label="Next picture" @click={() => { go(at + 1) }}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                             stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg>
+                    </button>,
+                ]}
+            </div>
+            <p.ui-image-gallery-cap>{get(cur, "caption") ?? cur.alt}</p>
+            {n > 1 && <ul.ui-image-gallery-strip aria-label="All pictures">
+                {for [i, im] in enumerate(images) => <li key={i}>
+                    <button type="button" aria-label={`${i + 1}: ${im.alt}`} aria-current={i == at ? "true" : null}
+                            @click={() => { go(i) }}><img src={thumb_of(im)} alt="" loading="lazy"/></button>
+                </li>}
+            </ul>}
+        </dialog>
+    </div>
+}

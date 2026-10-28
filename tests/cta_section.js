@@ -1,0 +1,14 @@
+const bands = $$("section.ui-cta");
+if (bands.length !== 3) return `expected 3 bands, found ${bands.length}`;
+const [accent, soft, outline] = bands;
+if (accent.id !== "cta-section-demo" || accent.getAttribute("aria-labelledby") !== "cta-section-demo-title") return "the band is not labelled by its title";
+if (accent.querySelector("h2#cta-section-demo-title.ui-cta-title")?.textContent !== "Ready to try it?") return "the title is not an h2 with the id";
+if (accent.querySelectorAll(".ui-cta-actions a.ui-btn").length !== 2) return "the buttons are not in the actions row";
+if (getComputedStyle(accent).backgroundColor === getComputedStyle(soft).backgroundColor) return "accent and soft look the same";
+if (getComputedStyle(outline).borderStyle !== "solid") return "outline has no border";
+const words = accent.querySelector(".ui-cta-words").getBoundingClientRect(), box = accent.getBoundingClientRect();
+if (Math.abs((words.left + words.right) / 2 - (box.left + box.right) / 2) > 2) return "the words are not centred";
+if (!soft.classList.contains("ui-cta-split")) return "align=split is not marked";
+const sw = soft.querySelector(".ui-cta-words").getBoundingClientRect(), sa = soft.querySelector(".ui-cta-actions").getBoundingClientRect();
+if (!(sw.right <= sa.left) || Math.abs(sw.top - sa.top) > 40) return "split does not put the buttons beside the words";
+if (outline.querySelector(".ui-cta-text")) return "no text still draws a line";

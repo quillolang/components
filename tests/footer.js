@@ -1,0 +1,17 @@
+const site = $("#footer-demo-site"), narrow = $("#footer-demo-narrow");
+if (!site || site.tagName !== "FOOTER" || site.getAttribute("aria-label") !== "Footer") return "the footer is not a labelled <footer>";
+const brand = site.querySelector("a.ui-footer-name");
+if (!brand || brand.textContent !== "Acme" || brand.getAttribute("href") !== "#footer") return "the brand link is missing";
+if (!site.querySelector(".ui-footer-tagline")?.textContent.startsWith("Tools")) return "the tagline is missing";
+const navs = [...site.querySelectorAll("nav.ui-footer-col")];
+if (navs.length !== 3 || navs.map((n) => n.getAttribute("aria-label")).join() !== "Product,Company,Help") return "the three columns are not navs named by their titles";
+if (navs[0].querySelector("h3").textContent !== "Product" || navs[0].querySelectorAll("li a").length !== 3) return "a column's title or links are missing";
+if (new Set(navs.map((n) => Math.round(n.getBoundingClientRect().top))).size !== 1) return "wide, the columns are not side by side";
+const bottom = site.querySelector(".ui-footer-bottom");
+if (!bottom.querySelector("p")?.textContent.startsWith("© 2026")) return "the bottom line is missing";
+if (bottom.querySelectorAll(".ui-footer-links a").length !== 3) return "the small links are missing";
+const end = bottom.querySelector(".ui-footer-end");
+if (end.querySelectorAll("a").length !== 2 || Math.abs(end.getBoundingClientRect().right - (bottom.getBoundingClientRect().right)) > 1) return "the children are not at the end of the bottom line";
+if (!site.classList.contains("ui-footer-subtle")) return "tone=\"subtle\" is missing";
+const ne = narrow.querySelector(".ui-footer-end"), nb = narrow.querySelector(".ui-footer-bottom");
+if (Math.abs(ne.getBoundingClientRect().left - nb.getBoundingClientRect().left) > 1) return "in a 400px box the end slot does not take its own line";

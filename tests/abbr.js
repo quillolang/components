@@ -1,0 +1,12 @@
+const html = $("#abbr-demo-html"), nat = $("#abbr-demo-native");
+if (!html || html.tagName !== "ABBR" || !nat || nat.tagName !== "ABBR") return "an Abbr is not an <abbr>";
+if (html.firstChild.textContent !== "HTML") return "the short form is not the text";
+if (html.querySelector(".ui-sr")?.textContent !== " (HyperText Markup Language)") return "screen readers do not get the expansion";
+if (html.getAttribute("data-ui-abbr") !== "HyperText Markup Language" || html.tabIndex !== 0) return "the bubble one has no expansion to show, or cannot be focused";
+if (html.title) return "the bubble one also has a native title (two tooltips)";
+if (getComputedStyle(html, "::after").display !== "none") return "the bubble shows before hover";
+const rules = [...document.styleSheets].flatMap((s) => { try { return [...s.cssRules]; } catch { return []; } });
+if (!rules.some((r) => r.selectorText?.includes(".ui-abbr-bubble:hover::after") && r.selectorText.includes(":focus::after") && r.style.display === "block")) return "no rule shows the bubble on hover and focus";
+if (getComputedStyle(html, "::after").content !== '"HyperText Markup Language"') return `the bubble does not read the expansion: ${getComputedStyle(html, "::after").content}`;
+if (nat.title !== "as soon as possible" || nat.hasAttribute("tabindex") || nat.classList.contains("ui-abbr-bubble")) return "tooltip=native is not the title alone";
+if (getComputedStyle(html).textDecorationLine !== "underline" || getComputedStyle(html).cursor !== "help") return "it is not dotted-underlined with a help cursor";

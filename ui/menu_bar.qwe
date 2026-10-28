@@ -1,0 +1,162 @@
+// MenuBar: a desktop application's bar of menus (File, Edit, View), each opening a
+// list of actions with their shortcuts shown. It follows the ARIA menubar pattern: a
+// click or ArrowDown opens a menu, Left and Right move between menus (an open one
+// moves with them), Up and Down move in a menu, Enter chooses, Escape or a click
+// elsewhere closes. Resting the pointer on another menu while one is open switches
+// to it, as desktops do. Each menu is the browser's `popover`, anchored under its
+// button where the browser can (CSS anchor positioning), else mid-screen.
+//
+//   <MenuBar id="app-menu" menus={[
+//       { label: "File", items: [{ label: "New", shortcut: "Ctrl N" }, { label: "Open…", shortcut: "Ctrl O" },
+//                                { divider: true }, { label: "Export", href: "/export" }] },
+//       { label: "Edit", items: [{ label: "Undo", shortcut: "Ctrl Z", disabled: true }, { label: "Cut", shortcut: "Ctrl X" }] },
+//       { label: "View", items: [{ label: "Sidebar", checked: true }, { label: "Full screen", shortcut: "F11" }] },
+//   ]} on_select={(it) => { run(it.label) }}/>
+//
+// id (required): unique on the page; the menus' ids start with it.
+// menus: a list of { label, items }; items a list of { label, shortcut?, href?,
+// disabled?, checked?: true or false (a tick that shows the state), tone?: "danger" },
+// or { divider: true } for a line. An item with an href is a link; one without is a
+// button that closes the menu and, inside one of your components, calls
+// on_select(item). label: the bar's name for screen readers ("Application menu").
+
+let menu_bar_css = css`
+.ui-menu-bar { display: flex; align-items: center; gap: 2px; padding: 3px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-menu-bar-top {
+  height: 30px; padding: 0 11px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg);
+  font: inherit; cursor: pointer;
+}
+.ui-menu-bar-top:hover, .ui-menu-bar-top[aria-expanded="true"] { background: var(--ui-subtle); }
+.ui-menu-bar-top:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-menu-bar-list {
+  min-width: 200px; max-width: min(320px, calc(100vw - 16px)); margin: auto; padding: 5px; list-style: none;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg);
+  box-shadow: var(--ui-shadow-lg); font: 14px/1.4 var(--ui-font);
+}
+.ui-menu-bar-list:popover-open { animation: ui-menu-bar-in .1s ease-out; }
+@keyframes ui-menu-bar-in { from { opacity: 0; transform: translateY(-3px); } }
+@supports (position-area: bottom) {
+  .ui-menu-bar-list { inset: auto; margin: 3px 0; position-area: bottom span-right; position-try-fallbacks: flip-block, flip-inline; }
+}
+@supports not (position-area: bottom) { .ui-menu-bar-list::backdrop { background: var(--ui-overlay); } }
+.ui-menu-bar-item {
+  display: flex; align-items: center; gap: 16px; width: 100%; padding: 7px 10px 7px 28px; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-fg); font: inherit; text-align: left; text-decoration: none; cursor: pointer; position: relative;
+}
+.ui-menu-bar-item > span:first-of-type { flex: 1; }
+.ui-menu-bar-item:hover, .ui-menu-bar-item:focus { outline: none; background: var(--ui-subtle); }
+.ui-menu-bar-item:focus-visible { box-shadow: var(--ui-focus); }
+.ui-menu-bar-item[aria-disabled="true"] { opacity: .5; cursor: not-allowed; }
+.ui-menu-bar-item[aria-disabled="true"]:hover { background: transparent; }
+.ui-menu-bar-danger { color: var(--ui-danger); }
+.ui-menu-bar-danger:hover, .ui-menu-bar-danger:focus { background: var(--ui-danger-soft); }
+.ui-menu-bar-tick { position: absolute; left: 9px; width: 14px; height: 14px; }
+.ui-menu-bar-key { color: var(--ui-muted); font-size: 12px; letter-spacing: .02em; white-space: nowrap; }
+.ui-menu-bar-sep { height: 1px; margin: 4px 6px; background: var(--ui-border); }
+@media (prefers-reduced-motion: reduce) { .ui-menu-bar-list:popover-open { animation: none; } }
+`
+
+component MenuBar(id: str, menus: list = [], label: str = "Application menu", on_select = null, class: str? = null) {
+    style global menu_bar_css
+    state open = null       // the index of the menu open, or null
+    state current = 0       // the top button that takes the Tab
+    state want = null       // the item to focus once a menu opens: 0 (first), 99 (last) or null
+    state host = null
+    let n = len(menus)
+    let tops = () => js("Array.from", host.querySelectorAll(".ui-menu-bar-top"))
+    let menu = (i: int) => js("document.getElementById", `${id}-menu-${i}`)
+    let entries = (i: int) => js("Array.from", menu(i).querySelectorAll("[role=menuitem]:not([aria-disabled=true]), [role=menuitemcheckbox]:not([aria-disabled=true])"))
+    // Opens menu i, with the focus on its first (0) or last (99) item, or on its button (null).
+    let show = (i: int, which: int?) => {
+        current = i
+        want = which
+        let m = menu(i)
+        if !m.matches(":popover-open") { m.showPopover() } else if which != null { entries(i)[which == 99 ? len(entries(i)) - 1 : 0].focus() }
+        if which == null { tops()[i].focus() }
+    }
+    let close = (i: int) => {
+        menu(i).hidePopover()
+        tops()[i].focus()
+    }
+    let step = (i: int, by: int) => {
+        let found = entries(i)
+        let m = len(found)
+        if m == 0 { return null }
+        let at = reduce(enumerate(found), null, (got, p) => p[1].isSameNode(js("document.activeElement")) ? p[0] : got)
+        let to = by == 0 ? 0 : by == 99 ? m - 1 : at == null ? 0 : (at + by + m) % m
+        found[to].focus()
+    }
+    <div class={ui_cls(["ui-menu-bar", class])} role="menubar" aria-label={label} @mount={(el) => { host = el }}>
+        {for [i, m] in enumerate(menus) => <div key={m.label} style={`anchor-name: --${id}-${i}`}>
+            <button.ui-menu-bar-top type="button" role="menuitem" id={`${id}-top-${i}`} aria-haspopup="menu"
+                    aria-expanded={open == i ? "true" : "false"} aria-controls={`${id}-menu-${i}`}
+                    tabindex={current == i ? "0" : "-1"} popovertarget={`${id}-menu-${i}`}
+                    @click={() => { current = i }}
+                    @pointerenter={() => { if open != null && open != i { show(i, null) } }}
+                    @keydown={(e) => {
+                        if e.key == "ArrowDown" { e.preventDefault(); show(i, 0) }
+                        if e.key == "ArrowUp" { e.preventDefault(); show(i, 99) }
+                        if e.key == "ArrowRight" || e.key == "ArrowLeft" {
+                            e.preventDefault()
+                            let to = (i + (e.key == "ArrowRight" ? 1 : n - 1)) % n
+                            if open != null { show(to, null) } else { current = to; tops()[to].focus() }
+                        }
+                        if e.key == "Home" { e.preventDefault(); current = 0; tops()[0].focus() }
+                        if e.key == "End" { e.preventDefault(); current = n - 1; tops()[n - 1].focus() }
+                        if e.key == "Escape" && open == i { e.preventDefault(); close(i) }
+                    }}>{m.label}</button>
+            <ul.ui-menu-bar-list id={`${id}-menu-${i}`} popover="auto" role="menu" aria-labelledby={`${id}-top-${i}`}
+                style={`position-anchor: --${id}-${i}`}
+                @toggle={(e) => {
+                    if e.newState == "open" {
+                        open = i
+                        if want != null {
+                            let found = entries(i)
+                            if len(found) > 0 { found[want == 99 ? len(found) - 1 : 0].focus() }
+                        }
+                        want = null
+                    } else {
+                        if open == i { open = null }
+                        if menu(i).contains(js("document.activeElement")) { tops()[i].focus() }
+                    }
+                }}
+                @keydown={(e) => {
+                    let k = e.key
+                    if k == "ArrowDown" { e.preventDefault(); step(i, 1) }
+                    if k == "ArrowUp" { e.preventDefault(); step(i, -1) }
+                    if k == "Home" { e.preventDefault(); step(i, 0) }
+                    if k == "End" { e.preventDefault(); step(i, 99) }
+                    if k == "ArrowRight" { e.preventDefault(); show((i + 1) % n, 0) }
+                    if k == "ArrowLeft" { e.preventDefault(); show((i + n - 1) % n, 0) }
+                    if k == "Escape" { e.preventDefault(); close(i) }
+                    if k == "Tab" { menu(i).hidePopover() }
+                }}>
+                {for [j, it] in enumerate(get(m, "items") ?? []) => get(it, "divider") == true
+                    ? <li.ui-menu-bar-sep key={j} role="separator"></li>
+                    : <li key={j} role="none">{get(it, "href") != null && get(it, "disabled") != true
+                        ? <a role="menuitem" tabindex="-1" href={it.href}
+                             class={ui_cls(["ui-menu-bar-item", get(it, "tone") == "danger" && "ui-menu-bar-danger"])}
+                             @click={() => { menu(i).hidePopover() }}>
+                              <span>{it.label}</span>
+                              {get(it, "shortcut") != null && <span.ui-menu-bar-key>{it.shortcut}</span>}
+                          </a>
+                        : <button type="button" role={get(it, "checked") != null ? "menuitemcheckbox" : "menuitem"} tabindex="-1"
+                                  class={ui_cls(["ui-menu-bar-item", get(it, "tone") == "danger" && "ui-menu-bar-danger"])}
+                                  aria-disabled={get(it, "disabled") == true ? "true" : null}
+                                  aria-checked={get(it, "checked") != null ? (it.checked ? "true" : "false") : null}
+                                  aria-keyshortcuts={get(it, "shortcut") != null ? replace(it.shortcut, " ", "+") : null}
+                                  @click={() => {
+                                      if get(it, "disabled") != true {
+                                          close(i)
+                                          on_select && on_select(it)
+                                      }
+                                  }}>
+                              {get(it, "checked") == true && <svg.ui-menu-bar-tick viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                   stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>}
+                              <span>{it.label}</span>
+                              {get(it, "shortcut") != null && <span.ui-menu-bar-key>{it.shortcut}</span>}
+                          </button>}</li>}
+            </ul>
+        </div>}
+    </div>
+}

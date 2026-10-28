@@ -1,0 +1,38 @@
+const [dlg, dlg2] = $$("dialog.ui-share-sheet"), note = () => $(".demo-note").textContent;
+const trig = $$("button.ui-btn").find((b) => b.textContent === "Share"), fromState = $$("button.ui-btn").find((b) => b.textContent.startsWith("Invite"));
+const target = (d, t) => d.querySelector(`[data-target="${t}"]`);
+if (!dlg || dlg.open || dlg.getAttribute("aria-label") !== "Share") return "not a closed, named dialog";
+trig.click(); await wait(400);
+if (!dlg.open) return "the trigger does not open it";
+const r = dlg.getBoundingClientRect();
+if (Math.abs(r.bottom - innerHeight) > 2) return "it is not at the bottom of the screen";
+if (dlg.querySelector("input[readonly]").value !== "https://quillolang.org/components/") return "the link is not shown";
+const all = [...dlg.querySelectorAll("[data-target]")].map((a) => a.dataset.target);
+const hasShare = "share" in navigator;
+if (all.join() !== "copy,email,x,linkedin,facebook,whatsapp,reddit,telegram" + (hasShare ? ",more" : "")) return `targets: ${all}`;
+const x = new URL(target(dlg, "x").href);
+if (x.host !== "x.com" || x.searchParams.get("url") !== "https://quillolang.org/components/" || x.searchParams.get("text") !== "Quillo UI: components for Quillo") return `the X link: ${x}`;
+if (target(dlg, "x").target !== "_blank" || !target(dlg, "x").rel.includes("noopener")) return "site links do not open in a new tab safely";
+const mail = target(dlg, "email").getAttribute("href");
+if (!mail.startsWith("mailto:?") || !mail.includes("subject=Quillo%20UI") || target(dlg, "email").target) return `the email link: ${mail}`;
+if (!new URL(target(dlg, "linkedin").href).searchParams.get("url")) return "the LinkedIn link has no url";
+const real = navigator.clipboard.writeText; let copied = null;
+try {
+    navigator.clipboard.writeText = async (t) => { copied = t; };
+    target(dlg, "copy").click(); await wait(150);
+    if (copied !== "https://quillolang.org/components/" || !target(dlg, "copy").textContent.includes("Link copied") || dlg.querySelector("[role=status]").textContent !== "Link copied") return "Copy link does not copy and say so";
+} finally { navigator.clipboard.writeText = real; }
+dlg.dispatchEvent(new MouseEvent("click", { bubbles: true })); await wait();
+if (dlg.open) return "a click above it does not close it";
+fromState.click(); await wait(400);
+if (!dlg2.open || dlg2.getAttribute("aria-label") !== "Invite to the project") return "open={state} does not open it";
+const t2 = [...dlg2.querySelectorAll("[data-target]")].map((a) => a.dataset.target);
+if (t2.join() !== "copy,email,whatsapp,telegram") return `targets={...} shows ${t2}`;
+const wa = target(dlg2, "whatsapp");
+if (new URL(wa.href).searchParams.get("text") !== "Join my project on Quillo https://quillolang.org/join/7f3a") return "the WhatsApp text is not the text and the link";
+wa.addEventListener("click", (e) => e.preventDefault(), { once: true });
+wa.click(); await wait();
+if (dlg2.open || note() !== "Shared by whatsapp.") return `a target does not close it and call on_share: ${note()}`;
+fromState.click(); await wait(300);
+if (!dlg2.open) return "on_close did not set the state back";
+dlg2.close();

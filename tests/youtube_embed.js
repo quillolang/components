@@ -1,0 +1,21 @@
+const [main, later] = $$(".ui-youtube-embed");
+if (!main || !later) return "expected two embeds";
+if (main.querySelector("iframe")) return "the player is loaded before any click";
+const btn = main.querySelector(".ui-youtube-embed-poster");
+if (!btn || btn.getAttribute("aria-label") !== "Play video: Big Buck Bunny") return "the poster is not a named play button";
+const img = btn.querySelector("img");
+if (!img || img.src !== "https://i.ytimg.com/vi/aqz-KE-bpKQ/hqdefault.jpg") return `the poster is ${img?.src}`;
+if (main.querySelector(".ui-youtube-embed-title").textContent !== "Big Buck Bunny") return "the title is not on the poster";
+const r = main.getBoundingClientRect();
+if (Math.abs(r.width / r.height - 16 / 9) > 0.03) return `the ratio is ${r.width / r.height}`;
+const lr = later.getBoundingClientRect();
+if (Math.abs(lr.width / lr.height - 4 / 3) > 0.03) return "ratio 4/3 is not applied";
+btn.click(); await wait();
+const f = main.querySelector("iframe");
+if (!f) return "clicking does not load the player";
+if (!f.src.startsWith("https://www.youtube-nocookie.com/embed/aqz-KE-bpKQ?autoplay=1")) return `the player's src is ${f.src}`;
+if (f.title !== "Big Buck Bunny" || !f.hasAttribute("allowfullscreen") || !f.getAttribute("allow").includes("autoplay")) return "the player has no title, fullscreen or autoplay";
+if (main.querySelector(".ui-youtube-embed-poster")) return "the poster stays under the player";
+if ($("#youtube-embed-demo-note").textContent !== "The player is loaded.") return `on_play: ${$("#youtube-embed-demo-note").textContent}`;
+// Loading YouTube's player itself is not part of the test.
+f.src = "about:blank";

@@ -1,0 +1,263 @@
+// RichTextEditor: a box for formatted text (bold, italic, underline, lists,
+// links, headings) that edits the text as it will look, on the browser's own
+// contenteditable. The HTML goes in a hidden input named `name`, so a plain
+// <form> sends it; the route keeps it as it is or passes it through a sanitizer
+// of its own before showing it to others (it is what the browser made, from
+// what the user typed or pasted).
+//
+//   <RichTextEditor name="body" label="Description" value={raw_html} min_height={200}/>
+//   <RichTextEditor name="note" tools={["bold", "italic", "list"]} on_change={(html) => { note = html }}/>
+//
+// value: the HTML to start with, which you trust (it is put in as it is).
+// tools: which buttons, in order, from "bold", "italic", "underline", "strike",
+// "heading", "quote", "list", "numbered", "link", "clear" (all by default).
+// min_height: the box's least height in pixels (120). placeholder: shown while empty.
+// Ctrl/Cmd+B, I and U work as in a word processor; the toolbar's buttons say which
+// is on at the caret. Quillo neither sets innerHTML nor runs execCommand (both
+// write HTML from text), so the buttons work on the selection with the DOM's own
+// Range calls: a style wraps what is selected (or unwraps it when it is on there),
+// heading and quote change the paragraph the caret is in, a list button makes it
+// a list item (or turns the list back into paragraphs), and "clear" leaves its
+// plain text. The HTML is read back after each change.
+// name, label, hint, error, required (your route checks it), disabled and field
+// (the box's id, "rich-text-editor-" + name by default) as for every field.
+// on_change(html): inside one of your components, given the HTML after each change.
+
+let rich_text_editor_css = css`
+.ui-rich-text-editor { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-rich-text-editor-label { font-size: 13px; font-weight: 500; }
+.ui-rich-text-editor-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-rich-text-editor-frame { border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); overflow: hidden; transition: border-color .15s, box-shadow .15s; }
+.ui-rich-text-editor-frame:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-rich-text-editor-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; padding: 4px 6px; border-bottom: 1px solid var(--ui-border); background: var(--ui-subtle); }
+.ui-rich-text-editor-sep { width: 1px; height: 18px; margin: 0 4px; background: var(--ui-border); }
+.ui-rich-text-editor-tool {
+  display: inline-grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-fg); font: 600 13px/1 var(--ui-font); cursor: pointer;
+}
+.ui-rich-text-editor-tool:hover { background: var(--ui-surface); box-shadow: 0 0 0 1px var(--ui-border); }
+.ui-rich-text-editor-tool[aria-pressed="true"] { background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-rich-text-editor-tool:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-rich-text-editor-tool:disabled { opacity: .45; cursor: not-allowed; }
+.ui-rich-text-editor-tool svg { width: 16px; height: 16px; }
+.ui-rich-text-editor-tool i { font-style: italic; font-family: Georgia, serif; font-size: 15px; }
+.ui-rich-text-editor-tool u { text-decoration: underline; }
+.ui-rich-text-editor-tool s { text-decoration: line-through; }
+.ui-rich-text-editor-area {
+  position: relative; min-height: var(--ui-rich-text-editor-h, 120px); padding: 10px 12px; outline: none; line-height: 1.6; overflow-wrap: anywhere;
+}
+.ui-rich-text-editor-area:empty::before, .ui-rich-text-editor-area:has(> br:only-child)::before { content: attr(data-placeholder); color: var(--ui-muted); pointer-events: none; position: absolute; }
+.ui-rich-text-editor-area > :first-child { margin-top: 0; }
+.ui-rich-text-editor-area > :last-child { margin-bottom: 0; }
+.ui-rich-text-editor-area h1, .ui-rich-text-editor-area h2, .ui-rich-text-editor-area h3 { margin: .8em 0 .4em; line-height: 1.25; }
+.ui-rich-text-editor-area blockquote { margin: .6em 0; padding: 0 0 0 12px; border-left: 3px solid var(--ui-border); color: var(--ui-muted); }
+.ui-rich-text-editor-area a { color: var(--ui-accent); }
+.ui-rich-text-editor-area[contenteditable="false"] { opacity: .55; cursor: not-allowed; }
+.ui-rich-text-editor-invalid .ui-rich-text-editor-frame { border-color: var(--ui-danger); }
+.ui-rich-text-editor-hint, .ui-rich-text-editor-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-rich-text-editor-error { color: var(--ui-danger); }
+@media (prefers-reduced-motion: reduce) { .ui-rich-text-editor-frame { transition: none; } }
+`
+
+let rich_text_editor_tools = ["bold", "italic", "underline", "strike", "heading", "quote", "list", "numbered", "link", "clear"]
+
+// The tag each style is written with, and the tags that already mean it.
+let rich_text_editor_tags = { bold: "b", italic: "i", underline: "u", strike: "s" }
+let rich_text_editor_same = { bold: "b,strong", italic: "i,em", underline: "u", strike: "s,strike,del", list: "ul", numbered: "ol" }
+
+component RichTextEditor(name: str? = null, label: str? = null, value: str = "", tools: list? = null, min_height: int = 120,
+                         placeholder: str = "Write something…", hint: str? = null, error: str? = null, required: bool = false,
+                         disabled: bool = false, field: str? = null, on_change = null, class: str? = null) {
+    style global rich_text_editor_css
+    state html = value
+    state on = []
+    let id = field ?? `rich-text-editor-${name ?? re.replace(lower(label ?? "text"), "[^a-z0-9]+", "-")}`
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
+    let offered = (tools ?? rich_text_editor_tools) | filter((t) => contains(rich_text_editor_tools, t))
+    let area = (e) => e.target.closest(".ui-rich-text-editor").querySelector(".ui-rich-text-editor-area")
+    let element_of = (node) => node.nodeType == 1 ? node : node.parentElement
+    // The selection, when it is inside `el`.
+    let range_in = (el) => {
+        let sel = js("getSelection")
+        if sel == null || sel.rangeCount == 0 { return null }
+        let r = sel.getRangeAt(0)
+        el.contains(r.commonAncestorContainer) ? r : null
+    }
+    // The element around the selection's start that matches `selector`, inside `el`.
+    let around = (el, r, selector: str) => {
+        let found = element_of(r.startContainer).closest(selector)
+        found != null && found != el && el.contains(found) ? found : null
+    }
+    let select_in = (node) => {
+        let sel = js("getSelection")
+        let r = js("document.createRange")
+        r.selectNodeContents(node)
+        sel.removeAllRanges()
+        sel.addRange(r)
+    }
+    let unwrap = (w) => {
+        let parent = w.parentNode
+        while w.firstChild != null { parent.insertBefore(w.firstChild, w) }
+        w.remove()
+    }
+    // `node`'s children moved into a new `tag` element that takes its place.
+    let retag = (node, tag: str) => {
+        let fresh = js("document.createElement", tag)
+        while node.firstChild != null { fresh.appendChild(node.firstChild) }
+        node.replaceWith(fresh)
+        fresh
+    }
+    // The paragraph (a child of `el`) the selection starts in; loose text is put in a <p> first.
+    let block_of = (el, r) => {
+        let b = r.startContainer
+        if b == el {
+            b = el.childNodes[r.startOffset] ?? el.lastChild
+            if b == null {
+                let p = js("document.createElement", "p")
+                el.appendChild(p)
+                return p
+            }
+        }
+        while b.parentNode != el { b = b.parentNode }
+        if b.nodeType != 1 || b.nodeName == "BR" || b.nodeName == "B" || b.nodeName == "I" || b.nodeName == "U" || b.nodeName == "A" {
+            let p = js("document.createElement", "p")
+            el.insertBefore(p, b)
+            p.appendChild(b)
+            return p
+        }
+        b
+    }
+    let look = (el) => {
+        let r = range_in(el)
+        on = r == null ? [] : ["bold", "italic", "underline", "strike", "list", "numbered"]
+            | filter((t) => around(el, r, rich_text_editor_same[t]) != null)
+    }
+    let changed = (el) => {
+        let next = el.innerHTML
+        if next == "<br>" || next == "<p><br></p>" { el.textContent = "" }
+        html = el.innerHTML
+        on_change && on_change(el.innerHTML)
+        look(el)
+    }
+    let run = (e, tool: str) => {
+        let el = area(e)
+        let r = range_in(el)
+        if r == null {
+            el.focus()
+            return null
+        }
+        let style = rich_text_editor_tags[tool]
+        if style != null || tool == "link" {
+            let on_already = around(el, r, tool == "link" ? "a" : rich_text_editor_same[tool])
+            if on_already != null {
+                unwrap(on_already)
+            } else if !r.collapsed {
+                let url = tool == "link" ? js("prompt", "Link address", "https://") : null
+                if tool != "link" || (url != null && trim(url) != "" && trim(url) != "https://") {
+                    let wrapper = js("document.createElement", style ?? "a")
+                    if tool == "link" { wrapper.href = trim(url) }
+                    wrapper.appendChild(r.extractContents())
+                    r.insertNode(wrapper)
+                    select_in(wrapper)
+                }
+            }
+        } else if tool == "list" || tool == "numbered" {
+            let tag = tool == "list" ? "ul" : "ol"
+            let list = around(el, r, "ul,ol")
+            if list != null && lower(list.nodeName) == tag {
+                for li in js("Array.from", list.children) => {
+                    let p = retag(li, "p")
+                    list.parentNode.insertBefore(p, list)
+                }
+                list.remove()
+            } else if list != null {
+                select_in(retag(list, tag))
+            } else {
+                let b = block_of(el, r)
+                let li = retag(b, "li")
+                let wrapper = js("document.createElement", tag)
+                li.replaceWith(wrapper)
+                wrapper.appendChild(li)
+                select_in(li)
+            }
+        } else {
+            let b = block_of(el, r)
+            if lower(b.nodeName) == "ul" || lower(b.nodeName) == "ol" {
+                // Headings and quotes are for paragraphs: a list stays a list.
+                null
+            } else if tool == "clear" {
+                let p = lower(b.nodeName) == "p" ? b : retag(b, "p")
+                p.textContent = p.textContent
+                select_in(p)
+            } else {
+                let tag = tool == "heading" ? "h2" : "blockquote"
+                select_in(retag(b, lower(b.nodeName) == tag ? "p" : tag))
+            }
+        }
+        el.focus()
+        changed(el)
+    }
+    let icon = (tool: str) => match tool {
+        "bold" => <span aria-hidden="true">B</span>
+        "italic" => <i aria-hidden="true">I</i>
+        "underline" => <u aria-hidden="true">U</u>
+        "strike" => <s aria-hidden="true">S</s>
+        "heading" => <span aria-hidden="true">H</span>
+        "quote" => <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M3 9.5a2.5 2.5 0 1 0 2.5-2.5h-.3C5.5 5.6 6.3 4.6 7.5 4V2.5C5 3.2 3 5.3 3 8.6zM9 9.5a2.5 2.5 0 1 0 2.5-2.5h-.3c.3-1.4 1.1-2.4 2.3-3V2.5C11 3.2 9 5.3 9 8.6z"/></svg>
+        "list" => <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M6 4h7M6 8h7M6 12h7"/><circle cx="3" cy="4" r=".8" fill="currentColor"/><circle cx="3" cy="8" r=".8" fill="currentColor"/><circle cx="3" cy="12" r=".8" fill="currentColor"/></svg>
+        "numbered" => <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M7 4h6M7 8h6M7 12h6M2.5 3l1-.6V6M2.3 9.5c.3-.6 1.4-.8 1.8 0 .3.7-1.6 1.6-1.8 2.5h2"/></svg>
+        "link" => <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M6.5 9.5l3-3M7 11l-1.5 1.5a2.1 2.1 0 0 1-3-3L4 8M9 5l1.5-1.5a2.1 2.1 0 0 1 3 3L12 8"/></svg>
+        _ => <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12.5h10M4 3.5h8l-5 6M7.5 3.5v6"/></svg>
+    }
+    let title = (tool: str) => match tool {
+        "bold" => "Bold (Ctrl+B)"
+        "italic" => "Italic (Ctrl+I)"
+        "underline" => "Underline (Ctrl+U)"
+        "strike" => "Strikethrough"
+        "heading" => "Heading"
+        "quote" => "Quote"
+        "list" => "Bulleted list"
+        "numbered" => "Numbered list"
+        "link" => "Link"
+        _ => "Clear formatting"
+    }
+    <div class={ui_cls(["ui-rich-text-editor", error != null && "ui-rich-text-editor-invalid", class])}>
+        {label != null && <span.ui-rich-text-editor-label id={`${id}-label`}>
+            {label}{required && <span.ui-rich-text-editor-req aria-hidden="true">*</span>}
+        </span>}
+        <div.ui-rich-text-editor-frame>
+            <div.ui-rich-text-editor-bar role="toolbar" aria-label="Formatting" aria-controls={id}>
+                {for t in offered => [
+                    (t == "heading" || t == "list" || t == "link") && <span.ui-rich-text-editor-sep aria-hidden="true"></span>,
+                    <button.ui-rich-text-editor-tool type="button" key={t} title={title(t)} aria-label={title(t)} disabled={disabled}
+                            aria-pressed={contains(["bold", "italic", "underline", "strike", "list", "numbered"], t) ? (contains(on, t) ? "true" : "false") : null}
+                            @mousedown={(e) => { e.preventDefault() }} @click={(e) => run(e, t)}>{icon(t)}</button>,
+                ]}
+            </div>
+            <div.ui-rich-text-editor-area id={id} contenteditable={disabled ? "false" : "true"} role="textbox" aria-multiline="true"
+                 aria-labelledby={label != null ? `${id}-label` : null} aria-required={required ? "true" : null}
+                 aria-invalid={error != null ? "true" : null} aria-describedby={described != "" ? described : null}
+                 data-placeholder={placeholder} style={`--ui-rich-text-editor-h: ${min_height}px`}
+                 @mount={(el) => {
+                     // The starting HTML arrives wrapped (raw markup in a component is): unwrap it, so the
+                     // box holds the text itself and what is read back is only the user's HTML.
+                     let w = el.querySelector("quillo-raw")
+                     if w != null {
+                         while w.firstChild != null { el.insertBefore(w.firstChild, w) }
+                         w.remove()
+                     }
+                 }}
+                 @input={(e) => changed(e.target)}
+                 @keyup={(e) => look(e.target)} @mouseup={(e) => look(area(e))}
+                 @keydown={(e) => {
+                     if (e.ctrlKey || e.metaKey) && contains(["b", "i", "u"], lower(e.key)) {
+                         e.preventDefault()
+                         run(e, lower(e.key) == "b" ? "bold" : lower(e.key) == "i" ? "italic" : "underline")
+                     }
+                 }}>{raw(value)}</div>
+        </div>
+        {name != null && <input type="hidden" name={name} value={html}/>}
+        {hint != null && <p.ui-rich-text-editor-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-rich-text-editor-error id={`${id}-error`} role="alert">{error}</p>}
+    </div>
+}

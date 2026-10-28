@@ -1,0 +1,12 @@
+const [full, bare] = $$(".ui-pdf-viewer");
+if (!full || !bare) return "expected two viewers";
+const obj = full.querySelector("object");
+if (!obj || obj.getAttribute("type") !== "application/pdf" || !obj.getAttribute("data").startsWith("data:application/pdf")) return "the object is not the PDF";
+if (obj.getAttribute("aria-label") !== "Hello.pdf") return "the object is not named by the title";
+if (Math.round(obj.getBoundingClientRect().height) !== 360) return `height 360px gives ${obj.getBoundingClientRect().height}`;
+if (full.querySelector(".ui-pdf-viewer-title")?.textContent !== "Hello.pdf") return "the bar does not show the title";
+const links = [...full.querySelectorAll(".ui-pdf-viewer-bar a")];
+if (links.length !== 2 || links[0].target !== "_blank" || links[1].getAttribute("download") !== "hello.pdf") return "the open and download links are wrong";
+if (!full.querySelector(".ui-pdf-viewer-fallback a")) return "the fallback has no link";
+if (bare.querySelector(".ui-pdf-viewer-bar")) return "bar false still shows the bar";
+if (Math.round(bare.querySelector("object").getBoundingClientRect().height) !== 160) return "the second height is wrong";

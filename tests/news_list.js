@@ -1,0 +1,16 @@
+const latest = $("#news-list-demo-latest");
+if (latest.tagName !== "OL" || latest.getAttribute("aria-label") !== "Latest") return "the list is not a named <ol>";
+const items = [...latest.querySelectorAll(".ui-news-list-item")];
+if (items.length !== 4) return `expected 4 items, found ${items.length}`;
+const a = items[0].querySelector("h4 a");
+if (!a || a.getAttribute("href") !== "#news_list" || !a.textContent.startsWith("Quillo 0.5")) return "the headline is not a link";
+const meta = items[0].querySelector(".ui-news-list-meta");
+if (meta.querySelector("span").textContent !== "Blog" || meta.querySelector("time").textContent !== "2 h ago" || meta.querySelector("time").getAttribute("datetime") !== "2026-10-28T08:00:00Z") return "source and time";
+if (items[0].querySelector("img.ui-news-list-pic")?.getAttribute("src") !== "https://picsum.photos/seed/n1/128/96") return "the picture";
+if (items[2].querySelector("img")) return "an item without src shows a picture";
+if (latest.querySelector(".ui-news-list-rank")) return "ranks show when not numbered";
+const top = $("#news-list-demo-top");
+if (!top.classList.contains("ui-news-list-dense")) return "dense";
+const ranks = [...top.querySelectorAll(".ui-news-list-rank")].map((r) => r.textContent);
+if (ranks.join() !== "1,2,3,4") return `ranks: ${ranks}`;
+if (top.querySelector(".ui-news-list-meta span")) return "no source, no source span";

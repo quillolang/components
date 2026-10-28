@@ -1,0 +1,14 @@
+const all = $$(".ui-stock");
+if (all.length !== 8) return `expected 8, found ${all.length}`;
+const text = (s) => s.querySelector(".ui-stock-text").textContent;
+if (text(all[0]) !== "In stock" || !all[0].classList.contains("ui-stock-in")) return `24 reads "${text(all[0])}"`;
+if (all[0].getAttribute("role") !== "status") return "it is not a status region";
+if (text(all[1]) !== "Only 3 left" || !all[1].classList.contains("ui-stock-low")) return `3 reads "${text(all[1])}"`;
+if (text(all[2]) !== "Out of stock" || !all[2].classList.contains("ui-stock-out")) return `0 reads "${text(all[2])}"`;
+const dot = (s) => getComputedStyle(s.querySelector(".ui-stock-dot")).backgroundColor;
+if (dot(all[0]) === dot(all[1]) || dot(all[1]) === dot(all[2])) return "the dots are not coloured by state";
+if (text(all[3]) !== "Pre-order" || all[3].querySelector(".ui-stock-hint")?.textContent !== "· ships Dec 1, 2026") return `pre-order: "${all[3].textContent}"`;
+if (all[4].querySelector(".ui-stock-hint")?.textContent !== "· ships 15 Nov 2026") return `en-GB date: "${all[4].querySelector(".ui-stock-hint")?.textContent}"`;
+if (text(all[5]) !== "120 in stock") return `show_count: "${text(all[5])}"`;
+if (text(all[6]) !== "Only 8 left") return `low_at={10} with 8: "${text(all[6])}"`;
+if (text(all[7]) !== "Ships today" || !all[7].classList.contains("ui-stock-sm")) return "text and size are not used";

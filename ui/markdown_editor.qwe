@@ -1,0 +1,183 @@
+// MarkdownEditor: a box for Markdown with a toolbar (bold, italic, heading, link,
+// list, quote, code) that wraps what is selected, and a Preview tab that shows the
+// text rendered, by Quillo's own `markdown()` (so the preview is what the page
+// will show). It is a real <textarea> named `name`, so a plain <form> sends the
+// Markdown; the route renders it with `markdown(text)`.
+//
+//   <MarkdownEditor name="body" label="Post" rows={10} value={post.body}/>
+//   <MarkdownEditor name="note" placeholder="Write in Markdown…" on_change={(t) => { note = t }}/>
+//
+// value: the Markdown to start with. rows: the box's height in lines (8).
+// tools: which buttons, in order, from "bold", "italic", "heading", "link",
+// "list", "numbered", "quote", "code" (all by default). preview: whether to offer
+// the Preview tab (true). Ctrl/Cmd+B and Ctrl/Cmd+I make bold and italic.
+// name, label, placeholder, hint, error, required, disabled and field (the box's
+// id, "markdown-editor-" + name by default) as for every field.
+// on_change(text): inside one of your components, given the Markdown as it is typed.
+
+let markdown_editor_css = css`
+.ui-markdown-editor { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-markdown-editor-label { font-size: 13px; font-weight: 500; }
+.ui-markdown-editor-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-markdown-editor-frame { border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); overflow: hidden; transition: border-color .15s, box-shadow .15s; }
+.ui-markdown-editor-frame:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-markdown-editor-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; padding: 4px 6px; border-bottom: 1px solid var(--ui-border); background: var(--ui-subtle); }
+.ui-markdown-editor-tabs { display: flex; gap: 2px; margin-right: 8px; }
+.ui-markdown-editor-tab {
+  height: 28px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted);
+  font: 500 13px/1 var(--ui-font); cursor: pointer;
+}
+.ui-markdown-editor-tab[aria-selected="true"] { background: var(--ui-surface); color: var(--ui-fg); box-shadow: 0 0 0 1px var(--ui-border); }
+.ui-markdown-editor-tab:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-markdown-editor-tool {
+  display: inline-grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-fg); font: 600 13px/1 var(--ui-font); cursor: pointer;
+}
+.ui-markdown-editor-tool:hover { background: var(--ui-surface); box-shadow: 0 0 0 1px var(--ui-border); }
+.ui-markdown-editor-tool:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-markdown-editor-tool:disabled { opacity: .45; cursor: not-allowed; }
+.ui-markdown-editor-tool svg { width: 16px; height: 16px; }
+.ui-markdown-editor-tool i { font-style: italic; font-family: Georgia, serif; font-size: 15px; }
+.ui-markdown-editor-frame textarea {
+  display: block; box-sizing: border-box; width: 100%; min-height: 80px; margin: 0; padding: 10px 12px; border: 0; outline: none; resize: vertical;
+  background: transparent; color: var(--ui-fg); font: 14px/1.6 var(--ui-mono);
+}
+.ui-markdown-editor-frame textarea::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-markdown-editor-frame textarea:disabled { opacity: .55; cursor: not-allowed; }
+.ui-markdown-editor-preview { min-height: 80px; padding: 10px 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.ui-markdown-editor-preview > :first-child { margin-top: 0; }
+.ui-markdown-editor-preview > :last-child { margin-bottom: 0; }
+.ui-markdown-editor-preview h1, .ui-markdown-editor-preview h2, .ui-markdown-editor-preview h3 { margin: .8em 0 .4em; line-height: 1.25; }
+.ui-markdown-editor-preview pre { padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); overflow: auto; font: 13px/1.5 var(--ui-mono); }
+.ui-markdown-editor-preview code { font: 13px var(--ui-mono); }
+.ui-markdown-editor-preview blockquote { margin: .6em 0; padding: 0 0 0 12px; border-left: 3px solid var(--ui-border); color: var(--ui-muted); }
+.ui-markdown-editor-preview a { color: var(--ui-accent); }
+.ui-markdown-editor-empty { color: var(--ui-muted); font-style: italic; }
+.ui-markdown-editor-invalid .ui-markdown-editor-frame { border-color: var(--ui-danger); }
+.ui-markdown-editor-hint, .ui-markdown-editor-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-markdown-editor-error { color: var(--ui-danger); }
+@media (prefers-reduced-motion: reduce) { .ui-markdown-editor-frame { transition: none; } }
+`
+
+let markdown_editor_tools = ["bold", "italic", "heading", "link", "list", "numbered", "quote", "code"]
+
+// `text` with the selection (from a to b) wrapped or its lines prefixed for the
+// tool: { text, start, end } with where the selection goes after.
+fn markdown_editor_apply(tool: str, text: str, a: int, b: int) {
+    let before = slice(text, 0, a)
+    let sel = slice(text, a, b)
+    let after = slice(text, b)
+    let wrap = (open: str, close: str, blank: str) => {
+        let body = sel == "" ? blank : sel
+        { text: before + open + body + close + after, start: a + len(open), end: a + len(open) + len(body) }
+    }
+    let lines = (mark) => {
+        // The whole lines the selection touches, each given its mark.
+        let from = (index_of(reverse(split(before, "")), "\n") ?? len(before))
+        let line_start = len(before) - from
+        let to_nl = index_of(split(after, ""), "\n")
+        let line_end = to_nl == null ? len(text) : b + to_nl
+        let block = slice(text, line_start, line_end)
+        let marked = split(block, "\n") | enumerate | map((p) => mark(p[0]) + p[1]) | join("\n")
+        { text: slice(text, 0, line_start) + marked + slice(text, line_end), start: line_start, end: line_start + len(marked) }
+    }
+    match tool {
+        "bold" => wrap("**", "**", "bold text")
+        "italic" => wrap("_", "_", "italic text")
+        "code" => contains(sel, "\n") ? wrap("```\n", "\n```", "code") : wrap("`", "`", "code")
+        "link" => {
+            let body = sel == "" ? "link text" : sel
+            { text: before + "[" + body + "](https://)" + after, start: a + len(body) + 3, end: a + len(body) + 11 }
+        }
+        "heading" => lines((i) => "## ")
+        "list" => lines((i) => "- ")
+        "numbered" => lines((i) => `${i + 1}. `)
+        "quote" => lines((i) => "> ")
+        _ => { text, start: a, end: b }
+    }
+}
+
+component MarkdownEditor(name: str? = null, label: str? = null, value: str = "", rows: int = 8, tools: list? = null,
+                         preview: bool = true, placeholder: str? = null, hint: str? = null, error: str? = null,
+                         required: bool = false, disabled: bool = false, field: str? = null, on_change = null, class: str? = null) {
+    style global markdown_editor_css
+    state text = value
+    state tab = "write"
+    state html = ""
+    state rendering = false
+    let id = field ?? `markdown-editor-${name ?? re.replace(lower(label ?? "text"), "[^a-z0-9]+", "-")}`
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
+    let offered = (tools ?? markdown_editor_tools) | filter((t) => contains(markdown_editor_tools, t))
+    let apply = (e, tool: str) => {
+        let box = e.target.closest(".ui-markdown-editor").querySelector("textarea")
+        let r = markdown_editor_apply(tool, text, box.selectionStart, box.selectionEnd)
+        text = r.text
+        box.value = r.text
+        box.focus()
+        box.setSelectionRange(r.start, r.end)
+        on_change && on_change(r.text)
+    }
+    let show_preview = () => {
+        tab = "preview"
+        rendering = true
+        html = trim(text) == "" ? "" : str(markdown(text))
+        rendering = false
+    }
+    let icon = (tool: str) => match tool {
+        "bold" => <span aria-hidden="true">B</span>
+        "italic" => <i aria-hidden="true">I</i>
+        "heading" => <span aria-hidden="true">H</span>
+        "link" => <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M6.5 9.5l3-3M7 11l-1.5 1.5a2.1 2.1 0 0 1-3-3L4 8M9 5l1.5-1.5a2.1 2.1 0 0 1 3 3L12 8"/></svg>
+        "list" => <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M6 4h7M6 8h7M6 12h7"/><circle cx="3" cy="4" r=".8" fill="currentColor"/><circle cx="3" cy="8" r=".8" fill="currentColor"/><circle cx="3" cy="12" r=".8" fill="currentColor"/></svg>
+        "numbered" => <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M7 4h6M7 8h6M7 12h6M2.5 3l1-.6V6M2.3 9.5c.3-.6 1.4-.8 1.8 0 .3.7-1.6 1.6-1.8 2.5h2"/></svg>
+        "quote" => <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M3 9.5a2.5 2.5 0 1 0 2.5-2.5h-.3C5.5 5.6 6.3 4.6 7.5 4V2.5C5 3.2 3 5.3 3 8.6zM9 9.5a2.5 2.5 0 1 0 2.5-2.5h-.3c.3-1.4 1.1-2.4 2.3-3V2.5C11 3.2 9 5.3 9 8.6z"/></svg>
+        _ => <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 4L2 8l3.5 4M10.5 4L14 8l-3.5 4"/></svg>
+    }
+    let title = (tool: str) => match tool {
+        "bold" => "Bold (Ctrl+B)"
+        "italic" => "Italic (Ctrl+I)"
+        "heading" => "Heading"
+        "link" => "Link"
+        "list" => "Bulleted list"
+        "numbered" => "Numbered list"
+        "quote" => "Quote"
+        _ => "Code"
+    }
+    <div class={ui_cls(["ui-markdown-editor", error != null && "ui-markdown-editor-invalid", class])}>
+        {label != null && <label.ui-markdown-editor-label for={id}>
+            {label}{required && <span.ui-markdown-editor-req aria-hidden="true">*</span>}
+        </label>}
+        <div.ui-markdown-editor-frame>
+            <div.ui-markdown-editor-bar>
+                {preview && <div.ui-markdown-editor-tabs role="tablist" aria-label="Write or preview">
+                    <button.ui-markdown-editor-tab type="button" role="tab" id={`${id}-tab-write`} aria-selected={tab == "write" ? "true" : "false"}
+                            aria-controls={`${id}-write`} @click={() => { tab = "write" }}>Write</button>
+                    <button.ui-markdown-editor-tab type="button" role="tab" id={`${id}-tab-preview`} aria-selected={tab == "preview" ? "true" : "false"}
+                            aria-controls={`${id}-preview`} @click={() => { show_preview() }}>Preview</button>
+                </div>}
+                {for t in offered => <button.ui-markdown-editor-tool type="button" key={t} title={title(t)} aria-label={title(t)}
+                        disabled={disabled || tab != "write"} @click={(e) => apply(e, t)}>{icon(t)}</button>}
+            </div>
+            <div id={`${id}-write`} role={preview ? "tabpanel" : null} aria-labelledby={preview ? `${id}-tab-write` : null} hidden={tab != "write"}>
+                <textarea id={id} name={name} value={text} rows={rows} placeholder={placeholder} required={required} disabled={disabled}
+                          spellcheck="true" aria-invalid={error != null ? "true" : null} aria-describedby={described != "" ? described : null}
+                          @input={(e) => {
+                              text = e.value
+                              on_change && on_change(e.value)
+                          }}
+                          @keydown={(e) => {
+                              if (e.ctrlKey || e.metaKey) && (lower(e.key) == "b" || lower(e.key) == "i") {
+                                  e.preventDefault()
+                                  apply(e, lower(e.key) == "b" ? "bold" : "italic")
+                              }
+                          }}></textarea>
+            </div>
+            {preview && <div.ui-markdown-editor-preview id={`${id}-preview`} role="tabpanel" aria-labelledby={`${id}-tab-preview`}
+                    aria-busy={rendering ? "true" : null} hidden={tab != "preview"}>
+                {html == "" ? <p.ui-markdown-editor-empty>{rendering ? "Rendering…" : "Nothing to preview."}</p> : raw(html)}
+            </div>}
+        </div>
+        {hint != null && <p.ui-markdown-editor-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-markdown-editor-error id={`${id}-error`} role="alert">{error}</p>}
+    </div>
+}

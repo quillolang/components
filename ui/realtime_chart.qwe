@@ -1,0 +1,199 @@
+// RealtimeChart: a line of live values that scrolls as new ones come, showing a
+// window of the last N, with the latest value and its change written above, a
+// pulsing dot at the newest point, and a Pause button that holds the picture still
+// while values keep coming. The values are the parent's: a component that adds to
+// its list (from every(ms, ...), a stream, a socket) redraws it. Hovering a point
+// shows its value; screen readers get the latest value, and the window as a table.
+//
+//   component Load() {
+//       state points = []
+//       every(1000, () => { points = points + [read_load()] })
+//       <RealtimeChart label="CPU load" values={points} suffix="%" low={0} high={100}/>
+//   }
+//
+// values: the numbers, oldest first; only the last `window` (60) are drawn.
+// labels: what each value is (times), in step with values; by default how many
+// steps ago it came ("-3"). low, high: fixed ends for the scale (by default it
+// spans the window's values, widened to round ticks). color: 1 to 8, from the chart
+// palette (1, blue). prefix and suffix: around every value shown ("$", " ms");
+// decimals: digits after the point, always, instead of up to two as needed. height:
+// the plot's height in pixels (160). label: what the chart shows; it names it for
+// screen readers and captions their table. show_label also writes it above.
+// on_pause(paused): inside one of your components, given true when it is paused
+// and false when it goes on.
+
+let realtime_chart_css = css`
+.ui-realtime {
+  --ui-realtime-1: light-dark(#2a78d6, #3987e5); --ui-realtime-2: light-dark(#eb6834, #d95926);
+  --ui-realtime-3: light-dark(#1baf7a, #199e70); --ui-realtime-4: light-dark(#eda100, #c98500);
+  --ui-realtime-5: light-dark(#e87ba4, #d55181); --ui-realtime-6: light-dark(#008300, #008300);
+  --ui-realtime-7: light-dark(#6250d6, #9085e9); --ui-realtime-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 8px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-realtime-s1 { --c: var(--ui-realtime-1); } .ui-realtime-s2 { --c: var(--ui-realtime-2); } .ui-realtime-s3 { --c: var(--ui-realtime-3); }
+.ui-realtime-s4 { --c: var(--ui-realtime-4); } .ui-realtime-s5 { --c: var(--ui-realtime-5); } .ui-realtime-s6 { --c: var(--ui-realtime-6); }
+.ui-realtime-s7 { --c: var(--ui-realtime-7); } .ui-realtime-s8 { --c: var(--ui-realtime-8); }
+.ui-realtime-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.ui-realtime-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-realtime-now { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-realtime-up { color: var(--ui-success); } .ui-realtime-down { color: var(--ui-danger); }
+.ui-realtime-chg { font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-realtime-live { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: var(--ui-muted); }
+.ui-realtime-live i { width: 8px; height: 8px; border-radius: 50%; background: var(--ui-success); }
+.ui-realtime-paused .ui-realtime-live i { background: var(--ui-strong); }
+.ui-realtime-pause { height: 26px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); cursor: pointer; }
+.ui-realtime-pause:hover { border-color: var(--ui-strong); }
+.ui-realtime-pause:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-realtime-frame { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; padding-top: 6px; }
+.ui-realtime-y { position: relative; min-width: 24px; }
+.ui-realtime-y span { position: absolute; right: 0; transform: translateY(50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-realtime-plot { position: relative; }
+.ui-realtime-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-realtime-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.ui-realtime-line { fill: none; stroke: var(--c); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.ui-realtime-area { fill: var(--c); opacity: .12; }
+.ui-realtime-head-dot { position: absolute; width: 8px; height: 8px; margin: -4px 0 0 -4px; border-radius: 50%; background: var(--c); }
+.ui-realtime-head-dot::after { content: ""; position: absolute; inset: -4px; border-radius: 50%; border: 2px solid var(--c);
+  animation: ui-realtime-pulse 1.4s ease-out infinite; }
+.ui-realtime-paused .ui-realtime-head-dot::after { animation: none; opacity: 0; }
+@keyframes ui-realtime-pulse { from { transform: scale(.6); opacity: .9; } to { transform: scale(1.8); opacity: 0; } }
+.ui-realtime-cols { position: absolute; inset: 0; display: flex; }
+.ui-realtime-col { position: relative; flex: 1; min-width: 0; --x: 50%; }
+.ui-realtime-col:first-child:not(:last-child) { flex: .5; --x: 0%; }
+.ui-realtime-col:last-child:not(:first-child) { flex: .5; --x: 100%; }
+.ui-realtime-col::before { content: ""; position: absolute; top: 0; bottom: 0; left: var(--x); width: 1px; background: var(--ui-strong); opacity: 0; }
+.ui-realtime-col:hover::before { opacity: 1; }
+.ui-realtime-tip { position: absolute; z-index: 20; top: 0; left: var(--x); display: none; padding: 4px 8px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); box-shadow: var(--ui-shadow); color: var(--ui-muted);
+  font-size: 12px; transform: translateX(8px); white-space: nowrap; pointer-events: none; }
+.ui-realtime-tip b { margin-left: 6px; color: var(--ui-fg); font-variant-numeric: tabular-nums; }
+.ui-realtime-flip .ui-realtime-tip { transform: translateX(calc(-100% - 8px)); }
+.ui-realtime-col:hover .ui-realtime-tip { display: block; }
+@media (prefers-reduced-motion: reduce) { .ui-realtime-head-dot::after { animation: none; opacity: 0; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn realtime_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn realtime_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : realtime_chart_group(floor(n / 1000)) + "," + realtime_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn realtime_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${realtime_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${realtime_chart_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate or a percentage for CSS and SVG, to two decimals.
+fn realtime_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// An axis tick, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn realtime_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? realtime_chart_num(v)
+        : `${v < 0 ? "-" : ""}${realtime_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// The axis from lo to hi, widened to round ticks: about `steps` steps of 1, 2, 2.5 or 5 x 10^n.
+fn realtime_chart_scale(lo: num, hi: num, steps: int = 4) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo)) : hi - lo
+    let raw = span / steps
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+component RealtimeChart(values: list = [], labels: list? = null, window: int = 60, low: num? = null, high: num? = null,
+                        color: int = 1, prefix: str = "", suffix: str = "", decimals: int? = null, height: int = 160,
+                        label: str = "Live values", show_label: bool = true, on_pause = null, class: str? = null) {
+    style global realtime_chart_css
+    state frozen = null
+    let data = frozen ?? { values: values, labels: labels }
+    let total = len(data.values)
+    let keep = window > 1 ? window : 2
+    let start = total > keep ? total - keep : 0
+    let vals = slice(data.values, start, total)
+    let names = for i in range(len(vals)) => data.labels != null ? (data.labels[start + i] ?? "") : str(i - len(vals) + 1)
+    let m = len(vals)
+    let fmt = (v) => v == null ? "—" : `${v < 0 ? "-" : ""}${prefix}${realtime_chart_num(abs(v), decimals)}${suffix}`
+    let known = vals | filter((v) => v != null)
+    let lo0 = low ?? (len(known) == 0 ? 0 : min(known))
+    let hi0 = high ?? (len(known) == 0 ? 1 : max(known))
+    let sc = low != null && high != null && high > low ? { lo: low, hi: high, ticks: realtime_chart_scale(low, high).ticks | filter((t) => t >= low && t <= high) }
+        : realtime_chart_scale(lo0, hi0)
+    let top = (v) => (sc.hi - v) * 100 / (sc.hi - sc.lo)
+    // Points sit where they will be when the window is full, so the line scrolls left as values come.
+    let x = (i) => (keep - m + i) * 100 / (keep - 1)
+    let pt = (i) => `${realtime_chart_pct(x(i))},${realtime_chart_pct(top(vals[i]))}`
+    let idx = range(m) | filter((i) => vals[i] != null)
+    let line = len(idx) == 0 ? "" : "M" + join(idx | map(pt), " L")
+    let last = m > 0 ? vals[m - 1] : null
+    let before = m > 1 ? vals[m - 2] : null
+    let change = last != null && before != null ? last - before : null
+    let tone = `ui-realtime-s${color < 1 || color > 8 ? 1 : color}`
+    <figure class={ui_cls(["ui-realtime", tone, frozen != null && "ui-realtime-paused", class])} aria-label={label}>
+        <div.ui-realtime-head>
+            {show_label && <figcaption.ui-realtime-title>{label}</figcaption>}
+            <span.ui-realtime-now>{fmt(last)}</span>
+            {change != null && <span class={ui_cls(["ui-realtime-chg", change > 0 && "ui-realtime-up", change < 0 && "ui-realtime-down"])}>
+                {change > 0 ? "▲ " : (change < 0 ? "▼ " : "")}{fmt(abs(change))}
+            </span>}
+            <span.ui-realtime-live aria-hidden="true"><i></i>{frozen != null ? "Paused" : "Live"}</span>
+            <button.ui-realtime-pause type="button" aria-pressed={frozen != null ? "true" : "false"} @click={() => {
+                if frozen == null {
+                    frozen = { values: values, labels: labels }
+                    on_pause && on_pause(true)
+                } else {
+                    frozen = null
+                    on_pause && on_pause(false)
+                }
+            }}>{frozen != null ? "Resume" : "Pause"}</button>
+        </div>
+        <div.ui-realtime-frame aria-hidden="true">
+            <div.ui-realtime-y style={`height: ${height}px`}>
+                {for t in sc.ticks => <span style={`bottom: ${realtime_chart_pct(100 - top(t))}%`}>{t < 0 ? "-" : ""}{prefix}{realtime_chart_short(abs(t))}</span>}
+            </div>
+            <div.ui-realtime-plot style={`height: ${height}px`}>
+                {for t in sc.ticks => <span.ui-realtime-grid style={`top: ${realtime_chart_pct(top(t))}%`}></span>}
+                <svg.ui-realtime-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                    {len(idx) > 1 && <path.ui-realtime-area d={`${line} L${realtime_chart_pct(x(idx[-1]))},100 L${realtime_chart_pct(x(idx[0]))},100 Z`}/>}
+                    <path.ui-realtime-line d={line} vector-effect="non-scaling-stroke"/>
+                </svg>
+                {last != null && <span.ui-realtime-head-dot style={`left: 100%; top: ${realtime_chart_pct(top(last))}%`}></span>}
+                <div.ui-realtime-cols style={`left: ${realtime_chart_pct(m > 0 ? x(0) : 100)}%`}>
+                    {for i in range(m) => <div class={ui_cls(["ui-realtime-col", i > m / 2 && "ui-realtime-flip"])}>
+                        <span.ui-realtime-tip>{names[i]}<b>{fmt(vals[i])}</b></span>
+                    </div>}
+                </div>
+            </div>
+        </div>
+        <p.ui-sr>{label}: {frozen != null ? "paused at" : "latest"} {fmt(last)}</p>
+        <table.ui-sr>
+            <caption>{label}, the last {m}</caption>
+            <tbody>{for i in range(m) => <tr><th scope="row">{names[i]}</th><td>{fmt(vals[i])}</td></tr>}</tbody>
+        </table>
+    </figure>
+}

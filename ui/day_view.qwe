@@ -1,0 +1,121 @@
+// DayView: one day as a column of hours with its events drawn where their time is,
+// side by side when they overlap, each with its time and place; all-day events are
+// listed above the hours, and a line shows the time now when it is given.
+//
+//   <DayView day="2026-11-04" now="2026-11-04T14:20" events={[
+//       { id: 1, title: "Stand-up", start: "09:00", end: "09:15", tone: "accent" },
+//       { id: 2, title: "Design review", start: "14:00", end: "15:30", place: "Room 2", href: "/events/2" },
+//       { id: 3, title: "Ana out" },
+//   ]}/>
+//
+// day: the day ("YYYY-MM-DD"), named in the heading. events: a list of { title, start?,
+// end?, id?, place?, tone?, href? }: start and end are "HH:MM" (or "YYYY-MM-DDTHH:MM";
+// an end left out is an hour after the start); one with no start is all day. tone:
+// "accent" (default), "success", "warning", "danger", "info" or "neutral". href makes
+// the event a link; otherwise, inside one of your components, on_open(id) is called
+// with its id when it is pressed. from_hour, to_hour: the hours shown (8 to 18); an
+// event past them is cut at the edge, one wholly outside them is not drawn.
+// hour_height: pixels per hour (56). now: "YYYY-MM-DDTHH:MM" or "HH:MM", the time to
+// draw a line at. heading: false drops the day's name above. label: what screen
+// readers call it (the day's name); each event is heard with its time and place.
+
+let day_view_css = css`
+.ui-day-view { display: grid; min-width: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); font: 13px/1.3 var(--ui-font); color: var(--ui-fg); overflow: hidden; --dv-h: 56px; }
+.ui-day-view-head { padding: 10px 14px; border-bottom: 1px solid var(--ui-border); }
+.ui-day-view-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+.ui-day-view-head h3 span { color: var(--ui-muted); font-weight: 400; }
+.ui-day-view-allday { display: flex; flex-wrap: wrap; gap: 4px; padding: 6px 8px 6px 58px; border-bottom: 1px solid var(--ui-border); }
+.ui-day-view-scroll { display: grid; grid-template-columns: 56px minmax(0, 1fr); max-height: 600px; overflow-y: auto; }
+.ui-day-view-hours { position: relative; height: calc(var(--dv-hours) * var(--dv-h)); }
+.ui-day-view-hour { position: absolute; right: 8px; transform: translateY(-50%); color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-day-view-body { position: relative; height: calc(var(--dv-hours) * var(--dv-h)); border-left: 1px solid var(--ui-border); background-image: linear-gradient(var(--ui-border) 1px, transparent 1px); background-size: 100% var(--dv-h); }
+.ui-day-view-event {
+  position: absolute; display: grid; align-content: start; gap: 2px; overflow: hidden; margin: 1px 4px; padding: 4px 8px; border: 0; border-left: 3px solid var(--t);
+  border-radius: 5px; background: color-mix(in srgb, var(--t) 16%, var(--ui-surface)); color: var(--ui-fg); font: inherit; text-align: left;
+  text-decoration: none; cursor: pointer; --t: var(--ui-accent);
+}
+.ui-day-view-event:hover { background: color-mix(in srgb, var(--t) 28%, var(--ui-surface)); }
+.ui-day-view-event:focus-visible { outline: none; box-shadow: var(--ui-focus); z-index: 2; }
+.ui-day-view-event b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-day-view-event span { color: var(--ui-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-day-view-success { --t: var(--ui-success); }
+.ui-day-view-warning { --t: var(--ui-warning); }
+.ui-day-view-danger { --t: var(--ui-danger); }
+.ui-day-view-info { --t: var(--ui-info); }
+.ui-day-view-neutral { --t: var(--ui-strong); }
+.ui-day-view-allday .ui-day-view-event { position: static; margin: 0; padding: 3px 8px; }
+.ui-day-view-now { position: absolute; left: 0; right: 0; z-index: 1; height: 2px; background: var(--ui-danger); pointer-events: none; }
+.ui-day-view-now::before { content: ""; position: absolute; left: -4px; top: -3px; width: 8px; height: 8px; border-radius: 50%; background: var(--ui-danger); }
+.ui-day-view-empty { padding: 14px; color: var(--ui-muted); }
+`
+
+// The minutes since midnight of "HH:MM" or "YYYY-MM-DDTHH:MM".
+fn day_view_minutes(t: str) -> int {
+    let hm = len(t) > 5 ? slice(t, 11, 16) : t
+    (int(slice(hm, 0, 2)) ?? 0) * 60 + (int(slice(hm, 3, 5)) ?? 0)
+}
+
+// "HH:MM" from minutes since midnight.
+fn day_view_clock(m: int) -> str {
+    let two = (n: int) => n < 10 ? `0${n}` : str(n)
+    `${two(floor(m / 60))}:${two(m % 60)}`
+}
+
+// Events placed side by side where they overlap: each gets { ...e, from, to (minutes),
+// lane, lanes }, lanes being how many columns its cluster of overlapping events needs.
+fn day_view_lay(events: list) -> list {
+    let sorted = events | map((e) => { ...e, from: day_view_minutes(e.start), to: e.end != null ? day_view_minutes(e.end) : day_view_minutes(e.start) + 60 })
+        | sort_by((e) => e.from * 10000 - e.to)
+    let placed = sorted | reduce({ out: [], ends: [], cluster: [], cluster_end: -1 }, (acc, e) => {
+        let fresh = e.from >= acc.cluster_end
+        let ends = fresh ? [] : acc.ends
+        let free = ends | enumerate | find((p) => p[1] <= e.from)
+        let lane = free != null ? free[0] : len(ends)
+        { out: fresh ? acc.out + (acc.cluster | map((c) => { ...c, lanes: len(acc.ends) })) : acc.out,
+          ends: free != null ? set(ends, lane, e.to) : ends | push(e.to),
+          cluster: (fresh ? [] : acc.cluster) | push({ ...e, lane }),
+          cluster_end: fresh ? e.to : max([acc.cluster_end, e.to]) }
+    })
+    placed.out + (placed.cluster | map((c) => { ...c, lanes: len(placed.ends) }))
+}
+
+view DayView(day: str, events: list = [], from_hour: int = 8, to_hour: int = 18, hour_height: int = 56, now: str? = null,
+             heading: bool = true, label: str? = null, on_open = null, class: str? = null) {
+    style global day_view_css
+    let hours = to_hour - from_hour
+    let name = date.format(day, "dddd D MMMM YYYY")
+    let timed = events | filter((e) => e.start != null)
+        | filter((e) => day_view_minutes(e.start) < to_hour * 60 && (e.end != null ? day_view_minutes(e.end) : day_view_minutes(e.start) + 60) > from_hour * 60)
+    let allday = events | filter((e) => e.start == null)
+    let px = (m: int) => (m - from_hour * 60) / 60 * hour_height
+    let at = now != null && (len(now) <= 5 || slice(now, 0, 10) == day) ? day_view_minutes(now) : null
+    let event = (e: map, styles: str?) => {
+        let said = `${e.title}, ${e.from != null ? `${day_view_clock(e.from)} to ${day_view_clock(e.to)}` : "all day"}${e.place != null ? `, ${e.place}` : ""}`
+        let cls = ui_cls(["ui-day-view-event", e.tone != null && e.tone != "accent" && `ui-day-view-${e.tone}`])
+        let body = [<b>{e.title}</b>, (e.from != null || e.place != null) && <span>{e.from != null ? `${day_view_clock(e.from)}–${day_view_clock(e.to)}` : ""}{e.from != null && e.place != null ? " · " : ""}{e.place ?? ""}</span>]
+        e.href != null
+            ? <a class={cls} href={e.href} style={styles} aria-label={said} data-id={e.id}>{body}</a>
+            : <button class={cls} type="button" style={styles} aria-label={said} data-id={e.id} @click={() => { on_open && on_open(e.id) }}>{body}</button>
+    }
+    <div class={ui_cls(["ui-day-view", class])} role="group" aria-label={label ?? name}
+         style={`--dv-hours: ${hours}; --dv-h: ${hour_height}px`}>
+        {heading && <div.ui-day-view-head><h3>{date.format(day, "dddd")} <span>{date.format(day, "D MMMM YYYY")}</span></h3></div>}
+        {len(allday) > 0 && <div.ui-day-view-allday>{for e in allday => event(e, null)}</div>}
+        {len(events) == 0 && <div.ui-day-view-empty>Nothing planned.</div>}
+        <div.ui-day-view-scroll>
+            <div.ui-day-view-hours aria-hidden="true">
+                {for h in range(from_hour + 1, to_hour) => <span.ui-day-view-hour key={h} style={`top: ${(h - from_hour) * hour_height}px`}>{day_view_clock(h * 60)}</span>}
+            </div>
+            <div.ui-day-view-body>
+                {for e in day_view_lay(timed) => {
+                    let top = max([px(e.from), 0])
+                    let bottom = min([px(e.to), hours * hour_height])
+                    let w = 100 / e.lanes
+                    event(e, `top: ${top}px; height: ${max([bottom - top, 20])}px; left: ${round(e.lane * w, 2)}%; width: ${round(w, 2)}%`)
+                }}
+                {at != null && at >= from_hour * 60 && at <= to_hour * 60
+                    && <div.ui-day-view-now style={`top: ${px(at)}px`} role="img" aria-label={`Now, ${day_view_clock(at)}`}></div>}
+            </div>
+        </div>
+    </div>
+}

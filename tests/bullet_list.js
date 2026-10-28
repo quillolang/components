@@ -1,0 +1,18 @@
+const dots = $("#bullet-list-demo-dots"), checks = $("#bullet-list-demo-checks"), arrows = $("#bullet-list-demo-arrows");
+if (!dots || dots.tagName !== "UL" || dots.querySelectorAll(":scope > li").length !== 3) return "the list is not a <ul> of three";
+const bullet = (ul) => getComputedStyle(ul.querySelector("li"), "::before").content.replace(/"/g, "");
+if (bullet(dots) !== "•") return `the default bullet is ${bullet(dots)}`;
+if (bullet(checks) !== "✓" || bullet(arrows) !== "→") return `check and arrow bullets are ${bullet(checks)} ${bullet(arrows)}`;
+const color = (ul) => getComputedStyle(ul.querySelector("li"), "::before").color;
+if (color(checks) === color(dots) || color(arrows) === color(dots) || color(arrows) === color(checks)) return "the tones do not colour the bullets";
+if (color(checks) === getComputedStyle(checks).color) return "the bullet is the text colour";
+const gap = (ul) => { const [a, b] = ul.querySelectorAll(":scope > li"); return b.getBoundingClientRect().top - a.getBoundingClientRect().bottom; };
+if (!(gap(arrows) < gap(dots))) return "spacing=tight is not tighter";
+const glyph = $("#bullet-list-demo-glyph");
+if (bullet(glyph) !== "🚀") return `glyph gives ${bullet(glyph)}`;
+if (!(gap(glyph) > gap(dots))) return "spacing=loose is not looser";
+const kids = $("#bullet-list-demo-kids");
+if (!kids.querySelector(":scope > li b")) return "<li> children are not kept";
+if (bullet(kids) !== "" || parseFloat(getComputedStyle(kids.querySelector("li")).paddingLeft) !== 0) return "icon=none still has a bullet or an indent";
+if (kids.querySelectorAll(":scope > li ul.ui-bullets > li").length !== 2) return "a nested list is missing";
+if (getComputedStyle(dots).listStyleType !== "none") return "the browser's own bullet is still there";

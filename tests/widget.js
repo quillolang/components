@@ -1,0 +1,16 @@
+const panels = $$("section.ui-widget");
+if (panels.length !== 3) return `3 widgets, found ${panels.length}`;
+const [rev, orders, sync] = panels;
+if (rev.id !== "widget-demo-revenue" || rev.getAttribute("aria-labelledby") !== "widget-demo-revenue-title") return "with an id the region is labelled by its title";
+if (rev.querySelector("h3#widget-demo-revenue-title.ui-widget-title")?.textContent !== "Revenue") return "the title is not an h3";
+if (rev.querySelector(".ui-widget-sub")?.textContent !== "This month") return "the subtitle is missing";
+if (!rev.querySelector(".ui-widget-menu .ui-dropdown-btn")) return "the menu slot does not hold the dropdown";
+if (!rev.querySelector(".ui-widget-body .ui-stat")) return "the body is missing";
+if (rev.querySelector(".ui-widget-foot p")?.textContent !== "Updated 2 minutes ago") return "a text footer is not shown";
+if (orders.getAttribute("aria-label") !== "Recent orders" || orders.getAttribute("aria-labelledby")) return "without an id the region takes its title as its name";
+const link = orders.querySelector(".ui-widget-foot a.ui-widget-link");
+if (!link || link.getAttribute("href") !== "#widget" || link.textContent !== "All orders →") return "href and link do not make the footer link";
+if (getComputedStyle(orders.querySelector(".ui-widget-body")).paddingLeft !== "0px") return "padding=none still pads the body";
+if (sync.getAttribute("aria-busy") !== "true" || !sync.querySelector(".ui-widget-stripe")) return "loading does not mark it busy with a stripe";
+if (rev.querySelector(".ui-widget-stripe") || rev.getAttribute("aria-busy")) return "a widget not loading has a stripe";
+if (!sync.querySelector(".ui-widget-foot time")) return "an HTML footer is not shown as it is";

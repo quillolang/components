@@ -1,0 +1,16 @@
+const row = $("ul#social-links-demo.ui-social");
+if (!row || row.getAttribute("aria-label") !== "Social links") return "the row is not a named list";
+const links = row.querySelectorAll("li > a");
+if (links.length !== 13) return `13 links, found ${links.length}`;
+if (links[0].getAttribute("aria-label") !== "X" || links[1].getAttribute("aria-label") !== "GitHub" || links[7].getAttribute("aria-label") !== "Bluesky") return "the networks are not named";
+if (links[10].getAttribute("aria-label") !== "Email us") return "label does not replace the name";
+if ([...links].some((a) => !a.querySelector("svg"))) return "a link has no icon";
+if (links[1].getAttribute("target") !== "_blank" || links[1].getAttribute("rel") !== "me noopener") return "an https link does not open in a new tab with rel";
+if (links[10].getAttribute("target") || links[11].getAttribute("target")) return "mailto and same-site links open in a new tab";
+if (new Set([...links].map((a) => a.querySelector("svg").innerHTML)).size !== 13) return "two kinds draw the same icon";
+const [outline, solid, labelled] = $$("ul.ui-social").slice(1);
+if (getComputedStyle(outline.querySelector("a")).borderStyle !== "solid" || getComputedStyle(outline.querySelector("a")).borderColor === getComputedStyle(row.querySelector("a")).borderColor) return "outline has no border";
+if (solid.querySelector("a").getBoundingClientRect().height >= outline.querySelector("a").getBoundingClientRect().height) return "sm is not smaller";
+const big = labelled.querySelector("a");
+if (big.textContent.trim() !== "GitHub" || big.getAttribute("aria-label")) return "show_labels does not show the name as text";
+if (big.getBoundingClientRect().height < 42) return "lg is not bigger";

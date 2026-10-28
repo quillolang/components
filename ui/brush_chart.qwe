@@ -1,0 +1,310 @@
+// BrushChart: a large line chart of a range, with a small overview of everything
+// under it where a window picks that range: drag the window to move it, drag its
+// edges to widen or narrow it, or drag across the overview to draw a new one. The
+// keyboard does the same: the window and each edge are sliders (the arrow keys move
+// them a label, Page Up and Page Down a window's width, Home and End to the ends).
+// Hovering the large chart shows each value; screen readers hear the range and get
+// every number as a table.
+//
+//   <BrushChart label="Price" labels={days} values={closes} prefix="$" start={200} end={260}/>
+//   <BrushChart label="Traffic" labels={hours} series={[{ name: "In", values: rx }, { name: "Out", values: tx }]}
+//               on_change={(first, last) => { range = `${first} to ${last}` }}/>
+//
+// labels: the x axis, in order. values: one series' numbers, one per label; or
+// series: a list of { name, values } (up to eight, each in a colour of its own, with
+// a legend). A null leaves a gap. start, end: the indexes of the first and last
+// labels in the window to begin with (by default the last quarter). zero: the large
+// chart's axis starts at 0; otherwise it spans the values in the window. height:
+// the large chart's height in pixels (220); overview: the small one's (56). prefix
+// and suffix: around every value shown ("$", " ms"; the axis takes the prefix);
+// decimals: digits after the point, always, instead of up to two as needed. label:
+// what the chart shows; it names it for screen readers and captions their table.
+// show_label also writes it above. on_change(first, last): inside one of your
+// components, given the first and last labels in the window after each change.
+
+let brush_chart_css = css`
+.ui-brush {
+  --ui-brush-1: light-dark(#2a78d6, #3987e5); --ui-brush-2: light-dark(#eb6834, #d95926);
+  --ui-brush-3: light-dark(#1baf7a, #199e70); --ui-brush-4: light-dark(#eda100, #c98500);
+  --ui-brush-5: light-dark(#e87ba4, #d55181); --ui-brush-6: light-dark(#008300, #008300);
+  --ui-brush-7: light-dark(#6250d6, #9085e9); --ui-brush-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-brush-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-brush-s1 { --c: var(--ui-brush-1); } .ui-brush-s2 { --c: var(--ui-brush-2); } .ui-brush-s3 { --c: var(--ui-brush-3); }
+.ui-brush-s4 { --c: var(--ui-brush-4); } .ui-brush-s5 { --c: var(--ui-brush-5); } .ui-brush-s6 { --c: var(--ui-brush-6); }
+.ui-brush-s7 { --c: var(--ui-brush-7); } .ui-brush-s8 { --c: var(--ui-brush-8); }
+.ui-brush-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-brush-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.ui-brush-key { width: 14px; height: 3px; border-radius: 2px; background: var(--c); flex: none; }
+.ui-brush-frame { display: grid; grid-template-columns: 44px minmax(0, 1fr); column-gap: 8px; padding-top: 8px; }
+.ui-brush-y { position: relative; }
+.ui-brush-y span { position: absolute; right: 0; transform: translateY(50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-brush-plot { position: relative; }
+.ui-brush-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-brush-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.ui-brush-line { fill: none; stroke: var(--c); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.ui-brush-area { fill: var(--c); opacity: .1; }
+.ui-brush-mini .ui-brush-line { stroke-width: 1.25; opacity: .8; }
+.ui-brush-cols { position: absolute; inset: 0; display: flex; }
+.ui-brush-col { position: relative; flex: 1; min-width: 0; --x: 50%; }
+.ui-brush-col:first-child:not(:last-child) { flex: .5; --x: 0%; }
+.ui-brush-col:last-child:not(:first-child) { flex: .5; --x: 100%; }
+.ui-brush-col::before { content: ""; position: absolute; top: 0; bottom: 0; left: var(--x); width: 1px; background: var(--ui-strong); opacity: 0; }
+.ui-brush-col:hover::before { opacity: 1; }
+.ui-brush-dot { position: absolute; left: var(--x); display: none; width: 8px; height: 8px; margin: -4px 0 0 -4px; border-radius: 50%;
+  background: var(--c); box-shadow: 0 0 0 2px var(--ui-bg); }
+.ui-brush-col:hover .ui-brush-dot, .ui-brush-col:hover .ui-brush-tip { display: block; }
+.ui-brush-tip { position: absolute; z-index: 20; display: none; min-width: 120px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-brush-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-brush-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-brush-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-brush-tip { top: 0; left: calc(var(--x) + 10px); }
+.ui-brush-flip .ui-brush-tip { left: auto; right: calc(100% - var(--x) + 10px); }
+.ui-brush-tip .ui-brush-key { width: 8px; height: 8px; border-radius: 50%; }
+.ui-brush-x { position: relative; height: 16px; margin-top: 6px; }
+.ui-brush-x span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); white-space: nowrap; }
+.ui-brush-x .ui-brush-first { transform: none; }
+.ui-brush-x .ui-brush-last { transform: translateX(-100%); }
+.ui-brush-mini { position: relative; margin-top: 4px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-bg); cursor: crosshair; touch-action: none; user-select: none; }
+.ui-brush-shade { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb, var(--ui-muted) 16%, transparent); pointer-events: none; }
+.ui-brush-win { position: absolute; top: -1px; bottom: -1px; border: 1.5px solid var(--ui-accent); border-radius: 4px; cursor: grab; }
+.ui-brush-win:focus-visible, .ui-brush-edge:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-brush-edge { position: absolute; top: 50%; width: 10px; height: 26px; margin-left: -5px; border: 1px solid var(--ui-accent);
+  border-radius: 3px; background: var(--ui-surface); cursor: ew-resize; transform: translateY(-50%); z-index: 2; }
+.ui-brush-edge::before { content: ""; position: absolute; inset: 7px 3px; border-inline: 1px solid var(--ui-accent); }
+.ui-brush-ends { display: flex; justify-content: space-between; margin-top: 4px; color: var(--ui-muted); font-size: 11px; }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn brush_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn brush_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : brush_chart_group(floor(n / 1000)) + "," + brush_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn brush_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${brush_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${brush_chart_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate or a percentage for CSS and SVG, to two decimals.
+fn brush_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// An axis tick, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn brush_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? brush_chart_num(v)
+        : `${v < 0 ? "-" : ""}${brush_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// The axis from lo to hi, widened to round ticks: about `steps` steps of 1, 2, 2.5 or 5 x 10^n.
+fn brush_chart_scale(lo: num, hi: num, steps: int = 4) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo)) : hi - lo
+    let raw = span / steps
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+component BrushChart(labels: list, values: list? = null, series: list? = null, start: int? = null, end: int? = null,
+                     zero: bool = false, height: int = 220, overview: int = 56, prefix: str = "", suffix: str = "",
+                     decimals: int? = null, label: str = "Brush chart", show_label: bool = false, on_change = null,
+                     class: str? = null) {
+    style global brush_chart_css
+    let n = len(labels)
+    let sets = series ?? [{ name: label, values: values ?? [] }]
+    let last = n > 0 ? n - 1 : 0
+    let fix = (i: int) => i < 0 ? 0 : (i > last ? last : i)
+    let a0 = fix(start ?? (n - 1 - floor(n / 4)))
+    let b0 = fix(end ?? last)
+    state a = a0 < b0 ? a0 : (b0 > 0 ? b0 - 1 : 0)
+    state b = b0 > a0 ? b0 : (a0 < last ? a0 + 1 : last)
+    state mode = null
+    state grab = 0
+    state from_a = 0
+    state from_b = 0
+    let fmt = (v) => v == null ? "—" : `${v < 0 ? "-" : ""}${prefix}${brush_chart_num(abs(v), decimals)}${suffix}`
+    let span = b - a
+    let known = flatten(sets | map((s) => range(a, b + 1) | map((i) => s.values[i]))) | filter((v) => v != null)
+    let lo0 = len(known) == 0 ? 0 : min(known)
+    let hi0 = len(known) == 0 ? 1 : max(known)
+    let sc = brush_chart_scale(zero && lo0 > 0 ? 0 : lo0, zero && hi0 < 0 ? 0 : hi0)
+    let top = (v) => (sc.hi - v) * 100 / (sc.hi - sc.lo)
+    let all = flatten(sets | map((s) => s.values)) | filter((v) => v != null)
+    let mlo = len(all) == 0 ? 0 : min(all)
+    let mhi = len(all) == 0 ? 1 : (max(all) > mlo ? max(all) : mlo + 1)
+    let mtop = (v) => 8 + (mhi - v) * 84 / (mhi - mlo)
+    let x = (i) => span == 0 ? 50 : (i - a) * 100 / span
+    let mx = (i) => last == 0 ? 50 : i * 100 / last
+    // The path through a series between first and to, placed by px and py.
+    let path = (vals, first, to, px, py) => {
+        let starts = range(first, to + 1) | filter((i) => vals[i] != null && (i == first || vals[i - 1] == null))
+        join(for st in starts => {
+            let run = range(st, (find(range(st, to + 1), (k) => k == to || vals[k + 1] == null) ?? st) + 1)
+            "M" + join(run | map((i) => `${brush_chart_pct(px(i))},${brush_chart_pct(py(vals[i]))}`), " L") + (len(run) == 1 ? " l0.01,0" : "")
+        }, " ")
+    }
+    let tell = () => { on_change && on_change(labels[a], labels[b]) }
+    let set_window = (p: int, q: int) => {
+        let lo = fix(p < q ? p : q)
+        let hi = fix(p < q ? q : p)
+        if hi > lo {
+            a = lo
+            b = hi
+        }
+    }
+    let at = (e) => {
+        let r = e.target.closest(".ui-brush-mini").getBoundingClientRect()
+        fix(round((e.clientX - r.left) / r.width * last))
+    }
+    let every_nth = ceil((span + 1) / 8)
+    let keys = (e, part: str) => {
+        let size = b - a
+        let step = match e.key {
+            "ArrowLeft" | "ArrowDown" => -1
+            "ArrowRight" | "ArrowUp" => 1
+            "PageDown" => -size
+            "PageUp" => size
+            _ => 0
+        }
+        if step != 0 {
+            e.preventDefault()
+            if part == "start" { set_window(a + step < b ? a + step : b - 1, b) }
+            else if part == "end" { set_window(a, b + step > a ? b + step : a + 1) }
+            else {
+                let move = a + step < 0 ? -a : (b + step > last ? last - b : step)
+                set_window(a + move, b + move)
+            }
+            tell()
+        } else if e.key == "Home" || e.key == "End" {
+            e.preventDefault()
+            if part == "start" { set_window(e.key == "Home" ? 0 : b - 1, b) }
+            else if part == "end" { set_window(a, e.key == "End" ? last : a + 1) }
+            else { if e.key == "Home" { set_window(0, size) } else { set_window(last - size, last) } }
+            tell()
+        }
+    }
+    let said = `${labels[a] ?? ""} to ${labels[b] ?? ""}`
+    <figure class={ui_cls(["ui-brush", class])} aria-label={label}>
+        {show_label && <figcaption.ui-brush-title>{label}</figcaption>}
+        {len(sets) > 1 && <ul.ui-brush-legend aria-hidden="true">
+            {for [j, s] in enumerate(sets) => <li><span class={`ui-brush-key ui-brush-s${j % 8 + 1}`}></span>{s.name}</li>}
+        </ul>}
+        <div.ui-brush-frame>
+            <div.ui-brush-y style={`height: ${height}px`} aria-hidden="true">
+                {for t in sc.ticks => <span style={`bottom: ${brush_chart_pct(100 - top(t))}%`}>{t < 0 ? "-" : ""}{prefix}{brush_chart_short(abs(t))}</span>}
+            </div>
+            <div.ui-brush-plot style={`height: ${height}px`} aria-hidden="true">
+                {for t in sc.ticks => <span.ui-brush-grid style={`top: ${brush_chart_pct(top(t))}%`}></span>}
+                <svg.ui-brush-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                    {len(sets) == 1 && <path class="ui-brush-area ui-brush-s1"
+                        d={`${path(sets[0].values, a, b, x, top)} L100,100 L0,100 Z`}/>}
+                    {for [j, s] in enumerate(sets) => <path class={`ui-brush-line ui-brush-s${j % 8 + 1}`} d={path(s.values, a, b, x, top)}
+                                                            vector-effect="non-scaling-stroke"/>}
+                </svg>
+                <div.ui-brush-cols>
+                    {for i in range(a, b + 1) => <div class={ui_cls(["ui-brush-col", i - a > span / 2 && "ui-brush-flip"])}>
+                        {for [j, s] in enumerate(sets) => s.values[i] != null && <span class={`ui-brush-dot ui-brush-s${j % 8 + 1}`}
+                            style={`top: ${brush_chart_pct(top(s.values[i]))}%`}></span>}
+                        <span.ui-brush-tip>
+                            <strong>{labels[i]}</strong>
+                            {for [j, s] in enumerate(sets) => <p>
+                                {len(sets) > 1 && <span class={`ui-brush-key ui-brush-s${j % 8 + 1}`}></span>}
+                                {len(sets) > 1 ? s.name : label}<b>{fmt(s.values[i])}</b>
+                            </p>}
+                        </span>
+                    </div>}
+                </div>
+            </div>
+            <span></span>
+            <div.ui-brush-x aria-hidden="true">
+                {for i in range(a, b + 1) => (i - a) % every_nth == 0 && <span
+                    class={ui_cls([span > 0 && i == a && "ui-brush-first", span > 0 && i == b && "ui-brush-last"])}
+                    style={`left: ${brush_chart_pct(x(i))}%`}>{labels[i]}</span>}
+            </div>
+            <span></span>
+            <div>
+                <div.ui-brush-mini style={`height: ${overview}px`}
+                     @pointerdown={(e) => {
+                         if e.button == 0 {
+                             e.preventDefault()
+                             e.target.closest(".ui-brush-mini").setPointerCapture(e.pointerId)
+                             let part = e.target.dataset.part ?? "new"
+                             mode = part
+                             grab = at(e)
+                             from_a = a
+                             from_b = b
+                         }
+                     }}
+                     @pointermove={(e) => {
+                         if mode != null {
+                             let i = at(e)
+                             if mode == "start" { set_window(i < b ? i : b - 1, b) }
+                             else if mode == "end" { set_window(a, i > a ? i : a + 1) }
+                             else if mode == "move" {
+                                 let d0 = i - grab
+                                 let d = from_a + d0 < 0 ? -from_a : (from_b + d0 > last ? last - from_b : d0)
+                                 set_window(from_a + d, from_b + d)
+                             } else if i != grab { set_window(grab, i) }
+                         }
+                     }}
+                     @pointerup={() => {
+                         if mode != null {
+                             mode = null
+                             tell()
+                         }
+                     }}
+                     @pointercancel={() => { mode = null }}>
+                    <svg.ui-brush-svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                        {for [j, s] in enumerate(sets) => <path class={`ui-brush-line ui-brush-s${j % 8 + 1}`} d={path(s.values, 0, last, mx, mtop)}
+                                                                vector-effect="non-scaling-stroke"/>}
+                    </svg>
+                    <span.ui-brush-shade style={`left: 0; width: ${brush_chart_pct(mx(a))}%`}></span>
+                    <span.ui-brush-shade style={`left: ${brush_chart_pct(mx(b))}%; right: 0`}></span>
+                    <span.ui-brush-win data-part="move" tabindex="0" role="slider" aria-label={`${label}: the range shown`}
+                          aria-valuemin="0" aria-valuemax={last - span} aria-valuenow={a} aria-valuetext={said}
+                          style={`left: ${brush_chart_pct(mx(a))}%; width: ${brush_chart_pct(mx(b) - mx(a))}%`}
+                          @keydown={(e) => { keys(e, "move") }}></span>
+                    <span.ui-brush-edge data-part="start" tabindex="0" role="slider" aria-label="Start of the range"
+                          aria-valuemin="0" aria-valuemax={b - 1} aria-valuenow={a} aria-valuetext={str(labels[a] ?? "")}
+                          style={`left: ${brush_chart_pct(mx(a))}%`} @keydown={(e) => { keys(e, "start") }}></span>
+                    <span.ui-brush-edge data-part="end" tabindex="0" role="slider" aria-label="End of the range"
+                          aria-valuemin={a + 1} aria-valuemax={last} aria-valuenow={b} aria-valuetext={str(labels[b] ?? "")}
+                          style={`left: ${brush_chart_pct(mx(b))}%`} @keydown={(e) => { keys(e, "end") }}></span>
+                </div>
+                <div.ui-brush-ends aria-hidden="true"><span>{labels[0] ?? ""}</span><span>{labels[last] ?? ""}</span></div>
+            </div>
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col"></th>{for s in sets => <th scope="col">{len(sets) > 1 ? s.name : "Value"}</th>}</tr></thead>
+            <tbody>{for i in range(n) => <tr><th scope="row">{labels[i]}</th>{for s in sets => <td>{fmt(s.values[i])}</td>}</tr>}</tbody>
+        </table>
+    </figure>
+}

@@ -1,0 +1,14 @@
+const nav = $("#footer-nav-demo");
+if (!nav || nav.tagName !== "NAV" || nav.getAttribute("aria-label") !== "Footer") return "it is not a labelled <nav>";
+const titles = [...nav.querySelectorAll(".ui-footernav-title")].map((t) => t.textContent);
+if (titles.join() !== "Product,Resources,Company,Legal") return `the groups are ${titles}`;
+const lists = [...nav.querySelectorAll("ul")];
+if (lists[0].getAttribute("aria-label") !== "Product" || lists[0].querySelectorAll("a").length !== 4) return "a group's list is not named or is short";
+const tops = lists.map((u) => Math.round(u.getBoundingClientRect().top));
+const lefts = lists.map((u) => Math.round(u.getBoundingClientRect().left));
+if (new Set(tops).size !== 1 || new Set(lefts).size !== 4) return "the four groups are not in columns";
+const cur = nav.querySelectorAll("[aria-current=page]");
+if (cur.length !== 1 || cur[0].textContent.trim() !== "Components") return "the current page is not marked once";
+const gh = [...nav.querySelectorAll("a")].find((a) => a.textContent.includes("GitHub"));
+if (gh.target !== "_blank" || !gh.rel.includes("noopener") || !gh.querySelector("svg") || !gh.textContent.includes("new tab")) return "an external link does not open in a new tab, with the icon and the words";
+if (nav.querySelector(".ui-footernav-badge")?.textContent !== "New") return "the badge is missing";

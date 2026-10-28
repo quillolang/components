@@ -1,0 +1,12 @@
+const box = $("#sticky-demo-box"), title = $(".sticky-demo-title"), bar = $(".sticky-demo-bar");
+if (!box || !title || !bar) return "the box and its two stickies are missing";
+if (getComputedStyle(title).position !== "sticky" || getComputedStyle(title).top !== "8px") return `the title is ${getComputedStyle(title).position} at top ${getComputedStyle(title).top}`;
+if (getComputedStyle(bar).bottom !== "8px" || getComputedStyle(bar).top !== "auto") return `bottom={8} gives top ${getComputedStyle(bar).top} bottom ${getComputedStyle(bar).bottom}`;
+const br = box.getBoundingClientRect();
+const inner = { top: br.top + box.clientTop, bottom: br.top + box.clientTop + box.clientHeight };
+if (Math.abs(bar.getBoundingClientRect().bottom - (inner.bottom - 8)) > 1) return `before scrolling, the bottom bar is not 8px above the box's bottom edge: ${bar.getBoundingClientRect().bottom} vs ${inner.bottom}`;
+box.scrollTop = 300; await wait(100);
+if (Math.abs(title.getBoundingClientRect().top - (inner.top + 8)) > 1) return `scrolled, the title is at ${title.getBoundingClientRect().top - inner.top}px from the top, not 8`;
+box.scrollTop = box.scrollHeight; await wait(100);
+if (bar.getBoundingClientRect().bottom > inner.bottom - 8 + 1 || bar.getBoundingClientRect().top < title.getBoundingClientRect().bottom) return "at the end, the bar is not in its place in the flow";
+box.scrollTop = 0; await wait(50);

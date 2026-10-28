@@ -1,0 +1,215 @@
+// SearchOverlay: a search that takes the whole screen, with results as one types,
+// grouped (Pages, People, Orders...) and the words typed marked in them. The arrow
+// keys move through the results, Enter opens one, Escape closes. It opens from its
+// button or by pressing / anywhere on the page (outside a text box). It is the
+// browser's own <dialog>, so focus stays in it; the box is an ARIA combobox and the
+// number of results is announced.
+//
+//   <SearchOverlay id="site-search" items={pages}/>
+//   <SearchOverlay id="find" on_search={(t) => find_everything(t)} on_select={(r) => { open_result(r) }}/>
+//
+// id (required): unique on the page; the results' ids start with it.
+// items: what to search, a list of { title, text?, href?, group? }, matched on the
+// title and the text as one types. on_search(text): instead of items, called as one
+// types (once there are min_chars characters, 1) and gives back the results, of the
+// same shape: a `server fn` that queries, say. An answer that comes after a newer
+// question is dropped, and "Searching…" shows while one is on its way.
+// trigger: the button's text ("Search"); null for none. shortcut: / opens it (true).
+// placeholder ("Search…"), label (its name for screen readers, "Search"), empty ("No
+// results"), limit (the most results shown, 20).
+// on_select(result): inside one of your components, called with the result opened
+// (then its href, if it has one, is followed).
+
+let search_overlay_css = css`
+.ui-search-overlay-host { display: contents; }
+.ui-search-overlay-trigger {
+  display: inline-flex; align-items: center; gap: 8px; height: 38px; padding: 0 8px 0 11px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-muted); font: 14px/1 var(--ui-font); cursor: pointer;
+}
+.ui-search-overlay-trigger:hover { border-color: var(--ui-strong); }
+.ui-search-overlay-trigger:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-search-overlay-trigger svg { width: 16px; height: 16px; }
+.ui-search-overlay kbd, .ui-search-overlay-trigger kbd {
+  display: inline-block; min-width: 20px; padding: 2px 5px; border: 1px solid var(--ui-border); border-bottom-width: 2px;
+  border-radius: 4px; background: var(--ui-subtle); color: var(--ui-muted); font: 500 11px/1.3 var(--ui-font); text-align: center;
+}
+.ui-search-overlay {
+  box-sizing: border-box; width: 100vw; height: 100dvh; max-width: none; max-height: none; margin: 0; padding: 0; border: 0;
+  background: color-mix(in srgb, var(--ui-bg) 92%, transparent); color: var(--ui-fg); font: 15px/1.5 var(--ui-font);
+}
+.ui-search-overlay[open] { display: flex; justify-content: center; animation: ui-search-overlay-in .16s ease-out; }
+.ui-search-overlay::backdrop { background: var(--ui-overlay); backdrop-filter: blur(6px); }
+@keyframes ui-search-overlay-in { from { opacity: 0; } }
+.ui-search-overlay-col { display: flex; flex-direction: column; width: min(680px, 100%); height: 100%; padding: max(24px, 8vh) 20px 0; box-sizing: border-box; }
+.ui-search-overlay-bar { display: flex; align-items: center; gap: 12px; flex: none; padding: 0 4px 12px; border-bottom: 2px solid var(--ui-accent); }
+.ui-search-overlay-bar > svg { flex: none; width: 22px; height: 22px; color: var(--ui-muted); }
+.ui-search-overlay-input {
+  flex: 1; min-width: 0; height: 48px; padding: 0; border: 0; background: transparent; color: var(--ui-fg);
+  font: 500 22px/1.2 var(--ui-font); outline: none;
+}
+.ui-search-overlay-input::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-search-overlay-input::-webkit-search-cancel-button { display: none; }
+.ui-search-overlay-x {
+  display: inline-flex; align-items: center; gap: 6px; flex: none; height: 32px; padding: 0 8px; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); font: 13px/1 var(--ui-font); cursor: pointer;
+}
+.ui-search-overlay-x:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+.ui-search-overlay-x:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-search-overlay-list { flex: 1; min-height: 0; margin: 0; padding: 12px 0 32px; overflow: auto; list-style: none; overscroll-behavior: contain; }
+.ui-search-overlay-list ul { margin: 0; padding: 0; list-style: none; }
+.ui-search-overlay-group { padding: 14px 12px 6px; color: var(--ui-muted); font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+.ui-search-overlay-opt { display: grid; gap: 2px; padding: 10px 12px; border-radius: var(--ui-radius-sm); cursor: pointer; scroll-margin: 8px; }
+.ui-search-overlay-opt[aria-selected="true"] { background: var(--ui-accent-soft); }
+.ui-search-overlay-title { font-weight: 500; }
+.ui-search-overlay-text { overflow: hidden; color: var(--ui-muted); font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.ui-search-overlay-opt mark { background: none; color: var(--ui-accent); font-weight: 650; }
+.ui-search-overlay-note { margin: 0; padding: 32px 12px; color: var(--ui-muted); text-align: center; }
+@media (prefers-reduced-motion: reduce) { .ui-search-overlay[open] { animation: none; } }
+`
+
+// The text in pieces, [{ text, hit }], hit where the words of `query` are (any case).
+fn search_overlay_marks(text: str, query: str) -> list {
+    let q = lower(trim(query))
+    if q == "" { return [{ text, hit: false }] }
+    let low = lower(text)
+    let parts = []
+    let i = 0
+    while i < len(text) {
+        let rest = slice(low, i)
+        let at = index_of(rest, q)
+        if at == null {
+            parts = parts | push({ text: slice(text, i), hit: false })
+            i = len(text)
+        } else {
+            if at > 0 { parts = parts | push({ text: slice(text, i, i + at), hit: false }) }
+            parts = parts | push({ text: slice(text, i + at, i + at + len(q)), hit: true })
+            i = i + at + len(q)
+        }
+    }
+    parts
+}
+
+// The items whose title or text has every word of the query.
+fn search_overlay_filter(items: list, query: str) -> list {
+    let words = split(lower(trim(query)), " ") | filter((w) => w != "")
+    items | filter((it) => {
+        let hay = lower(`${it.title} ${get(it, "text") ?? ""}`)
+        all(words, (w) => contains(hay, w))
+    })
+}
+
+component SearchOverlay(id: str, items: list = [], on_search = null, min_chars: int = 1, trigger: str? = "Search",
+                        shortcut: bool = true, placeholder: str = "Search…", label: str = "Search", empty: str = "No results",
+                        limit: int = 20, on_select = null, class: str? = null) {
+    style global search_overlay_css
+    state dlg = null
+    state query = ""
+    state found = []
+    state busy = false
+    state asked = 0
+    state active = 0
+    let ready = len(trim(query)) >= min_chars
+    let results = take(!ready ? [] : on_search != null ? found : search_overlay_filter(items, query), limit)
+    let groups = unique(results | map((r) => get(r, "group") ?? ""))
+    let ordered = flatten(for g in groups => results | filter((r) => (get(r, "group") ?? "") == g))
+    let n = len(ordered)
+    let at = active < n ? active : 0
+    let show = () => {
+        query = ""
+        found = []
+        active = 0
+        if !dlg.open { dlg.showModal() }
+        dlg.querySelector("input").focus()
+    }
+    let choose = (r) => {
+        dlg.close()
+        on_select && on_select(r)
+        if get(r, "href") != null { navigate(r.href) }
+    }
+    <div class={ui_cls(["ui-search-overlay-host", class])}>
+        {trigger != null && <button.ui-search-overlay-trigger type="button" aria-haspopup="dialog"
+                                    aria-keyshortcuts={shortcut ? "/" : null} @click={show}>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                 aria-hidden="true"><circle cx="7" cy="7" r="4.75"/><path d="M10.5 10.5L14 14"/></svg>
+            <span>{trigger}</span>
+            {shortcut && <kbd aria-hidden="true">/</kbd>}
+        </button>}
+        <dialog.ui-search-overlay aria-label={label}
+                @mount={(el) => {
+                    dlg = el
+                    let onkey = (e) => {
+                        let t = e.target
+                        let typing = t != null && t.closest != null && t.closest("input, textarea, select, [contenteditable]") != null
+                        if e.key == "/" && !typing && !el.open && !e.defaultPrevented && !e.ctrlKey && !e.metaKey && !e.altKey {
+                            e.preventDefault()
+                            show()
+                        }
+                    }
+                    if shortcut { js("document.addEventListener", "keydown", onkey) }
+                    () => { if shortcut { js("document.removeEventListener", "keydown", onkey) } }
+                }}>
+            <div.ui-search-overlay-col>
+                <div.ui-search-overlay-bar>
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                         aria-hidden="true"><circle cx="7" cy="7" r="4.75"/><path d="M10.5 10.5L14 14"/></svg>
+                    <input.ui-search-overlay-input type="search" id={`${id}-input`} role="combobox" value={query}
+                           placeholder={placeholder} aria-label={label} aria-expanded={n > 0 ? "true" : "false"}
+                           aria-controls={`${id}-list`} aria-autocomplete="list" aria-busy={busy ? "true" : null}
+                           aria-activedescendant={n > 0 ? `${id}-opt-${at}` : null} autocomplete="off" spellcheck="false"
+                           @input={(e) => {
+                               query = e.value
+                               active = 0
+                               if on_search != null && len(trim(e.value)) >= min_chars {
+                                   asked += 1
+                                   let mine = asked
+                                   busy = true
+                                   // The answer, kept if no newer question was asked meanwhile.
+                                   let land = (v = null) => {
+                                       if mine == asked {
+                                           found = type_of(v) == "list" ? v : []
+                                           busy = false
+                                       }
+                                   }
+                                   let r = on_search(e.value)
+                                   if type_of(r) == "promise" { r.then(land, (_ = null) => { land([]) }) } else { land(r) }
+                               }
+                           }}
+                           @keydown={(e) => {
+                               if (e.key == "ArrowDown" || e.key == "ArrowUp") && n > 0 {
+                                   e.preventDefault()
+                                   active = e.key == "ArrowDown" ? (at + 1) % n : (at + n - 1) % n
+                                   let el = dlg.querySelector(`#${id}-opt-${active}`)
+                                   el && el.scrollIntoView({ block: "nearest" })
+                               }
+                               if e.key == "Enter" {
+                                   e.preventDefault()
+                                   if n > 0 { choose(ordered[at]) }
+                               }
+                           }}/>
+                    <button.ui-search-overlay-x type="button" aria-label="Close search" @click={() => dlg.close()}><kbd aria-hidden="true">Esc</kbd></button>
+                </div>
+                <ul.ui-search-overlay-list id={`${id}-list`} role="listbox" aria-label={label} hidden={n == 0}>
+                    {for g in groups => <li key={g} role="presentation">
+                        {g != "" && <div.ui-search-overlay-group aria-hidden="true">{g}</div>}
+                        <ul role="group" aria-label={g != "" ? g : null}>
+                            {for r in ordered | filter((r) => (get(r, "group") ?? "") == g) {
+                                let i = index_of(ordered, r) ?? 0
+                                <li.ui-search-overlay-opt key={`${g}/${r.title}/${i}`} id={`${id}-opt-${i}`} role="option"
+                                    aria-selected={i == at ? "true" : "false"}
+                                    @mousemove={() => { if active != i { active = i } }}
+                                    @mousedown={(e) => { e.preventDefault() }}
+                                    @click={() => { choose(r) }}>
+                                    <span.ui-search-overlay-title>{for p in search_overlay_marks(r.title, query) =>
+                                        p.hit ? <mark>{p.text}</mark> : p.text}</span>
+                                    {get(r, "text") != null && <span.ui-search-overlay-text>{r.text}</span>}
+                                </li>
+                            }}
+                        </ul>
+                    </li>}
+                </ul>
+                {n == 0 && <p.ui-search-overlay-note>{!ready ? "Type to search." : busy ? "Searching…" : `${empty} for “${trim(query)}”.`}</p>}
+                <p.ui-sr role="status" aria-live="polite">{!ready || busy ? "" : n == 1 ? "1 result" : `${n} results`}</p>
+            </div>
+        </dialog>
+    </div>
+}

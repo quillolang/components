@@ -1,0 +1,10 @@
+const acc = $("#gradient-text-demo-accent"), sun = $("#gradient-text-demo-sunset"), custom = $("#gradient-text-demo-custom");
+if (!acc || acc.tagName !== "SPAN" || acc.textContent !== "beautiful") return "a GradientText is not a span with its text";
+const cs = (el) => getComputedStyle(el);
+if (!cs(acc).backgroundImage.startsWith("linear-gradient(")) return `no gradient: ${cs(acc).backgroundImage}`;
+if (cs(acc).webkitBackgroundClip !== "text" || cs(acc).webkitTextFillColor !== "rgba(0, 0, 0, 0)") return "the gradient is not clipped to the text";
+if (cs(acc).backgroundImage === cs(sun).backgroundImage) return "preset=sunset is the same gradient";
+if (!cs(sun).backgroundImage.includes("rgb(249, 115, 22)")) return `sunset does not start orange: ${cs(sun).backgroundImage}`;
+if (custom.tagName !== "P" || !cs(custom).backgroundImage.includes("135deg") || !cs(custom).backgroundImage.includes("rgb(14, 165, 233)")) return `from/to/angle are not applied: ${cs(custom).backgroundImage}`;
+if (custom.getBoundingClientRect().width >= custom.parentElement.getBoundingClientRect().width - 1) return "a block one spans the row rather than its text";
+if (acc.parentElement.tagName !== "H1") return "it does not sit inside a heading";

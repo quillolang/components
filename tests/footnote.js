@@ -1,0 +1,17 @@
+const refs = $$("sup.ui-footnote-ref");
+if (refs.length !== 3) return `expected 3 marks, found ${refs.length}`;
+const a1 = refs[0].querySelector("a");
+if (refs[0].id !== "fnref1" || a1.getAttribute("href") !== "#fn1" || a1.textContent !== "1") return "the first mark is not #fnref1 linking to #fn1";
+if (a1.getAttribute("role") !== "doc-noteref" || a1.getAttribute("aria-label") !== "Footnote 1") return "the mark has no role or name";
+if (refs[2].querySelector("a").getAttribute("href") !== "#fn3") return "the third mark does not link to the third note";
+const list = $("section.ui-footnote-list");
+if (!list || list.getAttribute("role") !== "doc-endnotes" || list.getAttribute("aria-labelledby") !== "fn-label") return "the list is not a labelled doc-endnotes section";
+if ($("#fn-label").textContent !== "Footnotes") return "the label is missing";
+const notes = [...list.querySelectorAll("li")];
+if (notes.length !== 3 || notes.map((n) => n.id).join() !== "fn1,fn2,fn3") return `the notes are ${notes.map((n) => n.id)}`;
+if (notes[1].getAttribute("role") !== "doc-endnote" || !notes[1].querySelector("em")) return "a note with HTML is not kept, or has no role";
+const back = notes[2].querySelector("a.ui-footnote-back");
+if (!back || back.getAttribute("href") !== "#fnref3" || back.getAttribute("aria-label") !== "Back to reference 3") return "the back link is wrong";
+if (!document.getElementById("fn2") || !document.getElementById("fnref2")) return "the ids are not on the page";
+const sup = refs[0].getBoundingClientRect(), text = refs[0].parentElement.getBoundingClientRect();
+if (!(sup.top < text.top + 8)) return "the mark is not raised";

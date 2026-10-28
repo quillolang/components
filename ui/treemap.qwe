@@ -1,0 +1,230 @@
+// Treemap: parts of a whole as rectangles whose areas are their values, laid out
+// squarified (each as near a square as the space allows), and optionally in groups,
+// each group a rectangle of its own with its name over it. CSS only: hovering a tile
+// shows its value and share, and screen readers get the numbers as a table.
+//
+//   <Treemap label="Disk use" suffix=" GB" items={[
+//       { label: "Photos", value: 182 }, { label: "Music", value: 64 }, { label: "Mail", value: 12 }]}/>
+//   <Treemap label="Sales by product" prefix="$" aspect={1.6} items={[
+//       { label: "Chairs", value: 18400, group: "Furniture" }, { label: "Lamps", value: 6100, group: "Lighting" }]}/>
+//
+// items: a list of { label, value, group }; values of 0 or less are left out. group
+// (optional): items with the same group are laid out together, in its colour, with
+// its name above them and in the legend; without groups each tile has a colour of
+// its own. prefix and suffix: around every value shown ("$", " GB"); decimals:
+// digits after the point, always, instead of up to two as needed. aspect: its width
+// over its height (2; it keeps that shape as it grows or shrinks). legend: the groups
+// under it with their totals (true; only when there are groups). Tiles too small for
+// their text show it on hover. label: what it shows; it names it for screen readers
+// and captions their table. show_label also writes it above.
+
+let treemap_css = css`
+.ui-treemap {
+  --ui-treemap-1: light-dark(#2a78d6, #3987e5); --ui-treemap-2: light-dark(#eb6834, #d95926);
+  --ui-treemap-3: light-dark(#1baf7a, #199e70); --ui-treemap-4: light-dark(#eda100, #c98500);
+  --ui-treemap-5: light-dark(#e87ba4, #d55181); --ui-treemap-6: light-dark(#008300, #008300);
+  --ui-treemap-7: light-dark(#6250d6, #9085e9); --ui-treemap-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-treemap-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-treemap-s1 { --c: var(--ui-treemap-1); } .ui-treemap-s2 { --c: var(--ui-treemap-2); } .ui-treemap-s3 { --c: var(--ui-treemap-3); }
+.ui-treemap-s4 { --c: var(--ui-treemap-4); } .ui-treemap-s5 { --c: var(--ui-treemap-5); } .ui-treemap-s6 { --c: var(--ui-treemap-6); }
+.ui-treemap-s7 { --c: var(--ui-treemap-7); } .ui-treemap-s8 { --c: var(--ui-treemap-8); }
+.ui-treemap-box { position: relative; width: 100%; }
+.ui-treemap-group { position: absolute; display: flex; flex-direction: column; padding: 1px; }
+.ui-treemap-gname { flex: none; height: 20px; padding: 2px 5px 0; overflow: hidden; color: var(--ui-fg);
+  font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-treemap-gname span { margin-left: 6px; color: var(--ui-muted); font-weight: 400; }
+.ui-treemap-body { position: relative; flex: 1; }
+.ui-treemap-tile { position: absolute; border: 1px solid var(--ui-bg); border-radius: 4px;
+  background: color-mix(in srgb, var(--c) var(--k, 100%), var(--ui-bg)); color: #fff; container-type: size; }
+.ui-treemap-tile:hover { z-index: 5; filter: brightness(1.08); outline: 2px solid var(--ui-fg); outline-offset: -1px; }
+.ui-treemap-text { display: grid; align-content: start; gap: 1px; height: 100%; padding: 5px 7px; overflow: hidden; }
+.ui-treemap-text b { overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-treemap-text span { overflow: hidden; opacity: .9; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+@container (max-width: 54px) or (max-height: 34px) { .ui-treemap-text span { display: none; } }
+@container (max-width: 36px) or (max-height: 22px) { .ui-treemap-text { display: none; } }
+.ui-treemap-tip { position: absolute; z-index: 20; display: none; min-width: 120px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-treemap-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-treemap-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-treemap-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-treemap-tip { top: 6px; left: 6px; }
+.ui-treemap-tile:hover .ui-treemap-tip { display: block; }
+.ui-treemap-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-treemap-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.ui-treemap-legend b { color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-treemap-key { width: 10px; height: 10px; border-radius: 3px; background: var(--c); flex: none; }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn treemap_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn treemap_group(n: int) -> str =
+    n < 1000 ? str(n) : treemap_group(floor(n / 1000)) + "," + treemap_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn treemap_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${treemap_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${treemap_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate or a percentage for CSS and SVG, to two decimals.
+fn treemap_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// A share out of 100, to one decimal: "42%", "12.5%", "0.4%".
+fn treemap_share(p: num) -> str {
+    let tenths = round(p * 10)
+    `${floor(tenths / 10)}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}%`
+}
+
+// How far from square the worst rectangle of a row of areas laid along `side` is.
+fn treemap_worst(row: list, side: num) -> num {
+    let s = sum(row)
+    let big = max(row)
+    let small = min(row)
+    max([side * side * big / (s * s), s * s / (side * side * small)])
+}
+
+// Rectangles { x, y, w, h } for areas (largest first, adding up to w * h), filling
+// the box at x, y: rows laid along its shorter side, each grown while that makes its
+// rectangles more square (Bruls, Huizing and van Wijk's squarified layout).
+fn treemap_squarify(areas: list, x0: num, y0: num, w0: num, h0: num) -> list {
+    let out = []
+    let x = x0
+    let y = y0
+    let w = w0
+    let h = h0
+    let i = 0
+    let n = len(areas)
+    while i < n {
+        let side = w < h ? w : h
+        let row = [areas[i]]
+        let j = i + 1
+        let growing = true
+        while growing && j < n {
+            let longer = row + [areas[j]]
+            if treemap_worst(longer, side) <= treemap_worst(row, side) {
+                row = longer
+                j += 1
+            } else {
+                growing = false
+            }
+        }
+        let s = sum(row)
+        if w >= h {
+            let cw = h == 0 ? 0 : s / h
+            let at = y
+            for a in row {
+                let ah = cw == 0 ? 0 : a / cw
+                out = push(out, { x: x, y: at, w: cw, h: ah })
+                at += ah
+            }
+            x += cw
+            w -= cw
+        } else {
+            let ch = w == 0 ? 0 : s / w
+            let at = x
+            for a in row {
+                let aw = ch == 0 ? 0 : a / ch
+                out = push(out, { x: at, y: y, w: aw, h: ch })
+                at += aw
+            }
+            y += ch
+            h -= ch
+        }
+        i = j
+    }
+    out
+}
+
+// The items laid out in a box w by h: each { item, rect }, largest first.
+fn treemap_layout(items: list, w: num, h: num) -> list {
+    let sorted = reverse(sort_by(items, (it) => it.value))
+    let total = sum(sorted | map((it) => it.value))
+    let rects = total <= 0 ? [] : treemap_squarify(sorted | map((it) => it.value * w * h / total), 0, 0, w, h)
+    for [i, it] in enumerate(sorted) => { item: it, rect: rects[i] }
+}
+
+view Treemap(items: list, prefix: str = "", suffix: str = "", decimals: int? = null, aspect: num = 2,
+             legend: bool = true, label: str = "Treemap", show_label: bool = false, class: str? = null) {
+    style global treemap_css
+    let fmt = (v) => `${v < 0 ? "-" : ""}${prefix}${treemap_num(abs(v), decimals)}${suffix}`
+    let shown = items | filter((it) => it.value != null && it.value > 0)
+    let names = unique(shown | filter((it) => it.group != null) | map((it) => str(it.group)))
+    let grouped = len(names) > 0
+    let total = sum(shown | map((it) => it.value))
+    let share = (v) => treemap_share(total > 0 ? v * 100 / total : 0)
+    let ratio = aspect > 0 ? aspect : 2
+    // Groups: { name, color, total, items }, in the order they first come.
+    let groups = grouped
+        ? (for [g, name] in enumerate(names) => {
+              let mine = shown | filter((it) => str(it.group ?? "Other") == name)
+              { name: name, color: g % 8 + 1, value: sum(mine | map((it) => it.value)), items: mine }
+          }) + (len(shown | filter((it) => it.group == null)) > 0
+                ? [{ name: "Other", color: len(names) % 8 + 1, value: sum(shown | filter((it) => it.group == null) | map((it) => it.value)),
+                     items: shown | filter((it) => it.group == null) }]
+                : [])
+        : [{ name: "", color: 0, value: total, items: shown }]
+    let placed = treemap_layout(groups, ratio, 1)
+    let tile = (it, r, color, rank, count) => <div class={`ui-treemap-tile ui-treemap-s${color}`}
+            style={`left: ${treemap_pct(r.x * 100)}%; top: ${treemap_pct(r.y * 100)}%; width: ${treemap_pct(r.w * 100)}%; height: ${treemap_pct(r.h * 100)}%${grouped && count > 1 ? `; --k: ${treemap_pct(100 - rank * 22 / (count - 1))}%` : ""}`}
+            data-value={str(it.value)}>
+        <span.ui-treemap-text><b>{it.label}</b><span>{fmt(it.value)}</span></span>
+        <span.ui-treemap-tip>
+            <strong>{it.label}</strong>
+            {grouped && <p>Group<b>{it.group ?? "Other"}</b></p>}
+            <p>Value<b>{fmt(it.value)}</b></p>
+            <p>Share<b>{share(it.value)}</b></p>
+        </span>
+    </div>
+    <figure class={ui_cls(["ui-treemap", class])} aria-label={label}>
+        {show_label && <figcaption.ui-treemap-title>{label}</figcaption>}
+        <div.ui-treemap-box style={`aspect-ratio: ${treemap_pct(ratio)}`} aria-hidden="true">
+            {grouped
+                ? (for p in placed => {
+                      let g = p.item
+                      let r = p.rect
+                      let inner = treemap_layout(g.items, r.w, r.h)
+                      <div.ui-treemap-group style={`left: ${treemap_pct(r.x * 100 / ratio)}%; top: ${treemap_pct(r.y * 100)}%; width: ${treemap_pct(r.w * 100 / ratio)}%; height: ${treemap_pct(r.h * 100)}%`}>
+                          <span.ui-treemap-gname title={g.name}>{g.name}<span>{fmt(g.value)}</span></span>
+                          <div.ui-treemap-body>
+                              {for [k, q] in enumerate(inner) => tile(q.item,
+                                  { x: q.rect.x / r.w, y: q.rect.y / r.h, w: q.rect.w / r.w, h: q.rect.h / r.h }, g.color, k, len(inner))}
+                          </div>
+                      </div>
+                  })
+                : (for [k, q] in enumerate(treemap_layout(shown, ratio, 1)) =>
+                      tile(q.item, { x: q.rect.x / ratio, y: q.rect.y, w: q.rect.w / ratio, h: q.rect.h }, k % 8 + 1, k, len(shown)))}
+        </div>
+        {grouped && legend && <ul.ui-treemap-legend aria-hidden="true">
+            {for g in groups => <li class={`ui-treemap-s${g.color}`}><span.ui-treemap-key></span>{g.name}<b>{fmt(g.value)}</b></li>}
+        </ul>}
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr>{grouped && <th scope="col">Group</th>}<th scope="col">Item</th><th scope="col">Value</th><th scope="col">Share</th></tr></thead>
+            <tbody>
+                {for g in groups => for it in g.items => <tr>
+                    {grouped && <td>{g.name}</td>}
+                    <th scope="row">{it.label}</th>
+                    <td>{fmt(it.value)}</td>
+                    <td>{share(it.value)}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

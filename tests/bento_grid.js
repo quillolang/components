@@ -1,0 +1,16 @@
+const wall = $("#bento-grid-demo-wall"), narrow = $("#bento-grid-demo-narrow");
+if (!wall || !narrow) return "the two grids are missing";
+const grid = wall.querySelector(".ui-bento");
+if (getComputedStyle(grid).gridTemplateColumns.split(" ").length !== 4) return `columns={4} gives ${getComputedStyle(grid).gridTemplateColumns}`;
+const r = (sel, root = wall) => root.querySelector(sel).getBoundingClientRect();
+const big = r(".bento-grid-demo-big"), small = r(".bento-grid-demo-small"), wide = r(".bento-grid-demo-wide"), link = wall.querySelector(".bento-grid-demo-link");
+if (Math.abs(big.width - (2 * small.width + 16)) > 1) return `cols={2} is ${big.width}px beside a ${small.width}px tile`;
+if (Math.abs(big.height - (2 * 140 + 16)) > 1 || Math.abs(small.height - 140) > 1) return `rows={2} is ${big.height}px tall, a row ${small.height}px`;
+if (Math.abs(wide.width - big.width) > 1 || Math.abs(wide.height - 140) > 1) return "the wide tile does not span two columns and one row";
+if (link.tagName !== "A" || !link.href.includes("quillolang.org")) return "href does not make the tile a link";
+if (wall.querySelector(".bento-grid-demo-big h3.ui-bento-title")?.textContent !== "Fast" || !wall.querySelector(".bento-grid-demo-big .ui-bento-sub")) return "the title or subtitle is missing";
+if (!wall.querySelector(".bento-grid-demo-big").classList.contains("ui-bento-accent")) return "tone=\"accent\" is missing";
+const ng = narrow.querySelector(".ui-bento");
+if (getComputedStyle(ng).gridTemplateColumns.split(" ").length !== 2) return "in a 480px box the grid is not two columns";
+if (Math.abs(r(".bento-grid-demo-wide", narrow).width - ng.getBoundingClientRect().width) > 1) return "narrow, a wide tile does not take both columns";
+if (Math.abs(r(".bento-grid-demo-small", narrow).width - (ng.getBoundingClientRect().width - 8) / 2) > 1) return "narrow, a small tile is not half the width";

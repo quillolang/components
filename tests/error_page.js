@@ -1,0 +1,18 @@
+const nf = $("#error-page-demo-404");
+if (!nf || nf.getAttribute("role") !== "alert") return "the page is not an alert";
+if (nf.querySelector(".ui-errpage-code")?.textContent !== "404" || nf.querySelector(".ui-errpage-code").getAttribute("aria-hidden") !== "true") return "the code is not shown (hidden from screen readers)";
+const h = nf.querySelector("h1");
+if (h.id !== "error-page-demo-404-title" || h.textContent !== "Error 404: Page not found") return `the title: "${h.textContent}"`;
+if (!nf.querySelector(".ui-errpage-text").textContent.includes("moved")) return "no default text for 404";
+const form = nf.querySelector("form[role=search]");
+if (!form || form.getAttribute("action") !== "#error_page" || !form.querySelector("input[type=search][name=q]")) return "the search form does not send q";
+const links = nf.querySelectorAll(".ui-errpage-links a");
+if (links.length !== 2 || links[0].textContent !== "Go home" || !links[0].classList.contains("ui-errpage-link-main") || links[1].classList.contains("ui-errpage-link-main")) return "the links, the first one solid";
+const five = $("#error-page-demo-500");
+if (five.querySelector("h1").textContent !== "Error 500: Something went wrong") return "no default title for 500";
+if (five.querySelector(".ui-errpage-ref")?.textContent !== "Reference req_8f3a21") return "the reference";
+const home = five.querySelector(".ui-errpage-links a");
+if (home.getAttribute("href") !== "#error_page" || home.textContent !== "Go home") return "the default link does not go home";
+if (five.querySelector("form")) return "a search box shows without search";
+const members = $$(".ui-errpage")[2];
+if (members.querySelector("h1").textContent !== "Error 403: Members only" || !members.textContent.includes("Ask an admin")) return "a given title and text are not used";

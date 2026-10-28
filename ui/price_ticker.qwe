@@ -1,0 +1,102 @@
+// PriceTicker: a strip of symbols with their prices and changes that scrolls along by
+// itself (a CSS animation, no JavaScript), as on a trading floor or a news channel.
+// It stops while hovered or while a link in it has focus, and stands still, as a
+// strip one can scroll, for those who ask for less motion.
+//
+//   <PriceTicker items={[{ symbol: "ACME", price: 182.4, change: 1.25 }, { symbol: "GLBX", price: 48.61, change: -0.8 }]}/>
+//   <PriceTicker items={quotes} prefix="$" speed={60} label="Markets"/>
+//
+// items: a list of { symbol, price, change, href }: change is the day's change in
+// percent (+1.25 for 1.25% up); href makes the symbol a link. prefix and suffix:
+// around every price ("$"); decimals: digits after the point of prices (2). speed:
+// seconds for the whole strip to go by once (5 per item by default). label: what
+// screen readers call it ("Prices"); they get the list once, without the motion.
+
+let price_ticker_css = css`
+.ui-pt { position: relative; display: flex; min-width: 0; overflow: hidden; contain: inline-size; border-block: 1px solid var(--ui-border); background: var(--ui-surface);
+  font: 13px/1 var(--ui-font); color: var(--ui-fg);
+  mask-image: linear-gradient(90deg, transparent, #000 24px, #000 calc(100% - 24px), transparent); }
+.ui-pt-track { display: flex; flex: none; min-width: max-content; animation: ui-pt-scroll var(--d) linear infinite; }
+.ui-pt:hover .ui-pt-track, .ui-pt:focus-within .ui-pt-track { animation-play-state: paused; }
+.ui-pt-list { display: flex; flex: none; margin: 0; padding: 0; list-style: none; }
+.ui-pt-item { display: inline-flex; align-items: baseline; gap: 8px; padding: 10px 22px; white-space: nowrap;
+  border-right: 1px solid color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-pt-sym { font-weight: 650; letter-spacing: .02em; color: var(--ui-fg); text-decoration: none; }
+a.ui-pt-sym:hover { color: var(--ui-accent); }
+a.ui-pt-sym:focus-visible { outline: none; border-radius: 3px; box-shadow: var(--ui-focus); }
+.ui-pt-price { font-variant-numeric: tabular-nums; }
+.ui-pt-chg { display: inline-flex; align-items: center; gap: 3px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-pt-up .ui-pt-chg { color: var(--ui-success); } .ui-pt-down .ui-pt-chg { color: var(--ui-danger); } .ui-pt-flat .ui-pt-chg { color: var(--ui-muted); }
+.ui-pt-chg svg { width: 8px; height: 8px; fill: currentColor; }
+@keyframes ui-pt-scroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+@media (prefers-reduced-motion: reduce) {
+  .ui-pt { overflow-x: auto; mask-image: none; }
+  .ui-pt-track { animation: none; }
+  .ui-pt-track > [aria-hidden="true"] { display: none; }
+}
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn price_ticker_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn price_ticker_group(n: int) -> str =
+    n < 1000 ? str(n) : price_ticker_group(floor(n / 1000)) + "," + price_ticker_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn price_ticker_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${price_ticker_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${price_ticker_group(floor(units / scale))}${tail}`
+}
+
+// A large number, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn price_ticker_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? price_ticker_num(v)
+        : `${v < 0 ? "-" : ""}${price_ticker_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A change in percent, signed, to two decimals: "+1.25%", "-0.40%".
+fn price_ticker_signed(p: num) -> str = `${p > 0 ? "+" : (p < 0 && round(abs(p) * 100) > 0 ? "-" : "")}${price_ticker_num(abs(p), 2)}%`
+
+// A coordinate out of 100 (or a length), to two decimals.
+fn price_ticker_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+view PriceTicker(items: list, prefix: str = "", suffix: str = "", decimals: int = 2, speed: num? = null,
+                 label: str = "Prices", class: str? = null) {
+    style global price_ticker_css
+    let seconds = speed ?? (len(items) * 5 > 10 ? len(items) * 5 : 10)
+    let side = (c) => c == null || c == 0 ? "ui-pt-flat" : (c > 0 ? "ui-pt-up" : "ui-pt-down")
+    let arrow = (c) => c == null || c == 0 ? null : (c > 0 ? "M0 8 4 1 8 8Z" : "M0 0 4 7 8 0Z")
+    // A short list is said again, so each half of the strip is wider than where it is shown.
+    let rounds = len(items) == 0 ? 1 : ceil(10 / len(items))
+    let row = (copy: bool) => <ul.ui-pt-list aria-hidden={copy ? "true" : null}>
+        {for r in range(rounds) => for it in items => <li class={`ui-pt-item ${side(it.change)}`} aria-hidden={!copy && r > 0 ? "true" : null}>
+            {it.href != null ? <a.ui-pt-sym href={it.href} tabindex={copy || r > 0 ? "-1" : null}>{it.symbol}</a> : <span.ui-pt-sym>{it.symbol}</span>}
+            <span.ui-pt-price>{prefix}{price_ticker_num(it.price, decimals)}{suffix}</span>
+            <span.ui-pt-chg>
+                {arrow(it.change) != null && <svg viewBox="0 0 8 8" aria-hidden="true"><path d={arrow(it.change)}/></svg>}
+                {it.change == null ? "—" : price_ticker_signed(it.change)}
+            </span>
+        </li>}
+    </ul>
+    <div class={ui_cls(["ui-pt", class])} role="region" aria-label={label} style={`--d: ${price_ticker_pct(seconds)}s`}>
+        <div.ui-pt-track>{row(false)}{row(true)}</div>
+    </div>
+}

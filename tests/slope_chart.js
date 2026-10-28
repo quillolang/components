@@ -1,0 +1,33 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-slope");
+if (charts.length !== 2) return `expected 2 slope charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a slope chart has NaN, Infinity or undefined in it";
+const [share, rent] = charts;
+if (share.getAttribute("aria-label") !== "Share of sales by channel") return "the label does not name the chart";
+const heads = [...share.querySelectorAll(".ui-slope-heads span")].map((s) => s.textContent).join();
+if (heads !== "2021,2025") return `the two moments read ${heads}`;
+const items = [...share.querySelectorAll(".ui-slope-item")];
+if (items.length !== 4) return `4 items made ${items.length} lines`;
+// From 4 (the bottom, 100%) to 54 (the top, 0%): Online goes from 31 to 52.
+const d = items[0].querySelector(".ui-slope-line").getAttribute("d");
+if (d !== "M0,46 L100,4") return `Online's line is ${d}`;
+const cls = items.map((i) => ["up", "down", "flat"].find((k) => i.classList.contains(`ui-slope-${k}`))).join();
+if (cls !== "up,down,down,flat") return `by_change colours: ${cls}`;
+const stroke = (i) => getComputedStyle(i.querySelector(".ui-slope-line")).stroke;
+if (stroke(items[0]) === stroke(items[1]) || stroke(items[1]) !== stroke(items[2])) return "rises and falls are not coloured apart";
+const right = items[0].querySelector(".ui-slope-r").textContent, left = items[0].querySelector(".ui-slope-l").textContent;
+if (left !== "Online31%" || right !== "52%+67.7%Online") return `Online's labels: ${left} / ${right}`;
+if (items[3].querySelector(".ui-slope-chg").textContent !== "0%") return "no change does not read 0%";
+const dot = items[0].querySelectorAll(".ui-slope-dot")[1].getBoundingClientRect();
+const lab = items[0].querySelector(".ui-slope-r").getBoundingClientRect();
+if (Math.abs(dot.top + dot.height / 2 - (lab.top + lab.height / 2)) > 1) return "a label is not beside its point";
+if (getComputedStyle(items[0].querySelector(".ui-slope-hit")).pointerEvents !== "stroke") return "the line cannot be hovered";
+if (share.querySelector("tbody tr").textContent !== "Online31%52%+21%") return `the table: ${share.querySelector("tbody tr").textContent}`;
+if (!share.querySelector(".ui-slope-wrap").hasAttribute("aria-hidden")) return "the drawing is not hidden from screen readers";
+
+const rl = [...rent.querySelectorAll(".ui-slope-r")].map((l) => l.getBoundingClientRect().top + l.getBoundingClientRect().height / 2).sort((a, b) => a - b);
+for (let i = 1; i < rl.length; i++) if (rl[i] - rl[i - 1] < 15.5) return `end labels are ${rl[i] - rl[i - 1]}px apart`;
+const ri = [...rent.querySelectorAll(".ui-slope-item")];
+if (new Set(ri.map(stroke)).size !== 5) return "by_change={false} does not give each item a colour";
+if (rent.querySelector(".ui-slope-chg")) return "change={false} still shows the change";
+if (ri[0].querySelector(".ui-slope-r b").textContent !== "$1,690") return "prefix is not written";

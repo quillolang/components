@@ -1,0 +1,18 @@
+const [words, nums] = $$(".ui-marquee");
+if (!words || !nums) return "expected two marquees";
+if (words.getAttribute("role") !== "marquee" || words.getAttribute("aria-label") !== "What people say") return "the marquee has no role or label";
+const groups = words.querySelectorAll(".ui-marquee-group");
+if (groups.length !== 2 || groups[1].getAttribute("aria-hidden") !== "true") return "the content is not drawn twice with the copy hidden";
+if (groups[0].children.length !== 7 || groups[0].textContent !== groups[1].textContent) return "the copy differs from the content";
+const track = words.querySelector(".ui-marquee-track");
+const cs = getComputedStyle(track);
+if (cs.animationName !== "ui-marquee" || cs.animationDuration !== "18s") return `the track's animation is ${cs.animationName} ${cs.animationDuration}`;
+if (cs.animationIterationCount !== "infinite") return "the loop ends";
+if (Math.abs(groups[0].getBoundingClientRect().width * 2 - track.getBoundingClientRect().width) > 2) return "a group is not half the track, so the loop would jump";
+if (getComputedStyle(words).overflowX !== "hidden") return "the marquee does not clip its content";
+const x1 = track.getBoundingClientRect().left; await wait(400);
+if (track.getBoundingClientRect().left >= x1) return "the content does not move left";
+const n = nums.querySelector(".ui-marquee-track"), ncs = getComputedStyle(n);
+if (ncs.animationDirection !== "reverse" || ncs.animationDuration !== "30s") return "direction right / speed are not applied";
+if (nums.style.getPropertyValue("--g").trim() !== "24px") return "gap is not applied";
+if (nums.classList.contains("ui-marquee-pause") || !words.classList.contains("ui-marquee-pause")) return "pause is not applied";

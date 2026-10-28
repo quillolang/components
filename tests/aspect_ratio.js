@@ -1,0 +1,13 @@
+const ratio = (el) => { const r = el.getBoundingClientRect(); return r.width / r.height; };
+const wide = $(".aspect-ratio-demo-wide"), tv = $(".aspect-ratio-demo-tv"), sq = $(".aspect-ratio-demo-square"), img = $(".aspect-ratio-demo-img");
+if (!wide || !tv || !sq || !img) return "the four boxes are missing";
+if (Math.abs(ratio(wide) - 16 / 9) > 0.02) return `16/9 gives ${ratio(wide)}`;
+if (Math.abs(ratio(tv) - 4 / 3) > 0.02) return `4/3 gives ${ratio(tv)}`;
+if (Math.abs(ratio(sq) - 1) > 0.02) return `1 gives ${ratio(sq)}`;
+if (Math.abs(ratio(img) - 1.5) > 0.02) return `3/2 gives ${ratio(img)}`;
+const pic = img.querySelector("img"), pr = pic.getBoundingClientRect(), br = img.getBoundingClientRect();
+if (Math.abs(pr.width - br.width) > 1 || Math.abs(pr.height - br.height) > 1) return "the image does not fill its box";
+if (getComputedStyle(pic).objectFit !== "cover") return "fit=\"cover\" is not applied to the image";
+if (getComputedStyle(wide).borderRadius === "0px") return "round={true} has no radius";
+const art = wide.firstElementChild.getBoundingClientRect();
+if (Math.abs(art.height - wide.getBoundingClientRect().height) > 1) return "a plain child does not fill the box";

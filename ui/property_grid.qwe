@@ -1,0 +1,152 @@
+// PropertyGrid: an object's properties as name and value rows, grouped under
+// headings that fold, with each value edited in place by the control its type
+// asks for: an inspector panel, a settings sheet, a design tool's sidebar.
+// A changed value is marked, with a button that puts it back.
+//
+//   <PropertyGrid id="props" label="Button" name="props" groups={[
+//       { label: "Layout", items: [
+//           { field: "width", label: "Width", type: "number", value: 120, unit: "px" },
+//           { field: "align", label: "Align", type: "select", value: "left", options: ["left", "center", "right"] },
+//       ] },
+//       { label: "Look", items: [
+//           { field: "color", label: "Colour", type: "color", value: "#5b4bdb" },
+//           { field: "rounded", label: "Rounded", type: "bool", value: true },
+//           { field: "id", label: "Id", value: "btn-7", readonly: true },
+//       ] },
+//   ]} on_change={(field, v) => { set_prop(field, v) }}/>
+//
+// groups: maps of { label, items, open? (false: folded at first) }; items: maps
+// of { field, label?, value, type?, options?, unit?, hint?, readonly? }: type
+// "text" (default), "number", "bool" (a switch-like checkbox), "select" (options:
+// strings or { label, value }), "color" or "date". unit: after a number ("px").
+// hint: under the name, and the control's description. readonly: shown, not
+// edited. Each control is a real field named field (or name + "." + field when
+// name is given), so a <form> around it sends the values. id: a prefix for its
+// ids, unique on the page. label: the grid's name for screen readers.
+// on_change(field, value): inside one of your components, called with the
+// field and its new value (a number for number, true or false for bool).
+// on_values(values): called with every field's value, as a map.
+
+let property_grid_css = css`
+.ui-propgrid { min-width: 0; overflow: hidden; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); font: 13px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-propgrid-head { display: flex; align-items: center; gap: 6px; width: 100%; height: 32px; padding: 0 10px; border: 0;
+  border-bottom: 1px solid var(--ui-border); background: var(--ui-subtle); color: var(--ui-fg); font: 600 12px/1 var(--ui-font);
+  letter-spacing: .03em; text-transform: uppercase; text-align: left; cursor: pointer; }
+.ui-propgrid-head:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-propgrid-head svg { width: 10px; height: 10px; color: var(--ui-muted); transition: transform .15s; }
+.ui-propgrid-head[aria-expanded="true"] svg { transform: rotate(90deg); }
+.ui-propgrid-count { margin-left: auto; color: var(--ui-muted); font-weight: 500; }
+.ui-propgrid-rows { margin: 0; }
+.ui-propgrid-row { display: grid; grid-template-columns: minmax(90px, 40%) minmax(0, 1fr) 24px; align-items: center; gap: 8px;
+  min-height: 34px; padding: 3px 6px 3px 12px; border-bottom: 1px solid var(--ui-border); }
+.ui-propgrid-group:last-child .ui-propgrid-row:last-child { border-bottom: 0; }
+.ui-propgrid-name { min-width: 0; overflow: hidden; color: var(--ui-muted); text-overflow: ellipsis; white-space: nowrap; }
+.ui-propgrid-name label { cursor: default; }
+.ui-propgrid-changed .ui-propgrid-name { color: var(--ui-fg); font-weight: 600; }
+.ui-propgrid-hint { display: block; color: var(--ui-muted); font-size: 11px; font-weight: 400; white-space: normal; }
+.ui-propgrid-val { display: flex; align-items: center; gap: 6px; min-width: 0; margin: 0; }
+.ui-propgrid-val input:not([type="checkbox"]):not([type="color"]), .ui-propgrid-val select { width: 100%; min-width: 0; height: 26px; padding: 0 7px;
+  border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--ui-fg); font: 13px/1 var(--ui-font); }
+.ui-propgrid-val input:hover, .ui-propgrid-val select:hover { border-color: var(--ui-border); }
+.ui-propgrid-val input:focus, .ui-propgrid-val select:focus { outline: none; border-color: var(--ui-accent); background: var(--ui-surface); box-shadow: var(--ui-focus); }
+.ui-propgrid-val input[type="number"] { text-align: right; font-variant-numeric: tabular-nums; }
+.ui-propgrid-val input[type="checkbox"] { width: 16px; height: 16px; margin: 0 7px; accent-color: var(--ui-accent); }
+.ui-propgrid-val input[type="color"] { width: 26px; height: 22px; padding: 0; border: 1px solid var(--ui-border); border-radius: 4px; background: none; }
+.ui-propgrid-val input[type="checkbox"]:focus-visible, .ui-propgrid-val input[type="color"]:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-propgrid-unit, .ui-propgrid-code { color: var(--ui-muted); font: 12px/1 var(--ui-mono); }
+.ui-propgrid-ro { padding: 0 8px; color: var(--ui-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-propgrid-reset { display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 4px; background: none;
+  color: var(--ui-accent); cursor: pointer; }
+.ui-propgrid-reset:hover { background: var(--ui-accent-soft); }
+.ui-propgrid-reset:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-propgrid-reset svg { width: 12px; height: 12px; }
+@media (prefers-reduced-motion: reduce) { .ui-propgrid-head svg { transition: none; } }
+`
+
+fn property_grid_options(it: map) -> list =
+    (it.options ?? []) | map((o) => type_of(o) == "map" ? { label: o.label ?? str(o.value), value: o.value ?? o.label } : { label: str(o), value: o })
+
+// Every item's value, as a map from field to value.
+fn property_grid_values(groups: list) -> map =
+    reduce(flatten(groups | map((g) => g.items ?? [])), {}, (m, it) => set(m, it.field, it.value))
+
+component PropertyGrid(id: str, groups: list = [], name: str? = null, label: str? = null, on_change = null, on_values = null,
+                       class: str? = null) {
+    style global property_grid_css
+    state values = property_grid_values(groups)
+    state closed = for [i, g] in enumerate(groups) => g.open == false ? str(i) : null
+    let first = property_grid_values(groups)
+    let put = (field: str, v) => {
+        values = set(values, field, v)
+        on_change && on_change(field, v)
+        on_values && on_values(values)
+    }
+    let field_name = (it: map) => name != null ? `${name}.${it.field}` : it.field
+    <div class={ui_cls(["ui-propgrid", class])} id={id} role="group" aria-label={label}>
+        {for [gi, g] in enumerate(groups) => {
+            let open = index_of(closed, str(gi)) == null
+            <div.ui-propgrid-group key={gi}>
+                <button.ui-propgrid-head type="button" aria-expanded={open ? "true" : "false"} aria-controls={`${id}-g${gi}`}
+                        @click={() => { closed = open ? push(closed, str(gi)) : closed | filter((x) => x != str(gi)) }}>
+                    <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                         stroke-linejoin="round" aria-hidden="true"><path d="M4.5 2.5L8 6l-3.5 3.5"/></svg>
+                    {g.label}
+                    <span.ui-propgrid-count>{len(g.items ?? [])}</span>
+                </button>
+                <div.ui-propgrid-rows id={`${id}-g${gi}`} hidden={!open}>
+                    {for it in g.items ?? [] => {
+                        let fid = `${id}-${re.replace(it.field, "[^A-Za-z0-9_-]+", "-")}`
+                        let v = values[it.field]
+                        let kind = it.type ?? "text"
+                        let changed = v != first[it.field]
+                        let hint_id = it.hint != null ? `${fid}-hint` : null
+                        <div class={ui_cls(["ui-propgrid-row", changed && "ui-propgrid-changed"])} data-field={it.field}>
+                            <div.ui-propgrid-name>
+                                <label for={fid} title={it.label ?? it.field}>{it.label ?? it.field}</label>
+                                {it.hint != null && <span.ui-propgrid-hint id={hint_id}>{it.hint}</span>}
+                            </div>
+                            <div.ui-propgrid-val>
+                                {it.readonly == true
+                                    ? [<span.ui-propgrid-ro id={fid}>{v == null ? "—" : str(v)}</span>,
+                                       <input type="hidden" name={field_name(it)} value={v == null ? "" : str(v)}/>]
+                                    : match kind {
+                                        "bool" => [<input type="hidden" name={field_name(it)} value="false"/>,
+                                                   <input type="checkbox" id={fid} name={field_name(it)} value="true" checked={v == true}
+                                                          aria-describedby={hint_id} @change={(e) => { put(it.field, e.checked) }}/>,
+                                                   <span.ui-propgrid-code aria-hidden="true">{v == true ? "true" : "false"}</span>]
+                                        "select" => <select id={fid} name={field_name(it)} aria-describedby={hint_id}
+                                                            @change={(e) => {
+                                                                let o = find(property_grid_options(it), (o) => str(o.value) == e.value)
+                                                                put(it.field, o != null ? o.value : e.value)
+                                                            }}>
+                                            {for o in property_grid_options(it) => <option value={str(o.value)} selected={o.value == v}>{o.label}</option>}
+                                        </select>
+                                        "number" => [<input type="number" id={fid} name={field_name(it)} value={v == null ? "" : str(v)}
+                                                            step="any" aria-describedby={hint_id}
+                                                            @change={(e) => {
+                                                                let n = re.test(trim(e.value), "^-?\\d+$") ? int(trim(e.value)) : float(e.value)
+                                                                put(it.field, trim(e.value) == "" || is_err(n) ? null : n)
+                                                            }}/>,
+                                                     it.unit != null && <span.ui-propgrid-unit>{it.unit}</span>]
+                                        "color" => [<input type="color" id={fid} name={field_name(it)} value={v ?? "#000000"} aria-describedby={hint_id}
+                                                           @input={(e) => { put(it.field, e.value) }}/>,
+                                                    <span.ui-propgrid-code>{v}</span>]
+                                        _ => <input type={kind == "date" ? "date" : "text"} id={fid} name={field_name(it)} value={v == null ? "" : str(v)}
+                                                    aria-describedby={hint_id} @change={(e) => { put(it.field, e.value) }}/>
+                                    }}
+                            </div>
+                            {changed && it.readonly != true
+                                ? <button.ui-propgrid-reset type="button" title="Reset" aria-label={`Reset ${it.label ?? it.field}`}
+                                          @click={() => { put(it.field, first[it.field]) }}>
+                                      <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                                           stroke-linejoin="round" aria-hidden="true"><path d="M2.5 5A3.7 3.7 0 1 1 3 8.5M2.5 2v3h3"/></svg>
+                                  </button>
+                                : <span></span>}
+                        </div>
+                    }}
+                </div>
+            </div>
+        }}
+    </div>
+}

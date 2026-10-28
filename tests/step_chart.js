@@ -1,0 +1,34 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-stepc");
+if (charts.length !== 3) return `expected 3 step charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a chart has NaN, Infinity or undefined in it";
+const [rate, seats, price] = charts;
+const d = rate.querySelector(".ui-stepc-line").getAttribute("d");
+if (/ L/.test(d) || !/ H/.test(d) || !/ V/.test(d)) return `the line does not move in steps: ${d}`;
+if ((d.match(/H/g) || []).length !== 12) return "not a flat stretch per label";
+if (!d.startsWith("M0,") || !d.endsWith("H100")) return "the line does not span the width";
+const ticks = [...rate.querySelectorAll(".ui-stepc-y span")].map((s) => s.textContent);
+if (ticks.join() !== "3.5,3.75,4,4.25,4.5") return `the axis ticks: ${ticks}`;
+const cols = rate.querySelectorAll(".ui-stepc-col");
+if (cols.length !== 12) return "not a hover span per label";
+const c = cols[2].getBoundingClientRect(), p = rate.querySelector(".ui-stepc-plot").getBoundingClientRect();
+if (Math.abs(c.left - (p.left + p.width * 2 / 12)) > 1) return "the spans do not divide the plot";
+const tip = cols[2].querySelector(".ui-stepc-tip");
+if (getComputedStyle(tip).display !== "none") return "the tooltip shows before hover";
+if (tip.textContent !== "MarPolicy rate4.25%") return `tooltip: ${tip.textContent}`;
+if (rate.querySelector(".ui-stepc-legend")) return "one series has a legend";
+if (getComputedStyle(rate.querySelector(".ui-stepc-line")).strokeWidth !== "2px") return "the line is not 2px";
+
+if (seats.querySelectorAll(".ui-stepc-legend li").length !== 2) return "two series have no legend";
+if (seats.querySelectorAll(".ui-stepc-area").length !== 2) return "area={true} has no fill per series";
+if (!seats.querySelector(".ui-stepc-area").getAttribute("d").endsWith("Z")) return "the fill is not closed";
+if (seats.querySelector(".ui-stepc-y span").textContent !== "0") return "area does not start the axis at 0";
+if (seats.querySelectorAll(".ui-stepc-col")[3].querySelectorAll(".ui-stepc-dot").length !== 2) return "the hover has no dot per series";
+const colors = [...seats.querySelectorAll(".ui-stepc-line")].map((l) => getComputedStyle(l).stroke);
+if (new Set(colors).size !== 2) return "the series share a colour";
+
+const pd = price.querySelector(".ui-stepc-line").getAttribute("d");
+if ((pd.match(/M/g) || []).length !== 2) return `a null does not break the line: ${pd}`;
+if (price.querySelector(".ui-stepc-y span").textContent !== "$0") return "zero={true} does not start at $0";
+if (price.querySelectorAll("tbody td")[3].textContent !== "—") return "the missing value is not a dash in the table";
+if (price.querySelectorAll("tbody tr").length !== 7) return "the table has no row per label";

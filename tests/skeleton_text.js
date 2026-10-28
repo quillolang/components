@@ -1,0 +1,16 @@
+const plain = $("#skeleton-text-demo-plain");
+if (!plain || plain.getAttribute("aria-hidden") !== "true" || plain.getAttribute("role")) return "without a label it is not aria-hidden";
+const lines = plain.querySelectorAll(".ui-sktext-line");
+if (lines.length !== 3) return `lines={3} drew ${lines.length}`;
+if (!(lines[2].offsetWidth < lines[0].offsetWidth * 0.7)) return "the last line is not shorter";
+if (lines[0].offsetWidth === lines[1].offsetWidth) return "the lines do not vary";
+if (getComputedStyle(lines[0]).animationName !== "ui-sktext-shine") return "no shimmer";
+const article = $("#skeleton-text-demo-article");
+if (article.getAttribute("role") !== "status" || article.getAttribute("aria-hidden")) return "with a label it is not a status";
+if (article.querySelector(".ui-sr")?.textContent !== "Loading the article") return "the label is not there for screen readers";
+const h = article.querySelector(".ui-sktext-h");
+if (!h || h.offsetHeight <= lines[0].offsetHeight) return "no taller heading bar";
+if (article.querySelectorAll(".ui-sktext-line").length !== 4) return "lines={4}";
+const small = $("#skeleton-text-demo-small");
+if (small.querySelectorAll(".ui-sktext-p").length !== 2 || small.querySelectorAll(".ui-sktext-line").length !== 6) return "paragraphs={2} lines={3}";
+if (!(small.querySelector(".ui-sktext-line").offsetHeight < lines[0].offsetHeight)) return "size sm is not smaller";

@@ -1,0 +1,162 @@
+// SpotlightTour: a guided tour of a page, a step at a time: the page dims, the
+// element of the step shows through a lit hole (scrolled into view first), and a
+// card beside it says what it is, "2 of 4", with Back and Next (Done at the end).
+// It is the browser's own <dialog>, so focus stays in the card and Escape ends the
+// tour; the arrow keys go back and forward. A step whose element is not on the page
+// shows its card in the middle.
+//
+//   <SpotlightTour id="intro" trigger="Take the tour" steps={[
+//       { target: "search", title: "Search", text: "Find any order by its number or the customer's name." },
+//       { target: "new-order", title: "New order", text: "Start one here; drafts are kept for a week." },
+//   ]}/>
+//   <SpotlightTour id="intro" steps={steps} autostart={true} remember="tour-v2" on_finish={() => { done = true }}/>
+//
+// id (required): unique on the page; the card's ids start with it.
+// steps: a list of { target (an element's id), title, text }. trigger: the text of a
+// button that starts it (styled as a Button when button_css is on the page); null for
+// none. autostart: starts as the page opens, unless remembered as seen. remember: a
+// localStorage key; once the tour is finished or ended it is not started by itself again.
+// labels: next ("Next"), back ("Back"), done ("Done"), skip ("End tour").
+// on_finish(): called when Done is pressed; on_close(step): called with the index of
+// the step it was ended on (Escape or End tour), inside one of your components.
+
+let spotlight_tour_css = css`
+.ui-spotlight-tour-host { display: contents; }
+.ui-spotlight-tour {
+  box-sizing: border-box; width: 100vw; height: 100dvh; max-width: none; max-height: none; margin: 0; padding: 0; border: 0;
+  overflow: hidden; background: transparent; color: var(--ui-fg); font: 14px/1.5 var(--ui-font);
+}
+.ui-spotlight-tour::backdrop { background: transparent; }
+.ui-spotlight-tour-hole {
+  position: fixed; border-radius: var(--ui-radius); pointer-events: none;
+  box-shadow: 0 0 0 3px var(--ui-accent), 0 0 0 200vmax var(--ui-overlay);
+  transition: left .25s, top .25s, width .25s, height .25s;
+}
+.ui-spotlight-tour-hole-none { left: 50%; top: 50%; width: 0; height: 0; box-shadow: 0 0 0 200vmax var(--ui-overlay); }
+.ui-spotlight-tour-card {
+  position: fixed; box-sizing: border-box; width: min(320px, calc(100vw - 24px)); padding: 16px 18px 14px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); box-shadow: var(--ui-shadow-lg);
+  animation: ui-spotlight-tour-in .18s ease-out;
+}
+.ui-spotlight-tour-card-mid { left: 50%; top: 50%; translate: -50% -50%; }
+@keyframes ui-spotlight-tour-in { from { opacity: 0; } }
+.ui-spotlight-tour-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.ui-spotlight-tour-card h2 { margin: 0 0 4px; font-size: 16px; font-weight: 600; line-height: 1.3; }
+.ui-spotlight-tour-card p { margin: 0; color: var(--ui-muted); }
+.ui-spotlight-tour-x {
+  display: grid; place-items: center; flex: none; width: 26px; height: 26px; margin: -4px -8px 0 0; padding: 0; border: 0;
+  border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: pointer;
+}
+.ui-spotlight-tour-x:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+.ui-spotlight-tour-x svg { width: 16px; height: 16px; }
+.ui-spotlight-tour-foot { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+.ui-spotlight-tour-count { flex: 1; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-spotlight-tour-dots { display: flex; gap: 4px; margin-right: 6px; }
+.ui-spotlight-tour-dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--ui-strong); }
+.ui-spotlight-tour-dots .ui-spotlight-tour-dot-on { background: var(--ui-accent); }
+.ui-spotlight-tour-btn {
+  height: 32px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: transparent;
+  color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer;
+}
+.ui-spotlight-tour-btn:hover { background: var(--ui-subtle); }
+.ui-spotlight-tour-btn:disabled { opacity: .45; cursor: not-allowed; }
+.ui-spotlight-tour-next { border-color: transparent; background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-spotlight-tour-next:hover { background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-spotlight-tour-btn:focus-visible, .ui-spotlight-tour-x:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) { .ui-spotlight-tour-hole { transition: none; } .ui-spotlight-tour-card { animation: none; } }
+`
+
+component SpotlightTour(id: str, steps: list = [], trigger: str? = "Take the tour", autostart: bool = false,
+                        remember: str? = null, next: str = "Next", back: str = "Back", done: str = "Done",
+                        skip: str = "End tour", on_finish = null, on_close = null, class: str? = null) {
+    style global spotlight_tour_css
+    state dlg = null
+    state at = 0
+    state hole = null       // { x, y, w, h } of the step's element, or null for none
+    state card = ""         // the card's place, as CSS
+    state finished = false
+    let n = len(steps)
+    let step = n > 0 ? steps[min([at, n - 1])] : { title: "", text: "" }
+    // Lights the element of step i and puts the card beside it: under it, or above when there is no room.
+    let measure = (i: int) => {
+        let el = js("document.getElementById", get(steps[i], "target") ?? "")
+        if el == null {
+            hole = null
+            card = ""
+        } else {
+            let r = el.getBoundingClientRect()
+            let vw = js("innerWidth")
+            let vh = js("innerHeight")
+            hole = { x: r.left - 6, y: r.top - 6, w: r.width + 12, h: r.height + 12 }
+            let left = max([12, min([r.left, vw - 332])])
+            card = r.bottom + 220 < vh ? `left: ${left}px; top: ${r.bottom + 16}px` : `left: ${left}px; bottom: ${vh - r.top + 16}px`
+        }
+    }
+    let go = (i: int) => {
+        at = i
+        let el = js("document.getElementById", get(steps[i], "target") ?? "")
+        if el != null { el.scrollIntoView({ block: "center", behavior: "instant" }) }
+        measure(i)
+        let nb = dlg.querySelector(".ui-spotlight-tour-next")
+        nb && nb.focus()
+    }
+    let start = () => {
+        if n > 0 {
+            finished = false
+            dlg.showModal()
+            go(0)
+        }
+    }
+    let seen = () => { if remember != null { js("localStorage.setItem", remember, "seen") } }
+    <div class={ui_cls(["ui-spotlight-tour-host", class])}>
+        {trigger != null && <button.ui-btn.ui-btn-outline type="button" aria-haspopup="dialog" @click={start}>{trigger}</button>}
+        <dialog.ui-spotlight-tour aria-labelledby={`${id}-title`} aria-describedby={`${id}-text`}
+                @mount={(el) => {
+                    dlg = el
+                    let again = (_e = null) => { if el.open { measure(at) } }
+                    js("window.addEventListener", "resize", again)
+                    js("window.addEventListener", "scroll", again, { capture: true, passive: true })
+                    if autostart && (remember == null || js("localStorage.getItem", remember) != "seen") { start() }
+                    () => {
+                        js("window.removeEventListener", "resize", again)
+                        js("window.removeEventListener", "scroll", again, { capture: true })
+                    }
+                }}
+                @close={() => {
+                    seen()
+                    if finished { on_finish && on_finish() } else { on_close && on_close(at) }
+                }}
+                @keydown={(e) => {
+                    if e.key == "ArrowRight" && at < n - 1 { e.preventDefault(); go(at + 1) }
+                    if e.key == "ArrowLeft" && at > 0 { e.preventDefault(); go(at - 1) }
+                }}>
+            <div class={ui_cls(["ui-spotlight-tour-hole", hole == null && "ui-spotlight-tour-hole-none"])} aria-hidden="true"
+                 style={hole != null ? `left: ${hole.x}px; top: ${hole.y}px; width: ${hole.w}px; height: ${hole.h}px` : null}></div>
+            <div class={ui_cls(["ui-spotlight-tour-card", hole == null && "ui-spotlight-tour-card-mid"])} style={hole != null ? card : null}>
+                <div.ui-spotlight-tour-head>
+                    <h2 id={`${id}-title`}>{step.title}</h2>
+                    <button.ui-spotlight-tour-x type="button" aria-label={skip} title={skip} @click={() => dlg.close()}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                             aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                    </button>
+                </div>
+                <p id={`${id}-text`}>{get(step, "text") ?? ""}</p>
+                <div.ui-spotlight-tour-foot>
+                    <span.ui-spotlight-tour-count>
+                        <span.ui-sr>Step </span>{at + 1} of {n}
+                    </span>
+                    <span.ui-spotlight-tour-dots aria-hidden="true">
+                        {for i in range(0, n) => <span key={i} class={i == at ? "ui-spotlight-tour-dot-on" : null}></span>}
+                    </span>
+                    <button.ui-spotlight-tour-btn type="button" disabled={at == 0} @click={() => { go(at - 1) }}>{back}</button>
+                    <button.ui-spotlight-tour-btn.ui-spotlight-tour-next type="button" @click={() => {
+                        if at < n - 1 { go(at + 1) } else {
+                            finished = true
+                            dlg.close()
+                        }
+                    }}>{at < n - 1 ? next : done}</button>
+                </div>
+            </div>
+        </dialog>
+    </div>
+}

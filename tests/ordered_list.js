@@ -1,0 +1,22 @@
+const nums = $("#ordered-list-demo-numbers"), circles = $("#ordered-list-demo-circles"), letters = $("#ordered-list-demo-letters");
+const roman = $("#ordered-list-demo-roman"), plain = $("#ordered-list-demo-plain"), kids = $("#ordered-list-demo-kids");
+if (!nums || nums.tagName !== "OL" || nums.querySelectorAll(":scope > li").length !== 3) return "the list is not an <ol> of three";
+// Chrome gives counters in `content` unresolved, so the counter and the increments are what can be checked.
+const marks = (ol) => [...ol.querySelectorAll(":scope > li")].map((li) => getComputedStyle(li, "::before").content.replace(/\s/g, ""));
+const counts = (ol) => [...ol.querySelectorAll(":scope > li")].every((li) => getComputedStyle(li).counterIncrement === "ui-ol 1" && getComputedStyle(li, "::before").width !== "0px");
+if (marks(nums).join() !== 'counter(ui-ol)".",counter(ui-ol)".",counter(ui-ol)"."' || !counts(nums)) return `the numbers are ${marks(nums)}`;
+if (getComputedStyle(nums).counterReset !== "ui-ol 0") return `the list does not start its counter: ${getComputedStyle(nums).counterReset}`;
+if (marks(circles).join() !== "counter(ui-ol),counter(ui-ol),counter(ui-ol)" || !counts(circles)) return `the circles are ${marks(circles)}`;
+if (getComputedStyle(circles.querySelector("li"), "::before").borderRadius !== "50%") return "a circle is not round";
+if (getComputedStyle(circles.querySelector("li"), "::before").backgroundColor === getComputedStyle(nums.querySelector("li"), "::before").backgroundColor) return "tone=accent does not colour the circles";
+if (marks(letters)[0] !== 'counter(ui-ol,lower-alpha)"."' || letters.getAttribute("start") !== "3" || getComputedStyle(letters).counterReset !== "ui-ol 2") return `start={3} with letters gives ${marks(letters)} from ${getComputedStyle(letters).counterReset}`;
+if (marks(roman)[0] !== 'counter(ui-ol,lower-roman)"."') return `roman gives ${marks(roman)}`;
+if (getComputedStyle(plain).listStyleType !== "decimal" || getComputedStyle(plain.querySelector("li"), "::before").content !== "none") return "plain is not the browser's own numbering";
+if (getComputedStyle(nums).listStyleType !== "none") return "the browser's numbers show beside the kit's";
+const gap = (ol) => { const [a, b] = ol.querySelectorAll(":scope > li"); return b.getBoundingClientRect().top - a.getBoundingClientRect().bottom; };
+if (!(gap(letters) < gap(nums) && gap(nums) < gap(kids))) return "tight, normal and loose do not step up";
+if (!kids.querySelector(":scope > li b")) return "<li> children are not kept";
+const nested = kids.querySelector(":scope > li ol.ui-ol");
+if (!nested || marks(nested)[0] !== 'counter(ui-ol,lower-alpha)"."' || getComputedStyle(nested).counterReset !== "ui-ol 0") return `a nested list does not count on its own: ${nested && marks(nested)}`;
+if (marks(kids).join() !== 'counter(ui-ol)".",counter(ui-ol)"."') return `the outer list after a nested one counts ${marks(kids)}`;
+if (parseFloat(getComputedStyle(roman).fontSize) >= parseFloat(getComputedStyle(nums).fontSize)) return "size=sm is not smaller";

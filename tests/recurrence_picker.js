@@ -1,0 +1,46 @@
+const box = $("#recurrence-picker-demo-plain");
+const freq = $("#recurrence-picker-demo-plain-freq");
+const summary = $("#recurrence-picker-demo-plain-summary");
+const json = () => JSON.parse(box.querySelector("input[type=hidden][name=repeat]").value);
+const rrule = () => box.querySelector("input[type=hidden][name=repeat_rrule]").value;
+const days = () => [...box.querySelectorAll(".ui-recurrence-picker-day")];
+if (box.tagName !== "FIELDSET" || box.querySelector("legend")?.textContent !== "Repeat") return "it is not a fieldset with a Repeat legend";
+if (freq.value !== "weekly" || freq.getAttribute("aria-label") !== "How often") return `the frequency: ${freq.value}`;
+if (summary.getAttribute("aria-live") !== "polite" || summary.textContent.trim() !== "Every week on Mon and Wed.") return `the summary: ${summary.textContent}`;
+if (rrule() !== "FREQ=WEEKLY;BYDAY=MO,WE") return `the RRULE: ${rrule()}`;
+if (json().freq !== "weekly" || json().days.join() !== "MO,WE" || json().ends !== "never") return `the JSON: ${JSON.stringify(json())}`;
+if (days().length !== 7 || days()[0].getAttribute("aria-label") !== "Monday" || days()[0].getAttribute("aria-pressed") !== "true" || days()[1].getAttribute("aria-pressed") !== "false") return "the day buttons are not toggles starting on Mon and Wed";
+days()[4].click(); await wait();
+if (rrule() !== "FREQ=WEEKLY;BYDAY=MO,WE,FR" || !summary.textContent.includes("Mon, Wed and Fri")) return `adding Friday: ${rrule()} / ${summary.textContent}`;
+days()[0].click(); days()[2].click(); days()[4].click(); await wait();
+if (json().days.join() !== "FR" || days().filter((d) => d.getAttribute("aria-pressed") === "true").length !== 1) return `a week should keep at least one day: ${json().days}`;
+const interval = $("#recurrence-picker-demo-plain-interval");
+type(interval, "2"); await wait();
+if (!summary.textContent.startsWith("Every 2 weeks") || !rrule().includes("INTERVAL=2") || interval.getAttribute("aria-label") !== "Every how many weeks") return `interval 2: ${summary.textContent}`;
+type(interval, "0"); await wait();
+if (interval.value !== "1" || json().interval !== 1) return "an interval under 1 should become 1";
+// ends after 5 times
+const after = $("#recurrence-picker-demo-plain-ends-after"), count = $("#recurrence-picker-demo-plain-count");
+if (!count.disabled) return "the count should be disabled until After is chosen";
+after.click(); await wait();
+if (count.disabled) return "choosing After does not enable the count";
+type(count, "5"); await wait();
+if (!rrule().endsWith("COUNT=5") || !summary.textContent.endsWith(", 5 times.")) return `after 5: ${rrule()} / ${summary.textContent}`;
+$("#recurrence-picker-demo-plain-ends-on").click(); await wait();
+type($("#recurrence-picker-demo-plain-until"), "2026-12-31"); await wait();
+if (!rrule().endsWith("UNTIL=20261231") || !summary.textContent.includes("until December 31, 2026")) return `until: ${rrule()} / ${summary.textContent}`;
+// monthly on a weekday
+freq.value = "monthly"; freq.dispatchEvent(new Event("change", { bubbles: true })); await wait();
+if (!summary.textContent.startsWith("Every month on day 2") || !rrule().includes("BYMONTHDAY=2")) return `monthly: ${summary.textContent} / ${rrule()}`;
+box.querySelector("input[value=weekday]").click(); await wait();
+if (!summary.textContent.includes("on the first Monday") || !rrule().includes("BYDAY=1MO")) return `monthly by weekday: ${summary.textContent} / ${rrule()}`;
+freq.value = "yearly"; freq.dispatchEvent(new Event("change", { bubbles: true })); await wait();
+if (!summary.textContent.startsWith("Every year on November 2,") || !rrule().startsWith("FREQ=YEARLY")) return `yearly: ${summary.textContent} / ${rrule()}`;
+freq.value = "none"; freq.dispatchEvent(new Event("change", { bubbles: true })); await wait();
+if (summary.textContent.trim() !== "Happens once." || rrule() !== "" || box.querySelector(".ui-recurrence-picker-choices")) return "Does not repeat should hide the rest and say so";
+// the live one: second Tuesday, on_change
+const live = $("#recurrence-picker-demo-live");
+if (!$("#recurrence-picker-demo-live-summary").textContent.includes("Every month on day 10, 12 times")) return `the live summary: ${$("#recurrence-picker-demo-live-summary").textContent}`;
+live.querySelector("input[value=weekday]").click(); await wait();
+if (!$("#recurrence-picker-demo-live-summary").textContent.includes("second Tuesday")) return "Nov 10, 2026 should be the second Tuesday";
+if ($(".demo-note").textContent.trim() !== "on_change: monthly, every 1, by weekday, ends after.") return `on_change: ${$(".demo-note").textContent}`;

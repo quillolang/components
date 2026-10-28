@@ -1,0 +1,18 @@
+const wraps = $$(".ui-ndot");
+if (wraps.length !== 7) return `expected 7, found ${wraps.length}`;
+const [count, big, online, small, hidden, left, review] = wraps;
+const mark = (w) => w.querySelector(".ui-ndot-mark");
+if (mark(count).textContent !== "3" || mark(count).getAttribute("aria-label") !== "3 unread messages" || mark(count).getAttribute("role") !== "img") return "the count and its label";
+const w = count.getBoundingClientRect(), m = mark(count).getBoundingClientRect();
+if (!(m.right > w.right - 2 && m.top < w.top + 2)) return `the dot is not on the top right corner: ${JSON.stringify(m)} in ${JSON.stringify(w)}`;
+if (mark(big).textContent !== "99+") return `above the limit: ${mark(big).textContent}`;
+if (mark(online).textContent !== "" || mark(online).getAttribute("aria-label") !== "Online" || !online.classList.contains("ui-ndot-pulse")) return "a plain dot with a label, pulsing";
+const o = online.getBoundingClientRect(), om = mark(online).getBoundingClientRect();
+if (!(om.bottom > o.bottom - 2 && om.right > o.right - 2)) return "bottom-right is not at the bottom right";
+if (mark(small).getAttribute("aria-hidden") !== "true" || mark(small).hasAttribute("aria-label")) return "a dot without a label is not hidden from screen readers";
+if (mark(small).offsetWidth >= mark(count).offsetWidth) return "sm is not smaller than a count";
+if (mark(hidden)) return "show={false} still shows";
+if (getComputedStyle(mark(count)).backgroundColor === getComputedStyle(mark(online)).backgroundColor) return "tones look the same";
+const l = left.getBoundingClientRect(), lm = mark(left).getBoundingClientRect();
+if (!(lm.left < l.left + 2 && lm.top < l.top + 2) || mark(left).textContent !== "7") return "top-left";
+if (getComputedStyle(mark(review)).boxShadow !== "none") return "outline={false} still has the ring";

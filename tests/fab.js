@@ -1,0 +1,17 @@
+const link = $("#fab-demo-new"), add = $("#fab-demo-add"), call = $("#fab-demo-call");
+if (!link || link.tagName !== "A" || link.getAttribute("href") !== "#fab") return "href does not make the Fab a link";
+if (link.getAttribute("aria-label") !== "New message" || link.title !== "New message") return "the label is not its name and tooltip";
+if (!link.querySelector("svg path")?.getAttribute("d")) return "the icon is not drawn";
+if (getComputedStyle(link).position !== "absolute") return "inline does not make it absolute";
+if (getComputedStyle(link).borderRadius !== "999px") return `it is not round: ${getComputedStyle(link).borderRadius}`;
+const box = link.parentElement.getBoundingClientRect(), r = link.getBoundingClientRect();
+if (Math.abs(box.right - r.right - 16) > 1 || Math.abs(box.bottom - r.bottom - 16) > 1) return "the default corner is not the bottom right";
+if (add.textContent.trim() !== "Add" || add.hasAttribute("aria-label") || !add.classList.contains("ui-fab-extended")) return "extended does not show the label as text";
+const ar = add.getBoundingClientRect();
+if (Math.abs(ar.left - box.left - 16) > 1) return "corner=bottom-left is not at the left";
+if (ar.width <= ar.height) return "extended is not wider than tall";
+const sizes = $$(".ui-fab").map((f) => f.getBoundingClientRect().height);
+if (!(sizes[2] < sizes[0] && sizes[0] < sizes[3])) return `sizes sm < md < lg: ${sizes}`;
+if (call.tagName !== "BUTTON" || call.type !== "button") return "without href it is not a button";
+call.click(); call.click(); await wait();
+if (!$$(".demo-note").at(-1).textContent.includes("Called 2 times")) return `on_click did not reach the note: ${$$(".demo-note").at(-1).textContent}`;

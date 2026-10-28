@@ -1,0 +1,305 @@
+// MacdChart: the MACD of closing prices: the MACD line (the fast EMA less the slow
+// one), its signal line (an EMA of the MACD) and the histogram of the gap between
+// them, green above zero and red below, paler while it shrinks. Under a price chart
+// by default, or on its own. CSS only: hovering shows the close, MACD, signal and
+// histogram at that time, and screen readers get the numbers as a table.
+//
+//   <MacdChart label="ACME, MACD 12 26 9" candles={bars} prefix="$"/>
+//   <MacdChart label="MACD 5 35 5" candles={bars} fast={5} slow={35} signal={5} price={false}/>
+//
+// candles: a list of { time, close } (OHLC candles do), oldest first, time a date or a
+// date-time; or closes: the numbers alone, with labels for the axis if wanted.
+// fast, slow and signal: the periods of the two EMAs and of the signal line (12, 26
+// and 9); the MACD starts at the slow-th close, the signal and histogram signal - 1
+// closes later. price: the price chart above (true); height: its height in pixels
+// (200); macd_height: the MACD pane's (130). prefix and suffix: around every price
+// shown ("$"); decimals: digits after the point of prices (2), and of the MACD's
+// values, two more. label: what the chart shows; it names it for screen readers and
+// captions their table. show_label also writes it above the chart.
+
+let macd_chart_css = css`
+.ui-macd { --ui-macd-price: light-dark(#2a78d6, #3987e5); --ui-macd-line: light-dark(#2a78d6, #3987e5);
+  --ui-macd-signal: light-dark(#eb6834, #d95926);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-macd-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-macd-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-macd-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.ui-macd-key { width: 14px; height: 3px; border-radius: 2px; background: var(--c); }
+.ui-macd-kh { width: 10px; height: 10px; border-radius: 2px; background: linear-gradient(90deg, var(--ui-success) 50%, var(--ui-danger) 50%); }
+.ui-macd-cl { --c: var(--ui-macd-line); } .ui-macd-cs { --c: var(--ui-macd-signal); } .ui-macd-cp { --c: var(--ui-macd-price); }
+.ui-macd-up { --k: var(--ui-success); } .ui-macd-down { --k: var(--ui-danger); }
+.ui-macd-frame { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; padding-top: 8px; }
+.ui-macd-plot { position: relative; }
+.ui-macd-pane, .ui-macd-yp { position: relative; height: var(--h); }
+.ui-macd-ipane, .ui-macd-yi { position: relative; height: var(--ih); }
+.ui-macd-pane + .ui-macd-ipane, .ui-macd-yp + .ui-macd-yi { margin-top: 18px; }
+.ui-macd-name { position: absolute; z-index: 1; top: 2px; left: 4px; color: var(--ui-muted); font-size: 11px; font-weight: 600; pointer-events: none; }
+.ui-macd-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-macd-zero { background: var(--ui-strong); }
+.ui-macd-svg { position: absolute; z-index: 1; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.ui-macd-svg path { fill: none; stroke: var(--c); stroke-width: 1.75; stroke-linejoin: round; stroke-linecap: round; }
+.ui-macd-svg .ui-macd-fill { fill: var(--ui-macd-price); stroke: none; opacity: .08; }
+.ui-macd-cols { position: absolute; inset: 0; display: flex; }
+.ui-macd-col { position: relative; flex: 1; min-width: 0; }
+.ui-macd-col::before { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: var(--ui-strong); opacity: 0; }
+.ui-macd-col:hover::before { opacity: .9; }
+.ui-macd-hist { position: absolute; left: 18%; right: 18%; min-height: 1px; background: var(--k); }
+.ui-macd-fade { opacity: .45; }
+.ui-macd-dot { position: absolute; left: 50%; display: none; width: 7px; height: 7px; margin: -3.5px 0 0 -3.5px; border-radius: 50%;
+  background: var(--c); box-shadow: 0 0 0 2px var(--ui-bg); }
+.ui-macd-col:hover .ui-macd-dot { display: block; }
+.ui-macd-tip { position: absolute; z-index: 20; top: 0; left: calc(50% + 10px); display: none; min-width: 150px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-macd-flip .ui-macd-tip { left: auto; right: calc(50% + 10px); }
+.ui-macd-col:hover .ui-macd-tip { display: block; }
+.ui-macd-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-macd-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-macd-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-macd-tip .ui-macd-hv b { color: var(--k); }
+.ui-macd-y span { position: absolute; left: 0; transform: translateY(-50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-macd-y .ui-macd-tag { z-index: 1; left: -4px; padding: 1px 4px; border-radius: 3px; background: var(--c); color: var(--ui-bg); font-weight: 600; }
+.ui-macd-x { position: relative; height: 16px; margin-top: 6px; }
+.ui-macd-x span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); white-space: nowrap; }
+.ui-macd-x .ui-macd-first { transform: none; }
+.ui-macd-x .ui-macd-end { transform: translateX(-100%); }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn macd_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn macd_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : macd_chart_group(floor(n / 1000)) + "," + macd_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn macd_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${macd_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${macd_chart_group(floor(units / scale))}${tail}`
+}
+
+// A large number, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn macd_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? macd_chart_num(v)
+        : `${v < 0 ? "-" : ""}${macd_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A change in percent, signed, to two decimals: "+1.25%", "-0.40%".
+fn macd_chart_signed(p: num) -> str = `${p > 0 ? "+" : (p < 0 && round(abs(p) * 100) > 0 ? "-" : "")}${macd_chart_num(abs(p), 2)}%`
+
+// A coordinate out of 100 (or a length), to two decimals.
+fn macd_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The axis from lo to hi, widened to round ticks: about `steps` steps of 1, 2, 2.5 or 5 x 10^n.
+fn macd_chart_scale(lo: num, hi: num, steps: int = 5) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo) / 10) : hi - lo
+    let raw = span / steps
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+// A candle's time as it reads: "Mar 2, 2026" for a date, "Mar 2, 14:30" for a date-time.
+fn macd_chart_when(t) -> str =
+    type_of(t) != "str" || !date.valid(t) ? str(t) : (len(t) > 10 ? date.format(t, "MMM D, HH:mm") : date.format(t, "MMM D, YYYY"))
+
+// Where the time axis is labelled: about `limit` of { i, text }, at the starts of years,
+// months or days when the times cross them ("2026", "Mar", "Mar 2"), else every few
+// candles ("14:30", "Mar 2").
+fn macd_chart_ticks(times: list, limit: int) -> list {
+    let n = len(times)
+    let thin = (idx: list) => {
+        let step = ceil(len(idx) / limit)
+        range(len(idx)) | filter((k) => k % step == 0) | map((k) => idx[k])
+    }
+    let spaced = (fmt_at) => {
+        let step = ceil(n / limit)
+        range(n) | filter((i) => i % step == floor(step / 2)) | map((i) => { i, text: fmt_at(i) })
+    }
+    if n == 0 { return [] }
+    if !all(times, (t) => type_of(t) == "str" && date.valid(t)) { return spaced((i) => str(times[i])) }
+    let days = times | map((t) => slice(t, 0, 10))
+    let changes = (keys: list) => range(1, n) | filter((i) => keys[i] != keys[i - 1])
+    let day_starts = changes(days)
+    let month_starts = changes(days | map((d) => slice(d, 0, 7)))
+    let year_starts = changes(days | map((d) => slice(d, 0, 4)))
+    let picked = if any(times, (t) => len(t) > 10) {
+        len(day_starts) >= 3
+            ? thin(day_starts) | map((i) => { i, text: date.format(days[i], "MMM D") })
+            : spaced((i) => index_of(day_starts, i) != null ? date.format(days[i], "MMM D") : date.format(times[i], "HH:mm"))
+    } else if len(year_starts) >= 3 && len(month_starts) > limit * 2 {
+        thin(year_starts) | map((i) => { i, text: slice(days[i], 0, 4) })
+    } else if len(month_starts) >= 2 {
+        thin(month_starts) | map((i) => { i, text: index_of(year_starts, i) != null ? slice(days[i], 0, 4) : date.format(days[i], "MMM") })
+    } else {
+        spaced((i) => date.format(days[i], "MMM D"))
+    }
+    // Starts that fall close together (a short month) keep the first.
+    let gap = n / (limit * 1.5)
+    reduce(picked, [], (kept, t) => len(kept) == 0 || t.i - kept[-1].i >= gap ? kept + [t] : kept)
+}
+
+// The simple moving average of `period` values, null until there are that many.
+fn macd_chart_sma(xs: list, period: int) -> list {
+    let out = []
+    let total = 0
+    for i in range(len(xs)) {
+        total += xs[i]
+        if i >= period { total -= xs[i - period] }
+        out = out | push(i + 1 >= period ? total / period : null)
+    }
+    out
+}
+
+// The exponential moving average of `period` values (k = 2 / (period + 1)), started
+// from the simple average of the first `period`; null before that.
+fn macd_chart_ema(xs: list, period: int) -> list {
+    let k = 2 / (period + 1)
+    let out = []
+    let prev = null
+    for i in range(len(xs)) {
+        if i + 1 == period {
+            prev = sum(take(xs, period)) / period
+        } else if i + 1 > period {
+            prev = xs[i] * k + prev * (1 - k)
+        }
+        out = out | push(prev)
+    }
+    out
+}
+
+// The MACD of the closes: { macd, signal, hist }, three lists with null until each starts.
+fn macd_chart_macd(xs: list, fast: int, slow: int, signal: int) -> map {
+    let a = macd_chart_ema(xs, fast)
+    let b = macd_chart_ema(xs, slow)
+    let macd = for i in range(len(xs)) => a[i] == null || b[i] == null ? null : a[i] - b[i]
+    let start = index_of(macd | map((v) => v != null), true)
+    let sig0 = start == null ? [] : macd_chart_ema(drop(macd, start), signal)
+    let sig = for i in range(len(xs)) => start == null || i < start ? null : sig0[i - start]
+    let hist = for i in range(len(xs)) => macd[i] == null || sig[i] == null ? null : macd[i] - sig[i]
+    { macd, signal: sig, hist }
+}
+
+view MacdChart(candles: list = [], closes: list? = null, labels: list? = null, fast: int = 12, slow: int = 26,
+               signal: int = 9, price: bool = true, height: int = 200, macd_height: int = 130, prefix: str = "",
+               suffix: str = "", decimals: int = 2, label: str = "MACD chart", show_label: bool = false,
+               class: str? = null) {
+    style global macd_chart_css
+    let vals = closes ?? (candles | map((c) => c.close))
+    let times = closes != null ? (labels ?? []) : (candles | map((c) => c.time))
+    let n = len(vals)
+    let m = macd_chart_macd(vals, fast, slow, signal)
+    let sc = macd_chart_scale(n == 0 ? 0 : min(vals), n == 0 ? 1 : max(vals), 4)
+    let y = (v) => (sc.hi - v) * 100 / (sc.hi - sc.lo)
+    let ind = (m.macd + m.signal + m.hist) | filter((v) => v != null)
+    let reach = max([0.000001] + (ind | map((v) => abs(v))))
+    let isc = macd_chart_scale(0 - reach, reach, 6)
+    let iy = (v) => (isc.hi - v) * 100 / (isc.hi - isc.lo)
+    let x = (i) => (i + 0.5) * 100 / n
+    let pct = (v) => macd_chart_pct(v)
+    let money = (v) => `${v < 0 ? "-" : ""}${prefix}${macd_chart_num(abs(v), decimals)}${suffix}`
+    let tick = (t) => `${t < 0 ? "-" : ""}${prefix}${macd_chart_num(abs(t))}`
+    let fine = (v) => v == null ? "—" : macd_chart_num(v, decimals + 2)
+    let path = (list_vals: list, at) => {
+        let idx = range(n) | filter((i) => list_vals[i] != null)
+        len(idx) == 0 ? "" : "M" + join(idx | map((i) => `${pct(x(i))},${pct(at(list_vals[i]))}`), " L")
+    }
+    let pline = path(vals, y)
+    let when = (i) => i < len(times) ? macd_chart_when(times[i]) : `${i + 1}`
+    let shrinking = (i) => i > 0 && m.hist[i - 1] != null && abs(m.hist[i]) < abs(m.hist[i - 1])
+    let last_macd = n > 0 ? m.macd[-1] : null
+    let axis_width = max([5] + (sc.ticks | map((t) => len(tick(t)))) + (isc.ticks | map((t) => len(macd_chart_num(t)))) +
+                         [n > 0 ? len(money(vals[-1])) + 1 : 0, last_macd != null ? len(fine(last_macd)) + 1 : 0])
+    <figure class={ui_cls(["ui-macd", class])} aria-label={label} style={`--h: ${height}px; --ih: ${macd_height}px`}>
+        {show_label && <figcaption.ui-macd-title>{label}</figcaption>}
+        <ul.ui-macd-legend aria-hidden="true">
+            <li><span.ui-macd-key.ui-macd-cl></span>MACD ({fast}, {slow})</li>
+            <li><span.ui-macd-key.ui-macd-cs></span>Signal ({signal})</li>
+            <li><span.ui-macd-kh></span>Histogram</li>
+        </ul>
+        <div.ui-macd-frame aria-hidden="true">
+            <div.ui-macd-plot>
+                {price && <div.ui-macd-pane>
+                    {for t in sc.ticks => <span.ui-macd-grid style={`top: ${pct(y(t))}%`}></span>}
+                    <svg.ui-macd-svg.ui-macd-cp viewBox="0 0 100 100" preserveAspectRatio="none">
+                        {n > 0 && <path.ui-macd-fill d={`${pline} L${pct(x(n - 1))},100 L${pct(x(0))},100 Z`}/>}
+                        <path d={pline} vector-effect="non-scaling-stroke"/>
+                    </svg>
+                </div>}
+                <div.ui-macd-ipane>
+                    <span.ui-macd-name>MACD {fast} {slow} {signal}</span>
+                    {for t in isc.ticks => <span class={ui_cls(["ui-macd-grid", t == 0 && "ui-macd-zero"])} style={`top: ${pct(iy(t))}%`}></span>}
+                    <svg.ui-macd-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                        <path.ui-macd-cl d={path(m.macd, iy)} vector-effect="non-scaling-stroke"/>
+                        <path.ui-macd-cs d={path(m.signal, iy)} vector-effect="non-scaling-stroke"/>
+                    </svg>
+                </div>
+                <div.ui-macd-cols>
+                    {for i in range(n) => <div class={ui_cls(["ui-macd-col", n > 1 && i >= n / 2 && "ui-macd-flip"])}>
+                        {price && <div.ui-macd-pane><span.ui-macd-dot.ui-macd-cp style={`top: ${pct(y(vals[i]))}%`}></span></div>}
+                        <div.ui-macd-ipane>
+                            {m.hist[i] != null && <span class={ui_cls(["ui-macd-hist", m.hist[i] >= 0 ? "ui-macd-up" : "ui-macd-down", shrinking(i) && "ui-macd-fade"])}
+                                style={`top: ${pct(iy(m.hist[i] > 0 ? m.hist[i] : 0))}%; height: ${pct(abs(iy(m.hist[i]) - iy(0)))}%`}></span>}
+                            {m.macd[i] != null && <span.ui-macd-dot.ui-macd-cl style={`top: ${pct(iy(m.macd[i]))}%`}></span>}
+                        </div>
+                        <span.ui-macd-tip>
+                            <strong>{when(i)}</strong>
+                            <p>Close<b>{money(vals[i])}</b></p>
+                            <p><span.ui-macd-key.ui-macd-cl></span>MACD<b>{fine(m.macd[i])}</b></p>
+                            <p><span.ui-macd-key.ui-macd-cs></span>Signal<b>{fine(m.signal[i])}</b></p>
+                            <p class={ui_cls(["ui-macd-hv", m.hist[i] != null && (m.hist[i] >= 0 ? "ui-macd-up" : "ui-macd-down")])}>Histogram<b>{fine(m.hist[i])}</b></p>
+                        </span>
+                    </div>}
+                </div>
+            </div>
+            <div.ui-macd-y style={`width: ${axis_width}ch`}>
+                {price && <div.ui-macd-yp>
+                    {for t in sc.ticks => !(n > 0 && abs(y(t) - y(vals[-1])) * height < 1400) && <span style={`top: ${pct(y(t))}%`}>{tick(t)}</span>}
+                    {n > 0 && <span.ui-macd-tag.ui-macd-cp style={`top: ${pct(y(vals[-1]))}%`}>{money(vals[-1])}</span>}
+                </div>}
+                <div.ui-macd-yi>
+                    {for t in isc.ticks => !(last_macd != null && abs(iy(t) - iy(last_macd)) * macd_height < 1400) &&
+                        <span style={`top: ${pct(iy(t))}%`}>{t < 0 ? "-" : ""}{macd_chart_num(abs(t))}</span>}
+                    {last_macd != null && <span.ui-macd-tag.ui-macd-cl style={`top: ${pct(iy(last_macd))}%`}>{fine(last_macd)}</span>}
+                </div>
+            </div>
+            <div.ui-macd-x>
+                {len(times) == n && (for t in macd_chart_ticks(times, 7) => <span
+                    class={ui_cls([x(t.i) < 4 && "ui-macd-first", x(t.i) > 96 && "ui-macd-end"])} style={`left: ${pct(x(t.i))}%`}>{t.text}</span>)}
+            </div>
+            <span></span>
+        </div>
+        <table.ui-sr>
+            <caption>{label}: close, MACD ({fast}, {slow}), signal ({signal}) and histogram</caption>
+            <thead><tr><th scope="col">Time</th><th scope="col">Close</th><th scope="col">MACD</th><th scope="col">Signal</th><th scope="col">Histogram</th></tr></thead>
+            <tbody>
+                {for i in range(n) => <tr>
+                    <th scope="row">{when(i)}</th><td>{money(vals[i])}</td><td>{fine(m.macd[i])}</td><td>{fine(m.signal[i])}</td><td>{fine(m.hist[i])}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

@@ -1,0 +1,112 @@
+// CommentThread: comments and their replies, as deep as they go, each with Like and
+// Reply. Reply opens a ReplyBox under the comment; "Hide replies" folds a branch and
+// "Show 3 replies" opens it again. The thread keeps the comments it was given and adds
+// your replies and likes to them, and tells your component through on_reply and
+// on_like so it can save them. Needs comment.qwe and reply_box.qwe.
+//
+//   <CommentThread you="Ana Silva" comments={[
+//       { id: 1, name: "Ben Okafor", time: "2 h", text: "Does this work with SQLite?", likes: 3,
+//         replies: [{ id: 2, name: "Lee Chen", role: "Author", time: "1 h", text: "It does." }] },
+//       { id: 3, name: "Mia Rossi", time: "30 min", text: "Nice release!" },
+//   ]} on_reply={(to, text) => { save_reply(to, text) }}/>
+//
+// comments: a list of { id, name, text, avatar?, role?, time?, datetime?, likes?, liked?,
+// replies? (more of the same) }. you: your name, on your replies and beside the reply
+// box (avatar: your picture). depth: how deep replies may go (3); past it, Reply answers
+// the comment's parent, so the thread never grows too narrow. folded: ids whose replies
+// start hidden. label: what screen readers call the list ("Comments"). empty: what it
+// says with no comments ("No comments yet"). id: a prefix for the reply boxes' ids.
+// on_reply(id, text): inside one of your components, the comment answered and the text.
+// on_like(id, liked): the comment liked (true) or unliked (false).
+
+let comment_thread_css = css`
+.ui-comment-thread { display: grid; gap: 18px; min-width: 0; margin: 0; padding: 0; list-style: none; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-comment-thread-empty { margin: 0; color: var(--ui-muted); }
+.ui-comment-thread-fold {
+  display: inline-flex; align-items: center; gap: 5px; width: fit-content; height: 26px; padding: 0 6px; margin-left: -6px;
+  border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-accent); font: 500 13px/1 var(--ui-font); cursor: pointer;
+}
+.ui-comment-thread-fold svg { width: 12px; height: 12px; transition: transform .15s; }
+.ui-comment-thread-fold[aria-expanded="false"] svg { transform: rotate(-90deg); }
+.ui-comment-thread-fold:hover { background: var(--ui-accent-soft); }
+.ui-comment-thread-fold:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-comment-thread-reply { margin: 4px 0 6px; }
+.ui-comment-thread-list { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; }
+@media (prefers-reduced-motion: reduce) { .ui-comment-thread-fold svg { transition: none; } }
+`
+
+// The tree with `text` added as a reply to the comment `to` (at the end of its replies).
+fn comment_thread_add(items: list, to, added: map) -> list =
+    items | map((c) => c.id == to
+        ? { ...c, replies: (c.replies ?? []) | push(added) }
+        : (c.replies != null ? { ...c, replies: comment_thread_add(c.replies, to, added) } : c))
+
+// The tree with comment `id` liked or unliked.
+fn comment_thread_like(items: list, id, on: bool) -> list =
+    items | map((c) => c.id == id
+        ? { ...c, liked: on, likes: (c.likes ?? 0) + (on ? 1 : -1) }
+        : (c.replies != null ? { ...c, replies: comment_thread_like(c.replies, id, on) } : c))
+
+// How many comments a list holds, replies included.
+fn comment_thread_count(items: list) -> int = items | reduce(0, (n, c) => n + 1 + comment_thread_count(c.replies ?? []))
+
+// One comment and, under it, its reply box and its replies. ctx carries the thread's
+// state and what to do: { folded, replying, you, avatar, depth, id, fold, open, like, post }.
+view CommentThreadItem(c: map, level: int, parent, ctx: map) {
+    style global comment_thread_css
+    let replies = c.replies ?? []
+    let n = comment_thread_count(replies)
+    let hidden = contains(ctx.folded, c.id)
+    let target = level < ctx.depth ? c.id : parent
+    <li>
+        <Comment name={c.name} text={c.text} avatar={c.avatar} role={c.role} time={c.time} datetime={c.datetime}
+                 likes={c.likes ?? 0} liked={c.liked == true}
+                 on_like={(on) => { ctx.like(c.id, on) }} on_reply={() => { ctx.open(target) }}>
+            {ctx.replying == c.id && <div.ui-comment-thread-reply>
+                <ReplyBox id={`${ctx.id}-reply-${c.id}`} you={ctx.you} avatar={ctx.avatar} open={true}
+                          placeholder={`Reply to ${c.name}…`}
+                          on_post={(text) => { ctx.post(c.id, text) }} on_cancel={() => { ctx.open(null) }}/>
+            </div>}
+            {n > 0 && <button.ui-comment-thread-fold type="button" aria-expanded={hidden ? "false" : "true"}
+                              @click={() => { ctx.fold(c.id, !hidden) }}>
+                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                     stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4.5L6 8l3.5-3.5"/></svg>
+                {hidden ? `Show ${n} ${n == 1 ? "reply" : "replies"}` : "Hide replies"}
+            </button>}
+            {n > 0 && !hidden && <ol.ui-comment-thread-list>
+                {for r in replies => <CommentThreadItem key={r.id} c={r} level={level + 1} parent={c.id} ctx={ctx}/>}
+            </ol>}
+        </Comment>
+    </li>
+}
+
+component CommentThread(comments: list = [], you: str = "You", avatar: str? = null, depth: int = 3, folded: list = [],
+                        label: str = "Comments", empty: str = "No comments yet", id: str = "ui-comment-thread",
+                        on_reply = null, on_like = null, class: str? = null) {
+    style global comment_thread_css
+    state items = comments
+    state closed = folded
+    state replying = null
+    state seq = 0
+    let ctx = {
+        folded: closed, replying, you, avatar, depth, id,
+        fold: (cid, hide: bool) => { closed = hide ? closed | push(cid) : closed | filter((x) => x != cid) },
+        open: (cid) => { replying = cid },
+        like: (cid, on: bool) => {
+            items = comment_thread_like(items, cid, on)
+            on_like && on_like(cid, on)
+        },
+        post: (cid, text: str) => {
+            seq += 1
+            items = comment_thread_add(items, cid, { id: `${id}-new-${seq}`, name: you, avatar, text, time: "Just now" })
+            closed = closed | filter((x) => x != cid)
+            replying = null
+            on_reply && on_reply(cid, text)
+        },
+    }
+    len(items) == 0
+        ? <p class={ui_cls(["ui-comment-thread-empty", class])}>{empty}</p>
+        : <ol class={ui_cls(["ui-comment-thread", class])} aria-label={label}>
+              {for c in items => <CommentThreadItem key={c.id} c={c} level={1} parent={null} ctx={ctx}/>}
+          </ol>
+}

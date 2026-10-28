@@ -1,0 +1,159 @@
+// GanttChart: a project's tasks as bars over dates, each filled as far as it has
+// got, optionally in groups (phases, teams) with a bar spanning each group, and
+// milestones as diamonds and a line for today. CSS only: hovering a task shows its
+// dates, length and progress; screen readers get the plan as a table.
+//
+//   <GanttChart label="Launch plan" today="2026-03-18" tasks={[
+//       { label: "Research", start: "2026-03-02", end: "2026-03-13", progress: 100, group: "Design" },
+//       { label: "Build", start: "2026-03-16", end: "2026-04-10", progress: 35, group: "Build" },
+//       { label: "Launch", start: "2026-04-14", milestone: true }]}/>
+//
+// tasks: a list of { label, start, end, progress, group, milestone }: start and end
+// are ISO dates ("2026-03-02"), both days included (end defaults to start);
+// progress, from 0 to 100, fills the bar that far and is written on it; a milestone
+// is a diamond on its start. Tasks with a group are listed under its name, with a
+// bar from its first start to its last end, each group in a colour of its own.
+// today: an ISO date marked with a line (none by default, so the page reads the
+// same whenever it is made: pass date.today() for the real day). from, to: the
+// dates the chart spans (by default a day either side of the tasks). The dates
+// along the top are weeks (Mondays) for up to about two months, months beyond.
+// row: a row's height in pixels (32). label: what the chart shows; it names it for
+// screen readers and captions their table. show_label also writes it above.
+
+let gantt_chart_css = css`
+.ui-gantt {
+  --ui-gantt-1: light-dark(#2a78d6, #3987e5); --ui-gantt-2: light-dark(#eb6834, #d95926);
+  --ui-gantt-3: light-dark(#1baf7a, #199e70); --ui-gantt-4: light-dark(#eda100, #c98500);
+  --ui-gantt-5: light-dark(#e87ba4, #d55181); --ui-gantt-6: light-dark(#008300, #008300);
+  --ui-gantt-7: light-dark(#6250d6, #9085e9); --ui-gantt-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-gantt-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-gantt-s1 { --c: var(--ui-gantt-1); } .ui-gantt-s2 { --c: var(--ui-gantt-2); } .ui-gantt-s3 { --c: var(--ui-gantt-3); }
+.ui-gantt-s4 { --c: var(--ui-gantt-4); } .ui-gantt-s5 { --c: var(--ui-gantt-5); } .ui-gantt-s6 { --c: var(--ui-gantt-6); }
+.ui-gantt-s7 { --c: var(--ui-gantt-7); } .ui-gantt-s8 { --c: var(--ui-gantt-8); }
+.ui-gantt-grid { display: grid; grid-template-columns: minmax(7em, max-content) minmax(0, 1fr); column-gap: 12px; padding-bottom: 18px; }
+.ui-gantt-name { display: flex; align-items: center; min-width: 0; max-width: 16em; overflow: hidden; color: var(--ui-fg);
+  text-overflow: ellipsis; white-space: nowrap; }
+.ui-gantt-name.ui-gantt-gname { font-weight: 600; }
+.ui-gantt-name.ui-gantt-in { padding-left: 14px; color: var(--ui-muted); }
+.ui-gantt-axis { position: relative; height: 22px; border-bottom: 1px solid var(--ui-border); }
+.ui-gantt-axis span { position: absolute; bottom: 5px; padding-left: 4px; color: var(--ui-muted); white-space: nowrap; }
+.ui-gantt-track { position: relative; border-bottom: 1px solid color-mix(in srgb, var(--ui-border) 50%, transparent); }
+.ui-gantt-rule { position: absolute; top: 0; bottom: 0; width: 1px; background: color-mix(in srgb, var(--ui-border) 60%, transparent); }
+.ui-gantt-bar { position: absolute; top: 22%; bottom: 22%; min-width: 4px; overflow: visible; border-radius: 5px;
+  background: color-mix(in srgb, var(--c) 28%, var(--ui-bg)); }
+.ui-gantt-done { position: absolute; inset: 0 auto 0 0; border-radius: 5px; background: var(--c); }
+.ui-gantt-pct { position: absolute; top: 50%; left: 6px; color: var(--ui-fg); font-size: 11px; font-weight: 600;
+  font-variant-numeric: tabular-nums; transform: translateY(-50%); }
+.ui-gantt-span { position: absolute; top: 40%; bottom: 40%; border-radius: 2px; background: var(--c); }
+.ui-gantt-span::before, .ui-gantt-span::after { content: ""; position: absolute; top: 0; width: 0; height: 0; border: 4px solid transparent;
+  border-top: 5px solid var(--c); }
+.ui-gantt-span::before { left: 0; border-left-color: var(--c); }
+.ui-gantt-span::after { right: 0; border-right-color: var(--c); }
+.ui-gantt-ms { position: absolute; top: 50%; width: 13px; height: 13px; margin-left: -6.5px; background: var(--c);
+  border: 2px solid var(--ui-bg); transform: translateY(-50%) rotate(45deg); }
+.ui-gantt-today { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--ui-danger); z-index: 3; pointer-events: none; }
+.ui-gantt-today span { position: absolute; bottom: -18px; left: 50%; transform: translateX(-50%); padding: 0 4px; border-radius: 3px; background: var(--ui-danger);
+  color: #fff; font-size: 10px; font-weight: 600; white-space: nowrap; }
+.ui-gantt-bar:hover, .ui-gantt-ms:hover { z-index: 6; box-shadow: 0 0 0 2px var(--ui-fg); }
+.ui-gantt-tip { position: absolute; z-index: 20; display: none; min-width: 120px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-gantt-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-gantt-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-gantt-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-gantt-tip { top: calc(100% + 6px); left: 0; }
+.ui-gantt-ms .ui-gantt-tip { transform: rotate(-45deg); top: 14px; left: 14px; }
+.ui-gantt-late .ui-gantt-tip { left: auto; right: 0; }
+.ui-gantt-bar:hover .ui-gantt-tip, .ui-gantt-ms:hover .ui-gantt-tip { display: block; }
+`
+
+view GanttChart(tasks: list, today: str? = null, from: str? = null, to: str? = null, row: int = 32,
+                label: str = "Gantt chart", show_label: bool = false, class: str? = null) {
+    style global gantt_chart_css
+    let ends = (t) => t.end ?? t.start
+    let starts = tasks | map((t) => t.start)
+    let first = from ?? (len(starts) == 0 ? (today ?? "2026-01-01") : date.add_days(sort(starts)[0], -1))
+    let last = to ?? (len(tasks) == 0 ? date.add_days(first, 7) : date.add_days(sort(tasks | map(ends))[-1], 2))
+    let days0 = date.days_between(first, last)
+    let days = days0 > 0 ? days0 : 1
+    let at = (d) => date.days_between(first, d) * 100 / days
+    let fmt_day = (d) => date.format(d, "MMM D")
+    let long = (t) => date.days_between(t.start, ends(t)) + 1
+    // The ticks along the top: Mondays for up to 9 weeks, else the first of each month.
+    let weekly = days <= 63
+    let tick0 = weekly ? date.add_days(first, (8 - date.weekday(first)) % 7)
+                       : (date.parts(first).day == 1 ? first : date.add_months(date.start_of_month(first), 1))
+    let ticks = weekly
+        ? range(0, ceil(days / 7) + 1) | map((k) => date.add_days(tick0, k * 7)) | filter((d) => d < last)
+        : range(0, 40) | map((k) => date.add_months(tick0, k)) | filter((d) => d < last)
+    let groups = unique(tasks | filter((t) => t.group != null) | map((t) => str(t.group)))
+    let color = (t) => t.group == null ? 1 : (index_of(groups, str(t.group)) ?? 0) % 8 + 1
+    // The rows: ungrouped tasks first, then each group's name and its tasks.
+    let rows = (tasks | filter((t) => t.group == null) | map((t) => { kind: "task", task: t }))
+        + flatten(for g in groups => {
+              let mine = tasks | filter((t) => t.group != null && str(t.group) == g)
+              [{ kind: "group", name: g, start: sort(mine | map((t) => t.start))[0], end: sort(mine | map(ends))[-1], color: color(mine[0]) }]
+                  + (mine | map((t) => { kind: "task", task: t }))
+          })
+    let pct = (n) => { let r = round(n * 100) / 100; r == floor(r) ? str(floor(r)) : str(r) }
+    <figure class={ui_cls(["ui-gantt", class])} aria-label={label}>
+        {show_label && <figcaption.ui-gantt-title>{label}</figcaption>}
+        <div.ui-gantt-grid aria-hidden="true" style={`grid-template-rows: 22px repeat(${len(rows) > 0 ? len(rows) : 1}, ${row}px)`}>
+            <span></span>
+            <div.ui-gantt-axis>
+                {for d in ticks | filter((q) => at(q) < 93) => <span style={`left: ${pct(at(d))}%`}>{weekly ? fmt_day(d) : date.format(d, date.parts(d).month == 1 ? "MMM YYYY" : "MMM")}</span>}
+            </div>
+            {for [i, r] in enumerate(rows) => [
+                <span class={ui_cls(["ui-gantt-name", r.kind == "group" && "ui-gantt-gname", r.kind == "task" && r.task.group != null && "ui-gantt-in"])}
+                      title={r.kind == "group" ? r.name : str(r.task.label)}>{r.kind == "group" ? r.name : r.task.label}</span>,
+                <div.ui-gantt-track>
+                    {for d in ticks => <span.ui-gantt-rule style={`left: ${pct(at(d))}%`}></span>}
+                    {r.kind == "group"
+                        ? <span class={`ui-gantt-span ui-gantt-s${r.color}`}
+                                style={`left: ${pct(at(r.start))}%; width: ${pct((date.days_between(r.start, r.end) + 1) * 100 / days)}%`}></span>
+                        : {
+                              let t = r.task
+                              let p = t.progress == null ? null : (t.progress < 0 ? 0 : (t.progress > 100 ? 100 : t.progress))
+                              let late = at(t.start) > 60
+                              let tip = <span.ui-gantt-tip>
+                                  <strong>{t.label}</strong>
+                                  {t.milestone == true
+                                      ? <p>On<b>{fmt_day(t.start)}</b></p>
+                                      : [<p>From<b>{fmt_day(t.start)}</b></p>, <p>To<b>{fmt_day(ends(t))}</b></p>,
+                                         <p>Days<b>{long(t)}</b></p>]}
+                                  {p != null && t.milestone != true && <p>Done<b>{round(p)}%</b></p>}
+                              </span>
+                              t.milestone == true
+                                  ? <span class={ui_cls(["ui-gantt-ms", `ui-gantt-s${color(t)}`, late && "ui-gantt-late"])}
+                                          style={`left: ${pct(at(t.start) + 50 / days)}%`}>{tip}</span>
+                                  : <span class={ui_cls(["ui-gantt-bar", `ui-gantt-s${color(t)}`, late && "ui-gantt-late"])}
+                                          style={`left: ${pct(at(t.start))}%; width: ${pct(long(t) * 100 / days)}%`}>
+                                        {p != null && <span.ui-gantt-done style={`width: ${pct(p)}%`}></span>}
+                                        {p != null && long(t) * 100 / days > 6 && <span.ui-gantt-pct>{round(p)}%</span>}
+                                        {tip}
+                                    </span>
+                          }}
+                    {i == 0 && today != null && today >= first && today <= last && <span.ui-gantt-today
+                        style={`left: ${pct(at(today) + 50 / days)}%; bottom: ${(len(rows) - 1) * -row}px`}><span>Today</span></span>}
+                </div>
+            ]}
+        </div>
+        <table.ui-sr>
+            <caption>{label}{today != null ? `, today ${fmt_day(today)}` : ""}</caption>
+            <thead><tr><th scope="col">Task</th>{len(groups) > 0 && <th scope="col">Group</th>}<th scope="col">Start</th>
+                <th scope="col">End</th><th scope="col">Days</th><th scope="col">Done</th></tr></thead>
+            <tbody>
+                {for r in rows | filter((q) => q.kind == "task") => {
+                    let t = r.task
+                    <tr>
+                        <th scope="row">{t.label}{t.milestone == true ? " (milestone)" : ""}</th>
+                        {len(groups) > 0 && <td>{t.group ?? ""}</td>}
+                        <td>{fmt_day(t.start)}</td><td>{fmt_day(ends(t))}</td><td>{long(t)}</td>
+                        <td>{t.progress == null ? "—" : `${round(t.progress)}%`}</td>
+                    </tr>
+                }}
+            </tbody>
+        </table>
+    </figure>
+}

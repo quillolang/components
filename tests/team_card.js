@@ -1,0 +1,16 @@
+const cards = $$(".ui-team-card");
+if (cards[0].querySelector(".ui-avatar").getBoundingClientRect().width !== 112) return "the initials are not 112px";
+if (cards.length !== 4) return `expected 4 team cards, found ${cards.length}`;
+const ada = $("#team-card-demo-ada");
+if (ada.querySelector("h3 a")?.getAttribute("href") !== "#team_card") return "href does not make the name a link";
+if (ada.querySelector(".ui-team-card-role").textContent !== "Founder") return "the role is missing";
+if (!ada.querySelector(".ui-team-card-photo .ui-avatar.ui-avatar-square") || ada.querySelector(".ui-team-card-photo img")) return "no photo should show square initials";
+const links = [...ada.querySelectorAll(".ui-team-card-link")];
+if (links.map((a) => a.getAttribute("aria-label")).join("|") !== "Ada Lovelace on Email|Ada Lovelace on GitHub|Ada Lovelace on LinkedIn|Ada Lovelace on X") return `labels: ${links.map((a) => a.getAttribute("aria-label"))}`;
+if (links[0].getAttribute("target") || links[1].getAttribute("target") !== "_blank" || links[1].getAttribute("rel") !== "noopener") return "only links to other sites open a new tab";
+if (links.some((a) => !a.querySelector("svg"))) return "a link has no icon";
+const grace = cards[1];
+if (grace.querySelector(".ui-team-card-photo img")?.getAttribute("src") !== "https://i.pravatar.cc/224?img=47") return "the photo is missing";
+if (grace.querySelector(".ui-team-card-link").getAttribute("aria-label") !== "Grace's site") return "label does not name the link";
+if (cards[2].querySelector(".ui-team-card-link").getAttribute("href") !== "tel:+441234567") return "the phone link";
+if (!cards[3].classList.contains("ui-team-card-sm") || cards[3].querySelector(".ui-team-card-links")) return "size=sm, no links";

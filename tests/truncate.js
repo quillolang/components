@@ -1,0 +1,17 @@
+const long = "A very long name for a file that will not fit in the space it is given, so it is cut.pdf";
+const end = $("#truncate-demo-end"), mid = $("#truncate-demo-mid"), short = $("#truncate-demo-short"), inl = $("#truncate-demo-inline");
+if (!end || end.title !== long || end.textContent !== long) return "the whole text is not in the title and the element";
+if (end.scrollWidth <= end.clientWidth + 1) return "the end-cut text is not cut";
+if (getComputedStyle(end).textOverflow !== "ellipsis" || getComputedStyle(end).whiteSpace !== "nowrap") return "it is not an ellipsis on one line";
+if (end.getBoundingClientRect().width > end.parentElement.getBoundingClientRect().width) return "it is wider than its container";
+const head = mid.querySelector(".ui-truncate-head"), tail = mid.querySelector(".ui-truncate-tail");
+if (!head || !tail || tail.textContent !== "cut.pdf") return "keep={7} does not keep the last 7 characters";
+if (head.textContent + tail.textContent !== long) return "the two parts are not the whole text";
+if (head.scrollWidth <= head.clientWidth + 1) return "the head is not cut";
+if (tail.getBoundingClientRect().right > mid.getBoundingClientRect().right + 1) return "the tail is out of view";
+if (mid.querySelector(".ui-sr")?.textContent !== long || head.getAttribute("aria-hidden") !== "true") return "screen readers do not get the whole text once";
+if (mid.title !== long) return "the middle-cut text has no title";
+if (short.scrollWidth > short.clientWidth + 1 || short.getBoundingClientRect().width > 260) return "a short text is cut, or width is not applied";
+if (inl.getBoundingClientRect().width > 160 || inl.scrollWidth <= inl.clientWidth) return "an inline one is not held to its width";
+const note = inl.parentElement;
+if (Math.abs(inl.getBoundingClientRect().bottom - note.getBoundingClientRect().bottom) > 8) return "an inline one does not sit on the line";

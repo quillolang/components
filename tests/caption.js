@@ -1,0 +1,13 @@
+const fig = $("#caption-demo-figure");
+if (!fig || fig.tagName !== "FIGCAPTION" || fig.parentElement.tagName !== "FIGURE") return "the default caption is not a figcaption in its figure";
+const cs = (el) => getComputedStyle(el);
+if (parseFloat(cs(fig).fontSize) >= 14 || cs(fig).color === cs(document.body).color) return "the caption is not small and muted";
+if (cs(fig).textAlign !== "center") return "align=center is not applied";
+if (fig.getBoundingClientRect().top < fig.previousElementSibling.getBoundingClientRect().bottom) return "the caption is not under the figure";
+const table = $("#caption-demo-table"), cap = table.querySelector("caption");
+if (!cap || !cap.classList.contains("ui-caption") || cap.textContent !== "Orders this week, by day.") return "tag=caption is not a table caption";
+if (cap.getBoundingClientRect().top < table.querySelector("tbody").getBoundingClientRect().bottom - 1) return "a table caption is not under the table";
+const hint = $("#caption-demo-hint");
+if (hint.tagName !== "P" || parseFloat(cs(hint).fontSize) !== 12) return "tag=p with size=xs is not a 12px paragraph";
+if ($("#caption-demo-field").getAttribute("aria-describedby") !== "caption-demo-hint") return "the field is not described by its caption";
+if (!fig.querySelector("a") || cs(fig.querySelector("a")).color !== cs(fig).color) return "a link in a caption is not in its colour";

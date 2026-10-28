@@ -1,0 +1,164 @@
+// Watchlist: symbols to keep an eye on, each with its last price, the change and
+// percent change on the previous close (green or red) and a sparkline, in a table
+// whose columns sort with a click (again to reverse). When a price changes its cell
+// flashes, green for up and red for down. A row can be picked, with a click or Enter.
+//
+//   <Watchlist items={quotes} prefix="$" on_select={(s) => { symbol = s }}/>
+//
+// items: a list of { symbol, name, price, prev, values }: price the last price, prev
+// the previous close (the change is worked out from it), values the prices for the
+// sparkline, oldest first (optional). Give a new list as prices change. sort: the
+// column to start sorted by ("symbol", "price", "change" or "percent"; none keeps the
+// order given) and desc: largest first. selected: the symbol picked to start with.
+// prefix and suffix: around prices ("$"); decimals: digits after the point (2).
+// label: what screen readers call the table ("Watchlist"). on_select(symbol): called
+// with the symbol of the row picked.
+
+let watchlist_css = css`
+.ui-wlist { min-width: 0; overflow-x: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface);
+  font: 13px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-wlist-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-wlist-table th, .ui-wlist-table td { padding: 8px 12px; text-align: right; white-space: nowrap; }
+.ui-wlist-table thead th { padding: 0; border-bottom: 1px solid var(--ui-border); background: var(--ui-subtle); }
+.ui-wlist-table th:first-child, .ui-wlist-table td:first-child { text-align: left; }
+.ui-wlist-sort { display: inline-flex; align-items: center; justify-content: inherit; gap: 4px; width: 100%; padding: 8px 12px; border: 0;
+  background: none; color: var(--ui-muted); font: 600 11px/1 var(--ui-font); letter-spacing: .04em; text-transform: uppercase; cursor: pointer; }
+th:not(:first-child) > .ui-wlist-sort { justify-content: flex-end; }
+.ui-wlist-sort:hover { color: var(--ui-fg); }
+.ui-wlist-sort:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-wlist-sort svg { width: 8px; height: 8px; fill: currentColor; opacity: .35; }
+[aria-sort] > .ui-wlist-sort { color: var(--ui-fg); }
+[aria-sort] > .ui-wlist-sort svg { opacity: 1; }
+[aria-sort="descending"] > .ui-wlist-sort svg { transform: rotate(180deg); }
+.ui-wlist-plain { padding: 8px 12px; color: var(--ui-muted); font: 600 11px/1 var(--ui-font); letter-spacing: .04em; text-transform: uppercase; }
+.ui-wlist-row { cursor: pointer; }
+.ui-wlist-row:not(:last-child) > * { border-bottom: 1px solid color-mix(in srgb, var(--ui-border) 60%, transparent); }
+.ui-wlist-row:hover { background: var(--ui-subtle); }
+.ui-wlist-row:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-wlist-row[aria-selected="true"] { background: var(--ui-accent-soft); }
+.ui-wlist-row[aria-selected="true"] > :first-child { box-shadow: inset 3px 0 0 var(--ui-accent); }
+.ui-wlist-sym b { display: block; font-weight: 650; }
+.ui-wlist-sym { font-weight: 400; }
+.ui-wlist-sym small { color: var(--ui-muted); font-size: 12px; }
+.ui-wlist-up { --k: var(--ui-success); } .ui-wlist-down { --k: var(--ui-danger); } .ui-wlist-flat { --k: var(--ui-muted); }
+.ui-wlist-chg { color: var(--k); font-weight: 600; }
+.ui-wlist-pill { display: inline-block; min-width: 64px; padding: 2px 6px; border-radius: 4px; background: color-mix(in srgb, var(--k) 14%, transparent);
+  color: var(--k); font-weight: 600; text-align: right; }
+.ui-wlist-price { display: inline-block; padding: 2px 4px; border-radius: 3px; font-weight: 600; }
+.ui-wlist-tick-up { animation: ui-wlist-up 1s ease-out; } .ui-wlist-tick-down { animation: ui-wlist-down 1s ease-out; }
+@keyframes ui-wlist-up { from { background: color-mix(in srgb, var(--ui-success) 40%, transparent); } }
+@keyframes ui-wlist-down { from { background: color-mix(in srgb, var(--ui-danger) 40%, transparent); } }
+.ui-wlist-spark { display: block; width: 88px; height: 26px; margin-left: auto; overflow: visible; }
+.ui-wlist-spark path { fill: none; stroke: var(--k); stroke-width: 1.5; stroke-linejoin: round; }
+.ui-wlist-spark line { stroke: var(--ui-strong); stroke-dasharray: 2 2; }
+@media (prefers-reduced-motion: reduce) { .ui-wlist-tick-up, .ui-wlist-tick-down { animation: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn watchlist_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn watchlist_group(n: int) -> str =
+    n < 1000 ? str(n) : watchlist_group(floor(n / 1000)) + "," + watchlist_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn watchlist_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${watchlist_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${watchlist_group(floor(units / scale))}${tail}`
+}
+
+// A change in percent, signed, to two decimals: "+1.25%", "-0.40%".
+fn watchlist_signed(p: num) -> str = `${p > 0 ? "+" : (p < 0 && round(abs(p) * 100) > 0 ? "-" : "")}${watchlist_num(abs(p), 2)}%`
+
+// A coordinate out of 100 (or a length), to two decimals.
+fn watchlist_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+component Watchlist(items: list = [], sort: str? = null, desc: bool = false, selected: str? = null, prefix: str = "",
+                    suffix: str = "", decimals: int = 2, label: str = "Watchlist", on_select = null, class: str? = null) {
+    style global watchlist_css
+    state by = sort
+    state down = desc
+    state picked = selected
+    // The price last shown for each symbol, so a change can flash up or down.
+    state seen = {}
+    let rows = items | map((it) => {
+        let change = it.prev != null ? it.price - it.prev : 0
+        { ...it, change, percent: it.prev != null && it.prev != 0 ? change * 100 / it.prev : 0 }
+    })
+    let ordered = by == null ? rows : rows | sort_by((r) => get(r, by))
+    let shown = by != null && down ? reverse(ordered) : ordered
+    let money = (v) => `${v < 0 ? "-" : ""}${prefix}${watchlist_num(abs(v), decimals)}${suffix}`
+    let side = (r) => round(r.change * pow(10, decimals)) == 0 ? "ui-wlist-flat" : (r.change > 0 ? "ui-wlist-up" : "ui-wlist-down")
+    let pick = (s: str) => {
+        picked = s
+        on_select && on_select(s)
+    }
+    let head = (key: str, text: str) => <th scope="col" aria-sort={by == key ? (down ? "descending" : "ascending") : null}>
+        <button.ui-wlist-sort type="button" @click={() => {
+            if by == key { down = !down } else {
+                by = key
+                down = key != "symbol"
+            }
+        }}>{text}<svg viewBox="0 0 8 8" aria-hidden="true"><path d="M0 6 4 1 8 6Z"/></svg></button>
+    </th>
+    let spark = (vals: list, prev) => {
+        let n = len(vals)
+        let lo = min(vals + (prev != null ? [prev] : []))
+        let hi = max(vals + (prev != null ? [prev] : []))
+        let y = (v) => hi == lo ? 13 : 2 + (hi - v) * 22 / (hi - lo)
+        let d = "M" + join(range(n) | map((i) => `${watchlist_pct(n == 1 ? 88 : i * 88 / (n - 1))},${watchlist_pct(y(vals[i]))}`), " L")
+        <svg.ui-wlist-spark viewBox="0 0 88 26" preserveAspectRatio="none" aria-hidden="true">
+            {prev != null && <line x1="0" x2="88" y1={watchlist_pct(y(prev))} y2={watchlist_pct(y(prev))} vector-effect="non-scaling-stroke"/>}
+            <path d={d} vector-effect="non-scaling-stroke"/>
+        </svg>
+    }
+    let trend = any(rows, (r) => len(get(r, "values") ?? []) > 1)
+    <div class={ui_cls(["ui-wlist", class])}>
+        <table.ui-wlist-table aria-label={label}>
+            <thead><tr>
+                {head("symbol", "Symbol")}{head("price", "Last")}{head("change", "Change")}{head("percent", "% Chg")}
+                {trend && <th scope="col"><span.ui-wlist-plain>Trend</span></th>}
+            </tr></thead>
+            <tbody>
+                {for r in shown => <tr key={r.symbol} class={`ui-wlist-row ${side(r)}`} tabindex="0" data-symbol={r.symbol}
+                        aria-selected={picked == r.symbol ? "true" : "false"}
+                        @click={() => { pick(r.symbol) }}
+                        @keydown={(e) => {
+                            if e.key == "Enter" || e.key == " " {
+                                e.preventDefault()
+                                pick(r.symbol)
+                            }
+                            if e.key == "ArrowDown" || e.key == "ArrowUp" {
+                                e.preventDefault()
+                                let next = e.key == "ArrowDown" ? e.target.nextElementSibling : e.target.previousElementSibling
+                                next && next.focus()
+                            }
+                        }}>
+                    <th scope="row" class="ui-wlist-sym"><b>{r.symbol}</b>{r.name != null && <small>{r.name}</small>}</th>
+                    <td><span.ui-wlist-price key={`${r.symbol}|${r.price}`}
+                              @mount={(el) => {
+                                  let before = get(seen, r.symbol)
+                                  if before != null && before != r.price { el.classList.add(r.price > before ? "ui-wlist-tick-up" : "ui-wlist-tick-down") }
+                                  seen = set(seen, r.symbol, r.price)
+                              }}>{money(r.price)}</span></td>
+                    <td.ui-wlist-chg>{r.change > 0 ? "+" : ""}{money(r.change)}</td>
+                    <td><span.ui-wlist-pill>{watchlist_signed(r.percent)}</span></td>
+                    {trend && <td>{len(get(r, "values") ?? []) > 1 && spark(get(r, "values"), r.prev)}</td>}
+                </tr>}
+            </tbody>
+        </table>
+    </div>
+}

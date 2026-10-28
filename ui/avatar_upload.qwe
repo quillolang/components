@@ -1,0 +1,141 @@
+// AvatarUpload: a round (or square) picture with a button to change it, showing
+// the picture picked before anything is sent, and one to remove it. The picker is
+// a real <input type="file">, so a <form method="post" enctype="multipart/form-data">
+// sends the picture under `name` (see Uploads in the guide); a picture too large,
+// or not a picture, is refused with a word under it, and not sent.
+//
+//   <AvatarUpload name="photo" src={user.photo_url} initials="AL" max_size={2000000}/>
+//   <AvatarUpload name="logo" label="Logo" shape="square" size={120} on_change={(f) => { picked = f }}/>
+//
+// src: the picture there now (none: the initials on a plain disc). initials: one or
+// two letters shown when there is no picture. label: what it is called ("Profile
+// photo"). size: its width in pixels (96). shape: "circle" (default) or "square".
+// accept: the kinds taken ("image/*"). max_size: the most bytes a picture may have.
+// change_label / remove_label: the buttons' text ("Change", "Remove").
+// hint, error, required (a picture must be picked when there is none), disabled
+// and field (the input's id, "avatar-upload-" + name by default) as for every field.
+// Remove, with a picture from `src`, sends `name`_remove as "1" so the route knows
+// to take the old one away.
+// on_change(file): inside one of your components, given { name, size, type } of
+// the picture picked, or null when it is removed.
+
+let avatar_upload_css = css`
+.ui-avatar-upload { display: grid; gap: 8px; min-width: 0; width: fit-content; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-avatar-upload-label { font-size: 13px; font-weight: 500; }
+.ui-avatar-upload-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-avatar-upload-row { display: flex; align-items: center; gap: 16px; }
+.ui-avatar-upload-pic {
+  position: relative; flex: none; display: grid; place-items: center; width: var(--ui-avatar-upload-size, 96px); height: var(--ui-avatar-upload-size, 96px);
+  overflow: hidden; border-radius: 50%; background: var(--ui-accent-soft); color: var(--ui-accent); box-shadow: inset 0 0 0 1px var(--ui-border);
+  font-weight: 600; font-size: calc(var(--ui-avatar-upload-size, 96px) * .36); letter-spacing: .02em; user-select: none;
+}
+.ui-avatar-upload-square .ui-avatar-upload-pic { border-radius: var(--ui-radius); }
+.ui-avatar-upload-pic img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.ui-avatar-upload-pic svg { width: 45%; height: 45%; color: var(--ui-muted); }
+.ui-avatar-upload-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-avatar-upload-btn {
+  position: relative; display: inline-flex; align-items: center; justify-content: center; height: 32px; padding: 0 12px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 13px/1 var(--ui-font); cursor: pointer; transition: border-color .15s, background .15s, box-shadow .15s;
+}
+.ui-avatar-upload-btn input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+.ui-avatar-upload-btn:hover { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-avatar-upload-btn:has(input:focus-visible) { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-avatar-upload-btn:has(input:disabled) { opacity: .55; cursor: not-allowed; }
+.ui-avatar-upload-remove {
+  height: 32px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted);
+  font: 500 13px/1 var(--ui-font); cursor: pointer;
+}
+.ui-avatar-upload-remove:hover { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-avatar-upload-remove:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-avatar-upload-remove:disabled { opacity: .55; cursor: not-allowed; }
+.ui-avatar-upload-meta { font-size: 12px; color: var(--ui-muted); }
+.ui-avatar-upload-hint, .ui-avatar-upload-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-avatar-upload-error { color: var(--ui-danger); }
+.ui-avatar-upload-invalid .ui-avatar-upload-pic { box-shadow: inset 0 0 0 2px var(--ui-danger); }
+@media (prefers-reduced-motion: reduce) { .ui-avatar-upload-btn { transition: none; } }
+`
+
+// A size in bytes as people read it (812 B, 1.5 MB), in whole numbers so the server and the browser agree.
+fn avatar_upload_size(n: num) -> str {
+    if n < 1024 { return `${n} B` }
+    let unit = n < 1024 * 1024 ? 1024 : 1024 * 1024
+    let tenths = round(n * 10 / unit)
+    `${floor(tenths / 10)}${tenths % 10 == 0 ? "" : `.${tenths % 10}`} ${unit == 1024 ? "KB" : "MB"}`
+}
+
+component AvatarUpload(name: str = "avatar", src: str? = null, initials: str? = null, label: str = "Profile photo",
+                       size: int = 96, shape: str = "circle", accept: str = "image/*", max_size: int? = null,
+                       change_label: str = "Change", remove_label: str = "Remove", hint: str? = null, error: str? = null,
+                       required: bool = false, disabled: bool = false, field: str? = null, on_change = null,
+                       class: str? = null) {
+    style global avatar_upload_css
+    state url = src
+    state picked = null
+    state problem = ""
+    state removed = false
+    let id = field ?? `avatar-upload-${name}`
+    let shown_error = problem != "" ? problem : error
+    let described = ui_cls([hint != null && `${id}-hint`, shown_error != null && `${id}-error`])
+    let letters = upper(slice(trim(initials ?? ""), 0, 2))
+    let drop_preview = () => { if url != null && url != src { js("URL.revokeObjectURL", url) } }
+    <div class={ui_cls(["ui-avatar-upload", shape == "square" && "ui-avatar-upload-square", shown_error != null && "ui-avatar-upload-invalid", class])}
+         style={`--ui-avatar-upload-size: ${size}px`}>
+        <span.ui-avatar-upload-label id={`${id}-label`}>
+            {label}{required && <span.ui-avatar-upload-req aria-hidden="true">*</span>}
+        </span>
+        <div.ui-avatar-upload-row>
+            <div.ui-avatar-upload-pic role="img" aria-label={url != null ? `${label}: ${picked != null ? picked.name : "the picture there now"}` : `${label}: none yet`}>
+                {url != null ? <img src={url} alt=""/>
+                 : letters != "" ? <span aria-hidden="true">{letters}</span>
+                 : <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                        aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>}
+            </div>
+            <div.ui-avatar-upload-actions>
+                <label.ui-avatar-upload-btn>
+                    <input type="file" id={id} name={name} accept={accept} required={required && url == null} disabled={disabled}
+                           aria-labelledby={`${id}-label`} aria-describedby={described != "" ? described : null}
+                           aria-invalid={shown_error != null ? "true" : null}
+                           @change={(e) => {
+                               let f = e.target.files[0]
+                               if f == null { return null }
+                               if !starts_with(f.type ?? "", "image/") {
+                                   problem = "Choose a picture (a PNG, JPEG, GIF or WebP)."
+                                   e.value = ""
+                                   return null
+                               }
+                               if max_size != null && f.size > max_size {
+                                   problem = `Choose a picture up to ${avatar_upload_size(max_size)}: that one is ${avatar_upload_size(f.size)}.`
+                                   e.value = ""
+                                   return null
+                               }
+                               drop_preview()
+                               url = js("URL.createObjectURL", f)
+                               picked = { name: f.name, size: f.size, type: f.type }
+                               removed = false
+                               problem = ""
+                               on_change && on_change(picked)
+                           }}/>
+                    {url != null ? change_label : "Choose a picture"}
+                </label>
+                {url != null && <button.ui-avatar-upload-remove type="button" disabled={disabled}
+                        @click={(e) => {
+                            drop_preview()
+                            let input = e.target.closest(".ui-avatar-upload").querySelector("input[type=file]")
+                            input.value = ""
+                            url = null
+                            picked = null
+                            removed = src != null
+                            problem = ""
+                            on_change && on_change(null)
+                            input.focus()
+                        }}>{remove_label}</button>}
+                {picked != null && <span.ui-avatar-upload-meta>{picked.name} · {avatar_upload_size(picked.size)}</span>}
+            </div>
+        </div>
+        {src != null && <input type="hidden" name={`${name}_remove`} value={removed ? "1" : ""}/>}
+        <span.ui-sr aria-live="polite">{picked != null ? `${picked.name} chosen` : removed ? "Picture removed" : ""}</span>
+        {hint != null && <p.ui-avatar-upload-hint id={`${id}-hint`}>{hint}</p>}
+        {shown_error != null && <p.ui-avatar-upload-error id={`${id}-error`} role="alert">{shown_error}</p>}
+    </div>
+}

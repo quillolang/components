@@ -1,0 +1,139 @@
+// EmailInput: an email box that catches slips in the domain once the box is
+// left: "ada@gmial.com" gets "Did you mean ada@gmail.com?", and one click (or
+// Enter on it) takes the suggestion. It is a real <input type="email">, so a plain
+// <form> sends it and the browser checks its shape.
+//
+//   <EmailInput name="email" label="Email" required={true}/>
+//   <EmailInput name="work" label="Work email" domains={["example.com", "example.org"]} on_change={(v) => { email = v }}/>
+//
+// domains: the domains people most often mean (a list of the common mail services
+// by default); one typed within two letters of one of them, or ending ".con" and
+// the like, is offered. value, placeholder ("you@example.com"), autocomplete
+// ("email"), name ("email"), label, hint, error, required, disabled, field (the
+// box's id, "email-input-" + name by default) and size ("sm" or "md") as for every
+// field. on_change(value): inside one of your components, given the text as it is
+// typed, and the suggestion when it is taken.
+
+let email_input_css = css`
+.ui-email-input { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-email-input-label { font-size: 13px; font-weight: 500; }
+.ui-email-input-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-email-input-box {
+  display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 12px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  transition: border-color .15s, box-shadow .15s;
+}
+.ui-email-input-box:hover { border-color: var(--ui-strong); }
+.ui-email-input-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-email-input-box:has(input:user-invalid) { border-color: var(--ui-danger); }
+.ui-email-input-box svg { flex: none; width: 16px; height: 16px; color: var(--ui-muted); }
+.ui-email-input-box input {
+  flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: none; background: transparent;
+  color: var(--ui-fg); font: 14px var(--ui-font);
+}
+.ui-email-input-box input::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-email-input-suggest {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin: 0; padding: 8px 10px; border-radius: var(--ui-radius-sm);
+  background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px;
+}
+.ui-email-input-take { padding: 2px 4px; border: 0; border-radius: 3px; background: transparent; color: inherit; font: 600 13px var(--ui-font); text-decoration: underline; cursor: pointer; }
+.ui-email-input-take:hover { background: color-mix(in srgb, var(--ui-warning) 15%, transparent); }
+.ui-email-input-take:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-email-input-keep { margin-left: auto; padding: 2px 6px; border: 0; border-radius: 3px; background: transparent; color: inherit; font: 13px var(--ui-font); cursor: pointer; opacity: .8; }
+.ui-email-input-keep:hover { opacity: 1; text-decoration: underline; }
+.ui-email-input-keep:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-email-input-sm .ui-email-input-box { height: 30px; padding: 0 10px; }
+.ui-email-input-sm .ui-email-input-box input { font-size: 13px; }
+.ui-email-input-invalid .ui-email-input-box, .ui-email-input-invalid .ui-email-input-box:hover { border-color: var(--ui-danger); }
+.ui-email-input-hint, .ui-email-input-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-email-input-error { color: var(--ui-danger); }
+.ui-email-input-disabled { opacity: .55; }
+.ui-email-input-disabled input { cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) { .ui-email-input-box { transition: none; } }
+`
+
+let email_input_domains = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com", "proton.me", "protonmail.com",
+                           "live.com", "aol.com", "me.com", "mail.com", "gmx.com", "yandex.com", "zoho.com", "fastmail.com"]
+
+// The endings people hit next to ".com".
+let email_input_tlds = { con: "com", cmo: "com", ocm: "com", vom: "com", xom: "com", cpm: "com", comm: "com", cm: "com", co: "com" }
+
+// How many edits take `a` to `b` (Levenshtein).
+fn email_input_distance(a: str, b: str) -> int {
+    let xs = split(a, "")
+    let ys = split(b, "")
+    let last = reduce(enumerate(xs), range(len(ys) + 1), (prev, p) =>
+        reduce(enumerate(ys), [p[0] + 1], (row, q) =>
+            row | push(min([row[q[0]] + 1, prev[q[0] + 1] + 1, prev[q[0]] + (p[1] == q[1] ? 0 : 1)]))))
+    last[len(ys)]
+}
+
+// The address probably meant, or null when it looks right (or hopeless).
+fn email_input_suggest(email: str, domains: list) {
+    let at = index_of(email, "@")
+    if at == null || at == 0 { return null }
+    let local = slice(email, 0, at)
+    let domain = lower(slice(email, at + 1))
+    if domain == "" || contains(domain, "@") || contains(domains, domain) { return null }
+    let scored = domains | map((d) => { d, n: email_input_distance(domain, d) }) | filter((s) => s.n <= 2 && s.n < len(s.d) / 2)
+    if len(scored) > 0 {
+        let best = sort_by(scored, (s) => s.n)[0]
+        return `${local}@${best.d}`
+    }
+    let parts = split(domain, ".")
+    let tld = last(parts)
+    let fix = len(parts) >= 2 ? email_input_tlds[tld] : null
+    fix != null ? `${local}@${join(take(parts, len(parts) - 1), ".")}.${fix}` : null
+}
+
+component EmailInput(name: str = "email", label: str? = null, value: str = "", placeholder: str = "you@example.com",
+                     domains: list? = null, autocomplete: str = "email", hint: str? = null, error: str? = null,
+                     required: bool = false, disabled: bool = false, field: str? = null, size: str = "md",
+                     on_change = null, class: str? = null) {
+    style global email_input_css
+    state text = value
+    state left = false
+    state dismissed = ""
+    let id = field ?? `email-input-${name}`
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
+    let suggestion = left ? email_input_suggest(trim(text), domains ?? email_input_domains) : null
+    let offered = suggestion != null && suggestion != dismissed ? suggestion : null
+    let focus_box = (e) => e.target.closest(".ui-email-input").querySelector("input").focus()
+    <div class={ui_cls(["ui-email-input", size == "sm" && "ui-email-input-sm", error != null && "ui-email-input-invalid",
+                        disabled && "ui-email-input-disabled", class])}>
+        {label != null && <label.ui-email-input-label for={id}>
+            {label}{required && <span.ui-email-input-req aria-hidden="true">*</span>}
+        </label>}
+        <div.ui-email-input-box>
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+                <rect x="2.5" y="4.5" width="15" height="11" rx="2"/><path d="M3 6l7 5 7-5"/>
+            </svg>
+            <input type="email" id={id} name={name} value={text} placeholder={placeholder} autocomplete={autocomplete}
+                   autocapitalize="off" spellcheck="false" required={required} disabled={disabled}
+                   aria-invalid={error != null ? "true" : null} aria-describedby={described != "" ? described : null}
+                   @input={(e) => {
+                       text = e.value
+                       left = false
+                       on_change && on_change(e.value)
+                   }}
+                   @blur={() => { left = true }}/>
+        </div>
+        {offered != null && <p.ui-email-input-suggest role="status">
+            <span>Did you mean</span>
+            <button.ui-email-input-take type="button" @click={(e) => {
+                let taken = offered
+                text = taken
+                left = false
+                on_change && on_change(taken)
+                focus_box(e)
+            }}>{offered}</button>
+            <span>?</span>
+            <button.ui-email-input-keep type="button" aria-label={`No, keep ${trim(text)}`} @click={(e) => {
+                dismissed = offered
+                focus_box(e)
+            }}>Keep it</button>
+        </p>}
+        {hint != null && <p.ui-email-input-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-email-input-error id={`${id}-error`} role="alert">{error}</p>}
+    </div>
+}

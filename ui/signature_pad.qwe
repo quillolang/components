@@ -1,0 +1,181 @@
+// SignaturePad: a box to sign in with a finger, a pen or the mouse, with Clear,
+// and, for those who cannot draw, a box to type the name instead, written in a
+// script face. The signature goes in a hidden input named `name` as a PNG data
+// URL ("data:image/png;base64,..."), so a plain <form> sends it; empty when
+// nothing is signed.
+//
+//   <SignaturePad name="signature" label="Sign here" required={true}/>
+//   <SignaturePad name="initials" width={240} height={100} typed={false} on_change={(png) => { signed = png != null }}/>
+//
+// width, height: the drawing's size in pixels (400 by 160); on a narrower screen
+// it shrinks to fit and the drawing scales with it. line_width: the pen's (2).
+// typed: offers "Type it instead" (true). clear_label: the Clear button's text.
+// label, hint, error, required (your route checks it: a hidden input cannot),
+// disabled and field (the ids' start, "signature-pad-" + name by default) as for
+// every field. The pen takes the text colour, so it follows the theme.
+// on_change(png): inside one of your components, given the data URL after each
+// stroke or typed change, or null when cleared.
+
+let signature_pad_css = css`
+.ui-signature-pad { display: grid; gap: 8px; min-width: 0; width: fit-content; max-width: 100%; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-signature-pad-label { padding: 0; font-size: 13px; font-weight: 500; }
+.ui-signature-pad-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-signature-pad-box {
+  position: relative; width: var(--ui-signature-pad-w, 400px); max-width: 100%; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); overflow: hidden; transition: border-color .15s, box-shadow .15s;
+}
+.ui-signature-pad-box:hover { border-color: var(--ui-strong); }
+.ui-signature-pad-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-signature-pad-box canvas { display: block; width: 100%; height: auto; color: var(--ui-fg); cursor: crosshair; touch-action: none; outline: none; }
+.ui-signature-pad-line { position: absolute; left: 24px; right: 24px; bottom: 28%; border-top: 1px dashed var(--ui-strong); pointer-events: none; }
+.ui-signature-pad-x { position: absolute; left: 24px; bottom: calc(28% + 6px); color: var(--ui-muted); font-size: 16px; pointer-events: none; }
+.ui-signature-pad-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ui-muted); font-size: 13px; pointer-events: none; }
+.ui-signature-pad-invalid .ui-signature-pad-box { border-color: var(--ui-danger); }
+.ui-signature-pad-disabled .ui-signature-pad-box { opacity: .55; }
+.ui-signature-pad-disabled canvas { cursor: not-allowed; }
+.ui-signature-pad-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-signature-pad-btn {
+  height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer;
+}
+.ui-signature-pad-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-signature-pad-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-signature-pad-btn:disabled { opacity: .55; cursor: not-allowed; }
+.ui-signature-pad-link { padding: 0 4px; border: 0; background: none; color: var(--ui-accent); font: 500 13px var(--ui-font); cursor: pointer; border-radius: 3px; }
+.ui-signature-pad-link:hover { text-decoration: underline; }
+.ui-signature-pad-link:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-signature-pad-typed { flex: 1 1 160px; min-width: 0; height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); }
+.ui-signature-pad-typed:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-signature-pad-hint, .ui-signature-pad-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-signature-pad-error { color: var(--ui-danger); }
+@media (prefers-reduced-motion: reduce) { .ui-signature-pad-box { transition: none; } }
+`
+
+component SignaturePad(name: str = "signature", label: str? = null, width: int = 400, height: int = 160, line_width: num = 2,
+                       typed: bool = true, clear_label: str = "Clear", hint: str? = null, error: str? = null,
+                       required: bool = false, disabled: bool = false, field: str? = null, on_change = null,
+                       class: str? = null) {
+    style global signature_pad_css
+    state pad = null
+    state ctx = null
+    state drawing = false
+    state marks = 0
+    state value = ""
+    state mode = "draw"
+    state text = ""
+    let id = field ?? `signature-pad-${name}`
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
+    let point = (e) => {
+        let r = pad.getBoundingClientRect()
+        { x: (e.clientX - r.left) * width / r.width, y: (e.clientY - r.top) * height / r.height }
+    }
+    let save = () => {
+        value = pad.toDataURL("image/png")
+        on_change && on_change(value)
+    }
+    let wipe = () => {
+        ctx.clearRect(0, 0, width, height)
+        marks = 0
+        if value != "" {
+            value = ""
+            on_change && on_change(null)
+        }
+    }
+    let write = (t: str) => {
+        ctx.clearRect(0, 0, width, height)
+        if trim(t) == "" {
+            marks = 0
+            if value != "" {
+                value = ""
+                on_change && on_change(null)
+            }
+        } else {
+            ctx.font = `italic ${round(height * 0.32)}px "Segoe Script", "Brush Script MT", "Apple Chancery", cursive`
+            ctx.textBaseline = "alphabetic"
+            ctx.fillText(trim(t), round(width * 0.08), round(height * 0.68), round(width * 0.84))
+            marks = 1
+            save()
+        }
+    }
+    <fieldset class={ui_cls(["ui-signature-pad", error != null && "ui-signature-pad-invalid", disabled && "ui-signature-pad-disabled", class])}
+              id={id} disabled={disabled} style={`--ui-signature-pad-w: ${width}px`}
+              aria-describedby={described != "" ? described : null}>
+        {label != null && <legend.ui-signature-pad-label>
+            {label}{required && <span.ui-signature-pad-req aria-hidden="true">*</span>}
+        </legend>}
+        <div.ui-signature-pad-box>
+            <canvas width={width} height={height} role="img" tabindex={disabled ? null : "0"}
+                    aria-label={marks > 0 ? `${label ?? "Signature"}: signed` : `${label ?? "Signature"}: empty. Draw here with the pointer.`}
+                    @mount={(el) => {
+                        pad = el
+                        let c = el.getContext("2d")
+                        let color = js("getComputedStyle", el).color
+                        c.lineWidth = line_width
+                        c.lineCap = "round"
+                        c.lineJoin = "round"
+                        c.strokeStyle = color
+                        c.fillStyle = color
+                        ctx = c
+                    }}
+                    @pointerdown={(e) => {
+                        if disabled || mode != "draw" { return null }
+                        e.preventDefault()
+                        e.target.setPointerCapture(e.pointerId)
+                        let p = point(e)
+                        ctx.beginPath()
+                        ctx.moveTo(p.x, p.y)
+                        ctx.lineTo(p.x + 0.1, p.y + 0.1)
+                        ctx.stroke()
+                        drawing = true
+                    }}
+                    @pointermove={(e) => {
+                        if drawing {
+                            let p = point(e)
+                            ctx.lineTo(p.x, p.y)
+                            ctx.stroke()
+                        }
+                    }}
+                    @pointerup={() => {
+                        if drawing {
+                            drawing = false
+                            marks += 1
+                            save()
+                        }
+                    }}
+                    @pointercancel={() => { drawing = false }}></canvas>
+            <span.ui-signature-pad-line aria-hidden="true"></span>
+            <span.ui-signature-pad-x aria-hidden="true">×</span>
+            {marks == 0 && mode == "draw" && <span.ui-signature-pad-empty aria-hidden="true">Sign here</span>}
+        </div>
+        <div.ui-signature-pad-foot>
+            {mode == "type" && <input.ui-signature-pad-typed type="text" value={text} placeholder="Type your name"
+                    aria-label="Your name, written as your signature" autocomplete="name" disabled={disabled}
+                    @input={(e) => {
+                        text = e.value
+                        write(e.value)
+                    }}/>}
+            <button.ui-signature-pad-btn type="button" disabled={disabled || marks == 0}
+                    @click={() => {
+                        text = ""
+                        wipe()
+                    }}>{clear_label}</button>
+            {typed && <button.ui-signature-pad-link type="button" disabled={disabled}
+                    @click={(e) => {
+                        text = ""
+                        wipe()
+                        mode = mode == "draw" ? "type" : "draw"
+                        if mode == "type" {
+                            let root = e.target.closest(".ui-signature-pad")
+                            js("requestAnimationFrame", (t = null) => {
+                                let box = root.querySelector(".ui-signature-pad-typed")
+                                box && box.focus()
+                            })
+                        }
+                    }}>{mode == "draw" ? "Type it instead" : "Draw it instead"}</button>}
+        </div>
+        <input type="hidden" name={name} value={value}/>
+        <span.ui-sr aria-live="polite">{marks > 0 ? "Signed." : ""}</span>
+        {hint != null && <p.ui-signature-pad-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-signature-pad-error id={`${id}-error`} role="alert">{error}</p>}
+    </fieldset>
+}

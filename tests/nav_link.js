@@ -1,0 +1,12 @@
+const page = [...$("#nav-link-demo-page").querySelectorAll("a.ui-navlink")];
+if (page.length !== 3) return `expected 3 links, found ${page.length}`;
+const cur = (links) => links.filter((a) => a.getAttribute("aria-current") === "page").map((a) => [...a.children].find((c) => !c.className).textContent.trim());
+if (cur(page).join() !== "Home") return `from the page's own URL (/), the current one is ${cur(page)}`;
+const pill = [...$("#nav-link-demo-pill").querySelectorAll("a.ui-navlink")];
+if (cur(pill).join() !== "Inbox") return `with current="/inbox/42", the current one is ${cur(pill)}`;
+if (!pill[0].classList.contains("ui-navlink-pill") || pill[0].querySelector(".ui-navlink-badge")?.textContent !== "3") return "the pill variant or the badge is missing";
+if (!pill[0].querySelector(".ui-navlink-icon svg") || pill[2].querySelector(".ui-navlink-icon")?.textContent !== "✎") return "icons are not drawn";
+if (getComputedStyle(pill[0]).backgroundColor === getComputedStyle(pill[1]).backgroundColor) return "the current pill does not look different";
+const under = [...$("#nav-link-demo-underline").querySelectorAll("a.ui-navlink")];
+if (cur(under).join() !== "General") return `exact on /settings marks ${cur(under)}`;
+if (getComputedStyle(under[0]).boxShadow === getComputedStyle(under[1]).boxShadow) return "the current underline link has no line";

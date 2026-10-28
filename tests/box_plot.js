@@ -1,0 +1,40 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-boxplot");
+if (charts.length !== 2) return `expected 2 box plots, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a box plot has NaN, Infinity or undefined in it";
+const [resp, exam] = charts;
+if (resp.getAttribute("aria-label") !== "Response time by service") return "the label does not name the chart";
+const cols = [...resp.querySelectorAll(".ui-boxplot-col")];
+if (cols.length !== 5) return `5 groups made ${cols.length} columns`;
+if (cols.some((c) => c.querySelectorAll(".ui-boxplot-box").length !== 1 || c.querySelectorAll(".ui-boxplot-cap").length !== 2)) return "not a box and two caps per group";
+if (!cols[0].querySelector(".ui-boxplot-tip").textContent.includes("330 ms, 362 ms")) return `Auth's outliers: ${cols[0].querySelector(".ui-boxplot-tip").textContent}`;
+if (cols[0].querySelectorAll(".ui-boxplot-out").length < 2) return "the outliers are not drawn";
+if (new Set(cols.map((c) => getComputedStyle(c.querySelector(".ui-boxplot-box")).borderTopColor)).size !== 5) return "groups share a colour";
+if (!cols[4].classList.contains("ui-boxplot-flip") || cols[0].classList.contains("ui-boxplot-flip")) return "right-hand tooltips do not open to the left";
+const ticks = [...resp.querySelectorAll(".ui-boxplot-y span")].map((s) => s.textContent).join();
+if (ticks !== "0,200,400,600") return `the axis ticks are ${ticks}`;
+
+const [a, b] = exam.querySelectorAll(".ui-boxplot-col");
+const v = (el, k) => el.style.getPropertyValue(k).trim();
+const box = a.querySelector(".ui-boxplot-box");
+// Class A: 62 71 74 78 80 81 83 85 88 90 94: Q1 76, median 81, Q3 86.5 on an axis 0 to 100.
+if (v(box, "--a") !== "76%" || v(box, "--b") !== "10.5%") return `Class A's box is ${box.getAttribute("style")}`;
+if (Math.abs(box.getBoundingClientRect().height - 21) > 1) return `the box is ${box.getBoundingClientRect().height}px high, not 21`;
+if (v(a.querySelector(".ui-boxplot-median"), "--a") !== "81%") return "the median is not at 81";
+const caps = [...a.querySelectorAll(".ui-boxplot-cap")].map((c) => v(c, "--a")).join();
+if (caps !== "62%,94%") return `the whiskers end at ${caps}`;
+if (a.querySelector(".ui-boxplot-out")) return "Class A has no outliers";
+if (v(a.querySelector(".ui-boxplot-mean"), "--a") !== "80.55%") return "mean={true} does not mark the mean";
+if (a.querySelectorAll(".ui-boxplot-pt").length !== 11) return "points={true} does not draw every value";
+// Class B: 99 is past Q3 76 + 1.5 x 12.75.
+const outs = [...b.querySelectorAll(".ui-boxplot-out")];
+if (outs.length !== 1 || v(outs[0], "--a") !== "99%") return "Class B's 99 is not an outlier";
+if (v([...b.querySelectorAll(".ui-boxplot-cap")][1], "--a") !== "82%") return "Class B's upper whisker does not stop at 82";
+const tip = b.querySelector(".ui-boxplot-tip");
+if (getComputedStyle(tip).display !== "none") return "the tooltip shows before hover";
+if (tip.textContent !== "Class BHigh82Q376Median71Q163.25Low45Mean70.33Values12Outliers99") return `tooltip: ${tip.textContent}`;
+if (exam.querySelector(".ui-boxplot-y span").textContent !== "0") return "zero={true} does not start at 0";
+const row = [...exam.querySelectorAll("tbody tr")][0].textContent;
+if (row !== "Class A1162768186.59480.55None") return `the screen reader table: ${row}`;
+if (exam.querySelectorAll("thead th").length !== 9) return "the table's columns";
+if (!exam.querySelector(".ui-boxplot-frame").hasAttribute("aria-hidden")) return "the drawing is not hidden from screen readers";

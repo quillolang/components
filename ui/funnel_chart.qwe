@@ -1,0 +1,133 @@
+// FunnelChart: the stages of a process (visits, sign-ups, purchases) as a funnel
+// narrowing from the first, each as wide as its count, with the count and its share
+// of the first beside it, and between stages the share that went on. CSS only:
+// hovering a stage picks it out and shows what it kept of the first and of the one
+// before; screen readers get it all as a table.
+//
+//   <FunnelChart label="Checkout" stages={[
+//       { label: "Visited", value: 12400 }, { label: "Added to cart", value: 3100 },
+//       { label: "Checked out", value: 1240 }, { label: "Paid", value: 980 }]}/>
+//
+// stages: a list of { label, value }, in order (a null counts as 0). tapered: each
+// stage narrows to the next one's width, as a funnel (true); false draws plain
+// centred bars. conversion: the share that went on to the next stage, written
+// between stages (true). prefix and suffix: around every value shown ("$");
+// decimals: digits after the point, always, instead of up to two as needed. height:
+// each stage's height in pixels (40). label: what the chart shows; it names it for
+// screen readers and captions their table. show_label also writes it above.
+
+let funnel_chart_css = css`
+.ui-funnelc { --ui-funnelc-1: light-dark(#2a78d6, #3987e5);
+  display: grid; gap: 10px; align-content: start; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-funnelc-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-funnelc-body { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr) max-content; column-gap: 14px; align-items: center; }
+.ui-funnelc-stage { display: contents; }
+.ui-funnelc-name { grid-column: 1; max-width: 14em; overflow: hidden; color: var(--ui-fg); font-size: 13px; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+.ui-funnelc-cell { grid-column: 2; position: relative; height: var(--h); }
+.ui-funnelc-shape { position: absolute; inset: 0; background: var(--ui-funnelc-1); border-radius: 3px;
+  clip-path: polygon(var(--l1) 0, var(--r1) 0, var(--r2) 100%, var(--l2) 100%); transition: filter .12s ease; }
+.ui-funnelc-stage:hover .ui-funnelc-shape { filter: brightness(1.15); }
+.ui-funnelc-body:has(.ui-funnelc-stage:hover) .ui-funnelc-stage:not(:hover) .ui-funnelc-shape { opacity: .45; }
+.ui-funnelc-num { grid-column: 3; display: grid; justify-items: start; min-width: 5em; }
+.ui-funnelc-num b { font-size: 14px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-funnelc-num small { color: var(--ui-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.ui-funnelc-conv { grid-column: 2; padding: 3px 0; color: var(--ui-muted); font-size: 11px; text-align: center; font-variant-numeric: tabular-nums; }
+.ui-funnelc-conv b { color: var(--ui-fg); font-weight: 600; }
+.ui-funnelc-gap { grid-column: 2; height: 2px; }
+.ui-funnelc-tip { position: absolute; z-index: 20; top: 50%; left: 50%; display: none; min-width: 150px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; transform: translate(-50%, -50%); pointer-events: none; }
+.ui-funnelc-stage:hover .ui-funnelc-tip { display: block; }
+.ui-funnelc-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-funnelc-tip p { display: flex; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-funnelc-tip p b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+@media (prefers-reduced-motion: reduce) { .ui-funnelc-shape { transition: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn funnel_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn funnel_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : funnel_chart_group(floor(n / 1000)) + "," + funnel_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn funnel_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${funnel_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${funnel_chart_group(floor(units / scale))}${tail}`
+}
+
+// A percentage for CSS (or a coordinate out of 100), to two decimals.
+fn funnel_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// A share out of 100, to one decimal: "42%", "12.5%", "0.4%".
+fn funnel_chart_share(p: num) -> str {
+    let tenths = round(p * 10)
+    `${floor(tenths / 10)}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}%`
+}
+
+view FunnelChart(stages: list, tapered: bool = true, conversion: bool = true, prefix: str = "", suffix: str = "",
+                 decimals: int? = null, height: int = 40, label: str = "Funnel chart", show_label: bool = false,
+                 class: str? = null) {
+    style global funnel_chart_css
+    let n = len(stages)
+    let at = (i) => stages[i].value ?? 0
+    let fmt = (v) => `${v < 0 ? "-" : ""}${prefix}${funnel_chart_num(abs(v), decimals)}${suffix}`
+    let widest = n == 0 ? 0 : max(for i in range(n) => at(i))
+    let w = (i) => widest > 0 && at(i) > 0 ? at(i) * 100 / widest : 0
+    let of_first = (i) => n > 0 && at(0) > 0 ? funnel_chart_share(at(i) * 100 / at(0)) : "—"
+    let of_prev = (i) => i > 0 && at(i - 1) > 0 ? funnel_chart_share(at(i) * 100 / at(i - 1)) : "—"
+    <figure class={ui_cls(["ui-funnelc", class])} aria-label={label}>
+        {show_label && <figcaption.ui-funnelc-title>{label}</figcaption>}
+        <div.ui-funnelc-body aria-hidden="true" style={`--h: ${height}px`}>
+            {for i in range(n) => {
+                let top = w(i)
+                let bottom = tapered && i < n - 1 ? w(i + 1) : top
+                [
+                    <div.ui-funnelc-stage>
+                        <span.ui-funnelc-name style={`grid-row: ${2 * i + 1}`} title={str(stages[i].label)}>{stages[i].label}</span>
+                        <div.ui-funnelc-cell style={`grid-row: ${2 * i + 1}`}>
+                            <span.ui-funnelc-shape data-value={str(at(i))}
+                                style={`--l1: ${funnel_chart_pct(50 - top / 2)}%; --r1: ${funnel_chart_pct(50 + top / 2)}%; --l2: ${funnel_chart_pct(50 - bottom / 2)}%; --r2: ${funnel_chart_pct(50 + bottom / 2)}%`}></span>
+                            <span.ui-funnelc-tip>
+                                <strong>{stages[i].label}</strong>
+                                <p>Count<b>{fmt(at(i))}</b></p>
+                                <p>Of the first<b>{of_first(i)}</b></p>
+                                {i > 0 && <p>Of the one before<b>{of_prev(i)}</b></p>}
+                            </span>
+                        </div>
+                        <span.ui-funnelc-num style={`grid-row: ${2 * i + 1}`}><b>{fmt(at(i))}</b><small>{of_first(i)}</small></span>
+                    </div>,
+                    i < n - 1 && (conversion
+                        ? <span.ui-funnelc-conv style={`grid-row: ${2 * i + 2}`}>↓ <b>{of_prev(i + 1)}</b> went on</span>
+                        : <span.ui-funnelc-gap style={`grid-row: ${2 * i + 2}`}></span>)
+                ]
+            }}
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col">Stage</th><th scope="col">Count</th><th scope="col">Of the first</th><th scope="col">Of the one before</th></tr></thead>
+            <tbody>
+                {for i in range(n) => <tr>
+                    <th scope="row">{stages[i].label}</th>
+                    <td>{fmt(at(i))}</td>
+                    <td>{of_first(i)}</td>
+                    <td>{i > 0 ? of_prev(i) : "—"}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

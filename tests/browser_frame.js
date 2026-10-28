@@ -1,0 +1,14 @@
+const docs = $("#browser-frame-demo-docs"), local = $("#browser-frame-demo-local"), dark = $("#browser-frame-demo-dark");
+if (!docs || docs.getAttribute("role") !== "figure" || docs.getAttribute("aria-label") !== "The components page") return "the frame is not a figure named by its title";
+const url = docs.querySelector(".ui-browser-url");
+if (url.querySelector("b").textContent !== "quillolang.org" || url.textContent.trim() !== "quillolang.org/docs/components") return `the address shows "${url.textContent.trim()}"`;
+if (!url.querySelector("svg")) return "an https address has no lock";
+if (docs.querySelectorAll(".ui-browser-dots i").length !== 3) return "the three window dots are missing";
+if (!docs.querySelector(".ui-browser-body h4")) return "the children are not in the body";
+if (local.querySelector(".ui-browser-url svg")) return "a plain address has a lock";
+if (local.querySelector(".ui-browser-url b").textContent !== "localhost:8080" || local.querySelector(".ui-browser-tab")?.textContent !== "Admin") return "the tab or host is wrong";
+if (Math.abs(local.querySelector(".ui-browser-body").getBoundingClientRect().height - 120) > 1) return "height=\"120px\" is not applied";
+if (!dark.classList.contains("ui-browser-dark") || getComputedStyle(dark).colorScheme !== "dark") return "dark={true} is not dark";
+const img = dark.querySelector("img");
+if (Math.abs(img.getBoundingClientRect().width - dark.querySelector(".ui-browser-body").getBoundingClientRect().width) > 1) return "an image does not fill the width";
+if (docs.querySelector(".ui-browser-bar").getAttribute("aria-hidden") !== "true") return "the drawn bar is read to screen readers";

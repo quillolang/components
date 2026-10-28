@@ -1,0 +1,91 @@
+// UploadProgress: one file on its way up: its name, how much of its size has
+// gone, the speed, the time left, and a button to cancel. Give it new numbers as
+// the upload goes (from an XMLHttpRequest's progress events, or a server fn
+// that reports) and it redraws.
+//
+//   <UploadProgress name="holiday.mp4" size={84000000} sent={31000000} speed={2400000} on_cancel={() => { stop(id) }}/>
+//   <UploadProgress name="report.pdf" size={420000} sent={420000} status="done"/>
+//   <UploadProgress name="scan.tiff" size={9000000} sent={1200000} status="error" error="The connection dropped" on_retry={retry}/>
+//
+// name: the file's name. size: its bytes; sent: the bytes gone so far. speed:
+// bytes per second, when known; the time left is worked out from it.
+// status: "uploading" (default), "done", "error" or "paused". error: what went
+// wrong, shown under the name. on_cancel(): inside one of your components, what
+// the Cancel button does (shown while uploading or paused; none without it).
+// on_retry(): a Retry button after an error. cancel, retry: the buttons' words.
+// It is a progressbar named after the file; screen readers hear "37%".
+
+let upload_progress_css = css`
+.ui-upprog { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 12px; align-items: center; padding: 10px 12px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); font: 13px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-upprog-icon { grid-row: 1 / 3; display: grid; place-items: center; width: 36px; height: 36px; border-radius: var(--ui-radius-sm);
+  background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-upprog-icon svg { width: 18px; height: 18px; }
+.ui-upprog-done .ui-upprog-icon { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-upprog-error .ui-upprog-icon { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-upprog-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.ui-upprog-btn { grid-row: 1 / 3; height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 12px/1 var(--ui-font); cursor: pointer; }
+.ui-upprog-btn:hover { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-upprog-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-upprog-pct { grid-row: 1 / 3; font-variant-numeric: tabular-nums; color: var(--ui-muted); }
+.ui-upprog-body { display: grid; gap: 5px; min-width: 0; }
+.ui-upprog-track { height: 6px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-upprog-fill { height: 100%; border-radius: inherit; background: var(--ui-accent); transition: width .25s ease; }
+.ui-upprog-done .ui-upprog-fill { background: var(--ui-success); }
+.ui-upprog-error .ui-upprog-fill { background: var(--ui-danger); }
+.ui-upprog-paused .ui-upprog-fill { background: var(--ui-strong); }
+.ui-upprog-meta { color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-upprog-error .ui-upprog-meta { color: var(--ui-danger); }
+@media (prefers-reduced-motion: reduce) { .ui-upprog-fill { transition: none; } }
+`
+
+// Bytes as text: "840 B", "2.1 MB".
+fn upload_progress_size(n: num) -> str {
+    if n < 1024 { return `${round(n)} B` }
+    let unit = n < 1048576 ? 1024 : (n < 1073741824 ? 1048576 : 1073741824)
+    let tenths = round(n * 10 / unit)
+    `${floor(tenths / 10)}${tenths % 10 == 0 ? "" : `.${tenths % 10}`} ${unit == 1024 ? "KB" : (unit == 1048576 ? "MB" : "GB")}`
+}
+
+// Seconds as "5 s", "2 min", "1 h 20 min".
+fn upload_progress_time(s: num) -> str =
+    s < 60 ? `${ceil(s)} s` : (s < 3600 ? `${ceil(s / 60)} min` : `${floor(s / 3600)} h ${ceil(s % 3600 / 60)} min`)
+
+view UploadProgress(name: str, size: num, sent: num = 0, speed: num? = null, status: str = "uploading", error: str? = null,
+                    on_cancel = null, on_retry = null, cancel: str = "Cancel", retry: str = "Retry", id: str? = null, class: str? = null) {
+    style global upload_progress_css
+    let part = size > 0 ? (sent > size ? size : (sent < 0 ? 0 : sent)) : 0
+    let pct = status == "done" ? 100 : (size > 0 ? floor(part * 100 / size) : 0)
+    let left = speed != null && speed > 0 && status == "uploading" ? (size - part) / speed : null
+    let meta = match status {
+        "done" => `${upload_progress_size(size)} · Done`
+        "error" => error ?? "Upload failed"
+        "paused" => `${upload_progress_size(part)} of ${upload_progress_size(size)} · Paused`
+        _ => join([`${upload_progress_size(part)} of ${upload_progress_size(size)}`,
+                   speed != null && speed > 0 && `${upload_progress_size(speed)}/s`,
+                   left != null && `${upload_progress_time(left)} left`] | filter((p) => p != null && p != false), " · ")
+    }
+    let icon = match status {
+        "done" => <path d="M5 12.5l4 4 10-10"/>
+        "error" => <path d="M12 8v5M12 16.5h.01M5 19h14L12 5z"/>
+        _ => <path d="M12 17V5M6 11l6-6 6 6M5 20h14"/>
+    }
+    <div class={ui_cls(["ui-upprog", `ui-upprog-${status}`, class])} id={id}>
+        <span.ui-upprog-icon><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">{icon}</svg></span>
+        <div.ui-upprog-body>
+            <span.ui-upprog-name title={name}>{name}</span>
+            <div.ui-upprog-track role="progressbar" aria-label={name} aria-valuemin="0" aria-valuemax="100" aria-valuenow={pct}
+                 aria-valuetext={`${pct}%`}>
+                <div.ui-upprog-fill style={`width: ${pct}%`}></div>
+            </div>
+            <span.ui-upprog-meta role={status == "error" ? "alert" : null}>{meta}</span>
+        </div>
+        {status == "error" && on_retry != null
+            ? <button.ui-upprog-btn type="button" @click={() => { on_retry() }}>{retry}</button>
+            : ((status == "uploading" || status == "paused") && on_cancel != null
+                ? <button.ui-upprog-btn type="button" aria-label={`${cancel} ${name}`} @click={() => { on_cancel() }}>{cancel}</button>
+                : <span.ui-upprog-pct aria-hidden="true">{pct}%</span>)}
+    </div>
+}

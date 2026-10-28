@@ -1,0 +1,32 @@
+const l = $("#list-group-demo-links");
+if (!l || l.tagName !== "UL" || l.getAttribute("aria-label") !== "Settings") return "the list is not a named <ul>";
+const items = [...l.querySelectorAll(".ui-listgroup-item")];
+if (items.length !== 4 || items.some((i) => i.tagName !== "A")) return "items with href are not links";
+if (items[0].getAttribute("aria-current") !== "true" || items[1].hasAttribute("aria-current")) return "active does not set aria-current";
+if (items[0].querySelector(".ui-listgroup-desc")?.textContent !== "Name, photo and bio") return "the description is missing";
+const badge = items[1].querySelector(".ui-listgroup-badge");
+if (!badge || badge.textContent !== "New" || !badge.classList.contains("ui-listgroup-badge-success")) return "the badge and its tone";
+if (items[2].querySelector(".ui-listgroup-meta")?.textContent !== "Pro plan") return "meta is missing";
+// buttons with on_select
+const f = $("#list-group-demo-folders");
+const btns = [...f.querySelectorAll("button.ui-listgroup-item")];
+if (btns.length !== 3) return `expected 3 buttons, found ${btns.length}`;
+const spam = [...f.querySelectorAll(".ui-listgroup-item")].find((i) => i.textContent.includes("Spam"));
+if (spam.tagName !== "DIV" || spam.getAttribute("aria-disabled") !== "true") return "a disabled item is still a button";
+if (btns[0].getAttribute("aria-current") !== "true") return "the first folder does not start active";
+btns[2].click(); await wait();
+const note = f.closest(".demo-stack").querySelector(".demo-note").textContent;
+if (note !== "Showing drafts.") return `on_select: ${note}`;
+const after = [...f.querySelectorAll("button.ui-listgroup-item")];
+if (after[2].getAttribute("aria-current") !== "true" || after[0].hasAttribute("aria-current")) return "the active item did not follow the state";
+// numbered, flush, children
+const n = $("#list-group-demo-steps");
+if (n.tagName !== "OL" || !n.classList.contains("ui-listgroup-numbered") || !n.classList.contains("ui-listgroup-sm")) return "numbered/size";
+const num = getComputedStyle(n.querySelector(".ui-listgroup-item"), "::before").content;
+if (num === "none" || num === "normal" || !num.includes("counter")) return `the numbers are not drawn: ${num}`;
+const r = $("#list-group-demo-flush");
+if (getComputedStyle(r).borderTopWidth !== "0px") return "flush still has a border";
+const kids = [...r.querySelectorAll(".ui-listgroup-item")];
+if (kids.length !== 3 || !kids[0].querySelector("b") || kids[0].tagName !== "A") return "ListGroupItem children are not rendered";
+if (kids[1].querySelector(".ui-listgroup-badge")?.textContent !== "v2") return "a child item's badge";
+if (kids[2].getAttribute("aria-disabled") !== "true") return "a disabled child item";

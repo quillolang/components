@@ -1,0 +1,14 @@
+const all = $$(".ui-imsg");
+if (all.length !== 8) return `expected 8 messages, found ${all.length}`;
+const info = $("#inline-message-demo-info"), ok = $("#inline-message-demo-ok"), warn = $("#inline-message-demo-warn"), err = $("#inline-message-demo-err");
+if (info.getAttribute("role") !== "status" || ok.getAttribute("role") !== "status") return "info and success are not polite statuses";
+if (warn.getAttribute("role") !== "alert" || err.getAttribute("role") !== "alert") return "warning and error are not alerts";
+if (!err.classList.contains("ui-imsg-error")) return "tone error";
+if (!info.querySelector("svg.ui-imsg-icon") || info.querySelector("svg").getAttribute("aria-hidden") !== "true") return "the icon is missing or read aloud";
+const colour = (el) => getComputedStyle(el).color;
+if (new Set([info, ok, warn, err].map(colour)).size !== 4) return "the four tones share a colour";
+if (info.getBoundingClientRect().height > 24) return "it is not one line";
+const noIcon = all.find((m) => m.textContent.trim() === "Copied");
+if (!noIcon || noIcon.querySelector("svg")) return "icon={false} still draws the icon";
+if (!all.some((m) => m.classList.contains("ui-imsg-sm") && getComputedStyle(m).fontSize === "12px")) return "size sm is not smaller";
+if (!all.some((m) => m.querySelector("a"))) return "a link inside is lost";

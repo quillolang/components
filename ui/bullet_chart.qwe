@@ -1,0 +1,170 @@
+// BulletChart: rows of measures, each a thin bar against a target mark, over grey
+// bands that say how good a value is (poor, fair, good): a compact stand-in for a
+// gauge, for a dashboard of goals. CSS only: hovering a row shows the value, the
+// target and the band it falls in, and screen readers get it all as a table.
+//
+//   <BulletChart label="Quarter goals" items={[
+//       { label: "Revenue", sub: "$k", value: 270, target: 250, ranges: [150, 225, 300] },
+//       { label: "New customers", value: 1650, target: 2100, ranges: [1400, 2000, 2500] }]}/>
+//
+// items: a list of { label, sub, value, target, ranges }: sub (optional) a smaller
+// line under the label (a unit, a period); value the measure; target (optional) the
+// mark it is held against; ranges the bands' ends, in increasing order (three gives
+// poor, fair and good; the last is the axis' end unless a value or target is past
+// it). ranges here, for items that give none. band_names: what the bands are called
+// in the tooltip and table, worst first (["Poor", "Fair", "Good"]); lower_is_better:
+// the first band is the good one instead (for costs, response times). prefix and
+// suffix: around every value shown; decimals: digits after the point, always,
+// instead of up to two as needed. label: what the chart shows; it names it for
+// screen readers and captions their table. show_label also writes it above.
+
+let bullet_chart_css = css`
+.ui-bulletc { --ui-bulletc-1: light-dark(#2a78d6, #3987e5);
+  display: grid; gap: 14px; align-content: start; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-bulletc-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-bulletc-rows { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); gap: 14px 14px; align-items: start; }
+.ui-bulletc-row { display: contents; }
+.ui-bulletc-name { max-width: 14em; text-align: right; }
+.ui-bulletc-name b { display: block; overflow: hidden; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-bulletc-name small { display: block; color: var(--ui-muted); font-size: 11px; }
+.ui-bulletc-track { position: relative; height: 24px; }
+.ui-bulletc-band { position: absolute; top: 0; bottom: 0; left: var(--a); width: var(--b); }
+.ui-bulletc-band:first-child { border-radius: 3px 0 0 3px; }
+.ui-bulletc-end { border-radius: 0 3px 3px 0; }
+.ui-bulletc-b1 { background: color-mix(in srgb, var(--ui-fg) 24%, var(--ui-bg)); }
+.ui-bulletc-b2 { background: color-mix(in srgb, var(--ui-fg) 14%, var(--ui-bg)); }
+.ui-bulletc-b3 { background: color-mix(in srgb, var(--ui-fg) 7%, var(--ui-bg)); }
+.ui-bulletc-b4 { background: color-mix(in srgb, var(--ui-fg) 3%, var(--ui-bg)); }
+.ui-bulletc-bar { position: absolute; top: 8px; bottom: 8px; left: 0; width: var(--v); min-width: 1px; background: var(--ui-bulletc-1); border-radius: 0 2px 2px 0; }
+.ui-bulletc-target { position: absolute; top: 3px; bottom: 3px; left: var(--t); width: 3px; margin-left: -1.5px; border-radius: 1px; background: var(--ui-fg); }
+.ui-bulletc-hit:hover .ui-bulletc-bar { filter: brightness(1.12); }
+.ui-bulletc-ticks { position: relative; height: 14px; margin-top: 3px; }
+.ui-bulletc-ticks span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-bulletc-ticks span:first-child { transform: none; }
+.ui-bulletc-ticks span:last-child:not(:first-child) { transform: translateX(-100%); }
+.ui-bulletc-hit { position: relative; }
+.ui-bulletc-tip { position: absolute; z-index: 20; bottom: calc(100% - 10px); right: 0; display: none; min-width: 140px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-bulletc-hit:hover .ui-bulletc-tip { display: block; }
+.ui-bulletc-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-bulletc-tip p { display: flex; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-bulletc-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn bullet_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn bullet_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : bullet_chart_group(floor(n / 1000)) + "," + bullet_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn bullet_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${bullet_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${bullet_chart_group(floor(units / scale))}${tail}`
+}
+
+// An axis tick, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn bullet_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? bullet_chart_num(v)
+        : `${v < 0 ? "-" : ""}${bullet_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A percentage for CSS (or a coordinate out of 100), to two decimals.
+fn bullet_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The axis from lo to hi, widened to round ticks: about four steps of 1, 2, 2.5 or 5 x 10^n.
+fn bullet_chart_scale(lo: num, hi: num) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo)) : hi - lo
+    let raw = span / 4
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+view BulletChart(items: list, ranges: list = [], band_names: list = ["Poor", "Fair", "Good"],
+                 lower_is_better: bool = false, prefix: str = "", suffix: str = "", decimals: int? = null,
+                 label: str = "Bullet chart", show_label: bool = false, class: str? = null) {
+    style global bullet_chart_css
+    let fmt = (v) => v == null ? "—" : `${v < 0 ? "-" : ""}${prefix}${bullet_chart_num(abs(v), decimals)}${suffix}`
+    let names = lower_is_better ? reverse(band_names) : band_names
+    // Which band v falls in: 0 for the first.
+    let band_of = (rs, v) => find(range(len(rs)), (k) => v <= rs[k]) ?? len(rs) - 1
+    let rows = for it in items => {
+        let rs = len(it.ranges ?? []) > 0 ? it.ranges : ranges
+        let top0 = max([0, it.value ?? 0, it.target ?? 0] + rs)
+        let sc = bullet_chart_scale(0, top0)
+        let span = len(rs) > 0 && rs[-1] >= max([it.value ?? 0, it.target ?? 0]) ? rs[-1] : sc.hi
+        let ticks = len(rs) > 0 && span == rs[-1] ? bullet_chart_scale(0, span).ticks | filter((t) => t <= span) : sc.ticks
+        ({ it: it, rs: rs, span: span, ticks: ticks[-1] < span ? ticks + [span] : ticks })
+    }
+    <figure class={ui_cls(["ui-bulletc", class])} aria-label={label}>
+        {show_label && <figcaption.ui-bulletc-title>{label}</figcaption>}
+        <div.ui-bulletc-rows aria-hidden="true">
+            {for r in rows => {
+                let it = r.it
+                let pos = (v) => bullet_chart_pct((v < 0 ? 0 : v) * 100 / r.span)
+                let nb = len(r.rs)
+                // Bands shade darkest for the worst: the first, or with lower_is_better the last.
+                let shade = (k) => lower_is_better ? nb - k : k + 1
+                <div.ui-bulletc-row>
+                    <div.ui-bulletc-name><b title={str(it.label)}>{it.label}</b>{it.sub != null && <small>{it.sub}</small>}</div>
+                    <div.ui-bulletc-hit>
+                        <div.ui-bulletc-track>
+                            {for [k, edge] in enumerate(r.rs) => {
+                                let from = k == 0 ? 0 : r.rs[k - 1]
+                                <span class={ui_cls(["ui-bulletc-band", `ui-bulletc-b${shade(k) > 4 ? 4 : shade(k)}`, k == nb - 1 && "ui-bulletc-end"])}
+                                      style={`--a: ${pos(from)}%; --b: ${bullet_chart_pct((edge - from) * 100 / r.span)}%`}></span>
+                            }}
+                            {it.value != null && <span.ui-bulletc-bar style={`--v: ${pos(it.value)}%`} data-value={str(it.value)}></span>}
+                            {it.target != null && <span.ui-bulletc-target style={`--t: ${pos(it.target)}%`}></span>}
+                        </div>
+                        <div.ui-bulletc-ticks>{for t in r.ticks => <span style={`left: ${pos(t)}%`}>{prefix}{bullet_chart_short(t)}</span>}</div>
+                        <span.ui-bulletc-tip>
+                            <strong>{it.label}</strong>
+                            <p>Value<b>{fmt(it.value)}</b></p>
+                            {it.target != null && <p>Target<b>{fmt(it.target)}</b></p>}
+                            {nb > 0 && it.value != null && <p>Band<b>{names[band_of(r.rs, it.value)] ?? ""}</b></p>}
+                        </span>
+                    </div>
+                </div>
+            }}
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col"></th><th scope="col">Value</th><th scope="col">Target</th><th scope="col">Band</th></tr></thead>
+            <tbody>
+                {for r in rows => <tr>
+                    <th scope="row">{r.it.label}{r.it.sub != null ? ` (${r.it.sub})` : ""}</th>
+                    <td>{fmt(r.it.value)}</td>
+                    <td>{fmt(r.it.target)}</td>
+                    <td>{len(r.rs) > 0 && r.it.value != null ? (names[band_of(r.rs, r.it.value)] ?? "") : ""}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

@@ -1,0 +1,17 @@
+const boxes = $$(".ui-embed-frame");
+if (boxes.length !== 3) return `expected 3 frames, found ${boxes.length}`;
+const [map, btn, dark] = boxes;
+const f = map.querySelector("iframe");
+if (!f || f.getAttribute("title") !== "Map of central Lisbon" || !f.getAttribute("src").startsWith("https://www.openstreetmap.org/export/embed.html")) return "the iframe, its title or src is wrong";
+if (!f.hasAttribute("allowfullscreen") || f.getAttribute("allow") !== "fullscreen") return "fullscreen / allow are not applied";
+if (f.getAttribute("loading") !== "lazy") return "the frame is not lazy";
+const r = map.getBoundingClientRect();
+if (Math.abs(r.width / r.height - 21 / 9) > 0.03) return `ratio 21/9 gives ${r.width / r.height}`;
+const fr = f.getBoundingClientRect();
+if (Math.abs(fr.width - r.width) > 2 || Math.abs(fr.height - r.height) > 2) return "the iframe does not fill the box";
+const b = btn.getBoundingClientRect();
+if (Math.round(b.width) !== 320 || Math.abs(b.width / b.height - 4 / 3) > 0.03) return `width 320px / ratio 4/3 gives ${b.width} x ${b.height}`;
+const d = dark.getBoundingClientRect();
+if (Math.round(d.height) !== 200) return `height 200px gives ${d.height}`;
+if (dark.querySelector("iframe").getAttribute("sandbox") !== "allow-scripts allow-same-origin") return "sandbox is not applied";
+if (map.querySelector("iframe").hasAttribute("sandbox")) return "a frame without sandbox has one";

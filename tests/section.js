@@ -1,0 +1,15 @@
+const pricing = $("#section-demo-pricing"), cta = $("#section-demo-cta");
+if (!pricing || pricing.tagName !== "SECTION") return "the section is not a <section> with its id";
+const h = pricing.querySelector("h2.ui-section-title");
+if (!h || h.textContent !== "Pricing" || pricing.getAttribute("aria-labelledby") !== h.id) return "the title is not an <h2> that names the section";
+if (!pricing.querySelector(".ui-section-desc")?.textContent.startsWith("One price")) return "the description is missing";
+if (pricing.querySelectorAll(".ui-section-actions .ui-btn").length !== 2) return "the two actions are not in the title row";
+if (pricing.querySelectorAll(".ui-section-body .ui-grid > *").length !== 3) return "the children are not in the body";
+if (getComputedStyle(pricing).paddingTop !== "20px") return `spacing="sm" pads ${getComputedStyle(pricing).paddingTop}`;
+if (!cta.querySelector("h3.ui-section-title")) return "level={3} does not make an <h3>";
+const inner = cta.querySelector(".ui-section-in");
+if (inner.getBoundingClientRect().width > 641) return `size="sm" is ${inner.getBoundingClientRect().width}px wide`;
+const r = inner.getBoundingClientRect(), p = cta.getBoundingClientRect();
+if (Math.abs((r.left - p.left) - (p.right - r.right)) > 1) return "the narrow content is not centred";
+if (getComputedStyle(cta.querySelector(".ui-section-title")).textAlign !== "center") return "align=\"center\" does not centre the title";
+if (!cta.classList.contains("ui-section-subtle")) return "tone=\"subtle\" is missing";

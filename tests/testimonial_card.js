@@ -1,0 +1,16 @@
+const figs = $$("figure.ui-testimonial-card");
+if (figs.length !== 4) return `expected 4 testimonials, found ${figs.length}`;
+const ada = $("#testimonial-card-demo-ada");
+if (!ada.querySelector("blockquote p")?.textContent.startsWith("Quillo cut")) return "the quote is not in a blockquote";
+if (ada.querySelector("figcaption .ui-testimonial-card-name")?.textContent !== "Ada Lovelace") return "the name is not in the figcaption";
+if (ada.querySelector(".ui-testimonial-card-role").textContent !== "CTO, Analytical Engines") return `role: ${ada.querySelector(".ui-testimonial-card-role").textContent}`;
+const stars = ada.querySelector(".ui-testimonial-card-stars");
+if (stars.getAttribute("aria-label") !== "5 out of 5 stars" || stars.querySelectorAll("svg").length !== 5 || stars.querySelector(".ui-testimonial-card-off")) return "five stars are not all on";
+if (ada.querySelector(".ui-avatar span").textContent !== "AL") return "no initials without a picture";
+const grace = figs[1];
+if (grace.querySelector(".ui-testimonial-card-logo")?.getAttribute("alt") !== "Navy Labs") return "the logo's alt is not the company";
+if (grace.querySelector(".ui-testimonial-card-role").textContent !== "Head of engineering") return "with a logo the company is still written";
+if (!grace.querySelector(".ui-testimonial-card-mark")) return "without a rating there is no quote mark";
+const alan = figs[2];
+if (!alan.classList.contains("ui-testimonial-card-large") || alan.querySelectorAll(".ui-testimonial-card-off").length !== 1) return "large with 4 stars";
+if (!figs[3].classList.contains("ui-testimonial-card-plain") || figs[3].querySelector(".ui-testimonial-card-role")) return "plain, no role";

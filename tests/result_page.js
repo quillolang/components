@@ -1,0 +1,15 @@
+const ok = $("#result-page-demo-ok");
+if (!ok || ok.getAttribute("role") !== "status") return "success is not a status";
+if (ok.getAttribute("aria-labelledby") !== "result-page-demo-ok-title" || ok.querySelector("h1").id !== "result-page-demo-ok-title") return "the title does not name the section";
+if (ok.querySelector("h1").textContent !== "Order placed") return "the title";
+if (ok.querySelector(".ui-result-code")?.textContent !== "Order #4821") return "the code is not shown";
+if (!ok.querySelector(".ui-result-text").textContent.includes("We emailed a receipt")) return "the text";
+if (ok.querySelectorAll(".ui-result-actions a.ui-btn").length !== 2) return "two action buttons";
+if (!ok.querySelector(".ui-result-extra dl")) return "extra is not under the actions";
+const t = ok.querySelector("h1").getBoundingClientRect(), s = ok.getBoundingClientRect();
+if (Math.abs((t.left + t.right) / 2 - (s.left + s.right) / 2) > 2) return "the title is not centred";
+const err = $("#result-page-demo-err");
+if (err.getAttribute("role") !== "alert") return "error is not an alert";
+if (getComputedStyle(err.querySelector(".ui-result-icon")).color === getComputedStyle(ok.querySelector(".ui-result-icon")).color) return "error and success icons share a colour";
+if (err.querySelector(".ui-result-icon svg").getAttribute("aria-hidden") !== "true") return "the icon is read aloud";
+if ($$(".ui-result").length !== 3 || !$(".ui-result-info")) return "three results, one info";

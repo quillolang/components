@@ -1,0 +1,47 @@
+const thread = $("ol.ui-comment-thread");
+const note = () => thread.closest(".demo-stack").querySelector(".demo-note").textContent;
+if (!thread || thread.getAttribute("aria-label") !== "Comments") return "the thread is not a labelled list";
+if (thread.querySelectorAll(":scope > li").length !== 2) return "expected 2 top-level comments";
+const all = () => [...thread.querySelectorAll(".ui-comment")];
+if (all().length !== 4) return `expected 4 comments shown with [2] folded, found ${all().length}`;
+if ($("#comment-thread-demo-empty")) return "an empty thread has the id";
+if ($(".ui-comment-thread-empty")?.textContent !== "Be the first to comment.") return "an empty thread does not say so";
+const folds = () => [...thread.querySelectorAll(".ui-comment-thread-fold")];
+const lee = all()[1];
+const leeFold = lee.querySelector(".ui-comment-thread-fold");
+if (lee.querySelector(".ui-comment-name").textContent !== "Lee Chen" || leeFold.getAttribute("aria-expanded") !== "false" || leeFold.textContent.trim() !== "Show 1 reply") return `Lee's fold says ${leeFold?.textContent}`;
+leeFold.click(); await wait();
+if (all().length !== 5 || leeFold.getAttribute("aria-expanded") !== "true" || leeFold.textContent.trim() !== "Hide replies") return "Show did not open the branch";
+const benFold = folds()[0];
+if (benFold.textContent.trim() !== "Hide replies") return `Ben's fold says ${benFold.textContent}`;
+benFold.click(); await wait();
+if (all().length !== 2 || folds()[0].textContent.trim() !== "Show 3 replies") return `folding Ben left ${all().length} comments, ${folds()[0].textContent}`;
+benFold.click(); await wait();
+if (all().length !== 5) return "unfolding did not bring the branch back";
+// Like: the count moves and on_like is told.
+const like = all()[4].querySelector("[aria-pressed]");
+like.click(); await wait();
+if (like.getAttribute("aria-pressed") !== "true" || like.textContent.trim() !== "8" || !note().includes("liked 5")) return `like: ${like.textContent} / ${note()}`;
+like.click(); await wait();
+if (like.textContent.trim() !== "7" || !note().includes("unliked 5")) return `unlike: ${like.textContent} / ${note()}`;
+// Reply: a box opens under the comment, the reply joins its replies, on_reply is told.
+const replyBtn = (el) => [...el.querySelectorAll(":scope > .ui-comment-actions .ui-comment-btn")].find((b) => b.textContent.trim() === "Reply");
+replyBtn(all()[4]).click(); await wait();
+const box = thread.querySelector("textarea");
+if (!box || box.closest(".ui-comment").querySelector(".ui-comment-name").textContent !== "Sam Patel" || box.placeholder !== "Reply to Sam Patel…") return "the reply box did not open under Sam's comment";
+if (document.activeElement !== box) return "the reply box did not take the focus";
+type(box, "Agreed, twice as fast here."); await wait();
+box.closest("form").querySelector("button[type=submit]").click(); await wait();
+if (thread.querySelector("textarea")) return "the reply box stayed open after posting";
+const sam = all().find((c) => c.querySelector(".ui-comment-name").textContent === "Sam Patel");
+const added = sam.querySelector(".ui-comment-thread-list .ui-comment");
+if (!added || added.querySelector(".ui-comment-name").textContent !== "Ana Silva" || added.querySelector(".ui-comment-text").textContent !== "Agreed, twice as fast here.") return "the reply did not join Sam's replies";
+if (!note().includes("reply to 5: Agreed, twice as fast here.")) return `on_reply did not reach the note: ${note()}`;
+if (sam.querySelector(".ui-comment-thread-fold")?.textContent.trim() !== "Hide replies") return "a first reply did not bring a fold button";
+// Past depth 3, Reply answers the parent (Ben's "Perfect, thanks." is at level 3).
+const deep = all().find((c) => c.querySelector(".ui-comment-text").textContent === "Perfect, thanks.");
+replyBtn(deep).click(); await wait();
+const box2 = thread.querySelector("textarea");
+if (!box2 || box2.placeholder !== "Reply to Lee Chen…") return `past the depth, the box opened for ${box2?.placeholder}`;
+key(box2, "Escape"); await wait();
+if (thread.querySelector("textarea")) return "Escape did not close the reply box";

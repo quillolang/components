@@ -1,0 +1,18 @@
+const tags = $$(".ui-price-tag");
+if (tags.length !== 6) return `expected 6 price tags, found ${tags.length}`;
+const [plan, night, free, seat, year, big] = tags;
+if (plan.querySelector(".ui-price-tag-amount").textContent !== "$12") return `the plan's amount reads "${plan.querySelector(".ui-price-tag-amount").textContent}"`;
+if (plan.querySelector(".ui-price-tag-period").textContent !== "/month") return "the period is not shown as /month";
+if (plan.querySelector(".ui-price-tag-note").textContent !== "billed yearly") return "the note is missing";
+if (plan.querySelector(".ui-price-tag-line").getAttribute("aria-label") !== "$12 per month") return `screen readers hear "${plan.querySelector(".ui-price-tag-line").getAttribute("aria-label")}"`;
+if (night.querySelector(".ui-price-tag-prefix").textContent !== "From") return "the prefix is missing";
+const sp = (t) => t.replace(/\s/g, " ");
+if (sp(night.querySelector(".ui-price-tag-amount").textContent) !== "89 €") return `de-DE EUR reads "${night.querySelector(".ui-price-tag-amount").textContent}"`;
+const old = night.querySelector("s.ui-price-tag-old");
+if (!old || sp(old.textContent) !== "120 €" || getComputedStyle(old).textDecorationLine !== "line-through") return "the old price is not struck through";
+if (!night.querySelector(".ui-price-tag-line").getAttribute("aria-label").replace(/\s/g, " ").includes("was 120 €")) return "screen readers are not told the old price";
+if (free.querySelector(".ui-price-tag-amount").textContent !== "Free" || free.querySelector(".ui-price-tag-period")) return "text amounts are not shown as they are";
+if (parseFloat(getComputedStyle(seat.querySelector(".ui-price-tag-amount")).fontSize) >= parseFloat(getComputedStyle(plan.querySelector(".ui-price-tag-amount")).fontSize)) return "sm is not smaller";
+if (parseFloat(getComputedStyle(big.querySelector(".ui-price-tag-amount")).fontSize) <= parseFloat(getComputedStyle(year.querySelector(".ui-price-tag-amount")).fontSize)) return "xl is not larger than lg";
+if (big.querySelector(".ui-price-tag-amount").textContent !== "£1,999") return `en-GB GBP reads "${big.querySelector(".ui-price-tag-amount").textContent}"`;
+if (getComputedStyle(year).justifyItems !== "center") return "align=center does not centre";

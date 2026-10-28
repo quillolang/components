@@ -1,0 +1,232 @@
+// FormWizard: a long form in steps: the steps shown at the top, one step's
+// fields at a time with Back and Next, and a last step that reviews what was
+// entered, with Edit buttons, before it is sent. Every step's fields are in one
+// real <form method="post">, so the route gets them all as one form; Next checks
+// the step's fields with the browser's own validation first and points to the
+// one to fix.
+//
+//   <FormWizard id="signup" action="/signup" steps={[
+//       { title: "Account", fields: [{ name: "email", label: "Email", type: "email", required: true },
+//                                    { name: "password", label: "Password", type: "password", required: true }] },
+//       { title: "Profile", fields: [{ name: "name", label: "Name" },
+//                                    { name: "role", label: "Role", type: "select", options: ["Developer", "Designer"] }] },
+//   ]}/>
+//
+// id: a prefix for its ids, unique on the page. action: where it posts.
+// steps: maps of { title, text?, fields }. A field is { name, label, type?,
+// required?, placeholder?, hint?, options? (for "select" and "radio": strings or
+// { label, value }), rows? (for "textarea"), autocomplete? }; type is an input
+// type ("text" by default, "email", "tel", "number", "date", "password", ...),
+// "textarea", "select", "radio" or "checkbox" (sent as "on" when ticked).
+// values: what to fill in to start with, by name. review (true): the last step
+// that shows what was entered; review_title ("Review"). submit ("Submit"),
+// next ("Next"), back ("Back"). The steps done can be gone back to from the top.
+// on_step(index): inside one of your components, called with the step shown
+// (len(steps) for the review). FormWizardField is the view each field is drawn
+// with. on_submit(values): inside one of your components,
+// called with the values by name in place of posting the form (send them
+// yourself, with a server fn); without it the form posts to `action`.
+
+let form_wizard_css = css`
+.ui-form-wizard { display: grid; gap: 18px; min-width: 0; max-width: 560px; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-form-wizard-steps { display: flex; gap: 6px; margin: 0; padding: 0; list-style: none; counter-reset: ui-form-wizard; }
+.ui-form-wizard-step { flex: 1 1 0; min-width: 0; display: grid; gap: 6px; }
+.ui-form-wizard-step::before { content: ""; height: 4px; border-radius: 2px; background: var(--ui-border); }
+.ui-form-wizard-done::before, .ui-form-wizard-current::before { background: var(--ui-accent); }
+.ui-form-wizard-step-label {
+  display: flex; align-items: center; gap: 6px; padding: 0; border: 0; background: none; color: var(--ui-muted);
+  font: 500 12px var(--ui-font); text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 3px;
+}
+.ui-form-wizard-current .ui-form-wizard-step-label { color: var(--ui-fg); }
+button.ui-form-wizard-step-label { color: var(--ui-accent); cursor: pointer; }
+button.ui-form-wizard-step-label:hover { text-decoration: underline; }
+button.ui-form-wizard-step-label:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-form-wizard-num { font-variant-numeric: tabular-nums; }
+.ui-form-wizard-form { display: grid; gap: 18px; margin: 0; }
+.ui-form-wizard-panel { display: grid; gap: 14px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-form-wizard-panel[hidden] { display: none; }
+.ui-form-wizard-title { margin: 0; padding: 0; font-size: 18px; font-weight: 650; line-height: 1.3; outline: none; }
+.ui-form-wizard-text { margin: -8px 0 0; color: var(--ui-muted); }
+.ui-form-wizard-field { display: grid; gap: 6px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-form-wizard-label { padding: 0; font-size: 13px; font-weight: 500; }
+.ui-form-wizard-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-form-wizard-input {
+  box-sizing: border-box; width: 100%; height: 38px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.5 var(--ui-font);
+  transition: border-color .15s, box-shadow .15s;
+}
+textarea.ui-form-wizard-input { height: auto; padding: 8px 12px; resize: vertical; }
+select.ui-form-wizard-input { appearance: none; padding-right: 32px; cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, var(--ui-muted) 50%), linear-gradient(-45deg, transparent 50%, var(--ui-muted) 50%);
+  background-position: right 16px top 50%, right 11px top 50%; background-size: 5px 5px; background-repeat: no-repeat; }
+.ui-form-wizard-input:hover { border-color: var(--ui-strong); }
+.ui-form-wizard-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-form-wizard-input:user-invalid { border-color: var(--ui-danger); }
+.ui-form-wizard-check { display: flex; align-items: center; gap: 8px; width: fit-content; cursor: pointer; }
+.ui-form-wizard-check input { width: 16px; height: 16px; margin: 0; accent-color: var(--ui-accent); cursor: pointer; }
+.ui-form-wizard-check input:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 3px; }
+.ui-form-wizard-choices { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.ui-form-wizard-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-form-wizard-review { display: grid; gap: 14px; }
+.ui-form-wizard-review-step { display: grid; gap: 8px; }
+.ui-form-wizard-review-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding-bottom: 6px; border-bottom: 1px solid var(--ui-border); }
+.ui-form-wizard-review-head h4 { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-form-wizard-edit { padding: 0; border: 0; background: none; color: var(--ui-accent); font: 500 13px var(--ui-font); cursor: pointer; border-radius: 3px; }
+.ui-form-wizard-edit:hover { text-decoration: underline; }
+.ui-form-wizard-edit:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-form-wizard-dl { display: grid; gap: 6px; margin: 0; }
+.ui-form-wizard-dl div { display: grid; grid-template-columns: minmax(110px, 1fr) 2fr; gap: 12px; }
+.ui-form-wizard-dl dt { color: var(--ui-muted); }
+.ui-form-wizard-dl dd { margin: 0; overflow-wrap: anywhere; }
+.ui-form-wizard-actions { display: flex; align-items: center; gap: 10px; padding-top: 4px; }
+.ui-form-wizard-gap { flex: 1; }
+.ui-form-wizard-button {
+  display: inline-flex; align-items: center; justify-content: center; height: 38px; padding: 0 18px; border: 1px solid transparent;
+  border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg); font: 500 14px var(--ui-font); cursor: pointer;
+  transition: background .15s, box-shadow .15s, border-color .15s;
+}
+.ui-form-wizard-button:hover { background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-form-wizard-button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-form-wizard-back { background: transparent; color: var(--ui-fg); border-color: var(--ui-border); }
+.ui-form-wizard-back:hover { background: var(--ui-subtle); border-color: var(--ui-strong); }
+.ui-form-wizard-count { font-size: 13px; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+@media (max-width: 480px) { .ui-form-wizard-step-label .ui-form-wizard-name { display: none; } .ui-form-wizard-dl div { grid-template-columns: 1fr; gap: 2px; } }
+@media (prefers-reduced-motion: reduce) { .ui-form-wizard-input, .ui-form-wizard-button { transition: none; } }
+`
+
+fn form_wizard_option(o) = type_of(o) == "map" ? { label: o.label ?? str(o.value), value: str(o.value ?? o.label) }
+                                              : { label: str(o), value: str(o) }
+
+// What the review shows for a field's value.
+fn form_wizard_shown(f: map, v) -> str {
+    let t = f.type ?? "text"
+    if t == "checkbox" { return v == true || v == "on" ? "Yes" : "No" }
+    if v == null || v == "" { return "—" }
+    if t == "password" { return "••••••••" }
+    if t == "select" || t == "radio" {
+        let hit = find((f.options ?? []) | map(form_wizard_option), (o) => o.value == str(v))
+        return hit != null ? hit.label : str(v)
+    }
+    str(v)
+}
+
+// One field of a step: its label (a legend for radios), its control and its hint.
+view FormWizardField(id: str, f: map, value = null, on_value = null) {
+    style global form_wizard_css
+    let t = f.type ?? "text"
+    let fid = `${id}-${f.name}`
+    let hint_id = f.hint != null ? `${fid}-hint` : null
+    let v = value
+    let req = (f.required ?? false) && <span.ui-form-wizard-req aria-hidden="true">*</span>
+    let keep = (x) => { on_value && on_value(x) }
+    let opts = (f.options ?? []) | map(form_wizard_option)
+    t == "radio"
+        ? <fieldset.ui-form-wizard-field aria-describedby={hint_id}>
+            <legend.ui-form-wizard-label>{f.label}{req}</legend>
+            <div.ui-form-wizard-choices>
+                {for [i, o] in enumerate(opts) => <label.ui-form-wizard-check>
+                    <input type="radio" id={`${fid}-${i}`} name={f.name} value={o.value} checked={o.value == str(v ?? "")}
+                           required={f.required ?? false} @change={(e) => keep(e.value)}/>
+                    {o.label}
+                </label>}
+            </div>
+            {f.hint != null && <p.ui-form-wizard-hint id={hint_id}>{f.hint}</p>}
+        </fieldset>
+        : <div.ui-form-wizard-field>
+            {t != "checkbox" && <label.ui-form-wizard-label for={fid}>{f.label}{req}</label>}
+            {match t {
+                "textarea" => <textarea.ui-form-wizard-input id={fid} name={f.name} rows={f.rows ?? 3} required={f.required ?? false}
+                                       placeholder={f.placeholder} aria-describedby={hint_id}
+                                       @input={(e) => keep(e.value)}>{v ?? ""}</textarea>
+                "select" => <select.ui-form-wizard-input id={fid} name={f.name} required={f.required ?? false} aria-describedby={hint_id}
+                                    @change={(e) => keep(e.value)}>
+                    <option value="" disabled selected={v == null}>{f.placeholder ?? "Choose one"}</option>
+                    {for o in opts => <option value={o.value} selected={o.value == str(v ?? "")}>{o.label}</option>}
+                </select>
+                "checkbox" => <label.ui-form-wizard-check>
+                    <input type="checkbox" id={fid} name={f.name} checked={v == true || v == "on"} required={f.required ?? false}
+                           aria-describedby={hint_id} @change={(e) => keep(e.checked)}/>
+                    {f.label}
+                </label>
+                _ => <input.ui-form-wizard-input type={t} id={fid} name={f.name} value={v} required={f.required ?? false}
+                           placeholder={f.placeholder} autocomplete={f.autocomplete} aria-describedby={hint_id}
+                           @input={(e) => keep(e.value)}/>
+            }}
+            {f.hint != null && <p.ui-form-wizard-hint id={hint_id}>{f.hint}</p>}
+        </div>
+}
+
+component FormWizard(id: str, action: str = "/", steps: list = [], values: map = {}, review: bool = true,
+                     review_title: str = "Review", submit: str = "Submit", next: str = "Next", back: str = "Back",
+                     on_step = null, on_submit = null, class: str? = null) {
+    style global form_wizard_css
+    state at = 0
+    state vals = values
+    let n = len(steps)
+    let last = review ? n : n - 1
+    let titles = review ? [...(steps | map((s) => s.title)), review_title] : steps | map((s) => s.title)
+    let go = (e, i: int) => {
+        at = i
+        on_step && on_step(i)
+        let root = e.target.closest(".ui-form-wizard")
+        js("requestAnimationFrame", (t = null) => {
+            let h = root.querySelector(`#${id}-title-${i}`)
+            h && h.focus()
+        })
+    }
+    // Next: the step's fields are checked first, and the first one wrong is pointed to.
+    let forward = (e) => {
+        let panel = e.target.closest("form").querySelector(`[data-step="${at}"]`)
+        let wrong = panel.querySelector("input:invalid, select:invalid, textarea:invalid")
+        if wrong != null { wrong.reportValidity() } else { go(e, at + 1) }
+    }
+    let keep = (name: str, v) => { vals = set(vals, name, v) }
+    <div class={ui_cls(["ui-form-wizard", class])}>
+        <ol.ui-form-wizard-steps aria-label="Steps">
+            {for [i, t] in enumerate(titles) => {
+                let phase = i < at ? "done" : i == at ? "current" : "upcoming"
+                let text = [<span.ui-form-wizard-num>{i + 1}.</span>, " ", <span.ui-form-wizard-name>{t}</span>,
+                            phase == "done" && <span.ui-sr> (done)</span>]
+                <li class={`ui-form-wizard-step ui-form-wizard-${phase}`} aria-current={phase == "current" ? "step" : null}>
+                    {phase == "done"
+                        ? <button.ui-form-wizard-step-label type="button" @click={(e) => go(e, i)}>{text}</button>
+                        : <span.ui-form-wizard-step-label>{text}</span>}
+                </li>
+            }}
+        </ol>
+        <p.ui-sr aria-live="polite">Step {at + 1} of {len(titles)}: {titles[at]}</p>
+        <form.ui-form-wizard-form method="post" action={action} @submit={(e) => {
+            // Each step was checked on Next; without on_submit the form is posted as it is.
+            if on_submit != null { on_submit(vals) } else { e.target.submit() }
+        }}>
+                {for [i, s] in enumerate(steps) => <fieldset.ui-form-wizard-panel key={i} data-step={i} hidden={i != at}
+                        aria-labelledby={`${id}-title-${i}`}>
+                    <h3.ui-form-wizard-title id={`${id}-title-${i}`} tabindex="-1">{s.title}</h3>
+                    {s.text != null && <p.ui-form-wizard-text>{s.text}</p>}
+                    {for f in s.fields ?? [] => <FormWizardField key={f.name} id={id} f={f} value={vals[f.name]} on_value={(x) => keep(f.name, x)}/>}
+                </fieldset>}
+                {review && <section.ui-form-wizard-panel data-step={n} hidden={at != n} aria-labelledby={`${id}-title-${n}`}>
+                    <h3.ui-form-wizard-title id={`${id}-title-${n}`} tabindex="-1">{review_title}</h3>
+                    <div.ui-form-wizard-review>
+                        {for [i, s] in enumerate(steps) => <div.ui-form-wizard-review-step>
+                            <div.ui-form-wizard-review-head>
+                                <h4>{s.title}</h4>
+                                <button.ui-form-wizard-edit type="button" aria-label={`Edit ${s.title}`} @click={(e) => go(e, i)}>Edit</button>
+                            </div>
+                            <dl.ui-form-wizard-dl>
+                                {for f in s.fields ?? [] => <div><dt>{f.label}</dt><dd>{form_wizard_shown(f, vals[f.name])}</dd></div>}
+                            </dl>
+                        </div>}
+                    </div>
+                </section>}
+                <div.ui-form-wizard-actions>
+                    {at > 0 && <button.ui-form-wizard-button.ui-form-wizard-back type="button" @click={(e) => go(e, at - 1)}>{back}</button>}
+                    <span.ui-form-wizard-gap></span>
+                    <span.ui-form-wizard-count>Step {at + 1} of {len(titles)}</span>
+                    {at < last
+                        ? <button.ui-form-wizard-button type="button" @click={forward}>{next}</button>
+                        : <button.ui-form-wizard-button type="submit">{submit}</button>}
+                </div>
+        </form>
+    </div>
+}

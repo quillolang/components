@@ -1,0 +1,146 @@
+// AuditLog: who did what to what, and when, as a table newest first, with
+// filters by person and by action, a search box, and a count of what is shown:
+// the security or admin history of an account.
+//
+//   <AuditLog id="audit" label="Audit log" zone="Europe/Lisbon" entries={[
+//       { who: "ada@example.com", action: "user.invite", target: "grace@example.com",
+//         at: "2026-10-28T09:12:00Z", ip: "81.2.69.160" },
+//       { who: "grace@example.com", action: "api_key.delete", target: "ci-deploy", at: "2026-10-27T17:40:00Z",
+//         detail: "Key ending 4f2a" },
+//   ]}/>
+//
+// entries: maps of { who, action, target?, at, ip?, detail?, tone? }: at is an ISO
+// date-time; detail a line under the target; tone the action's colour ("success",
+// "warning", "danger", "info", "neutral"), by default from its words: create, add,
+// invite, enable and login are success, delete, remove, revoke and disable danger,
+// update, change and edit info. They are shown newest first. zone: the time zone
+// times are shown in (UTC by default; an IANA name or "+05:30"). show_ip: an IP
+// column (true when any entry has one). page_size: entries per page (25), with
+// Newer and Older. empty: what it says when nothing matches. label: the table's
+// name. id: a prefix for its ids, unique on the page. The filters are selects of
+// the people and actions found, and the search keeps entries where any field has
+// what is typed. on_filter(count): inside one of your components, called with how
+// many entries match after a filter changes.
+
+let audit_log_css = css`
+.ui-auditlog { display: grid; gap: 10px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-auditlog-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-auditlog-bar select, .ui-auditlog-search { height: 34px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background-color: var(--ui-surface); color: var(--ui-fg); font: 13px/1 var(--ui-font); }
+.ui-auditlog-bar select { padding: 0 28px 0 10px; appearance: none; -webkit-appearance: none; background: var(--ui-surface) no-repeat right 9px center / 9px
+  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round'%3E%3Cpath d='M1 1l4 4 4-4'/%3E%3C/svg%3E"); }
+.ui-auditlog-search { flex: 1 1 180px; max-width: 280px; padding: 0 10px; }
+.ui-auditlog-bar select:focus, .ui-auditlog-search:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-auditlog-count { margin-left: auto; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-auditlog-scroll { overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-auditlog table { width: 100%; border-collapse: separate; border-spacing: 0; }
+.ui-auditlog th, .ui-auditlog td { padding: 9px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--ui-border); }
+.ui-auditlog th { background: var(--ui-subtle); color: var(--ui-muted); font-size: 12px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; white-space: nowrap; }
+.ui-auditlog tbody tr:last-child td { border-bottom: 0; }
+.ui-auditlog tbody tr:hover td { background: color-mix(in srgb, var(--ui-subtle) 70%, transparent); }
+.ui-auditlog-when { white-space: nowrap; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-auditlog-who { font-weight: 500; }
+.ui-auditlog-action { display: inline-block; padding: 1px 7px; border-radius: 4px; font: 500 12px/1.5 var(--ui-mono); white-space: nowrap;
+  --t: var(--ui-muted); color: var(--t); background: color-mix(in srgb, var(--t) 12%, transparent); }
+.ui-auditlog-success { --t: var(--ui-success); }
+.ui-auditlog-warning { --t: var(--ui-warning); }
+.ui-auditlog-danger { --t: var(--ui-danger); }
+.ui-auditlog-info { --t: var(--ui-info); }
+.ui-auditlog-detail { display: block; color: var(--ui-muted); font-size: 12px; }
+.ui-auditlog-ip { font: 12px/1.6 var(--ui-mono); color: var(--ui-muted); white-space: nowrap; }
+.ui-auditlog-empty td { padding: 28px 14px; text-align: center; color: var(--ui-muted); }
+.ui-auditlog-pages { display: flex; justify-content: flex-end; gap: 6px; }
+.ui-auditlog-pages button { height: 30px; padding: 0 11px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-auditlog-pages button:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-auditlog-pages button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-auditlog-pages button:disabled { opacity: .5; cursor: not-allowed; }
+`
+
+// An action's tone from its words: "user.delete" is danger.
+fn audit_log_tone(action: str) -> str {
+    let a = lower(action)
+    if re.test(a, "(delete|remove|revoke|disable|fail|ban)") { return "danger" }
+    if re.test(a, "(create|add|invite|enable|login|grant)") { return "success" }
+    if re.test(a, "(update|change|edit|rename|reset)") { return "info" }
+    "neutral"
+}
+
+// When, in a zone: "Oct 28, 2026, 10:12".
+fn audit_log_when(at: str, zone: str) -> str =
+    date.valid(at) ? date.format(date.to_zone(at, zone), "MMM D, YYYY, HH:mm") : at
+
+component AuditLog(id: str, entries: list = [], zone: str = "UTC", show_ip: bool? = null, page_size: int = 25,
+                   empty: str = "No entries match.", label: str? = null, on_filter = null, class: str? = null) {
+    style global audit_log_css
+    state who = ""
+    state action = ""
+    state query = ""
+    state page = 0
+    let newest = reverse(sort_by(entries, (e) => date.valid(e.at ?? "") ? date.ms(e.at) : 0))
+    let people = sort(unique(entries | map((e) => str(e.who ?? ""))) | filter((p) => p != ""))
+    let actions = sort(unique(entries | map((e) => str(e.action ?? ""))) | filter((a) => a != ""))
+    let needle = lower(trim(query))
+    let found = newest
+        | filter((e) => who == "" || e.who == who)
+        | filter((e) => action == "" || e.action == action)
+        | filter((e) => needle == "" || contains(lower(join([e.who ?? "", e.action ?? "", e.target ?? "", e.detail ?? "", e.ip ?? "",
+                                                              audit_log_when(e.at ?? "", zone)], " ")), needle))
+    let ips = show_ip ?? any(entries, (e) => e.ip != null)
+    let total = len(found)
+    let pages = total == 0 ? 1 : ceil(total / page_size)
+    let at = page >= pages ? pages - 1 : page
+    let shown = slice(found, at * page_size, at * page_size + page_size)
+    let changed = () => {
+        page = 0
+        // Worked out here from the new filters: the `let`s follow them a moment later.
+        on_filter && on_filter(len(newest
+            | filter((e) => who == "" || e.who == who)
+            | filter((e) => action == "" || e.action == action)
+            | filter((e) => trim(query) == "" || contains(lower(join([e.who ?? "", e.action ?? "", e.target ?? "", e.detail ?? "", e.ip ?? "",
+                                                                     audit_log_when(e.at ?? "", zone)], " ")), lower(trim(query))))))
+    }
+    let cols = ips ? 5 : 4
+    <div class={ui_cls(["ui-auditlog", class])} id={id}>
+        <div.ui-auditlog-bar>
+            <select aria-label="Filter by person" id={`${id}-who`} @change={(e) => { who = e.value; changed() }}>
+                <option value="" selected={who == ""}>Everyone</option>
+                {for p in people => <option value={p} selected={who == p}>{p}</option>}
+            </select>
+            <select aria-label="Filter by action" id={`${id}-action`} @change={(e) => { action = e.value; changed() }}>
+                <option value="" selected={action == ""}>All actions</option>
+                {for a in actions => <option value={a} selected={action == a}>{a}</option>}
+            </select>
+            <input.ui-auditlog-search type="search" placeholder="Search" aria-label="Search the log" value={query}
+                   @input={(e) => { query = e.value; changed() }}/>
+            <span.ui-auditlog-count aria-live="polite">{total == len(entries) ? `${total} entries` : `${total} of ${len(entries)} entries`}</span>
+        </div>
+        <div.ui-auditlog-scroll>
+            <table aria-label={label}>
+                <thead>
+                    <tr>
+                        <th scope="col">When</th>
+                        <th scope="col">Who</th>
+                        <th scope="col">Action</th>
+                        <th scope="col">Target</th>
+                        {ips && <th scope="col">IP</th>}
+                    </tr>
+                </thead>
+                <tbody>
+                    {total == 0 && <tr.ui-auditlog-empty><td colspan={str(cols)}>{empty}</td></tr>}
+                    {for [i, e] in enumerate(shown) => <tr key={`${e.at}-${e.who}-${e.action}-${at * page_size + i}`}>
+                        <td.ui-auditlog-when><time datetime={e.at}>{audit_log_when(e.at ?? "", zone)}</time></td>
+                        <td.ui-auditlog-who>{e.who}</td>
+                        <td><span class={`ui-auditlog-action ui-auditlog-${e.tone ?? audit_log_tone(e.action ?? "")}`}>{e.action}</span></td>
+                        <td>{e.target ?? "—"}{e.detail != null && <span.ui-auditlog-detail>{e.detail}</span>}</td>
+                        {ips && <td.ui-auditlog-ip>{e.ip ?? "—"}</td>}
+                    </tr>}
+                </tbody>
+            </table>
+        </div>
+        {pages > 1 && <div.ui-auditlog-pages>
+            <button type="button" disabled={at == 0} @click={() => { page = at - 1 }}>Newer</button>
+            <button type="button" disabled={at >= pages - 1} @click={() => { page = at + 1 }}>Older</button>
+        </div>}
+    </div>
+}

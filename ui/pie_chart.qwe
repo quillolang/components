@@ -1,0 +1,182 @@
+// PieChart: the parts of a whole as slices of a pie, each named outside it with its
+// share, joined to its slice by a short line. Small slices are gathered into one
+// "Other", so the pie stays readable. CSS only: hovering a slice pulls it out and
+// fades the rest, and screen readers get the parts, values and shares as a table.
+//
+//   <PieChart label="Traffic by source" parts={[
+//       { label: "Search", value: 4210 }, { label: "Direct", value: 2380 }, { label: "Social", value: 1120 }]}/>
+//   <PieChart label="Browsers" parts={browsers} other_below={5} legend={true} labels={false}/>
+//
+// parts: a list of { label, value }, drawn clockwise from the top in the order given;
+// parts of 0 or less are left out. other_below: parts with a smaller share than this
+// (in percent, 3) are gathered into one slice, other_label ("Other"), drawn last; past
+// eight slices the smallest are gathered too. labels: each slice's name and share
+// beside it (true). legend: a list beside the pie with each part's value and share
+// (false). Screen readers get a table of the parts, Other naming what it gathers.
+// prefix and suffix: around every value shown ("$", " GB"); decimals: digits after the
+// point, always, instead of up to two as needed. size: the pie's width in pixels (200;
+// it shrinks to fit). label: what it shows, for screen readers with the total;
+// show_label also writes it above.
+
+let pie_chart_css = css`
+.ui-piec {
+  --ui-piec-1: light-dark(#2a78d6, #3987e5); --ui-piec-2: light-dark(#eb6834, #d95926);
+  --ui-piec-3: light-dark(#1baf7a, #199e70); --ui-piec-4: light-dark(#eda100, #c98500);
+  --ui-piec-5: light-dark(#e87ba4, #d55181); --ui-piec-6: light-dark(#008300, #008300);
+  --ui-piec-7: light-dark(#6250d6, #9085e9); --ui-piec-8: light-dark(#e34948, #e66767);
+  --ui-piec-9: var(--ui-strong);
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 16px 28px; min-width: 0; margin: 0;
+  font: 13px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-piec-title { flex-basis: 100%; margin: 0; font-size: 14px; font-weight: 600; }
+.ui-piec-s1 { --c: var(--ui-piec-1); } .ui-piec-s2 { --c: var(--ui-piec-2); } .ui-piec-s3 { --c: var(--ui-piec-3); }
+.ui-piec-s4 { --c: var(--ui-piec-4); } .ui-piec-s5 { --c: var(--ui-piec-5); } .ui-piec-s6 { --c: var(--ui-piec-6); }
+.ui-piec-s7 { --c: var(--ui-piec-7); } .ui-piec-s8 { --c: var(--ui-piec-8); }
+.ui-piec-s9 { --c: var(--ui-piec-9); }
+.ui-piec-svg { display: block; max-width: 100%; height: auto; overflow: visible; }
+.ui-piec-slice { fill: var(--c); stroke: var(--ui-bg); stroke-width: 2; stroke-linejoin: round; transition: transform .15s ease; }
+.ui-piec-part { transition: opacity .15s ease; }
+.ui-piec-part:hover .ui-piec-slice { transform: translate(var(--dx), var(--dy)); }
+.ui-piec:has(.ui-piec-part:hover) .ui-piec-part:not(:hover) { opacity: .4; }
+.ui-piec-lead { fill: none; stroke: var(--ui-strong); stroke-width: 1; }
+.ui-piec-name { fill: var(--ui-fg); font-size: 12px; }
+.ui-piec-pct { fill: var(--ui-muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-piec-legend { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 6px 10px; align-items: center;
+  flex: 1 1 200px; min-width: 0; max-width: 340px; margin: 0; padding: 0; list-style: none; }
+.ui-piec-legend li { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; }
+.ui-piec-key { width: 10px; height: 10px; border-radius: 3px; background: var(--c); }
+.ui-piec-lname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-piec-val { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-piec-share { min-width: 3.2em; color: var(--ui-muted); text-align: right; font-variant-numeric: tabular-nums; }
+@media (prefers-reduced-motion: reduce) { .ui-piec-slice, .ui-piec-part { transition: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn pie_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn pie_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : pie_chart_group(floor(n / 1000)) + "," + pie_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn pie_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${pie_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${pie_chart_group(floor(units / scale))}${tail}`
+}
+
+// A share out of 100, to one decimal: "42%", "12.5%", "0.4%".
+fn pie_chart_share(p: num) -> str {
+    let tenths = round(p * 10)
+    `${floor(tenths / 10)}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}%`
+}
+
+// A coordinate for SVG, to two decimals.
+fn pie_chart_len(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The point at `turn` (0 to 1, clockwise from the top) on a circle of radius r.
+fn pie_chart_at(turn: num, r: num) -> list = [r * math.sin(turn * 2 * math.pi), -r * math.cos(turn * 2 * math.pi)]
+
+// Label heights on one side of the pie, moved apart (down, then back up from the
+// bottom) so that no two are closer than `gap`: ys sorted top to bottom.
+fn pie_chart_spread(ys: list, gap: num, bottom: num) -> list {
+    let down = reduce(ys, [], (acc, y) => acc + [len(acc) == 0 ? y : (y > acc[-1] + gap ? y : acc[-1] + gap)])
+    let n = len(down)
+    reduce(reverse(range(n)), down, (acc, i) => {
+        let limit = i == n - 1 ? bottom : acc[i + 1] - gap
+        acc[i] > limit ? set(acc, i, limit) : acc
+    })
+}
+
+view PieChart(parts: list, other_below: num = 3, other_label: str = "Other", labels: bool = true,
+              legend: bool = false, prefix: str = "", suffix: str = "", decimals: int? = null,
+              size: int = 200, label: str = "Pie chart", show_label: bool = false, class: str? = null) {
+    style global pie_chart_css
+    let fmt = (v) => `${v < 0 ? "-" : ""}${prefix}${pie_chart_num(abs(v), decimals)}${suffix}`
+    let positive = parts | filter((p) => p.value != null && p.value > 0)
+    let total = sum(positive | map((p) => p.value))
+    let pct = (v) => total > 0 ? v * 100 / total : 0
+    let big0 = positive | filter((p) => pct(p.value) >= other_below)
+    // At most eight slices: when more, the smallest of the big ones join Other too.
+    let small0 = positive | filter((p) => pct(p.value) < other_below)
+    let room = len(small0) > 0 || len(big0) > 8 ? 7 : 8
+    let keep = take(sort_by(big0, (p) => -p.value), room)
+    let big = big0 | filter((p) => any(keep, (q) => q == p))
+    let rest = total - sum(big | map((p) => p.value))
+    let shown = len(big) == len(positive) ? big
+        : (len(positive) - len(big) == 1 ? big + (positive | filter((p) => !any(big, (q) => q == p)))
+                                         : big + [{ label: other_label, value: rest, other: true }])
+    let starts = reduce(shown, [], (acc, p) => acc + [len(acc) == 0 ? 0 : acc[-1] + shown[len(acc) - 1].value / total])
+    let r = size / 2
+    let side = labels ? 130 : 8
+    let top = labels ? 26 : 8
+    let mids = for [i, p] in enumerate(shown) => starts[i] + p.value / total / 2
+    let rights = range(len(shown)) | filter((i) => mids[i] <= 0.5) | sort_by((i) => pie_chart_at(mids[i], r + 12)[1])
+    let lefts = range(len(shown)) | filter((i) => mids[i] > 0.5) | sort_by((i) => pie_chart_at(mids[i], r + 12)[1])
+    let ry = pie_chart_spread(for i in rights => pie_chart_at(mids[i], r + 12)[1], 16, r + top - 6)
+    let ly = pie_chart_spread(for i in lefts => pie_chart_at(mids[i], r + 12)[1], 16, r + top - 6)
+    let label_y = (i) => mids[i] <= 0.5 ? ry[index_of(rights, i)] : ly[index_of(lefts, i)]
+    let color = (i, p) => p.other == true ? 9 : i % 8 + 1
+    let slice = (i, p) => {
+        let a = starts[i]
+        let b = a + p.value / total
+        let [x1, y1] = pie_chart_at(a, r)
+        let [x2, y2] = pie_chart_at(b, r)
+        len(shown) == 1 ? `M0,${pie_chart_len(-r)} A${r},${r} 0 1 1 0,${pie_chart_len(r)} A${r},${r} 0 1 1 0,${pie_chart_len(-r)} Z`
+            : `M0,0 L${pie_chart_len(x1)},${pie_chart_len(y1)} A${r},${r} 0 ${b - a > 0.5 ? 1 : 0} 1 ${pie_chart_len(x2)},${pie_chart_len(y2)} Z`
+    }
+    <figure class={ui_cls(["ui-piec", class])} aria-label={`${label}, total ${fmt(total)}`}>
+        {show_label && <figcaption.ui-piec-title>{label}</figcaption>}
+        <svg.ui-piec-svg width={size + 2 * side} height={size + 2 * top} aria-hidden="true"
+             viewBox={`${-r - side} ${-r - top} ${size + 2 * side} ${size + 2 * top}`}>
+            {for [i, p] in enumerate(shown) => {
+                let [dx, dy] = pie_chart_at(mids[i], 6)
+                let [ax, ay] = pie_chart_at(mids[i], r - 2)
+                let [ex, ey] = pie_chart_at(mids[i], r + 10)
+                let right = mids[i] <= 0.5
+                let y = label_y(i)
+                let end = right ? r + 18 : -r - 18
+                <g class={`ui-piec-part ui-piec-p${i + 1} ui-piec-s${color(i, p)}`}>
+                    <path.ui-piec-slice d={slice(i, p)} style={`--dx: ${pie_chart_len(dx)}px; --dy: ${pie_chart_len(dy)}px`}>
+                        <title>{p.label}: {fmt(p.value)} ({pie_chart_share(pct(p.value))})</title>
+                    </path>
+                    {labels && [
+                        <path.ui-piec-lead d={`M${pie_chart_len(ax)},${pie_chart_len(ay)} L${pie_chart_len(ex)},${pie_chart_len(y)} L${pie_chart_len(end)},${pie_chart_len(y)}`}/>,
+                        <text.ui-piec-name x={pie_chart_len(right ? end + 4 : end - 4)} y={pie_chart_len(y)} dy="0.32em"
+                              text-anchor={right ? "start" : "end"}>{p.label} <tspan.ui-piec-pct>{pie_chart_share(pct(p.value))}</tspan></text>
+                    ]}
+                </g>
+            }}
+        </svg>
+        {legend && <ul.ui-piec-legend aria-hidden="true">
+            {for [i, p] in enumerate(shown) => <li class={`ui-piec-s${color(i, p)}`}>
+                <span.ui-piec-key></span>
+                <span.ui-piec-lname>{p.label}</span>
+                <span.ui-piec-val>{fmt(p.value)}</span>
+                <span.ui-piec-share>{pie_chart_share(pct(p.value))}</span>
+            </li>}
+        </ul>}
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col">Part</th><th scope="col">Value</th><th scope="col">Share</th></tr></thead>
+            <tbody>
+                {for p in shown => <tr>
+                    <th scope="row">{p.label}{p.other == true ? ` (${join(positive | filter((q) => !any(big, (b) => b == q)) | map((q) => q.label), ", ")})` : ""}</th>
+                    <td>{fmt(p.value)}</td>
+                    <td>{pie_chart_share(pct(p.value))}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

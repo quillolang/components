@@ -1,0 +1,16 @@
+const nav = $("#link-list-demo");
+if (!nav || nav.tagName !== "NAV" || nav.getAttribute("aria-labelledby") !== "link-list-demo-heading") return "the list is not a <nav> named by its heading";
+if (document.getElementById("link-list-demo-heading")?.textContent !== "Read next") return "the heading is missing";
+const links = [...nav.querySelectorAll("a.ui-linklist-link")];
+if (links.length !== 3 || links[0].getAttribute("href") !== "#start") return "the links are wrong";
+if (links[0].querySelector(".ui-linklist-label")?.textContent !== "Getting started" || !links[0].querySelector(".ui-linklist-desc")?.textContent.includes("Install Quillo")) return "the label or the description is wrong";
+if (!links[0].querySelector(".ui-linklist-icon svg path")) return "an SVG path icon is not drawn";
+const ext = links[2];
+if (ext.target !== "_blank" || !ext.rel.includes("noopener") || !ext.querySelector(".ui-linklist-label svg") || !ext.textContent.includes("new tab")) return "an external link does not say so";
+const [a, b] = links.map((l) => l.getBoundingClientRect());
+if (b.top <= a.bottom - 1) return "the items are not one under another";
+const div = $("#link-list-demo-divided");
+if (div.getAttribute("aria-label") !== "Downloads" || !div.classList.contains("ui-linklist-divided")) return "the divided list is not labelled or divided";
+const lis = [...div.querySelectorAll("li")];
+if (getComputedStyle(lis[1]).borderTopWidth === "0px") return "divided draws no line between items";
+if (div.querySelector(".ui-linklist-meta")?.textContent !== "14 MB" || div.querySelectorAll(".ui-linklist-chev").length !== 3) return "meta or the arrows are missing";

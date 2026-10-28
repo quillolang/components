@@ -1,0 +1,16 @@
+const [big, small] = $$("section.ui-cover-image");
+if (!big || !small) return "expected two covers";
+if (big.getAttribute("aria-label") !== "The long way round") return "the cover is not named by its title";
+if (big.querySelector("img")?.alt !== "Green hills under a morning sky") return "the image or its alt is missing";
+if (big.querySelector("h2.ui-cover-image-title")?.textContent !== "The long way round") return "the title is not an h2";
+if (big.querySelector(".ui-cover-image-eyebrow")?.textContent !== "Travel" || !big.querySelector(".ui-cover-image-subtitle")?.textContent.startsWith("Six days")) return "the eyebrow or subtitle is missing";
+if (!big.querySelector(".ui-cover-image-actions a")) return "children are not placed under the text";
+if (Math.round(big.getBoundingClientRect().height) !== 320) return `md is ${big.getBoundingClientRect().height}px tall`;
+if (!getComputedStyle(big.querySelector(".ui-cover-image-shade")).backgroundImage.includes("gradient")) return "there is no gradient";
+const text = big.querySelector(".ui-cover-image-text").getBoundingClientRect(), box = big.getBoundingClientRect();
+if (text.bottom > box.bottom + 1 || text.top < box.top + box.height / 3) return "the text does not sit at the bottom";
+if (Math.round(small.getBoundingClientRect().height) !== 220) return "sm is not 220px tall";
+if (getComputedStyle(small.querySelector(".ui-cover-image-text")).textAlign !== "center") return "align center is not applied";
+if (getComputedStyle(small.querySelector("img")).objectPosition !== "50% 0%") return `position top gives ${getComputedStyle(small.querySelector("img")).objectPosition}`;
+if (small.style.getPropertyValue("--shade").trim() !== "0.5") return "shade is not passed through";
+if (small.querySelector(".ui-cover-image-actions")) return "a cover without children has an actions row";

@@ -1,0 +1,18 @@
+const l = $("#ranking-list-demo-songs");
+if (!l || l.tagName !== "OL" || l.getAttribute("aria-label") !== "Top songs this week") return "the list is not a named <ol>";
+const rows = [...l.querySelectorAll(".ui-ranking-row")];
+if (rows.map((r) => r.dataset.move).join() !== "up,down,new,same,down") return `moves: ${rows.map((r) => r.dataset.move)}`;
+const mv = (i) => rows[i].querySelector(".ui-ranking-move");
+if (mv(0).querySelector("[aria-hidden]").textContent.trim() !== "2" || mv(0).querySelector(".ui-sr").textContent !== "up 2 places") return `the first move: ${mv(0).textContent}`;
+if (!mv(0).classList.contains("ui-ranking-up") || !mv(0).querySelector("svg")) return "up is not green with an arrow";
+if (mv(1).querySelector(".ui-sr").textContent !== "down 1 place" || !mv(1).classList.contains("ui-ranking-down")) return "down 1 place";
+if (mv(2).textContent.includes("NEW") !== true || mv(2).querySelector(".ui-sr").textContent !== "new") return "a new item";
+if (mv(3).querySelector(".ui-sr").textContent !== "no change") return "the same place";
+if (rows[0].querySelector(".ui-ranking-num").textContent !== "1" || rows[4].querySelector(".ui-ranking-num").textContent !== "5") return "place numbers";
+if (rows[0].querySelector("a.ui-ranking-label")?.getAttribute("href") !== "#midnight") return "href";
+if (rows[0].querySelector(".ui-ranking-meta").textContent !== "M83" || rows[0].querySelector(".ui-ranking-value").textContent !== "1.2M plays") return "meta and value";
+const s = $("#ranking-list-demo-searches");
+if (s.getAttribute("start") !== "11" || s.querySelector(".ui-ranking-num").textContent !== "11") return "start={11}";
+const sm = [...s.querySelectorAll(".ui-ranking-move")];
+if (sm[0].querySelector(".ui-sr").textContent !== "up 6 places" || sm[3].querySelector(".ui-sr").textContent !== "down 1 place") return "move and by given";
+if (sm[2].textContent.includes("NEW") || !sm[2].classList.contains("ui-ranking-same")) return "show_new={false} still says NEW";

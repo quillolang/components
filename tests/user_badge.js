@@ -1,0 +1,17 @@
+const ana = $("#user-badge-demo-ana");
+if (!ana || ana.tagName !== "SPAN" || ana.querySelector(".ui-user-badge-name").textContent !== "Ana Silva") return "the badge does not name Ana";
+if (!ana.querySelector(".ui-user-badge-avatar img") || !ana.querySelector("[aria-label=Verified]")) return "the picture or the verified tick is missing";
+const ben = $("#user-badge-demo-ben");
+if (ben.tagName !== "A" || ben.getAttribute("href") !== "#user_badge") return "href does not make it a link";
+if (ben.querySelector(".ui-user-badge-avatar").textContent.trim() !== "BO" || ben.querySelector(".ui-user-badge-role").textContent !== "Admin") return "initials or the role are wrong";
+const sm = $("#user-badge-demo-sm");
+if (!sm.classList.contains("ui-user-badge-sm") || sm.getBoundingClientRect().height >= ana.getBoundingClientRect().height) return "size sm is not smaller";
+const plain = $("#user-badge-demo-plain");
+if (!plain.classList.contains("ui-user-badge-plain") || getComputedStyle(plain).borderTopWidth !== "0px") return "tone plain still has a border";
+const online = $$(".ui-user-badge").find((b) => b.querySelector(".ui-user-badge-online"));
+if (!online || online.querySelector(".ui-sr").textContent !== "(online)") return "the status dot is not told to screen readers";
+const hues = $$(".ui-user-badge-avatar").map((a) => [...a.classList].find((c) => /^ui-user-badge-c\d$/.test(c)));
+if (hues.some((h) => !h)) return "an avatar has no colour class";
+if ($$(".ui-user-badge-name").filter((n) => n.textContent === "Ana Silva").length !== 2) return "expected Ana twice";
+const anaHues = $$(".ui-user-badge").filter((b) => b.querySelector(".ui-user-badge-name").textContent === "Ana Silva").map((b) => [...b.querySelector(".ui-user-badge-avatar").classList].find((c) => /^ui-user-badge-c\d$/.test(c)));
+if (anaHues[0] !== anaHues[1]) return "the same name does not get the same colour";

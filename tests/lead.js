@@ -1,0 +1,10 @@
+const lead = $("#lead-demo-first"), body = $("#lead-demo-body"), big = $("#lead-demo-large");
+if (!lead || lead.tagName !== "P" || !big) return "a Lead is not a <p>";
+const cs = (el) => getComputedStyle(el);
+if (!(parseFloat(cs(lead).fontSize) > parseFloat(cs(body).fontSize))) return "the lede is not larger than the body";
+if (cs(lead).color === cs(body).color) return "the lede is not lighter than the body";
+if (cs(lead).fontWeight !== "400") return "the lede is not a light weight";
+if (!(parseFloat(cs(big).fontSize) > parseFloat(cs(lead).fontSize))) return "size=lg is not larger";
+if (cs(big).textAlign !== "center") return "align=center is not applied";
+if (cs(big).color !== cs(body).color) return "tone=fg is not the text colour";
+if (lead.getBoundingClientRect().width > 60 * parseFloat(cs(lead).fontSize) + 4) return "the lede is wider than its measure";

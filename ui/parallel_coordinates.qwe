@@ -1,0 +1,165 @@
+// ParallelCoordinates: records compared on several measures at once, each measure
+// an upright axis of its own and each record a line across them (cars by price,
+// power and weight; cities by cost, rain and sunshine), so patterns and outliers
+// show. CSS only: hovering a line picks it out and names it; screen readers get
+// the records as a table.
+//
+//   <ParallelCoordinates label="Cars" name_field="model" group_field="origin" records={cars}
+//       axes={[{ field: "price", label: "Price", prefix: "$" }, { field: "hp", label: "Power", suffix: " hp" },
+//              { field: "mpg", label: "Economy", suffix: " mpg" }]}/>
+//
+// axes: the measures, left to right: { field, label, prefix, suffix, decimals,
+// zero } (or just the field's name). Each spans its own values with round ticks;
+// zero starts it at 0. records: a list of maps holding those fields; a record
+// missing one has a gap in its line there. name_field: the field naming each record
+// ("name"), shown on hover and in the table. group_field: a field whose values
+// colour the lines (eight colours, then they repeat), with a legend; without it the
+// lines share one colour. height: the plot's height in pixels (260). label: what
+// the chart shows; it names it for screen readers and captions their table.
+// show_label also writes it above.
+
+let parallel_coordinates_css = css`
+.ui-parcoords {
+  --ui-parcoords-1: light-dark(#2a78d6, #3987e5); --ui-parcoords-2: light-dark(#eb6834, #d95926);
+  --ui-parcoords-3: light-dark(#1baf7a, #199e70); --ui-parcoords-4: light-dark(#eda100, #c98500);
+  --ui-parcoords-5: light-dark(#e87ba4, #d55181); --ui-parcoords-6: light-dark(#008300, #008300);
+  --ui-parcoords-7: light-dark(#6250d6, #9085e9); --ui-parcoords-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-parcoords-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-parcoords-s1 { --c: var(--ui-parcoords-1); } .ui-parcoords-s2 { --c: var(--ui-parcoords-2); } .ui-parcoords-s3 { --c: var(--ui-parcoords-3); }
+.ui-parcoords-s4 { --c: var(--ui-parcoords-4); } .ui-parcoords-s5 { --c: var(--ui-parcoords-5); } .ui-parcoords-s6 { --c: var(--ui-parcoords-6); }
+.ui-parcoords-s7 { --c: var(--ui-parcoords-7); } .ui-parcoords-s8 { --c: var(--ui-parcoords-8); }
+.ui-parcoords-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-parcoords-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.ui-parcoords-key { width: 14px; height: 3px; border-radius: 2px; background: var(--c); flex: none; }
+.ui-parcoords-wrap { padding: 22px 30px 8px 44px; }
+.ui-parcoords-plot { position: relative; }
+.ui-parcoords-axis { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--ui-strong); }
+.ui-parcoords-name { position: absolute; bottom: calc(100% + 8px); left: 0; transform: translateX(-50%); color: var(--ui-fg);
+  font-weight: 600; white-space: nowrap; }
+.ui-parcoords-tick { position: absolute; z-index: 1; right: 5px; transform: translateY(-50%); color: var(--ui-muted); font-size: 11px;
+  font-variant-numeric: tabular-nums; white-space: nowrap; text-shadow: 0 0 3px var(--ui-bg), 0 0 2px var(--ui-bg); pointer-events: none; }
+.ui-parcoords-tick::after { content: ""; position: absolute; top: 50%; right: -5px; width: 4px; height: 1px; background: var(--ui-strong); }
+.ui-parcoords-svg { position: absolute; z-index: 0; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.ui-parcoords-line { fill: none; stroke: var(--c); stroke-width: 1.5; stroke-opacity: .7; stroke-linejoin: round;
+  pointer-events: visibleStroke; transition: stroke-opacity .15s ease; }
+.ui-parcoords-svg:hover .ui-parcoords-line { stroke-opacity: .15; }
+.ui-parcoords-svg .ui-parcoords-line:hover { stroke-opacity: 1; stroke-width: 3; }
+.ui-parcoords-solo { --c: var(--ui-parcoords-1); }
+@media (prefers-reduced-motion: reduce) { .ui-parcoords-line { transition: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn parallel_coordinates_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn parallel_coordinates_group(n: int) -> str =
+    n < 1000 ? str(n) : parallel_coordinates_group(floor(n / 1000)) + "," + parallel_coordinates_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn parallel_coordinates_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${parallel_coordinates_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${parallel_coordinates_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate or a percentage for CSS and SVG, to two decimals.
+fn parallel_coordinates_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// An axis tick, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn parallel_coordinates_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? parallel_coordinates_num(v)
+        : `${v < 0 ? "-" : ""}${parallel_coordinates_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// The axis from lo to hi, widened to round ticks: about `steps` steps of 1, 2, 2.5 or 5 x 10^n.
+fn parallel_coordinates_scale(lo: num, hi: num, steps: int = 4) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo)) : hi - lo
+    let raw = span / steps
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+view ParallelCoordinates(axes: list, records: list, name_field: str = "name", group_field: str? = null,
+                         height: int = 260, label: str = "Parallel coordinates", show_label: bool = false,
+                         class: str? = null) {
+    style global parallel_coordinates_css
+    let ax = axes | map((a) => type_of(a) == "map" ? { field: a.field, label: a.label ?? str(a.field), prefix: a.prefix ?? "",
+                                                         suffix: a.suffix ?? "", decimals: a.decimals, zero: a.zero ?? false }
+                                                   : { field: str(a), label: str(a), prefix: "", suffix: "", decimals: null, zero: false })
+    let k = len(ax)
+    let fmt = (a, v) => v == null ? "—" : `${v < 0 ? "-" : ""}${a.prefix}${parallel_coordinates_num(abs(v), a.decimals)}${a.suffix}`
+    let scales = ax | map((a) => {
+        let vs = records | map((r) => r[a.field]) | filter((v) => v != null)
+        let lo = len(vs) == 0 ? 0 : min(vs)
+        let hi = len(vs) == 0 ? 1 : max(vs)
+        parallel_coordinates_scale(a.zero && lo > 0 ? 0 : lo, a.zero && hi < 0 ? 0 : hi)
+    })
+    let y = (q, v) => (scales[q].hi - v) * 100 / (scales[q].hi - scales[q].lo)
+    let x = (q) => k <= 1 ? 50 : q * 100 / (k - 1)
+    let groups = group_field == null ? [] : unique(records | map((r) => str(r[group_field] ?? "—")))
+    let tone = (r) => group_field == null ? "ui-parcoords-solo" : `ui-parcoords-s${(index_of(groups, str(r[group_field] ?? "—")) ?? 0) % 8 + 1}`
+    // The line through a record's values, broken where one is missing.
+    let path = (r) => {
+        let has = (q) => r[ax[q].field] != null
+        let pt = (q) => `${parallel_coordinates_pct(x(q))},${parallel_coordinates_pct(y(q, r[ax[q].field]))}`
+        let starts = range(k) | filter((q) => has(q) && (q == 0 || !has(q - 1)))
+        join(for st in starts => {
+            let run = range(st, (find(range(st, k), (q) => q == k - 1 || !has(q + 1)) ?? st) + 1)
+            "M" + join(map(run, pt), " L") + (len(run) == 1 ? " l0.01,0" : "")
+        }, " ")
+    }
+    <figure class={ui_cls(["ui-parcoords", class])} aria-label={label}>
+        {show_label && <figcaption.ui-parcoords-title>{label}</figcaption>}
+        {len(groups) > 0 && <ul.ui-parcoords-legend aria-hidden="true">
+            {for [g, name] in enumerate(groups) => <li><span class={`ui-parcoords-key ui-parcoords-s${g % 8 + 1}`}></span>{name}</li>}
+        </ul>}
+        <div.ui-parcoords-wrap aria-hidden="true">
+            <div.ui-parcoords-plot style={`height: ${height}px`}>
+                {for [q, a] in enumerate(ax) => <div.ui-parcoords-axis style={`left: ${parallel_coordinates_pct(x(q))}%`}>
+                    <span.ui-parcoords-name>{a.label}</span>
+                    {for t in scales[q].ticks => <span.ui-parcoords-tick style={`top: ${parallel_coordinates_pct(y(q, t))}%`}>{t < 0 ? "-" : ""}{a.prefix}{parallel_coordinates_short(abs(t))}</span>}
+                </div>}
+                <svg.ui-parcoords-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                    {for r in records => <path class={`ui-parcoords-line ${tone(r)}`} d={path(r)} vector-effect="non-scaling-stroke">
+                        <title>{r[name_field] ?? ""}{group_field != null ? ` (${r[group_field] ?? "—"})` : ""}: {join(ax | map((a) => `${a.label} ${fmt(a, r[a.field])}`), ", ")}</title>
+                    </path>}
+                </svg>
+            </div>
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col"></th>{group_field != null && <th scope="col">{group_field}</th>}{for a in ax => <th scope="col">{a.label}</th>}</tr></thead>
+            <tbody>
+                {for r in records => <tr>
+                    <th scope="row">{r[name_field] ?? ""}</th>
+                    {group_field != null && <td>{r[group_field] ?? "—"}</td>}
+                    {for a in ax => <td>{fmt(a, r[a.field])}</td>}
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

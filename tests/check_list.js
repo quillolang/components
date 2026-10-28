@@ -1,0 +1,17 @@
+const plan = $("#check-list-demo-plan"), steps = $("#check-list-demo-steps");
+if (!plan || plan.tagName !== "UL" || plan.querySelectorAll("li").length !== 4) return "the list is not a <ul> of four";
+const lis = [...plan.querySelectorAll("li")];
+if (lis.map((l) => l.classList.contains("ui-checklist-done")).join() !== "true,true,false,false") return "done does not mark the items";
+if (lis.map((l) => l.querySelector(".ui-sr").textContent).join("|") !== "Done: |Done: |Not done: |Not done: ") return "screen readers are not told which are done";
+if (lis[0].textContent.replace(/\s+/g, " ").trim() !== "Done: Unlimited projects") return `an item reads "${lis[0].textContent}"`;
+const cs = (el) => getComputedStyle(el);
+const icon = (li) => li.querySelector(".ui-checklist-icon");
+if (icon(lis[0]).getAttribute("aria-hidden") !== "true" || !icon(lis[0]).querySelector("svg")) return "the icon is missing or read out";
+if (cs(icon(lis[0])).color === cs(icon(lis[2])).color) return "a tick and a cross are the same colour";
+if (icon(lis[0]).querySelector("path").getAttribute("d") === icon(lis[2]).querySelector("path").getAttribute("d")) return "a tick and a cross are the same shape";
+const sum = steps.previousElementSibling;
+if (!sum || !sum.classList.contains("ui-checklist-summary") || sum.textContent.trim() !== "2 of 3 done") return `the summary reads "${sum?.textContent}"`;
+const sl = [...steps.querySelectorAll("li")];
+if (cs(sl[0].querySelector(".ui-checklist-text")).textDecorationLine !== "line-through") return "strike does not strike done items";
+if (cs(sl[2].querySelector(".ui-checklist-text")).textDecorationLine === "line-through") return "strike strikes an undone item";
+if (cs(icon(sl[2])).backgroundColor !== "rgba(0, 0, 0, 0)" || cs(icon(sl[2])).borderTopWidth === "0px") return "undone=empty is not an empty circle";

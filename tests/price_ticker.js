@@ -1,0 +1,30 @@
+const strips = $$(".ui-pt");
+if (strips.length !== 2) return `expected 2 tickers, found ${strips.length}`;
+const s = $("#price_ticker-demo-stocks .ui-pt");
+if (s.getAttribute("role") !== "region" || s.getAttribute("aria-label") !== "Stocks") return "the strip is not a named region";
+const lists = s.querySelectorAll(".ui-pt-list");
+if (lists.length !== 2 || lists[0].getAttribute("aria-hidden") || lists[1].getAttribute("aria-hidden") !== "true") return "the strip should be the list and a hidden copy";
+const items = [...lists[0].querySelectorAll(".ui-pt-item:not([aria-hidden])")];
+if (items.length !== 8) return `8 quotes made ${items.length} items screen readers hear`;
+const first = items[0].textContent.replace(/\s+/g, "");
+if (first !== "ACME$182.40+1.25%") return `the first quote reads ${first}`;
+if (!items[0].classList.contains("ui-pt-up") || !items[1].classList.contains("ui-pt-down") || !items[5].classList.contains("ui-pt-flat")) return "changes are not marked up, down and flat";
+if (getComputedStyle(items[0].querySelector(".ui-pt-chg")).color === getComputedStyle(items[1].querySelector(".ui-pt-chg")).color) return "up and down share a colour";
+if (items[5].querySelector("svg") || !items[0].querySelector("svg")) return "an unchanged price has an arrow";
+const link = lists[0].querySelector("a.ui-pt-sym"), copy = lists[1].querySelector("a.ui-pt-sym");
+if (!link || link.getAttribute("href") !== "#price_ticker" || copy.getAttribute("tabindex") !== "-1") return "the link, and its copy kept out of the tab order";
+const track = s.querySelector(".ui-pt-track"), cs = getComputedStyle(track);
+if (cs.animationName !== "ui-pt-scroll" || cs.animationDuration !== "40s" || cs.animationIterationCount !== "infinite") return `animation: ${cs.animationName} ${cs.animationDuration}`;
+// The copy makes the loop seamless: the track is two equal lists, moved by half.
+if (Math.abs(lists[0].getBoundingClientRect().width - lists[1].getBoundingClientRect().width) > 1) return "the copy is not the same width";
+const c = $("#price_ticker-demo-crypto .ui-pt");
+if (getComputedStyle(c.querySelector(".ui-pt-track")).animationDuration !== "18s") return "speed={18} is not the duration";
+if (c.querySelectorAll(".ui-pt-list")[0].textContent.replace(/\s+/g, "").indexOf("BTC61,250+2.14%") !== 0) return "decimals={0}";
+if (!c.querySelectorAll(".ui-pt-item")[3].textContent.includes("—")) return "a missing change is not a dash";
+// Four quotes are said three times in each half, so the loop has no gap; screen readers hear them once.
+const half = c.querySelectorAll(".ui-pt-list")[0];
+if (half.querySelectorAll(".ui-pt-item").length !== 12 || half.querySelectorAll(".ui-pt-item:not([aria-hidden])").length !== 4) return "a short list is not repeated to fill the strip";
+if (half.getBoundingClientRect().width < c.getBoundingClientRect().width) return "half the strip is narrower than the strip";
+const stage = root.getBoundingClientRect(), box = s.getBoundingClientRect();
+if (box.right > stage.right + 0.5) return "the strip is wider than where it is put";
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";

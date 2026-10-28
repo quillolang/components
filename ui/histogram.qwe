@@ -1,0 +1,174 @@
+// Histogram: how a list of numbers is spread, as the count of values falling in each
+// of a row of equal bins, drawn as touching bars over the value axis. CSS only:
+// hovering a bar shows its range, count and share, and screen readers get the bins
+// as a table.
+//
+//   <Histogram label="Response times" values={times} bins={12} suffix=" ms"/>
+//   <Histogram label="Order totals" values={totals} width={25} prefix="$" show_mean={true}/>
+//
+// values: the numbers (nulls are left out). bins: how many bins, from the lowest
+// value to the highest (10); or width: each bin's width, the bins then starting at a
+// multiple of it (width={25}: 0-25, 25-50, ...). Each bin holds the values from its
+// start up to its end; the last one holds its end too. show_mean: a dashed line at
+// the mean, labelled. prefix and suffix: around the values on the axis and in the
+// tooltip ("$", " ms"); decimals: digits after the point, always, instead of up to two
+// as needed. count_label: what a count is called in the tooltip and table ("Count").
+// height: the plot's height in pixels (220). label: what the chart shows; it names it
+// for screen readers and captions their table. show_label also writes it above.
+
+let histogram_css = css`
+.ui-histc { --ui-histc-1: light-dark(#2a78d6, #3987e5);
+  display: grid; gap: 10px; align-content: start; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-histc-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-histc-frame { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; padding-top: 8px; }
+.ui-histc-y { position: relative; min-width: 24px; }
+.ui-histc-y span { position: absolute; right: 0; transform: translateY(50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-histc-plot { position: relative; }
+.ui-histc-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-histc-grid.ui-histc-zero { background: var(--ui-strong); }
+.ui-histc-bin { position: absolute; top: 0; bottom: 0; left: var(--x); width: var(--w); }
+.ui-histc-bin:hover { background: color-mix(in srgb, var(--ui-subtle) 70%, transparent); }
+.ui-histc-bar { position: absolute; left: 1px; right: 1px; bottom: 0; height: var(--b); background: var(--ui-histc-1); border-radius: 3px 3px 0 0; }
+.ui-histc-bin:hover .ui-histc-bar { filter: brightness(1.12); }
+.ui-histc-mean { position: absolute; top: 0; bottom: 0; left: var(--x); border-left: 1.5px dashed var(--ui-fg); pointer-events: none; }
+.ui-histc-mean span { position: absolute; top: -2px; left: 5px; padding: 1px 4px; border-radius: 4px; background: var(--ui-bg);
+  color: var(--ui-fg); font-size: 11px; font-weight: 600; white-space: nowrap; }
+.ui-histc-tip { position: absolute; z-index: 20; bottom: calc(var(--b) + 6px); left: 50%; display: none; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-muted); font-size: 12px; white-space: nowrap; transform: translateX(-50%); pointer-events: none; }
+.ui-histc-tip strong { display: block; margin-bottom: 3px; color: var(--ui-fg); font-weight: 600; }
+.ui-histc-tip b { padding-left: 10px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-histc-tip i { padding-left: 6px; font-style: normal; }
+.ui-histc-first .ui-histc-tip { left: 0; transform: none; }
+.ui-histc-last .ui-histc-tip { left: auto; right: 0; transform: none; }
+.ui-histc-bin:hover .ui-histc-tip { display: block; }
+.ui-histc-x { position: relative; height: 16px; margin-top: 6px; }
+.ui-histc-x span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-histc-x span:first-child { transform: none; }
+.ui-histc-x .ui-histc-end { transform: translateX(-100%); }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn histogram_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn histogram_group(n: int) -> str =
+    n < 1000 ? str(n) : histogram_group(floor(n / 1000)) + "," + histogram_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn histogram_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${histogram_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${histogram_group(floor(units / scale))}${tail}`
+}
+
+// An axis tick, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn histogram_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? histogram_num(v)
+        : `${v < 0 ? "-" : ""}${histogram_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A percentage for CSS (or a coordinate out of 100), to two decimals.
+fn histogram_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// A share out of 100, to one decimal: "42%", "12.5%", "0.4%".
+fn histogram_share(p: num) -> str {
+    let tenths = round(p * 10)
+    `${floor(tenths / 10)}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}%`
+}
+
+// The axis from lo to hi, widened to round ticks: about four steps of 1, 2, 2.5 or 5 x 10^n.
+fn histogram_scale(lo: num, hi: num) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo)) : hi - lo
+    let raw = span / 4
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+view Histogram(values: list, bins: int = 10, width: num? = null, show_mean: bool = false,
+               prefix: str = "", suffix: str = "", decimals: int? = null, count_label: str = "Count",
+               height: int = 220, label: str = "Histogram", show_label: bool = false, class: str? = null) {
+    style global histogram_css
+    let vals = values | filter((v) => v != null)
+    let total = len(vals)
+    let lo = total == 0 ? 0 : min(vals)
+    let hi = total == 0 ? 1 : max(vals)
+    let w = width != null && width > 0 ? width : (hi > lo ? (hi - lo) / (bins < 1 ? 1 : bins) : 1)
+    let start = width != null && width > 0 ? floor(lo / w + 0.000001) * w : (hi > lo ? lo : lo - 0.5)
+    let k = width != null && width > 0 ? floor((hi - start) / w + 0.000001) + 1 : (bins < 1 ? 1 : bins)
+    let bin_of = (v) => {
+        let b = floor((v - start) / w + 0.000001)
+        b < 0 ? 0 : (b > k - 1 ? k - 1 : b)
+    }
+    let counts = reduce(vals, for i in range(k) => 0, (c, v) => set(c, bin_of(v), c[bin_of(v)] + 1))
+    let top_count = max(counts) ?? 0
+    let sc0 = histogram_scale(0, top_count < 1 ? 1 : top_count)
+    // Counts are whole: a step of 2.5 becomes 3.
+    let step = ceil(sc0.ticks[1])
+    let sc = { hi: ceil(sc0.hi / step) * step, ticks: for i in range(ceil(sc0.hi / step) + 1) => i * step }
+    let edge = (i) => start + i * w
+    let val = (v) => `${v < 0 ? "-" : ""}${prefix}${histogram_num(abs(v), decimals)}${suffix}`
+    let range_text = (i) => `${val(edge(i))} – ${val(edge(i + 1))}`
+    let every_nth = ceil((k + 1) / 9)
+    let mean = total == 0 ? 0 : sum(vals) / total
+    let at = (v) => (v - start) * 100 / (k * w)
+    <figure class={ui_cls(["ui-histc", class])} aria-label={`${label}, ${total} values`}>
+        {show_label && <figcaption.ui-histc-title>{label}</figcaption>}
+        <div.ui-histc-frame aria-hidden="true">
+            <div.ui-histc-y style={`height: ${height}px`}>
+                {for t in sc.ticks => <span style={`bottom: ${histogram_pct(t * 100 / sc.hi)}%`}>{histogram_short(t)}</span>}
+            </div>
+            <div.ui-histc-plot style={`height: ${height}px`}>
+                {for t in sc.ticks => <span class={ui_cls(["ui-histc-grid", t == 0 && "ui-histc-zero"])}
+                                            style={`bottom: ${histogram_pct(t * 100 / sc.hi)}%`}></span>}
+                {for i in range(k) => <div class={ui_cls(["ui-histc-bin", i == 0 && "ui-histc-first", i == k - 1 && k > 1 && "ui-histc-last"])}
+                        style={`--x: ${histogram_pct(i * 100 / k)}%; --w: ${histogram_pct(100 / k)}%; --b: ${histogram_pct(counts[i] * 100 / sc.hi)}%`}>
+                    {counts[i] > 0 && <span.ui-histc-bar data-count={str(counts[i])}></span>}
+                    <span.ui-histc-tip>
+                        <strong>{range_text(i)}</strong>
+                        {count_label}<b>{counts[i]}</b><i>{histogram_share(total > 0 ? counts[i] * 100 / total : 0)}</i>
+                    </span>
+                </div>}
+                {show_mean && total > 0 && <span.ui-histc-mean style={`--x: ${histogram_pct(at(mean))}%`}>
+                    <span>Mean {val(mean)}</span>
+                </span>}
+            </div>
+            <span></span>
+            <div.ui-histc-x>
+                {for i in range(k + 1) => (i % every_nth == 0 || i == k) && (i == k || k - i >= every_nth / 2 || i == 0) && <span
+                    class={i == k && k > 0 ? "ui-histc-end" : null}
+                    style={`left: ${histogram_pct(i * 100 / k)}%`}>{val(edge(i))}</span>}
+            </div>
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col">Range</th><th scope="col">{count_label}</th></tr></thead>
+            <tbody>
+                {for i in range(k) => <tr><th scope="row">{range_text(i)}</th><td>{counts[i]}</td></tr>}
+            </tbody>
+        </table>
+    </figure>
+}

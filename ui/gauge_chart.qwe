@@ -1,0 +1,141 @@
+// GaugeChart: one value on a half-circle dial of coloured bands (good, warning, bad)
+// with a needle pointing at it, and the value and its band's name written under it:
+// for a single reading against known limits (load, temperature, a score). CSS only:
+// the needle swings to its place, hovering a band names its range, and screen readers
+// get a meter with the value and its band.
+//
+//   <GaugeChart label="CPU load" value={72} suffix="%"/>
+//   <GaugeChart label="Response time" value={340} high={1000} suffix=" ms" bands={[
+//       { to: 300, tone: "good", name: "Fast" }, { to: 700, tone: "warning", name: "Slow" },
+//       { to: 1000, tone: "bad", name: "Too slow" }]}/>
+//
+// value: the reading (a null shows "—" and no needle). low and high: the dial's ends
+// (0 and 100); a value past them stops the needle at the end. bands: a list of { to,
+// tone, name } from low upwards, each ending at `to`: tone "good", "warning", "bad"
+// or "neutral" colours it, and name (optional; "Good", "Warning", "Bad") is said
+// with the value. The default is good to 60% of the way, warning to 85%, bad to the
+// end. prefix and suffix: around every value shown ("$", "%", " ms"); decimals:
+// digits after the point, always, instead of up to two as needed. size: its width in
+// pixels (240; it shrinks to fit). label: what it measures, for screen readers and
+// under the value; show_label also writes it above.
+
+let gauge_chart_css = css`
+.ui-gaugec { display: grid; gap: 6px; justify-items: center; align-content: start; min-width: 0; margin: 0;
+  font: 13px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-gaugec-title { justify-self: start; margin: 0; font-size: 14px; font-weight: 600; }
+.ui-gaugec-meter { display: grid; justify-items: center; max-width: 100%; }
+.ui-gaugec-svg { display: block; max-width: 100%; height: auto; overflow: visible; }
+.ui-gaugec-good { --c: var(--ui-success); } .ui-gaugec-warning { --c: var(--ui-warning); }
+.ui-gaugec-bad { --c: var(--ui-danger); } .ui-gaugec-neutral { --c: var(--ui-strong); }
+.ui-gaugec-track { fill: none; stroke: var(--ui-subtle); stroke-width: 18; }
+.ui-gaugec-band { fill: none; stroke: var(--c); stroke-width: 18; opacity: .85; transition: opacity .15s ease; }
+.ui-gaugec-band:hover { opacity: 1; }
+.ui-gaugec-end { fill: var(--ui-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.ui-gaugec-needle { transform: rotate(var(--turn)); transition: transform .6s cubic-bezier(.3, 1.4, .6, 1); }
+@starting-style { .ui-gaugec-needle { transform: rotate(0deg); } }
+.ui-gaugec-needle path { fill: var(--ui-fg); }
+.ui-gaugec-hub { fill: var(--ui-fg); stroke: var(--ui-bg); stroke-width: 3; }
+.ui-gaugec-reading { display: grid; justify-items: center; margin-top: -4px; }
+.ui-gaugec-value { font-size: 26px; font-weight: 650; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.ui-gaugec-state { display: inline-flex; align-items: center; gap: 6px; color: var(--ui-muted); font-size: 12px; }
+.ui-gaugec-state::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--c, var(--ui-strong)); }
+.ui-gaugec-name { color: var(--ui-muted); font-size: 12px; }
+@media (prefers-reduced-motion: reduce) { .ui-gaugec-needle, .ui-gaugec-band { transition: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn gauge_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn gauge_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : gauge_chart_group(floor(n / 1000)) + "," + gauge_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn gauge_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${gauge_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${gauge_chart_group(floor(units / scale))}${tail}`
+}
+
+// An axis tick, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn gauge_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? gauge_chart_num(v)
+        : `${v < 0 ? "-" : ""}${gauge_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A coordinate for SVG, to two decimals.
+fn gauge_chart_len(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The point a fraction f (0 to 1) of the way round the half circle of radius r, from the left end over the top.
+fn gauge_chart_at(f: num, r: num) -> list = [-r * math.cos(f * math.pi), -r * math.sin(f * math.pi)]
+
+view GaugeChart(value: num? = null, low: num = 0, high: num = 100, bands: list? = null, prefix: str = "",
+                suffix: str = "", decimals: int? = null, size: int = 240, label: str = "Gauge",
+                show_label: bool = false, class: str? = null) {
+    style global gauge_chart_css
+    let span = high - low == 0 ? 1 : high - low
+    let fmt = (v) => v == null ? "—" : `${v < 0 ? "-" : ""}${prefix}${gauge_chart_num(abs(v), decimals)}${suffix}`
+    let named = { good: "Good", warning: "Warning", bad: "Bad", neutral: "" }
+    let given = bands ?? [{ to: low + span * 0.6, tone: "good" }, { to: low + span * 0.85, tone: "warning" }, { to: high, tone: "bad" }]
+    let parts = for [k, b] in enumerate(given) => ({ from: k == 0 ? low : given[k - 1].to, to: b.to, tone: b.tone ?? "neutral",
+                                                     name: b.name ?? (named[b.tone ?? "neutral"] ?? "") })
+    let frac = (v) => {
+        let f = (v - low) / span
+        f < 0 ? 0 : (f > 1 ? 1 : f)
+    }
+    let band = value == null ? null : (find(parts, (b) => value <= b.to) ?? parts[-1])
+    let arc = (f1, f2, r) => {
+        let [x1, y1] = gauge_chart_at(f1, r)
+        let [x2, y2] = gauge_chart_at(f2, r)
+        `M${gauge_chart_len(x1)},${gauge_chart_len(y1)} A${r},${r} 0 0 1 ${gauge_chart_len(x2)},${gauge_chart_len(y2)}`
+    }
+    let said = value == null ? "no reading" : `${fmt(value)}${band != null && band.name != "" ? `, ${lower(band.name)}` : ""}`
+    <figure class={ui_cls(["ui-gaugec", class])} aria-label={label}>
+        {show_label && <figcaption.ui-gaugec-title>{label}</figcaption>}
+        <div.ui-gaugec-meter role="meter" aria-label={label} aria-valuemin={str(low)} aria-valuemax={str(high)}
+             aria-valuenow={value == null ? null : str(value)} aria-valuetext={said}>
+            <svg.ui-gaugec-svg width={size} height={gauge_chart_len(size * 130 / 240)} viewBox="-120 -112 240 130" aria-hidden="true">
+                <path.ui-gaugec-track d={arc(0, 1, 100)}/>
+                {for b in parts => {
+                    let f1 = frac(b.from)
+                    let f2 = frac(b.to)
+                    f2 > f1 && <path class={`ui-gaugec-band ui-gaugec-${b.tone}`} d={arc(f1 + (f1 > 0 ? 0.004 : 0), f2 - (f2 < 1 ? 0.004 : 0), 100)}>
+                        <title>{b.name != "" ? `${b.name}: ` : ""}{fmt(b.from)} – {fmt(b.to)}</title>
+                    </path>
+                }}
+                <text.ui-gaugec-end x="-100" y="16" text-anchor="middle">{prefix}{gauge_chart_short(low)}</text>
+                <text.ui-gaugec-end x="100" y="16" text-anchor="middle">{prefix}{gauge_chart_short(high)}</text>
+                {value != null && <g.ui-gaugec-needle style={`--turn: ${gauge_chart_len(frac(value) * 180)}deg`}>
+                    <path d="M-86,0 L0,-5 L0,5 Z"/>
+                </g>}
+                <circle.ui-gaugec-hub cx="0" cy="0" r="8"/>
+            </svg>
+            <div.ui-gaugec-reading aria-hidden="true">
+                <span.ui-gaugec-value>{fmt(value)}</span>
+                {band != null && band.name != "" && <span class={`ui-gaugec-state ui-gaugec-${band.tone}`}>{band.name}</span>}
+                {!show_label && <span.ui-gaugec-name>{label}</span>}
+            </div>
+        </div>
+        <table.ui-sr>
+            <caption>{label}: {said}</caption>
+            <thead><tr><th scope="col">Band</th><th scope="col">From</th><th scope="col">To</th></tr></thead>
+            <tbody>{for b in parts => <tr><th scope="row">{b.name != "" ? b.name : b.tone}</th><td>{fmt(b.from)}</td><td>{fmt(b.to)}</td></tr>}</tbody>
+        </table>
+    </figure>
+}

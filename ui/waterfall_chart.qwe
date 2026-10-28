@@ -1,0 +1,183 @@
+// WaterfallChart: how a start value becomes an end value: a bar for the start, a
+// floating bar for each rise (green) and fall (red) beginning where the last one
+// ended, joined by dashed steps, and a bar for the end total; subtotals on the way
+// if asked. CSS only: hovering a bar shows its change and the running total, and
+// screen readers get the steps as a table.
+//
+//   <WaterfallChart label="Cash this quarter" prefix="$" start={42000} steps={[
+//       { label: "Sales", value: 31500 }, { label: "Refunds", value: -2400 }, { label: "Payroll", value: -18800 }]}/>
+//   <WaterfallChart label="Headcount" start={120} start_label="Jan 1" end_label="Dec 31" steps={moves}/>
+//
+// start: the value the chart begins from, drawn as a bar labelled start_label
+// ("Start"). steps: a list of { label, value }, each a rise (above 0) or a fall; a step
+// { label, total: true } instead draws the running total so far, as a subtotal.
+// end_label: the bar for the total at the end ("End"); null leaves it out.
+// value_labels: each bar's change (or total), short ("+$31.5k"), above a rise and
+// below a fall (true). prefix and suffix: around every value shown ("$"; the axis
+// takes the prefix); decimals: digits after the point, always, instead of up to two
+// as needed. height: the plot's height in pixels (240). label: what the chart shows;
+// it names it for screen readers and captions their table. show_label also writes it
+// above the chart.
+
+let waterfall_chart_css = css`
+.ui-wfallc { --ui-wfallc-total: light-dark(#2a78d6, #3987e5); --ui-wfallc-up: light-dark(#1baf7a, #199e70);
+  --ui-wfallc-down: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; align-content: start; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-wfallc-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-wfallc-total { --c: var(--ui-wfallc-total); } .ui-wfallc-up { --c: var(--ui-wfallc-up); } .ui-wfallc-down { --c: var(--ui-wfallc-down); }
+.ui-wfallc-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-wfallc-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.ui-wfallc-key { width: 10px; height: 10px; border-radius: 3px; background: var(--c); flex: none; }
+.ui-wfallc-frame { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; padding-top: 10px; }
+.ui-wfallc-y { position: relative; min-width: 24px; }
+.ui-wfallc-y span { position: absolute; right: 0; transform: translateY(50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-wfallc-plot { position: relative; }
+.ui-wfallc-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-wfallc-grid.ui-wfallc-zero { background: var(--ui-strong); }
+.ui-wfallc-cols { position: absolute; inset: 0; display: flex; }
+.ui-wfallc-col { position: relative; flex: 1; min-width: 0; border-radius: 4px; }
+.ui-wfallc-col:hover { background: color-mix(in srgb, var(--ui-subtle) 70%, transparent); }
+.ui-wfallc-step { position: absolute; left: 50%; width: 100%; bottom: var(--l); border-top: 1px dashed var(--ui-muted); }
+.ui-wfallc-bar { position: absolute; left: 50%; bottom: var(--a); width: min(48px, 62%); height: var(--b); min-height: 1px;
+  background: var(--c); border-radius: 3px; transform: translateX(-50%); }
+.ui-wfallc-val { position: absolute; left: 50%; bottom: calc(var(--a) + var(--b) + 3px); transform: translateX(-50%);
+  color: var(--ui-muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-wfallc-val.ui-wfallc-under { bottom: auto; top: calc(100% - var(--a) + 3px); }
+.ui-wfallc-tip { position: absolute; z-index: 20; top: 0; left: 50%; display: none; min-width: 140px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; transform: translate(-50%, -100%); pointer-events: none; }
+.ui-wfallc-col:first-child .ui-wfallc-tip { left: 0; transform: translateY(-100%); }
+.ui-wfallc-col:last-child .ui-wfallc-tip { left: auto; right: 0; transform: translateY(-100%); }
+.ui-wfallc-col:hover .ui-wfallc-tip { display: block; }
+.ui-wfallc-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-wfallc-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-wfallc-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-wfallc-x { display: flex; margin-top: 6px; }
+.ui-wfallc-x span { flex: 1; min-width: 0; padding: 0 2px; overflow: hidden; color: var(--ui-muted); text-align: center;
+  text-overflow: ellipsis; white-space: nowrap; }
+.ui-wfallc-x .ui-wfallc-sum { color: var(--ui-fg); font-weight: 600; }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn waterfall_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn waterfall_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : waterfall_chart_group(floor(n / 1000)) + "," + waterfall_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn waterfall_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${waterfall_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${waterfall_chart_group(floor(units / scale))}${tail}`
+}
+
+// An axis tick, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn waterfall_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? waterfall_chart_num(v)
+        : `${v < 0 ? "-" : ""}${waterfall_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A percentage for CSS (or a coordinate out of 100), to two decimals.
+fn waterfall_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The axis from lo to hi, widened to round ticks: about four steps of 1, 2, 2.5 or 5 x 10^n.
+fn waterfall_chart_scale(lo: num, hi: num) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo)) : hi - lo
+    let raw = span / 4
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+view WaterfallChart(start: num = 0, steps: list = [], start_label: str = "Start", end_label: str? = "End",
+                    value_labels: bool = true, prefix: str = "", suffix: str = "", decimals: int? = null,
+                    height: int = 240, label: str = "Waterfall chart", show_label: bool = false, class: str? = null) {
+    style global waterfall_chart_css
+    // Each bar: { label, kind: "total" | "up" | "down", from, to, change }, the running total after it in `to`.
+    let first = { label: start_label, kind: "total", from: 0, to: start, change: start, sum: true }
+    let walked = reduce(steps, [first], (acc, s) => {
+        let run = acc[-1].to
+        s.total == true
+            ? acc + [{ label: s.label, kind: "total", from: 0, to: run, change: run, sum: true }]
+            : acc + [{ label: s.label, kind: (s.value ?? 0) < 0 ? "down" : "up", from: run, to: run + (s.value ?? 0), change: s.value ?? 0, sum: false }]
+    })
+    let bars = end_label == null ? walked
+        : walked + [{ label: end_label, kind: "total", from: 0, to: walked[-1].to, change: walked[-1].to, sum: true }]
+    let n = len(bars)
+    let ends = [0] + flatten(for b in bars => [b.from, b.to])
+    let sc = waterfall_chart_scale(min(ends), max(ends))
+    let pos = (v) => (v - sc.lo) * 100 / (sc.hi - sc.lo)
+    let fmt = (v) => `${v < 0 ? "-" : ""}${prefix}${waterfall_chart_num(abs(v), decimals)}${suffix}`
+    let signed = (v) => `${v > 0 ? "+" : (v < 0 ? "-" : "")}${prefix}${waterfall_chart_num(abs(v), decimals)}${suffix}`
+    let short = (b) => `${b.sum ? (b.change < 0 ? "-" : "") : (b.change > 0 ? "+" : (b.change < 0 ? "-" : ""))}${prefix}${waterfall_chart_short(abs(b.change))}${suffix}`
+    <figure class={ui_cls(["ui-wfallc", class])} aria-label={label}>
+        {show_label && <figcaption.ui-wfallc-title>{label}</figcaption>}
+        <ul.ui-wfallc-legend aria-hidden="true">
+            <li><span class="ui-wfallc-key ui-wfallc-up"></span>Increase</li>
+            <li><span class="ui-wfallc-key ui-wfallc-down"></span>Decrease</li>
+            <li><span class="ui-wfallc-key ui-wfallc-total"></span>Total</li>
+        </ul>
+        <div.ui-wfallc-frame aria-hidden="true">
+            <div.ui-wfallc-y style={`height: ${height}px`}>
+                {for t in sc.ticks => <span style={`bottom: ${waterfall_chart_pct(pos(t))}%`}>{t < 0 ? "-" : ""}{prefix}{waterfall_chart_short(abs(t))}</span>}
+            </div>
+            <div.ui-wfallc-plot style={`height: ${height}px`}>
+                {for t in sc.ticks => <span class={ui_cls(["ui-wfallc-grid", t == 0 && "ui-wfallc-zero"])}
+                                            style={`bottom: ${waterfall_chart_pct(pos(t))}%`}></span>}
+                <div.ui-wfallc-cols>
+                    {for [k, b] in enumerate(bars) => {
+                        let lo = b.from < b.to ? b.from : b.to
+                        let hi = b.from < b.to ? b.to : b.from
+                        let below = b.kind == "down" || (b.sum && b.to < 0)
+                        <div.ui-wfallc-col style={`--a: ${waterfall_chart_pct(pos(lo))}%; --b: ${waterfall_chart_pct(pos(hi) - pos(lo))}%; --l: ${waterfall_chart_pct(pos(b.to))}%`}>
+                            {k < n - 1 && <span.ui-wfallc-step></span>}
+                            <span class={`ui-wfallc-bar ui-wfallc-${b.kind}`} data-from={str(b.from)} data-to={str(b.to)}></span>
+                            {value_labels && <span class={ui_cls(["ui-wfallc-val", below && "ui-wfallc-under"])}>{short(b)}</span>}
+                            <span.ui-wfallc-tip>
+                                <strong>{b.label}</strong>
+                                {!b.sum && <p>Change<b>{signed(b.change)}</b></p>}
+                                <p>{b.sum ? "Total" : "Running total"}<b>{fmt(b.to)}</b></p>
+                            </span>
+                        </div>
+                    }}
+                </div>
+            </div>
+            <span></span>
+            <div.ui-wfallc-x>{for b in bars => <span class={b.sum ? "ui-wfallc-sum" : null} title={str(b.label)}>{b.label}</span>}</div>
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col"></th><th scope="col">Change</th><th scope="col">Total</th></tr></thead>
+            <tbody>
+                {for b in bars => <tr>
+                    <th scope="row">{b.label}</th>
+                    <td>{b.sum ? "" : signed(b.change)}</td>
+                    <td>{fmt(b.to)}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

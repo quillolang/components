@@ -1,0 +1,36 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-lollic");
+if (charts.length !== 3) return `expected 3 lollipop charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a chart has NaN, Infinity or undefined in it";
+const [score, price, pages] = charts;
+const cols = [...score.querySelectorAll(".ui-lollic-col")];
+if (cols.length !== 12) return `12 values made ${cols.length} lollipops`;
+const ticks = [...score.querySelectorAll(".ui-lollic-y span")].map((s) => s.textContent);
+if (ticks[0] === "0") return `zero={false} still starts at 0: ${ticks}`;
+const stem = cols[11].querySelector(".ui-lollic-stem").getBoundingClientRect(), dot = cols[11].querySelector(".ui-lollic-dot").getBoundingClientRect();
+if (Math.abs(stem.width - 2) > 0.5) return "the stem is not 2px";
+if (Math.abs((dot.top + dot.bottom) / 2 - stem.top) > 1) return "the dot is not at the end of the stem";
+if (Math.abs((dot.left + dot.right) / 2 - (stem.left + stem.right) / 2) > 0.6) return "the dot is not on the stem";
+if (Math.abs(dot.width - 12) > 0.5) return "the dot is not 12px";
+const plot = score.querySelector(".ui-lollic-plot").getBoundingClientRect();
+if (Math.abs(stem.bottom - plot.bottom) > 1) return "the stems do not rise from the axis' start";
+if (cols[11].querySelector(".ui-lollic-val").textContent !== "88") return "value labels";
+const tip = cols[3].querySelector(".ui-lollic-tip");
+if (getComputedStyle(tip).display !== "none") return "the tooltip shows before hover";
+if (tip.textContent !== "Apr76") return `tooltip: ${tip.textContent}`;
+
+const rows = [...price.querySelectorAll(".ui-lollic-rl")].map((r) => r.textContent);
+if (rows.join() !== "Olive oil,Eggs,Coffee,Bread,Milk,Rice") return `sort="desc" gives ${rows}`;
+const zero = price.querySelector(".ui-lollic-zero").getBoundingClientRect();
+const prow = price.querySelectorAll(".ui-lollic-row");
+const negStem = prow[5].querySelector(".ui-lollic-stem").getBoundingClientRect();
+if (Math.abs(negStem.right - zero.left) > 1.5) return "a negative stem does not end at the zero line";
+const posStem = prow[0].querySelector(".ui-lollic-stem").getBoundingClientRect();
+if (Math.abs(posStem.left - zero.left) > 1.5 || Math.abs(posStem.height - 2) > 0.5) return "a stem across does not start at the zero line";
+const label = price.querySelectorAll(".ui-lollic-rl")[0].getBoundingClientRect();
+if (Math.abs((label.top + label.bottom) / 2 - (posStem.top + posStem.bottom) / 2) > 2) return "a label is not beside its stem";
+if (!prow[5].querySelector(".ui-lollic-under") || prow[5].querySelector(".ui-lollic-val").textContent !== "-6%") return "a negative value's label is not left of its dot";
+
+if (pages.querySelectorAll(".ui-lollic-dot").length !== 4) return "a null has a dot";
+if (pages.querySelectorAll("tbody td")[3].textContent !== "—") return "a null is not a dash in the table";
+if (pages.querySelectorAll("tbody td")[0].textContent !== "4.2") return "decimals={1}";

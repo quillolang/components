@@ -1,0 +1,170 @@
+// OrderBook: an order book's two ladders: asks (to sell) above, lowest nearest the
+// middle, bids (to buy) below, highest nearest it, each level with its size and the
+// running total, and a bar of that total behind it; between them the spread and the
+// mid price. Levels can be grouped into coarser steps (0.01, 0.1, 1), and a level
+// whose size changes flashes, green when it grew and red when it shrank.
+//
+//   <OrderBook bids={book.bids} asks={book.asks} prefix="$"/>
+//   <OrderBook bids={bids} asks={asks} groups={[0.5, 1, 5, 10]} depth={8} unit=" BTC"
+//              on_group={(step) => { saved_step = step }}/>
+//
+// bids and asks: lists of { price, size }, in any order; give new lists as the book
+// changes. groups: the steps it can group prices by ([0.01, 0.1, 1]); group: the step
+// to start with (the first). Grouping adds up the levels in each step: bids round down
+// to it, asks up. depth: levels shown each side (10). prefix and suffix: around prices
+// ("$"); decimals: digits after the point of prices (as many as the step has);
+// size_decimals: of sizes (up to 4, as needed); unit: after sizes. label: what screen
+// readers call it ("Order book"). on_group(step): called with the step picked.
+
+let order_book_css = css`
+.ui-obook { display: grid; gap: 8px; min-width: 0; font: 13px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-obook-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--ui-muted); font-size: 12px; }
+.ui-obook-name { margin-right: auto; font-weight: 600; color: var(--ui-fg); font-size: 13px; }
+.ui-obook-steps { display: inline-flex; padding: 2px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-obook-steps button { height: 24px; min-width: 38px; padding: 0 8px; border: 0; border-radius: 4px; background: none; color: var(--ui-muted);
+  font: 500 12px/1 var(--ui-font); font-variant-numeric: tabular-nums; cursor: pointer; }
+.ui-obook-steps button:hover { color: var(--ui-fg); }
+.ui-obook-steps button[aria-pressed="true"] { background: var(--ui-surface); color: var(--ui-fg); box-shadow: 0 1px 2px rgba(0, 0, 0, .12); }
+.ui-obook-steps button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-obook-table { width: 100%; table-layout: fixed; border-collapse: collapse; border: 1px solid var(--ui-border); background: var(--ui-surface); font-variant-numeric: tabular-nums; }
+.ui-obook-table th, .ui-obook-table td { padding: 3px 10px; text-align: right; white-space: nowrap; }
+.ui-obook-table thead th { padding: 6px 10px; background: var(--ui-subtle); color: var(--ui-muted); font-size: 11px; font-weight: 600;
+  letter-spacing: .04em; text-transform: uppercase; }
+.ui-obook-table th:first-child, .ui-obook-table td:first-child { text-align: left; }
+.ui-obook-ask { --k: var(--ui-danger); } .ui-obook-bid { --k: var(--ui-success); }
+/* The total's bar runs from the right across the three equal columns: each cell draws its part. */
+.ui-obook-row > * { --f: color-mix(in srgb, var(--k) 14%, transparent);
+  background: linear-gradient(to left, var(--f) var(--p), transparent var(--p)); }
+.ui-obook-row > :nth-child(3) { --p: clamp(0%, calc(var(--w) * 3), 100%); }
+.ui-obook-row > :nth-child(2) { --p: clamp(0%, calc(var(--w) * 3 - 100%), 100%); }
+.ui-obook-row > :nth-child(1) { --p: clamp(0%, calc(var(--w) * 3 - 200%), 100%); }
+.ui-obook-row th { color: var(--k); font-weight: 600; }
+.ui-obook-row:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--k) 40%, transparent); }
+.ui-obook-total { color: var(--ui-muted); }
+.ui-obook-mid td { padding: 7px 10px; border-block: 1px solid var(--ui-border); background: var(--ui-subtle); }
+.ui-obook-mid b { font-size: 15px; font-weight: 650; }
+.ui-obook-mid span { margin-left: 10px; color: var(--ui-muted); font-size: 12px; }
+.ui-obook-grew td, .ui-obook-grew th { animation: ui-obook-grew .9s ease-out; }
+.ui-obook-shrank td, .ui-obook-shrank th { animation: ui-obook-shrank .9s ease-out; }
+@keyframes ui-obook-grew { from { background: color-mix(in srgb, var(--ui-success) 35%, transparent); } }
+@keyframes ui-obook-shrank { from { background: color-mix(in srgb, var(--ui-danger) 35%, transparent); } }
+.ui-obook-empty td { color: var(--ui-muted); text-align: center !important; }
+@media (prefers-reduced-motion: reduce) { .ui-obook-grew td, .ui-obook-grew th, .ui-obook-shrank td, .ui-obook-shrank th { animation: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn order_book_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn order_book_group(n: int) -> str =
+    n < 1000 ? str(n) : order_book_group(floor(n / 1000)) + "," + order_book_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn order_book_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${order_book_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${order_book_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate out of 100 (or a length), to two decimals.
+fn order_book_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// How many digits after the point a step has: 0.01 has 2, 0.5 has 1, 10 has 0.
+fn order_book_places(step: num) -> int = len(range(7) | filter((d) => abs(step * pow(10, d) - round(step * pow(10, d))) > 0.000000001))
+
+// One side grouped by `step`, best first, at most `depth` levels of { price, size, total }:
+// bids round down to a step, asks up.
+fn order_book_side(levels: list, step: num, bids: bool, depth: int) -> list {
+    let places = order_book_places(step)
+    let keys = levels | filter((l) => l.size > 0) | map((l) => {
+        let k = bids ? floor(l.price / step + 0.000000001) : ceil(l.price / step - 0.000000001)
+        { k, size: l.size }
+    })
+    let ks = unique(keys | map((x) => x.k)) | sort_by((k) => bids ? 0 - k : k)
+    let shown = take(ks, depth)
+    let out = []
+    let total = 0
+    for k in shown {
+        let size = sum(keys | filter((x) => x.k == k) | map((x) => x.size))
+        total += size
+        out = out | push({ price: round(k * step, places), size, total })
+    }
+    out
+}
+
+component OrderBook(bids: list = [], asks: list = [], groups: list = [0.01, 0.1, 1], group: num? = null, depth: int = 10,
+                    prefix: str = "", suffix: str = "", decimals: int? = null, size_decimals: int? = null, unit: str = "",
+                    label: str = "Order book", on_group = null, class: str? = null) {
+    style global order_book_css
+    state step = group ?? (len(groups) > 0 ? groups[0] : 0.01)
+    // The size last shown at each price, so a level that changes can flash.
+    state seen = {}
+    let b = order_book_side(bids, step, true, depth < 1 ? 1 : depth)
+    let a = order_book_side(asks, step, false, depth < 1 ? 1 : depth)
+    let places = decimals ?? order_book_places(step)
+    let price = (v) => `${prefix}${order_book_num(v, places)}${suffix}`
+    let size = (v) => `${order_book_num(v, size_decimals)}${unit}`
+    let deepest = max([0.000001] + (b | map((l) => l.total)) + (a | map((l) => l.total)))
+    let best_bid = len(b) > 0 ? b[0].price : null
+    let best_ask = len(a) > 0 ? a[0].price : null
+    let spread = best_bid != null && best_ask != null ? best_ask - best_bid : null
+    let mid = spread != null ? (best_ask + best_bid) / 2 : null
+    let step_text = (s) => order_book_num(s, order_book_places(s))
+    let row = (l, ask: bool) => {
+        let key = `${ask ? "a" : "b"}|${step}|${l.price}`
+        <tr key={`${key}|${l.size}`} class={`ui-obook-row ${ask ? "ui-obook-ask" : "ui-obook-bid"}`}
+            data-price={str(l.price)} style={`--w: ${order_book_pct(l.total * 100 / deepest)}%`}
+            @mount={(el) => {
+                let before = get(seen, key)
+                if before != null && before != l.size { el.classList.add(l.size > before ? "ui-obook-grew" : "ui-obook-shrank") }
+                seen = set(seen, key, l.size)
+            }}>
+            <th scope="row"><span.ui-sr>{ask ? "Ask " : "Bid "}</span>{price(l.price)}</th>
+            <td>{size(l.size)}</td>
+            <td.ui-obook-total>{size(l.total)}</td>
+        </tr>
+    }
+    <div class={ui_cls(["ui-obook", class])}>
+        <div.ui-obook-bar>
+            <span.ui-obook-name>{label}</span>
+            {len(groups) > 1 && <span.ui-obook-steps role="group" aria-label="Group prices by">
+                {for g in groups => <button type="button" aria-pressed={g == step ? "true" : "false"}
+                        @click={() => {
+                            if g != step {
+                                step = g
+                                on_group && on_group(g)
+                            }
+                        }}>{step_text(g)}</button>}
+            </span>}
+        </div>
+        <table.ui-obook-table aria-label={label}>
+            <thead><tr><th scope="col">Price</th><th scope="col">Size</th><th scope="col">Total</th></tr></thead>
+            <tbody.ui-obook-asks>
+                {len(a) == 0 && <tr.ui-obook-empty><td colspan="3">No asks</td></tr>}
+                {for l in reverse(a) => row(l, true)}
+            </tbody>
+            <tbody>
+                <tr.ui-obook-mid><td colspan="3" role="status">
+                    {mid == null ? "—" : [<b>{price(mid)}</b>,
+                        <span>Spread {price(spread)} ({order_book_num(mid != 0 ? spread * 100 / mid : 0, 3)}%)</span>]}
+                </td></tr>
+            </tbody>
+            <tbody.ui-obook-bids>
+                {len(b) == 0 && <tr.ui-obook-empty><td colspan="3">No bids</td></tr>}
+                {for l in b => row(l, false)}
+            </tbody>
+        </table>
+    </div>
+}

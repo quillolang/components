@@ -1,0 +1,15 @@
+const all = $$(".ui-ldots");
+if (all.length !== 6) return `expected 6, found ${all.length}`;
+const [md, sm, lg, shown, inBtn, typing] = all;
+if (all.some((d) => d.getAttribute("role") !== "status")) return "one is not a status";
+if (md.querySelectorAll(".ui-ldots-dot").length !== 3) return "not three dots";
+if (md.querySelector(".ui-sr")?.textContent !== "Loading") return "the default label is not for screen readers";
+if (md.querySelector(".ui-ldots-row").getAttribute("aria-hidden") !== "true") return "the dots are not hidden from screen readers";
+const dots = md.querySelectorAll(".ui-ldots-dot");
+if (getComputedStyle(dots[0]).animationName !== "ui-ldots-bounce") return "the dots do not bounce";
+if (getComputedStyle(dots[1]).animationDelay === getComputedStyle(dots[0]).animationDelay) return "the dots bounce together";
+const size = (d) => d.querySelector(".ui-ldots-dot").offsetWidth;
+if (!(size(sm) < size(md) && size(md) < size(lg))) return `sizes: ${size(sm)}, ${size(md)}, ${size(lg)}`;
+if (shown.querySelector(".ui-ldots-label")?.textContent !== "Thinking") return "show_label does not write the label";
+if (getComputedStyle(lg.querySelector(".ui-ldots-dot")).backgroundColor === getComputedStyle(md.querySelector(".ui-ldots-dot")).backgroundColor) return "tones look the same";
+if (!inBtn.classList.contains("ui-ldots-current") || typing.querySelector(".ui-sr").textContent !== "Ada is typing") return "tone current or the typing label";

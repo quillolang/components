@@ -1,0 +1,161 @@
+// CodeEditor: a box for code, in a monospace face with line numbers down the
+// left, where Tab puts spaces in (and Shift+Tab takes them out, over every line
+// selected), Enter keeps the line's indent (one more after a line ending in "{",
+// "(", "[" or ":"), and a closing bracket typed right after its opening one is
+// not doubled. It is a real <textarea> named `name`, so a plain <form> sends the
+// code; without a script it is a plain box.
+//
+//   <CodeEditor name="source" label="Program" language="quillo" value={code} rows={16}/>
+//   <CodeEditor name="query" language="sql" tab_size={2} on_change={(q) => { sql = q }}/>
+//
+// value: the code to start with. language: a label in the corner ("sql"). rows: the
+// box's height in lines (12). tab_size: spaces per Tab (4). wrap: long lines wrap
+// instead of scrolling sideways (false). numbers: the line numbers (true).
+// name, label, placeholder, hint, error, required, disabled and field (the box's
+// id, "code-editor-" + name by default) as for every field. Escape then Tab leaves
+// the box, for the keyboard.
+// on_change(text): inside one of your components, given the code as it is typed.
+
+let code_editor_css = css`
+.ui-code-editor { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-code-editor-label { font-size: 13px; font-weight: 500; }
+.ui-code-editor-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-code-editor-frame {
+  position: relative; display: flex; overflow: hidden; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); transition: border-color .15s, box-shadow .15s;
+}
+.ui-code-editor-frame:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-code-editor-gutter {
+  flex: none; margin: 0; padding: 10px 0; overflow: hidden; border-right: 1px solid var(--ui-border); background: var(--ui-subtle);
+  color: var(--ui-muted); font: 13px/1.6 var(--ui-mono); text-align: right; user-select: none; white-space: pre;
+}
+.ui-code-editor-gutter span { display: block; padding: 0 10px 0 12px; }
+.ui-code-editor-frame textarea {
+  flex: 1; display: block; box-sizing: border-box; min-width: 0; margin: 0; padding: 10px 12px; border: 0; outline: none; resize: vertical;
+  background: transparent; color: var(--ui-fg); font: 13px/1.6 var(--ui-mono); tab-size: var(--ui-code-editor-tab, 4);
+  white-space: pre; overflow: auto; overflow-wrap: normal;
+}
+.ui-code-editor-wrap textarea { white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-code-editor-frame textarea::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-code-editor-frame textarea:disabled { opacity: .55; cursor: not-allowed; }
+.ui-code-editor-lang {
+  position: absolute; right: 8px; top: 6px; padding: 2px 7px; border-radius: 4px; background: var(--ui-subtle); color: var(--ui-muted);
+  font: 600 11px/1.4 var(--ui-font); letter-spacing: .04em; text-transform: uppercase; pointer-events: none;
+}
+.ui-code-editor-invalid .ui-code-editor-frame { border-color: var(--ui-danger); }
+.ui-code-editor-hint, .ui-code-editor-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-code-editor-error { color: var(--ui-danger); }
+@media (prefers-reduced-motion: reduce) { .ui-code-editor-frame { transition: none; } }
+`
+
+// Where the line holding position `at` starts.
+fn code_editor_line_start(text: str, at: int) -> int {
+    let before = slice(text, 0, at)
+    let back = index_of(reverse(split(before, "")), "\n")
+    back == null ? 0 : at - back
+}
+
+// The spaces a line starts with.
+fn code_editor_indent(line: str) -> str = (re.find(line, "^[ \\t]*") ?? { text: "" }).text
+
+// Shift+Tab: `n` spaces taken off the start of each line from a to b: { text, start, end }.
+fn code_editor_outdent(text: str, a: int, b: int, n: int) {
+    let from = code_editor_line_start(text, a)
+    let to_nl = index_of(split(slice(text, b), ""), "\n")
+    let to = to_nl == null ? len(text) : b + to_nl
+    let lines = split(slice(text, from, to), "\n")
+    let cut = lines | map((l) => len(code_editor_indent(l)) >= n ? n : len(code_editor_indent(l)))
+    let out = join(enumerate(lines) | map((p) => slice(p[1], cut[p[0]])), "\n")
+    let first = cut[0]
+    { text: slice(text, 0, from) + out + slice(text, to), start: a - first < from ? from : a - first, end: b - sum(cut) < from ? from : b - sum(cut) }
+}
+
+// Tab with lines selected: `n` spaces put before each: { text, start, end }.
+fn code_editor_indent_lines(text: str, a: int, b: int, n: int) {
+    let from = code_editor_line_start(text, a)
+    let to_nl = index_of(split(slice(text, b), ""), "\n")
+    let to = to_nl == null ? len(text) : b + to_nl
+    let lines = split(slice(text, from, to), "\n")
+    let out = join(lines | map((l) => repeat(" ", n) + l), "\n")
+    { text: slice(text, 0, from) + out + slice(text, to), start: a + n, end: b + n * len(lines) }
+}
+
+component CodeEditor(name: str? = null, label: str? = null, value: str = "", language: str? = null, rows: int = 12,
+                     tab_size: int = 4, wrap: bool = false, numbers: bool = true, placeholder: str? = null, hint: str? = null,
+                     error: str? = null, required: bool = false, disabled: bool = false, field: str? = null,
+                     on_change = null, class: str? = null) {
+    style global code_editor_css
+    state text = value
+    state leaving = false
+    let id = field ?? `code-editor-${name ?? re.replace(lower(label ?? "code"), "[^a-z0-9]+", "-")}`
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`, `${id}-keys`])
+    let count = len(split(text, "\n"))
+    let set_text = (box, next: str, start: int, end: int) => {
+        text = next
+        box.value = next
+        box.setSelectionRange(start, end)
+        on_change && on_change(next)
+    }
+    <div class={ui_cls(["ui-code-editor", wrap && "ui-code-editor-wrap", error != null && "ui-code-editor-invalid", class])}
+         style={`--ui-code-editor-tab: ${tab_size}`}>
+        {label != null && <label.ui-code-editor-label for={id}>
+            {label}{required && <span.ui-code-editor-req aria-hidden="true">*</span>}
+        </label>}
+        <div.ui-code-editor-frame>
+            {numbers && <div.ui-code-editor-gutter aria-hidden="true">
+                {for n in range(1, count + 1) => <span key={n}>{n}</span>}
+            </div>}
+            <textarea id={id} name={name} value={text} rows={rows} placeholder={placeholder} required={required} disabled={disabled}
+                      spellcheck="false" autocapitalize="off" autocomplete="off" wrap={wrap ? "soft" : "off"}
+                      aria-invalid={error != null ? "true" : null} aria-describedby={described}
+                      @input={(e) => {
+                          text = e.value
+                          on_change && on_change(e.value)
+                      }}
+                      @scroll={(e) => {
+                          let g = e.target.parentElement.querySelector(".ui-code-editor-gutter")
+                          if g != null { g.scrollTop = e.target.scrollTop }
+                      }}
+                      @keydown={(e) => {
+                          let box = e.target
+                          let a = box.selectionStart
+                          let b = box.selectionEnd
+                          let t = box.value
+                          if e.key == "Escape" {
+                              leaving = true
+                          } else if e.key == "Tab" && !leaving {
+                              e.preventDefault()
+                              if e.shiftKey {
+                                  let r = code_editor_outdent(t, a, b, tab_size)
+                                  set_text(box, r.text, r.start, r.end)
+                              } else if contains(slice(t, a, b), "\n") {
+                                  let r = code_editor_indent_lines(t, a, b, tab_size)
+                                  set_text(box, r.text, r.start, r.end)
+                              } else {
+                                  let col = a - code_editor_line_start(t, a)
+                                  let spaces = repeat(" ", tab_size - col % tab_size)
+                                  set_text(box, slice(t, 0, a) + spaces + slice(t, b), a + len(spaces), a + len(spaces))
+                              }
+                          } else if e.key == "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey {
+                              e.preventDefault()
+                              let line = slice(t, code_editor_line_start(t, a), a)
+                              let more = re.test(trim(line), "[{(\\[:]$") ? repeat(" ", tab_size) : ""
+                              let ins = "\n" + code_editor_indent(line) + more
+                              let close = re.test(slice(t, b, b + 1), "^[})\\]]$") && more != ""
+                              let tail = close ? "\n" + code_editor_indent(line) : ""
+                              set_text(box, slice(t, 0, a) + ins + tail + slice(t, b), a + len(ins), a + len(ins))
+                          } else if contains(["}", ")", "]"], e.key) && a == b && slice(t, a, a + 1) == e.key {
+                              e.preventDefault()
+                              box.setSelectionRange(a + 1, a + 1)
+                          } else if e.key != "Shift" {
+                              leaving = false
+                          }
+                      }}
+                      @blur={() => { leaving = false }}></textarea>
+            {language != null && <span.ui-code-editor-lang aria-hidden="true">{language}</span>}
+        </div>
+        <span.ui-sr id={`${id}-keys`}>Tab puts spaces in; press Escape then Tab to leave the box.</span>
+        {hint != null && <p.ui-code-editor-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-code-editor-error id={`${id}-error`} role="alert">{error}</p>}
+    </div>
+}

@@ -1,0 +1,18 @@
+const [notif, danger] = $$("section.ui-settings");
+if (!notif || !danger) return "the two sections are missing";
+if (notif.id !== "settings-section-demo" || notif.getAttribute("aria-labelledby") !== "settings-section-demo-title") return "the region is not labelled by its title";
+if (notif.querySelector("h2#settings-section-demo-title.ui-settings-title")?.textContent !== "Notifications") return "the title is not an h2";
+if (notif.querySelector(".ui-settings-desc")?.textContent !== "What we email you about.") return "the description is missing";
+const rows = notif.querySelectorAll("ul.ui-settings-rows > li.ui-settings-row");
+if (rows.length !== 3) return `3 rows, found ${rows.length}`;
+const [replies, digest, sig] = rows;
+const lab = replies.querySelector("label.ui-settings-label");
+if (!lab || lab.getAttribute("for") !== "settings-demo-replies" || !lab.textContent.startsWith("Replies")) return "field does not make the label a <label for>";
+if (replies.querySelector(".ui-settings-hint")?.textContent !== "When someone answers you.") return "the hint is missing";
+if (!replies.querySelector(".ui-settings-control input[role=switch]")) return "the control is not in the row";
+if (replies.querySelector(".ui-settings-control").getBoundingClientRect().left <= lab.getBoundingClientRect().right) return "the control is not to the right";
+if (digest.querySelector("label.ui-settings-label").control?.id !== "settings-demo-digest") return "the label does not reach the select";
+if (!sig.classList.contains("ui-settings-row-wide") || sig.querySelector("textarea").getBoundingClientRect().top <= sig.querySelector(".ui-settings-label").getBoundingClientRect().bottom) return "wide does not put the control under the label";
+if (!notif.querySelector(".ui-settings-foot .ui-btn")) return "the footer is missing";
+if (!danger.querySelector("h3.ui-settings-title") || danger.getAttribute("aria-label") !== "Danger") return "level={3} and the label without an id are wrong";
+if (danger.querySelector("label.ui-settings-label") || !danger.querySelector("span.ui-settings-label")) return "without field the label should be plain text";

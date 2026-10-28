@@ -1,0 +1,127 @@
+// TradeFeed: time and sales: trades as they happen, newest at the top, buys in green
+// and sells in red, an arrow where the price ticked up or down, large trades picked
+// out, and only the last `limit` kept. Each new row flashes once as it comes in. A
+// Pause button holds the list still to read it (new trades are counted meanwhile).
+//
+//   <TradeFeed trades={trades} limit={40} large={1} unit=" BTC" decimals={1}/>
+//   component Tape() {
+//       state trades = []
+//       if live { every(500, () => { trades = trades + [next_trade()] }) }
+//       <TradeFeed trades={trades} prefix="$"/>
+//   }
+//
+// trades: a list of { id, time, price, size, side }, oldest first, as they come (add new
+// ones at the end): time a date-time ("2026-10-28T14:30:05Z") or milliseconds since
+// 1970, shown as HH:MM:SS (UTC); side "buy" or "sell"; id tells trades apart (time,
+// price and size by default). limit: how many rows are shown (30). large: a size from
+// which a trade is picked out. prefix and suffix: around prices ("$"); decimals: digits
+// after the point of prices (2); size_decimals: of sizes (up to 4, as needed); unit:
+// after sizes (" BTC"). height: the list's height in pixels before it scrolls (320).
+// label: what screen readers call the table ("Trades").
+
+let trade_feed_css = css`
+.ui-tfeed { display: grid; gap: 8px; min-width: 0; font: 13px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-tfeed-bar { display: flex; align-items: center; gap: 10px; color: var(--ui-muted); font-size: 12px; }
+.ui-tfeed-bar span { margin-right: auto; }
+.ui-tfeed-pause { height: 26px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 12px/1 var(--ui-font); cursor: pointer; }
+.ui-tfeed-pause:hover { border-color: var(--ui-strong); }
+.ui-tfeed-pause:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-tfeed-pause[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-tfeed-box { max-height: var(--h); overflow-y: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-tfeed-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-tfeed-table th { position: sticky; top: 0; z-index: 1; padding: 6px 10px; background: var(--ui-subtle); color: var(--ui-muted);
+  font-size: 11px; font-weight: 600; letter-spacing: .04em; text-align: right; text-transform: uppercase; }
+.ui-tfeed-table td { padding: 4px 10px; text-align: right; white-space: nowrap; }
+.ui-tfeed-table th:first-child, .ui-tfeed-table td:first-child { text-align: left; }
+.ui-tfeed-time { color: var(--ui-muted); }
+.ui-tfeed-buy { --k: var(--ui-success); } .ui-tfeed-sell { --k: var(--ui-danger); }
+.ui-tfeed-price { color: var(--k); font-weight: 600; }
+.ui-tfeed-tick { display: inline-block; width: 10px; color: var(--ui-muted); font-size: 10px; }
+.ui-tfeed-large td { background: color-mix(in srgb, var(--k) 10%, transparent); font-weight: 650; }
+.ui-tfeed-large td:first-child { box-shadow: inset 3px 0 0 var(--k); }
+.ui-tfeed-new td { animation: ui-tfeed-flash 1s ease-out; }
+@keyframes ui-tfeed-flash { from { background: color-mix(in srgb, var(--k) 30%, transparent); } }
+.ui-tfeed-empty td { padding: 18px; color: var(--ui-muted); text-align: center !important; }
+@media (prefers-reduced-motion: reduce) { .ui-tfeed-new td { animation: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn trade_feed_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn trade_feed_group(n: int) -> str =
+    n < 1000 ? str(n) : trade_feed_group(floor(n / 1000)) + "," + trade_feed_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn trade_feed_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${trade_feed_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${trade_feed_group(floor(units / scale))}${tail}`
+}
+
+
+// A trade's time as HH:MM:SS: of a date-time as written, of milliseconds in UTC.
+fn trade_feed_clock(t) -> str {
+    let text = type_of(t) == "str" ? t : (t == null ? "" : date.from_ms(t, "UTC"))
+    len(text) >= 19 ? slice(text, 11, 19) : text
+}
+
+component TradeFeed(trades: list = [], limit: int = 30, large: num? = null, prefix: str = "", suffix: str = "",
+                    decimals: int = 2, size_decimals: int? = null, unit: str = "", height: int = 320,
+                    label: str = "Trades", class: str? = null) {
+    style global trade_feed_css
+    state paused = false
+    state held = []
+    // The trades the page started with, which do not flash.
+    state first = trades | map((t) => t.id ?? `${t.time}-${t.price}-${t.size}`)
+    let source = paused ? held : trades
+    let count = len(source)
+    let keep = limit < 1 ? 1 : limit
+    let recent = drop(source, count > keep ? count - keep : 0)
+    let rows = reverse(for [i, t] in enumerate(recent) => {
+        let before = i > 0 ? recent[i - 1] : (count > keep ? source[count - keep - 1] : null)
+        { ...t, key: t.id ?? `${t.time}-${t.price}-${t.size}`,
+          tick: before == null || before.price == t.price ? 0 : (t.price > before.price ? 1 : -1) }
+    })
+    let waiting = paused ? len(trades) - len(held) : 0
+    let price = (v) => `${prefix}${trade_feed_num(v, decimals)}${suffix}`
+    let size = (v) => `${trade_feed_num(v, size_decimals)}${unit}`
+    <div class={ui_cls(["ui-tfeed", class])} style={`--h: ${height}px`}>
+        <div.ui-tfeed-bar>
+            <span role="status">{paused ? `Paused · ${waiting} new` : `Last ${len(rows)} of ${count}`}</span>
+            <button.ui-tfeed-pause type="button" aria-pressed={paused ? "true" : "false"}
+                    @click={() => {
+                        if !paused { held = trades }
+                        paused = !paused
+                    }}>{paused ? "Resume" : "Pause"}</button>
+        </div>
+        <div.ui-tfeed-box tabindex="0" role="region" aria-label={label}>
+            <table.ui-tfeed-table>
+                <thead><tr><th scope="col">Time</th><th scope="col">Price</th><th scope="col">Size</th></tr></thead>
+                <tbody>
+                    {len(rows) == 0 && <tr.ui-tfeed-empty><td colspan="3">No trades yet.</td></tr>}
+                    {for r in rows => <tr key={r.key} data-id={r.key}
+                            class={ui_cls([r.side == "sell" ? "ui-tfeed-sell" : "ui-tfeed-buy", large != null && r.size >= large && "ui-tfeed-large"])}
+                            @mount={(el) => { if index_of(first, r.key) == null { el.classList.add("ui-tfeed-new") } }}>
+                        <td.ui-tfeed-time>{trade_feed_clock(r.time)}</td>
+                        <td.ui-tfeed-price>
+                            <span.ui-tfeed-tick aria-hidden="true">{r.tick > 0 ? "▲" : (r.tick < 0 ? "▼" : "")}</span>{price(r.price)}
+                            <span.ui-sr>{r.side == "sell" ? " sell" : " buy"}</span>
+                        </td>
+                        <td>{size(r.size)}</td>
+                    </tr>}
+                </tbody>
+            </table>
+        </div>
+    </div>
+}

@@ -1,0 +1,215 @@
+// RecurrencePicker: how something repeats: not at all, daily, weekly on chosen
+// days, monthly (on a day of the month or on, say, the second Tuesday) or yearly,
+// every so many of those, and when it ends (never, on a date, or after a number
+// of times). A sentence under it says the rule in words ("Every 2 weeks on Mon
+// and Wed, until December 31, 2026"). A plain <form> gets the rule as JSON in
+// `name`, and as an iCalendar RRULE in `name` + "_rrule" ("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE").
+//
+//   <RecurrencePicker id="standup" name="repeat" label="Repeat" start="2026-11-02"/>
+//   <RecurrencePicker id="rent" label="Repeat" start="2026-11-01" on_change={(r) => { rule = r }}
+//                     value={{ freq: "monthly", interval: 1, by: "day", ends: "after", count: 12 }}/>
+//
+// The value is a map: { freq: "none" | "daily" | "weekly" | "monthly" | "yearly",
+// interval (1 or more), days (for weekly: "MO" ... "SU"), by (for monthly: "day",
+// the start's day of the month, or "weekday", its place: the second Tuesday),
+// ends: "never" | "on" | "after", until ("YYYY-MM-DD", with "on"), count (with
+// "after") }. Left out, the fields take sensible values from `start`.
+// id: a prefix for its ids, unique on the page. start: the first date it happens
+// ("YYYY-MM-DD", today by default): it sets the weekly day, the monthly day and
+// the earliest end date. value: the rule to start with. label: the fieldset's
+// legend. hint: a line under it. week_start: 1 for Monday (default) or 7 for Sunday.
+// on_change(rule): inside one of your components, called with the map after each change.
+
+let recurrence_picker_css = css`
+.ui-recurrence-picker { display: grid; gap: 12px; min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-recurrence-picker-legend { padding: 0; margin-bottom: 2px; font-size: 13px; font-weight: 500; }
+.ui-recurrence-picker-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-recurrence-picker-select-box { position: relative; display: inline-block; }
+.ui-recurrence-picker-select-box::after {
+  content: ""; position: absolute; right: 12px; top: 50%; width: 6px; height: 6px; margin-top: -5px;
+  border: solid var(--ui-muted); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); pointer-events: none;
+}
+.ui-recurrence-picker select, .ui-recurrence-picker-num, .ui-recurrence-picker-date {
+  height: 36px; margin: 0; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); transition: border-color .15s, box-shadow .15s;
+}
+.ui-recurrence-picker select { appearance: none; padding-right: 30px; cursor: pointer; }
+.ui-recurrence-picker-num { width: 70px; font-variant-numeric: tabular-nums; }
+.ui-recurrence-picker select:hover, .ui-recurrence-picker-num:hover, .ui-recurrence-picker-date:hover { border-color: var(--ui-strong); }
+.ui-recurrence-picker select:focus-visible, .ui-recurrence-picker-num:focus, .ui-recurrence-picker-date:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-recurrence-picker-num:disabled, .ui-recurrence-picker-date:disabled { opacity: .5; }
+.ui-recurrence-picker-muted { color: var(--ui-muted); }
+.ui-recurrence-picker-days { display: flex; flex-wrap: wrap; gap: 4px; }
+.ui-recurrence-picker-day {
+  width: 38px; height: 34px; padding: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; transition: background .15s, border-color .15s, color .15s;
+}
+.ui-recurrence-picker-day:hover { border-color: var(--ui-accent); }
+.ui-recurrence-picker-day[aria-pressed="true"] { background: var(--ui-accent); border-color: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-recurrence-picker-day:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-recurrence-picker-choices { display: grid; gap: 8px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-recurrence-picker-choices legend { padding: 0; margin-bottom: 6px; font-size: 13px; font-weight: 500; }
+.ui-recurrence-picker-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; cursor: pointer; }
+.ui-recurrence-picker-choice input[type=radio] { width: 16px; height: 16px; margin: 0; accent-color: var(--ui-accent); cursor: pointer; }
+.ui-recurrence-picker-choice input[type=radio]:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 50%; }
+.ui-recurrence-picker-summary { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); color: var(--ui-fg); font-size: 13px; }
+.ui-recurrence-picker-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+@media (prefers-reduced-motion: reduce) { .ui-recurrence-picker select, .ui-recurrence-picker-num, .ui-recurrence-picker-date, .ui-recurrence-picker-day { transition: none; } }
+`
+
+// Monday first, as iCalendar names them: [code, short, long].
+let recurrence_picker_days = [["MO", "Mon", "Monday"], ["TU", "Tue", "Tuesday"], ["WE", "Wed", "Wednesday"], ["TH", "Thu", "Thursday"],
+                              ["FR", "Fri", "Friday"], ["SA", "Sat", "Saturday"], ["SU", "Sun", "Sunday"]]
+
+let recurrence_picker_units = { daily: ["day", "days"], weekly: ["week", "weeks"], monthly: ["month", "months"], yearly: ["year", "years"] }
+
+// The rule with every field there, from what was given and the start date.
+fn recurrence_picker_full(rule: map, start: str) -> map {
+    let p = date.parts(start)
+    {
+        freq: rule.freq ?? "none",
+        interval: max([1, rule.interval ?? 1]),
+        days: len(rule.days ?? []) > 0 ? rule.days : [recurrence_picker_days[p.weekday - 1][0]],
+        by: rule.by ?? "day",
+        ends: rule.ends ?? "never",
+        until: rule.until ?? date.add_months(start, 3),
+        count: max([1, rule.count ?? 10]),
+    }
+}
+
+// "second" for the 9th, a Tuesday (its place among the month's Tuesdays); "last" for a fifth.
+fn recurrence_picker_nth(day: int) -> str = ["first", "second", "third", "fourth", "last"][min([4, floor((day - 1) / 7)])]
+
+// The days in the order they were picked in, sorted Monday first.
+fn recurrence_picker_sorted(days: list) -> list = recurrence_picker_days | filter((d) => contains(days, d[0]))
+
+// The rule as an iCalendar RRULE ("" when it does not repeat).
+fn recurrence_picker_rrule(r: map, start: str) -> str {
+    if r.freq == "none" { return "" }
+    let p = date.parts(start)
+    let parts = [`FREQ=${upper(r.freq)}`, r.interval > 1 && `INTERVAL=${r.interval}`,
+                 r.freq == "weekly" && `BYDAY=${join(recurrence_picker_sorted(r.days) | map((d) => d[0]), ",")}`,
+                 r.freq == "monthly" && r.by == "day" && `BYMONTHDAY=${p.day}`,
+                 r.freq == "monthly" && r.by == "weekday" && `BYDAY=${floor((p.day - 1) / 7) >= 4 ? -1 : floor((p.day - 1) / 7) + 1}${recurrence_picker_days[p.weekday - 1][0]}`,
+                 r.ends == "on" && `UNTIL=${replace(r.until, "-", "")}`, r.ends == "after" && `COUNT=${r.count}`]
+    parts | filter((x) => x != false) | join(";")
+}
+
+// The rule in words: "Every 2 weeks on Mon and Wed, until December 31, 2026".
+fn recurrence_picker_words(r: map, start: str) -> str {
+    if r.freq == "none" { return "Happens once." }
+    let p = date.parts(start)
+    let unit = recurrence_picker_units[r.freq]
+    let every = r.interval == 1 ? `Every ${unit[0]}` : `Every ${r.interval} ${unit[1]}`
+    let names = recurrence_picker_sorted(r.days) | map((d) => d[1])
+    let days_text = len(names) <= 1 ? join(names, "") : join(slice(names, 0, len(names) - 1), ", ") + " and " + last(names)
+    let on = match r.freq {
+        "weekly" => ` on ${days_text}`
+        "monthly" => r.by == "day" ? ` on day ${p.day}` : ` on the ${recurrence_picker_nth(p.day)} ${recurrence_picker_days[p.weekday - 1][2]}`
+        "yearly" => ` on ${date.format(start, { style: "long" })}` | re.replace(", \\d{4}$", "")
+        _ => ""
+    }
+    let end = match r.ends {
+        "on" => `, until ${date.format(r.until, { style: "long" })}`
+        "after" => r.count == 1 ? ", once" : `, ${r.count} times`
+        _ => ""
+    }
+    `${every}${on}${end}.`
+}
+
+component RecurrencePicker(id: str, name: str? = null, label: str? = "Repeat", value: map = {}, start: str? = null,
+                           hint: str? = null, week_start: int = 1, on_change = null, class: str? = null) {
+    style global recurrence_picker_css
+    let first = start ?? date.today()
+    state rule = recurrence_picker_full(value, first)
+    let p = date.parts(first)
+    let week = week_start == 7 ? [recurrence_picker_days[6], ...slice(recurrence_picker_days, 0, 6)] : recurrence_picker_days
+    let unit = recurrence_picker_units[rule.freq] ?? ["", ""]
+    let update = (field: str, v) => {
+        rule = set(rule, field, v)
+        on_change && on_change(rule)
+    }
+    let whole = (text: str, least: int) => {
+        let n = int(text)
+        is_err(n) || n < least ? least : n
+    }
+    <fieldset class={ui_cls(["ui-recurrence-picker", class])} id={id} aria-describedby={hint != null ? `${id}-hint ${id}-summary` : `${id}-summary`}>
+        {label != null && <legend.ui-recurrence-picker-legend>{label}</legend>}
+        <div.ui-recurrence-picker-row>
+            <span.ui-recurrence-picker-select-box>
+                <select id={`${id}-freq`} aria-label="How often" @change={(e) => update("freq", e.value)}>
+                    {for o in [["none", "Does not repeat"], ["daily", "Daily"], ["weekly", "Weekly"], ["monthly", "Monthly"], ["yearly", "Yearly"]] =>
+                        <option value={o[0]} selected={o[0] == rule.freq}>{o[1]}</option>}
+                </select>
+            </span>
+            {rule.freq != "none" && [
+                <span.ui-recurrence-picker-muted>every</span>,
+                <input.ui-recurrence-picker-num type="number" id={`${id}-interval`} min="1" max="99" value={rule.interval} inputmode="numeric"
+                       aria-label={`Every how many ${unit[1]}`} @change={(e) => {
+                           let n = whole(e.value, 1)
+                           e.target.value = str(n)
+                           update("interval", n)
+                       }}/>,
+                <span.ui-recurrence-picker-muted>{rule.interval == 1 ? unit[0] : unit[1]}</span>,
+            ]}
+        </div>
+        {rule.freq == "weekly" && <div.ui-recurrence-picker-days role="group" aria-label="On these days">
+            {for d in week => <button.ui-recurrence-picker-day type="button" key={d[0]} aria-pressed={contains(rule.days, d[0]) ? "true" : "false"}
+                    aria-label={d[2]} title={d[2]}
+                    @click={() => {
+                        let on = contains(rule.days, d[0])
+                        // A week keeps at least one day.
+                        if !(on && len(rule.days) == 1) {
+                            update("days", on ? rule.days | filter((x) => x != d[0]) : [...rule.days, d[0]])
+                        }
+                    }}>{slice(d[1], 0, 2)}</button>}
+        </div>}
+        {rule.freq == "monthly" && <fieldset.ui-recurrence-picker-choices>
+            <legend>On</legend>
+            <label.ui-recurrence-picker-choice>
+                <input type="radio" name={`${id}-by`} value="day" checked={rule.by == "day"} form="ui-recurrence-picker-none"
+                       @change={() => update("by", "day")}/>
+                Day {p.day} of the month
+            </label>
+            <label.ui-recurrence-picker-choice>
+                <input type="radio" name={`${id}-by`} value="weekday" checked={rule.by == "weekday"} form="ui-recurrence-picker-none"
+                       @change={() => update("by", "weekday")}/>
+                The {recurrence_picker_nth(p.day)} {recurrence_picker_days[p.weekday - 1][2]}
+            </label>
+        </fieldset>}
+        {rule.freq != "none" && <fieldset.ui-recurrence-picker-choices>
+            <legend>Ends</legend>
+            <label.ui-recurrence-picker-choice>
+                <input type="radio" name={`${id}-ends`} value="never" checked={rule.ends == "never"} form="ui-recurrence-picker-none"
+                       @change={() => update("ends", "never")}/>
+                Never
+            </label>
+            <div.ui-recurrence-picker-choice>
+                <input type="radio" id={`${id}-ends-on`} name={`${id}-ends`} value="on" checked={rule.ends == "on"} form="ui-recurrence-picker-none"
+                       @change={() => update("ends", "on")}/>
+                <label for={`${id}-ends-on`}>On</label>
+                <input.ui-recurrence-picker-date type="date" id={`${id}-until`} value={rule.until} min={first} disabled={rule.ends != "on"}
+                       aria-label="End date" form="ui-recurrence-picker-none" @change={(e) => { if e.value != "" { update("until", e.value) } }}/>
+            </div>
+            <div.ui-recurrence-picker-choice>
+                <input type="radio" id={`${id}-ends-after`} name={`${id}-ends`} value="after" checked={rule.ends == "after"} form="ui-recurrence-picker-none"
+                       @change={() => update("ends", "after")}/>
+                <label for={`${id}-ends-after`}>After</label>
+                <input.ui-recurrence-picker-num type="number" id={`${id}-count`} min="1" max="999" value={rule.count} inputmode="numeric"
+                       disabled={rule.ends != "after"} aria-label="Number of times" form="ui-recurrence-picker-none"
+                       @change={(e) => {
+                           let n = whole(e.value, 1)
+                           e.target.value = str(n)
+                           update("count", n)
+                       }}/>
+                <span.ui-recurrence-picker-muted>{rule.count == 1 ? "time" : "times"}</span>
+            </div>
+        </fieldset>}
+        <p.ui-recurrence-picker-summary id={`${id}-summary`} aria-live="polite">{recurrence_picker_words(rule, first)}</p>
+        {name != null && [
+            <input type="hidden" name={name} value={json.stringify(rule)}/>,
+            <input type="hidden" name={`${name}_rrule`} value={recurrence_picker_rrule(rule, first)}/>,
+        ]}
+        {hint != null && <p.ui-recurrence-picker-hint id={`${id}-hint`}>{hint}</p>}
+    </fieldset>
+}

@@ -1,0 +1,12 @@
+const two = $("#line-clamp-demo-two"), three = $("#line-clamp-demo-three"), none = $("#line-clamp-demo-none");
+if (!two || !three || !none) return "the three examples are missing";
+const cs = (el) => getComputedStyle(el);
+const lh = parseFloat(cs(two).lineHeight);
+if (cs(two).webkitLineClamp !== "2" || cs(two).overflow !== "hidden") return `lines={2} gives a clamp of ${cs(two).webkitLineClamp}`;
+if (two.getBoundingClientRect().height > lh * 2 + 2) return "two lines are taller than two lines";
+if (two.scrollHeight <= two.clientHeight + 1) return "the text is not cut (nothing hidden)";
+if (!two.title.startsWith("Quillo renders a page")) return "the whole text is not in the title";
+if (cs(three).webkitLineClamp !== "3" || three.getBoundingClientRect().height > lh * 3 + 2) return "lines={3} with HTML is not three lines";
+if (three.querySelectorAll("p").length !== 2) return "HTML children are not kept";
+if (three.title) return "HTML children get a title";
+if (none.classList.contains("ui-clamp") || none.scrollHeight > none.clientHeight + 1) return "lines={0} still cuts";

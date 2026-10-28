@@ -1,0 +1,611 @@
+// StockChart: a full trading chart. Candles, a line or an area (a switch), volume
+// under the price, range buttons (1D 1W 1M 3M 1Y All), a crosshair that follows the
+// pointer with the open, high, low, close, change and volume where it is, the wheel to
+// zoom and a drag to pan, indicators to turn on and off (SMA 20, EMA 50, Bollinger
+// bands, an RSI pane and a MACD pane), and the last price as a line and a label. The
+// keyboard does it all too: with the chart focused, the arrow keys move the crosshair
+// (and pan at the ends), + and − zoom, Home and End go to the first and last candle,
+// and Escape lets go; screen readers hear the candle the crosshair is on.
+//
+//   <StockChart label="ACME" candles={bars} prefix="$"/>
+//   <StockChart label="BTC-USD" candles={hourly} kind="line" period="1W" indicators={["ema50", "rsi"]}
+//               decimals={0} on_range={(r) => { picked = r }}/>
+//
+// candles: a list of { time, open, high, low, close, volume }, oldest first; time is a
+// date ("2026-03-02") or a date-time ("2026-03-02T14:00:00Z", shown as written).
+// When more candles are in view than fit (about 160), neighbours are drawn as one
+// (the first open, the highest high, the lowest low, the last close, the volumes
+// added), and the readout says how many it holds. kind: "candles" (default), "line"
+// or "area" to start with. period: the range to start with ("3M"); a range that the
+// candles cannot fill (1D of daily candles) is disabled. indicators: those on to start
+// with, of "sma20", "ema50", "bb", "rsi" and "macd". height: the price pane's height
+// in pixels (340). prefix and suffix: around every price ("$"); decimals: digits after
+// the point of prices (2). label: what the chart shows, for screen readers and the
+// heading. on_range(range): called with the range picked ("1M"), or "" when the wheel,
+// a drag or the keyboard leaves the ranges.
+
+let stock_chart_css = css`
+.ui-stk { --ui-stk-1: light-dark(#2a78d6, #3987e5); --ui-stk-2: light-dark(#eb6834, #d95926);
+  --ui-stk-3: light-dark(#1baf7a, #199e70); --ui-stk-7: light-dark(#6250d6, #9085e9);
+  display: grid; gap: 10px; min-width: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-stk-up { --k: var(--ui-success); } .ui-stk-down { --k: var(--ui-danger); }
+.ui-stk-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.ui-stk-name { margin: 0; font-size: 15px; font-weight: 650; }
+.ui-stk-last { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-stk-move { color: var(--k); font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-stk-span { color: var(--ui-muted); font-size: 12px; }
+.ui-stk-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.ui-stk-group { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 2px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-stk-group button { height: 26px; min-width: 34px; padding: 0 9px; border: 0; border-radius: 4px; background: none; color: var(--ui-muted);
+  font: 500 12px/1 var(--ui-font); cursor: pointer; }
+.ui-stk-group button:hover:not(:disabled) { color: var(--ui-fg); }
+.ui-stk-group button[aria-pressed="true"] { background: var(--ui-surface); color: var(--ui-fg); box-shadow: 0 1px 2px rgba(0, 0, 0, .12); }
+.ui-stk-group button:disabled { opacity: .4; cursor: not-allowed; }
+.ui-stk-group button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-stk-ind button[aria-pressed="true"] { color: var(--c, var(--ui-fg)); }
+.ui-stk-chart { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; }
+.ui-stk-panes { position: relative; touch-action: none; cursor: crosshair; user-select: none; border-radius: 2px; }
+.ui-stk-panes:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-stk-dragging { cursor: grabbing; }
+.ui-stk-pane { position: relative; height: var(--ph); border-bottom: 1px solid var(--ui-border); }
+.ui-stk-pane + .ui-stk-pane { border-top: 0; }
+.ui-stk-pname { position: absolute; z-index: 3; left: 6px; top: 4px; color: var(--ui-muted); font-size: 11px; font-weight: 600; pointer-events: none; }
+.ui-stk-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 65%, transparent); }
+.ui-stk-zero { background: var(--ui-strong); }
+.ui-stk-level { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--ui-strong); }
+.ui-stk-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.ui-stk-svg path { fill: none; stroke-linejoin: round; stroke-linecap: round; }
+.ui-stk-svg .ui-stk-body { fill: var(--k); stroke: none; }
+.ui-stk-svg .ui-stk-wick { stroke: var(--k); stroke-width: 1; }
+.ui-stk-svg .ui-stk-vol { fill: var(--k); stroke: none; opacity: .28; }
+.ui-stk-svg .ui-stk-close { stroke: var(--ui-stk-1); stroke-width: 2; }
+.ui-stk-svg .ui-stk-fill { fill: var(--ui-stk-1); opacity: .1; stroke: none; }
+.ui-stk-svg .ui-stk-sma { stroke: var(--ui-stk-2); stroke-width: 1.5; }
+.ui-stk-svg .ui-stk-ema { stroke: var(--ui-stk-7); stroke-width: 1.5; }
+.ui-stk-svg .ui-stk-bb { stroke: var(--ui-stk-3); stroke-width: 1.25; }
+.ui-stk-svg .ui-stk-bbmid { stroke: var(--ui-stk-3); stroke-width: 1; stroke-dasharray: 4 3; }
+.ui-stk-svg .ui-stk-band { fill: var(--ui-stk-3); opacity: .09; stroke: none; }
+.ui-stk-svg .ui-stk-rsi { stroke: var(--ui-stk-7); stroke-width: 1.5; }
+.ui-stk-svg .ui-stk-macd { stroke: var(--ui-stk-1); stroke-width: 1.5; }
+.ui-stk-svg .ui-stk-signal { stroke: var(--ui-stk-2); stroke-width: 1.5; }
+.ui-stk-svg .ui-stk-hist { fill: var(--k); stroke: none; opacity: .55; }
+.ui-stk-band-rsi { position: absolute; left: 0; right: 0; background: color-mix(in srgb, var(--ui-stk-7) 8%, transparent); }
+.ui-stk-lastline { position: absolute; z-index: 1; left: 0; right: 0; border-top: 1px dashed var(--k); opacity: .8; pointer-events: none; }
+.ui-stk-vline { position: absolute; z-index: 4; top: 0; bottom: 0; width: 0; border-left: 1px dashed var(--ui-muted); pointer-events: none; }
+.ui-stk-hline { position: absolute; z-index: 4; left: 0; right: 0; height: 0; border-top: 1px dashed var(--ui-muted); pointer-events: none; }
+.ui-stk-read { position: absolute; z-index: 5; top: 6px; left: 6px; right: 6px; display: flex; flex-wrap: wrap; gap: 2px 10px; pointer-events: none;
+  color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-stk-read > span { padding: 1px 0; background: color-mix(in srgb, var(--ui-bg) 75%, transparent); white-space: nowrap; }
+.ui-stk-read b { color: var(--ui-fg); font-weight: 600; }
+.ui-stk-read .ui-stk-up b, .ui-stk-read .ui-stk-down b { color: var(--k); }
+.ui-stk-read .ui-stk-when { color: var(--ui-fg); font-weight: 600; }
+.ui-stk-axis { position: relative; }
+.ui-stk-ax { position: relative; height: var(--ph); }
+.ui-stk-ax span { position: absolute; left: 0; transform: translateY(-50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-stk-ax .ui-stk-tag { z-index: 2; left: -4px; padding: 1px 4px; border-radius: 3px; background: var(--k); color: var(--ui-bg); font-weight: 600; }
+.ui-stk-ax .ui-stk-cross { z-index: 3; left: -4px; padding: 1px 4px; border-radius: 3px; background: var(--ui-fg); color: var(--ui-bg); font-weight: 600; }
+.ui-stk-x { position: relative; height: 18px; margin-top: 4px; }
+.ui-stk-x span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); white-space: nowrap; }
+.ui-stk-x .ui-stk-first { transform: none; }
+.ui-stk-x .ui-stk-end { transform: translateX(-100%); }
+.ui-stk-x .ui-stk-cross { z-index: 2; padding: 1px 5px; border-radius: 3px; background: var(--ui-fg); color: var(--ui-bg); font-weight: 600; }
+.ui-stk-help { margin: 0; color: var(--ui-muted); font-size: 12px; }
+.ui-stk-help kbd { padding: 0 4px; border: 1px solid var(--ui-border); border-radius: 3px; background: var(--ui-subtle); font: 11px/1.4 var(--ui-mono); }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn stock_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn stock_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : stock_chart_group(floor(n / 1000)) + "," + stock_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn stock_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${stock_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${stock_chart_group(floor(units / scale))}${tail}`
+}
+
+// A large number, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn stock_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? stock_chart_num(v)
+        : `${v < 0 ? "-" : ""}${stock_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A change in percent, signed, to two decimals: "+1.25%", "-0.40%".
+fn stock_chart_signed(p: num) -> str = `${p > 0 ? "+" : (p < 0 && round(abs(p) * 100) > 0 ? "-" : "")}${stock_chart_num(abs(p), 2)}%`
+
+// A coordinate out of 100 (or a length), to two decimals.
+fn stock_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The axis from lo to hi, widened to round ticks: about `steps` steps of 1, 2, 2.5 or 5 x 10^n.
+fn stock_chart_scale(lo: num, hi: num, steps: int = 5) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo) / 10) : hi - lo
+    let raw = span / steps
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+// A candle's time as it reads: "Mar 2, 2026" for a date, "Mar 2, 14:30" for a date-time.
+fn stock_chart_when(t) -> str =
+    type_of(t) != "str" || !date.valid(t) ? str(t) : (len(t) > 10 ? date.format(t, "MMM D, HH:mm") : date.format(t, "MMM D, YYYY"))
+
+// Where the time axis is labelled: about `limit` of { i, text }, at the starts of years,
+// months or days when the times cross them ("2026", "Mar", "Mar 2"), else every few
+// candles ("14:30", "Mar 2").
+fn stock_chart_ticks(times: list, limit: int) -> list {
+    let n = len(times)
+    let thin = (idx: list) => {
+        let step = ceil(len(idx) / limit)
+        range(len(idx)) | filter((k) => k % step == 0) | map((k) => idx[k])
+    }
+    let spaced = (fmt_at) => {
+        let step = ceil(n / limit)
+        range(n) | filter((i) => i % step == floor(step / 2)) | map((i) => { i, text: fmt_at(i) })
+    }
+    if n == 0 { return [] }
+    if !all(times, (t) => type_of(t) == "str" && date.valid(t)) { return spaced((i) => str(times[i])) }
+    let days = times | map((t) => slice(t, 0, 10))
+    let changes = (keys: list) => range(1, n) | filter((i) => keys[i] != keys[i - 1])
+    let day_starts = changes(days)
+    let month_starts = changes(days | map((d) => slice(d, 0, 7)))
+    let year_starts = changes(days | map((d) => slice(d, 0, 4)))
+    let picked = if any(times, (t) => len(t) > 10) {
+        len(day_starts) >= 3
+            ? thin(day_starts) | map((i) => { i, text: date.format(days[i], "MMM D") })
+            : spaced((i) => index_of(day_starts, i) != null ? date.format(days[i], "MMM D") : date.format(times[i], "HH:mm"))
+    } else if len(year_starts) >= 3 && len(month_starts) > limit * 2 {
+        thin(year_starts) | map((i) => { i, text: slice(days[i], 0, 4) })
+    } else if len(month_starts) >= 2 {
+        thin(month_starts) | map((i) => { i, text: index_of(year_starts, i) != null ? slice(days[i], 0, 4) : date.format(days[i], "MMM") })
+    } else {
+        spaced((i) => date.format(days[i], "MMM D"))
+    }
+    // Starts that fall close together (a short month) keep the first.
+    let gap = n / (limit * 1.5)
+    reduce(picked, [], (kept, t) => len(kept) == 0 || t.i - kept[-1].i >= gap ? kept + [t] : kept)
+}
+
+// The simple moving average of `period` values, null until there are that many.
+fn stock_chart_sma(xs: list, period: int) -> list {
+    let out = []
+    let total = 0
+    for i in range(len(xs)) {
+        total += xs[i]
+        if i >= period { total -= xs[i - period] }
+        out = out | push(i + 1 >= period ? total / period : null)
+    }
+    out
+}
+
+// The exponential moving average of `period` values (k = 2 / (period + 1)), started
+// from the simple average of the first `period`; null before that.
+fn stock_chart_ema(xs: list, period: int) -> list {
+    let k = 2 / (period + 1)
+    let out = []
+    let prev = null
+    for i in range(len(xs)) {
+        if i + 1 == period {
+            prev = sum(take(xs, period)) / period
+        } else if i + 1 > period {
+            prev = xs[i] * k + prev * (1 - k)
+        }
+        out = out | push(prev)
+    }
+    out
+}
+
+// The RSI of each close (Wilder's smoothing), null for the first `period`.
+fn stock_chart_rsi(xs: list, period: int) -> list {
+    let out = []
+    let gain = 0
+    let loss = 0
+    for i in range(len(xs)) {
+        let d = i == 0 ? 0 : xs[i] - xs[i - 1]
+        let up = d > 0 ? d : 0
+        let down = d < 0 ? 0 - d : 0
+        if i > 0 && i <= period {
+            gain += up / period
+            loss += down / period
+        } else if i > period {
+            gain = (gain * (period - 1) + up) / period
+            loss = (loss * (period - 1) + down) / period
+        }
+        out = out | push(i < period ? null : (loss == 0 ? (gain == 0 ? 50 : 100) : 100 - 100 / (1 + gain / loss)))
+    }
+    out
+}
+
+// Bollinger bands: { mid, upper, lower }, `k` population deviations of `period` closes.
+fn stock_chart_bands(xs: list, period: int, k: num) -> map {
+    let mid = stock_chart_sma(xs, period)
+    let dev = for i in range(len(xs)) => mid[i] == null ? null
+        : sqrt(sum(slice(xs, i + 1 - period, i + 1) | map((v) => (v - mid[i]) * (v - mid[i]))) / period)
+    {
+        mid,
+        upper: for i in range(len(xs)) => mid[i] == null ? null : mid[i] + k * dev[i],
+        lower: for i in range(len(xs)) => mid[i] == null ? null : mid[i] - k * dev[i],
+    }
+}
+
+// MACD: { macd, signal, hist }, the fast EMA less the slow, its EMA, and their gap.
+fn stock_chart_macd(xs: list, fast: int, slow: int, signal: int) -> map {
+    let a = stock_chart_ema(xs, fast)
+    let b = stock_chart_ema(xs, slow)
+    let macd = for i in range(len(xs)) => a[i] == null || b[i] == null ? null : a[i] - b[i]
+    let from = index_of(macd | map((v) => v != null), true)
+    let sig0 = from == null ? [] : stock_chart_ema(drop(macd, from), signal)
+    let sig = for i in range(len(xs)) => from == null || i < from ? null : sig0[i - from]
+    { macd, signal: sig, hist: for i in range(len(xs)) => macd[i] == null || sig[i] == null ? null : macd[i] - sig[i] }
+}
+
+// A candle's time in milliseconds since 1970 (0 when it is not a date).
+fn stock_chart_ms(t) -> num = type_of(t) == "str" && date.valid(t) ? date.ms(t) : (type_of(t) == "int" || type_of(t) == "float" ? t : 0)
+
+// The candles of the last `days` days, as { start, count }; null when that is fewer than two
+// candles or every one of them (the range adds nothing).
+fn stock_chart_window(ms: list, days: num) -> map? {
+    let n = len(ms)
+    if n < 2 { return null }
+    let from = ms[n - 1] - days * 86400000
+    let start = index_of(ms | map((m) => m > from), true) ?? n
+    let count = n - start
+    count < 2 || count >= n ? null : { start, count }
+}
+
+// The candles from `start`, `count` of them, as at most about `most` bars: neighbours
+// drawn as one when there are more, each { i0, i1, time, open, high, low, close, volume }.
+fn stock_chart_buckets(candles: list, start: int, count: int, most: int) -> list {
+    let k = count > most ? ceil(count / most) : 1
+    for g in range(ceil(count / k)) => {
+        let i0 = start + g * k
+        let i1 = (g + 1) * k > count ? start + count - 1 : i0 + k - 1
+        let part = slice(candles, i0, i1 + 1)
+        { i0, i1, time: candles[i0].time, open: candles[i0].open, close: candles[i1].close,
+          high: max(part | map((c) => c.high)), low: min(part | map((c) => c.low)),
+          volume: sum(part | map((c) => c.volume ?? 0)) }
+    }
+}
+
+component StockChart(candles: list = [], kind: str = "candles", period: str = "3M", indicators: list = [],
+                     height: int = 340, prefix: str = "", suffix: str = "", decimals: int = 2,
+                     label: str = "Stock chart", on_range = null, class: str? = null) {
+    style global stock_chart_css
+    let n = len(candles)
+    let ms = candles | map((c) => stock_chart_ms(c.time))
+    let closes = candles | map((c) => c.close)
+    let sma20 = stock_chart_sma(closes, 20)
+    let ema50 = stock_chart_ema(closes, 50)
+    let bb = stock_chart_bands(closes, 20, 2)
+    let rsi14 = stock_chart_rsi(closes, 14)
+    let macd = stock_chart_macd(closes, 12, 26, 9)
+    let ranges = [{ name: "1D", days: 1 }, { name: "1W", days: 7 }, { name: "1M", days: 30 }, { name: "3M", days: 91 },
+                  { name: "1Y", days: 365 }, { name: "All", days: 0 }]
+    let window_of = (name: str) => {
+        let r = find(ranges, (x) => x.name == name)
+        r == null ? null : (r.days == 0 ? { start: 0, count: n } : stock_chart_window(ms, r.days))
+    }
+    let kinds = [{ id: "candles", name: "Candles" }, { id: "line", name: "Line" }, { id: "area", name: "Area" }]
+    let studies = [{ id: "sma20", name: "SMA 20", hue: 2 }, { id: "ema50", name: "EMA 50", hue: 7 }, { id: "bb", name: "Bollinger", hue: 3 },
+                   { id: "rsi", name: "RSI", hue: 7 }, { id: "macd", name: "MACD", hue: 1 }]
+    state shape = kind
+    state picked = window_of(period) != null ? period : "All"
+    state start = (window_of(period) ?? { start: 0 }).start
+    state count = (window_of(period) ?? { count: n }).count
+    state on = indicators
+    state hover = null
+    state at_y = null
+    state drag = null
+    state keyed = false
+    let fewest = n < 5 ? n : 5
+    let c = count < fewest ? fewest : (count > n ? n : count)
+    let s = start < 0 ? 0 : (start > n - c ? n - c : start)
+    let bars = stock_chart_buckets(candles, s, c, 160)
+    let nb = len(bars)
+    let per = c > 160 ? ceil(c / 160) : 1
+    let has = (id: str) => index_of(on, id) != null
+    let at = (vals: list) => bars | map((b) => vals[b.i1])
+    let known = (vals: list) => vals | filter((v) => v != null)
+    let in_view = flatten(bars | map((b) => shape == "candles" ? [b.low, b.high] : [b.close]))
+        + (has("sma20") ? known(at(sma20)) : []) + (has("ema50") ? known(at(ema50)) : [])
+        + (has("bb") ? known(at(bb.upper)) + known(at(bb.lower)) : [])
+    let sc = stock_chart_scale(nb == 0 ? 0 : min(in_view), nb == 0 ? 1 : max(in_view), 6)
+    // Prices take the pane from 3% to 79% down; the volume, the bottom 18%.
+    let y = (v) => 3 + (sc.hi - v) * 76 / (sc.hi - sc.lo)
+    let x = (j) => (j + 0.5) * 100 / nb
+    let w = nb == 0 ? 1 : 100 / nb
+    let pct = (v) => stock_chart_pct(v)
+    let price = (v) => v == null ? "—" : `${v < 0 ? "-" : ""}${prefix}${stock_chart_num(abs(v), decimals)}${suffix}`
+    let tick = (t) => `${t < 0 ? "-" : ""}${prefix}${stock_chart_num(abs(t))}`
+    let up = (b) => b.close >= b.open
+    let side = (ok: bool) => ok ? "ui-stk-up" : "ui-stk-down"
+    // The price pane's paths: bodies, wicks and volume of up or down bars, and lines.
+    let bodies = (rise: bool) => join(range(nb) | filter((j) => up(bars[j]) == rise) | map((j) => {
+        let b = bars[j]
+        let tall = abs(y(b.open) - y(b.close))
+        `M${pct(x(j) - w * 0.36)},${pct(y(max([b.open, b.close])))} h${pct(w * 0.72)} v${pct(tall < 0.4 ? 0.4 : tall)} h-${pct(w * 0.72)} Z`
+    }), " ")
+    let wicks = (rise: bool) => join(range(nb) | filter((j) => up(bars[j]) == rise)
+        | map((j) => `M${pct(x(j))},${pct(y(bars[j].high))} V${pct(y(bars[j].low))}`), " ")
+    let vtop = max([1] + (bars | map((b) => b.volume)))
+    let vols = (rise: bool) => join(range(nb) | filter((j) => up(bars[j]) == rise) | map((j) => {
+        let tall = bars[j].volume * 18 / vtop
+        `M${pct(x(j) - w * 0.36)},100 h${pct(w * 0.72)} v-${pct(tall)} h-${pct(w * 0.72)} Z`
+    }), " ")
+    let line_in = (vals: list, to) => {
+        let js = range(nb) | filter((j) => vals[j] != null)
+        len(js) == 0 ? "" : "M" + join(js | map((j) => `${pct(x(j))},${pct(to(vals[j]))}`), " L")
+    }
+    let close_line = line_in(bars | map((b) => b.close), y)
+    let band = () => {
+        let hi = at(bb.upper)
+        let lo = at(bb.lower)
+        let js = range(nb) | filter((j) => hi[j] != null)
+        len(js) == 0 ? "" : "M" + join(js | map((j) => `${pct(x(j))},${pct(y(hi[j]))}`), " L") + " L"
+            + join(reverse(js) | map((j) => `${pct(x(j))},${pct(y(lo[j]))}`), " L") + " Z"
+    }
+    // The RSI and MACD panes.
+    let ri = (v) => 100 - v
+    let mvals = known(at(macd.macd) + at(macd.signal) + at(macd.hist))
+    let reach = max([0.000001] + (mvals | map((v) => abs(v))))
+    let msc = stock_chart_scale(0 - reach, reach, 4)
+    let my = (v) => (msc.hi - v) * 100 / (msc.hi - msc.lo)
+    let hists = (rise: bool) => join(range(nb) | filter((j) => macd.hist[bars[j].i1] != null && (macd.hist[bars[j].i1] >= 0) == rise) | map((j) => {
+        let v = macd.hist[bars[j].i1]
+        `M${pct(x(j) - w * 0.32)},${pct(my(v > 0 ? v : 0))} h${pct(w * 0.64)} v${pct(abs(my(v) - my(0)))} h-${pct(w * 0.64)} Z`
+    }), " ")
+    let panes = [{ id: "price", h: height }] + (has("rsi") ? [{ id: "rsi", h: 90 }] : []) + (has("macd") ? [{ id: "macd", h: 100 }] : [])
+    // Where the crosshair is: the bar hovered, else the last in view.
+    let focus = hover != null && hover < nb ? hover : null
+    let shown = focus != null ? bars[focus] : (nb > 0 ? bars[nb - 1] : null)
+    let before = (b) => b.i0 > 0 ? candles[b.i0 - 1].close : b.open
+    let change = (b) => before(b) != 0 ? (b.close - before(b)) * 100 / before(b) : 0
+    let when = (b) => stock_chart_when(b.time)
+    let last = n > 0 ? candles[-1] : null
+    let last_up = n < 2 || last.close >= candles[n - 2].close
+    let first_view = nb > 0 ? bars[0].open : 0
+    let view_change = nb > 0 && first_view != 0 ? (bars[nb - 1].close - first_view) * 100 / first_view : 0
+    let cross_price = at_y != null && focus != null && at_y * 100 >= 3 && at_y * 100 <= 79 ? sc.hi - (at_y * 100 - 3) * (sc.hi - sc.lo) / 76 : null
+    let axis_width = max([6] + (sc.ticks | map((t) => len(tick(t)))) + [last != null ? len(price(last.close)) + 1 : 0])
+    let said = (b) => `${when(b)}: open ${price(b.open)}, high ${price(b.high)}, low ${price(b.low)}, close ${price(b.close)}, ${stock_chart_signed(change(b))}, volume ${stock_chart_short(b.volume)}`
+    // Moving the view: to a first candle, by a factor of zoom around a point (0 to 1 across).
+    let leave_range = () => {
+        if picked != "" {
+            picked = ""
+            on_range && on_range("")
+        }
+    }
+    let move_to = (first: int) => {
+        let next = first < 0 ? 0 : (first > n - c ? n - c : first)
+        if next != s {
+            start = next
+            leave_range()
+        }
+    }
+    let zoom = (factor: num, fx: num) => {
+        let anchor = s + fx * c
+        let want = round(c * factor)
+        let next = want < fewest ? fewest : (want > n ? n : want)
+        if next != c {
+            let first = round(anchor - fx * next)
+            count = next
+            start = first < 0 ? 0 : (first > n - next ? n - next : first)
+            leave_range()
+        }
+    }
+    let locate = (e) => {
+        let r = e.target.closest(".ui-stk-panes").getBoundingClientRect()
+        { fx: r.width > 0 ? (e.clientX - r.left) / r.width : 0.5, py: (e.clientY - r.top) / height, width: r.width }
+    }
+    <div class={ui_cls(["ui-stk", class])} style={`--ui-stk-h: ${height}px`}>
+        <div.ui-stk-head>
+            <h3.ui-stk-name>{label}</h3>
+            {last != null && <span.ui-stk-last>{price(last.close)}</span>}
+            {nb > 0 && <span class={`ui-stk-move ${side(view_change >= 0)}`}>{stock_chart_signed(view_change)}</span>}
+            {nb > 0 && <span.ui-stk-span>{picked != "" && picked != "All" ? `past ${picked}` : "in view"} · {when(bars[0])} – {when(bars[nb - 1])}</span>}
+        </div>
+        <div.ui-stk-tools>
+            <span.ui-stk-group role="group" aria-label="Range">
+                {for r in ranges => <button type="button" aria-pressed={picked == r.name ? "true" : "false"} disabled={window_of(r.name) == null}
+                        @click={() => {
+                            let wnd = window_of(r.name)
+                            if wnd != null {
+                                start = wnd.start
+                                count = wnd.count
+                                picked = r.name
+                                hover = null
+                                on_range && on_range(r.name)
+                            }
+                        }}>{r.name}</button>}
+            </span>
+            <span.ui-stk-group role="group" aria-label="Chart type">
+                {for k in kinds => <button type="button" aria-pressed={shape == k.id ? "true" : "false"} @click={() => { shape = k.id }}>{k.name}</button>}
+            </span>
+            <span.ui-stk-group.ui-stk-ind role="group" aria-label="Indicators">
+                {for t in studies => <button type="button" aria-pressed={has(t.id) ? "true" : "false"} style={`--c: var(--ui-stk-${t.hue})`}
+                        @click={() => { on = has(t.id) ? (on | filter((x) => x != t.id)) : on + [t.id] }}>{t.name}</button>}
+            </span>
+        </div>
+        <div.ui-stk-chart>
+            <div class={ui_cls(["ui-stk-panes", drag != null && "ui-stk-dragging"])} tabindex="0" role="application"
+                 aria-label={`${label}, ${nb > 0 ? `${when(bars[0])} to ${when(bars[nb - 1])}` : "no data"}`}
+                 aria-roledescription="chart"
+                 @pointermove={(e) => {
+                     let p = locate(e)
+                     if drag != null && p.width > 0 { move_to(drag.from + round((drag.x - e.clientX) * c / p.width)) }
+                     let j = floor(p.fx * nb)
+                     hover = nb == 0 ? null : (j < 0 ? 0 : (j >= nb ? nb - 1 : j))
+                     at_y = p.py >= 0 && p.py <= 1 ? p.py : null
+                     keyed = false
+                 }}
+                 @pointerleave={() => {
+                     if drag == null {
+                         hover = null
+                         at_y = null
+                     }
+                 }}
+                 @pointerdown={(e) => {
+                     if e.button == 0 {
+                         e.target.closest(".ui-stk-panes").setPointerCapture(e.pointerId)
+                         drag = { x: e.clientX, from: s }
+                     }
+                 }}
+                 @pointerup={() => { drag = null }}
+                 @pointercancel={() => { drag = null }}
+                 @wheel={(e) => {
+                     e.preventDefault()
+                     let p = locate(e)
+                     zoom(e.deltaY > 0 ? 1.25 : 0.8, p.fx < 0 ? 0 : (p.fx > 1 ? 1 : p.fx))
+                 }}
+                 @keydown={(e) => {
+                     let k = e.key
+                     if k == "ArrowRight" || k == "ArrowLeft" {
+                         e.preventDefault()
+                         let step = k == "ArrowRight" ? 1 : -1
+                         let next = focus == null ? nb - 1 : focus + step
+                         if next < 0 {
+                             move_to(s - per)
+                             next = 0
+                         } else if next >= nb {
+                             move_to(s + per)
+                             next = nb - 1
+                         }
+                         hover = next
+                         at_y = null
+                         keyed = true
+                     } else if k == "+" || k == "=" || k == "-" || k == "_" || k == "−" {
+                         e.preventDefault()
+                         zoom(k == "+" || k == "=" ? 0.8 : 1.25, focus != null && nb > 0 ? (focus + 0.5) / nb : 0.5)
+                         keyed = true
+                     } else if k == "Home" || k == "End" {
+                         e.preventDefault()
+                         move_to(k == "Home" ? 0 : n - c)
+                         hover = k == "Home" ? 0 : nb - 1
+                         keyed = true
+                     } else if k == "Escape" {
+                         hover = null
+                         keyed = false
+                     }
+                 }}>
+                {for p in panes => <div.ui-stk-pane data-pane={p.id} style={`--ph: ${p.h}px`}>
+                    {match p.id {
+                        "price" => [
+                            for t in sc.ticks => <span.ui-stk-grid style={`top: ${pct(y(t))}%`}></span>,
+                            <svg.ui-stk-svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                                <path.ui-stk-vol.ui-stk-up d={vols(true)}/>
+                                <path.ui-stk-vol.ui-stk-down d={vols(false)}/>
+                                {has("bb") && [<path.ui-stk-band d={band()}/>,
+                                    <path.ui-stk-bb d={line_in(at(bb.upper), y)} vector-effect="non-scaling-stroke"/>,
+                                    <path.ui-stk-bb d={line_in(at(bb.lower), y)} vector-effect="non-scaling-stroke"/>,
+                                    <path.ui-stk-bbmid d={line_in(at(bb.mid), y)} vector-effect="non-scaling-stroke"/>]}
+                                {shape == "candles" ? [
+                                    <path.ui-stk-wick.ui-stk-up d={wicks(true)} vector-effect="non-scaling-stroke"/>,
+                                    <path.ui-stk-wick.ui-stk-down d={wicks(false)} vector-effect="non-scaling-stroke"/>,
+                                    <path.ui-stk-body.ui-stk-up d={bodies(true)}/>,
+                                    <path.ui-stk-body.ui-stk-down d={bodies(false)}/>,
+                                ] : [
+                                    shape == "area" && nb > 0 && <path.ui-stk-fill d={`${close_line} L${pct(x(nb - 1))},100 L${pct(x(0))},100 Z`}/>,
+                                    <path.ui-stk-close d={close_line} vector-effect="non-scaling-stroke"/>,
+                                ]}
+                                {has("sma20") && <path.ui-stk-sma d={line_in(at(sma20), y)} vector-effect="non-scaling-stroke"/>}
+                                {has("ema50") && <path.ui-stk-ema d={line_in(at(ema50), y)} vector-effect="non-scaling-stroke"/>}
+                            </svg>,
+                            last != null && last.close >= sc.lo && last.close <= sc.hi &&
+                                <span class={`ui-stk-lastline ${side(last_up)}`} style={`top: ${pct(y(last.close))}%`}></span>,
+                            cross_price != null && <span.ui-stk-hline style={`top: ${pct(at_y * 100)}%`}></span>,
+                            shown != null && <div.ui-stk-read aria-hidden="true">
+                                <span.ui-stk-when>{when(shown)}{shown.i1 > shown.i0 ? ` (${shown.i1 - shown.i0 + 1} bars)` : ""}</span>
+                                <span>O <b>{price(shown.open)}</b></span>
+                                <span>H <b>{price(shown.high)}</b></span>
+                                <span>L <b>{price(shown.low)}</b></span>
+                                <span class={side(change(shown) >= 0)}>C <b>{price(shown.close)}</b> <b>{stock_chart_signed(change(shown))}</b></span>
+                                <span>Vol <b>{stock_chart_short(shown.volume)}</b></span>
+                                {has("sma20") && <span>SMA 20 <b>{price(sma20[shown.i1])}</b></span>}
+                                {has("ema50") && <span>EMA 50 <b>{price(ema50[shown.i1])}</b></span>}
+                                {has("bb") && <span>BB <b>{price(bb.lower[shown.i1])}</b> – <b>{price(bb.upper[shown.i1])}</b></span>}
+                            </div>,
+                        ]
+                        "rsi" => [
+                            <span.ui-stk-pname>RSI 14 {shown != null && rsi14[shown.i1] != null ? stock_chart_num(rsi14[shown.i1], 1) : ""}</span>,
+                            <span.ui-stk-band-rsi style="top: 30%; height: 40%"></span>,
+                            <span.ui-stk-level style="top: 30%"></span>,
+                            <span.ui-stk-level style="top: 70%"></span>,
+                            <svg.ui-stk-svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                                <path.ui-stk-rsi d={line_in(at(rsi14), ri)} vector-effect="non-scaling-stroke"/>
+                            </svg>,
+                        ]
+                        _ => [
+                            <span.ui-stk-pname>MACD 12 26 9 {shown != null && macd.macd[shown.i1] != null ? stock_chart_num(macd.macd[shown.i1], decimals + 2) : ""}</span>,
+                            <span.ui-stk-grid.ui-stk-zero style={`top: ${pct(my(0))}%`}></span>,
+                            <svg.ui-stk-svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                                <path.ui-stk-hist.ui-stk-up d={hists(true)}/>
+                                <path.ui-stk-hist.ui-stk-down d={hists(false)}/>
+                                <path.ui-stk-macd d={line_in(at(macd.macd), my)} vector-effect="non-scaling-stroke"/>
+                                <path.ui-stk-signal d={line_in(at(macd.signal), my)} vector-effect="non-scaling-stroke"/>
+                            </svg>,
+                        ]
+                    }}
+                </div>}
+                {focus != null && <span.ui-stk-vline style={`left: ${pct(x(focus))}%`}></span>}
+                <span.ui-sr aria-live="polite">{keyed && shown != null ? said(shown) : ""}</span>
+            </div>
+            <div.ui-stk-axis style={`width: ${axis_width}ch`} aria-hidden="true">
+                {for p in panes => <div.ui-stk-ax style={`--ph: ${p.h}px`}>
+                    {match p.id {
+                        "price" => [
+                            for t in sc.ticks => !(last != null && abs(y(t) - y(last.close)) * height < 1400) && <span style={`top: ${pct(y(t))}%`}>{tick(t)}</span>,
+                            last != null && last.close >= sc.lo && last.close <= sc.hi &&
+                                <span class={`ui-stk-tag ${side(last_up)}`} style={`top: ${pct(y(last.close))}%`}>{price(last.close)}</span>,
+                            cross_price != null && <span.ui-stk-cross style={`top: ${pct(at_y * 100)}%`}>{price(cross_price)}</span>,
+                        ]
+                        "rsi" => for t in [70, 30] => <span style={`top: ${pct(ri(t))}%`}>{t}</span>
+                        _ => for t in msc.ticks => <span style={`top: ${pct(my(t))}%`}>{t < 0 ? "-" : ""}{stock_chart_num(abs(t))}</span>
+                    }}
+                </div>}
+            </div>
+            <div.ui-stk-x aria-hidden="true">
+                {for t in stock_chart_ticks(bars | map((b) => b.time), 7) => !(focus != null && abs(x(t.i) - x(focus)) < 9) && <span
+                    class={ui_cls([x(t.i) < 4 && "ui-stk-first", x(t.i) > 96 && "ui-stk-end"])} style={`left: ${pct(x(t.i))}%`}>{t.text}</span>}
+                {focus != null && <span class={ui_cls(["ui-stk-cross", x(focus) < 8 && "ui-stk-first", x(focus) > 92 && "ui-stk-end"])}
+                                        style={`left: ${pct(x(focus))}%`}>{when(bars[focus])}</span>}
+            </div>
+            <span></span>
+        </div>
+        <p.ui-stk-help>Drag to pan and use the wheel to zoom; focused, <kbd>←</kbd> <kbd>→</kbd> move the crosshair, <kbd>+</kbd> <kbd>−</kbd> zoom, <kbd>Esc</kbd> lets go.</p>
+        <table.ui-sr>
+            <caption>{label}, the bars in view</caption>
+            <thead><tr><th scope="col">Time</th><th scope="col">Open</th><th scope="col">High</th><th scope="col">Low</th>
+                <th scope="col">Close</th><th scope="col">Volume</th></tr></thead>
+            <tbody>
+                {for b in bars => <tr>
+                    <th scope="row">{when(b)}</th><td>{price(b.open)}</td><td>{price(b.high)}</td><td>{price(b.low)}</td>
+                    <td>{price(b.close)}</td><td>{stock_chart_num(b.volume, 0)}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </div>
+}

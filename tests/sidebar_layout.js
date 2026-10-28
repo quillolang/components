@@ -1,0 +1,12 @@
+const parts = (sel) => { const l = $(sel); return { aside: l.querySelector(".ui-sidebar-layout-aside").getBoundingClientRect(), main: l.querySelector(".ui-sidebar-layout-main").getBoundingClientRect() }; };
+const left = parts(".sidebar-layout-demo-left");
+if (Math.abs(left.aside.width - 240) > 1) return `width="240px" gives ${left.aside.width}px`;
+if (left.main.left < left.aside.right || Math.abs(left.main.top - left.aside.top) > 1) return "the content is not beside the sidebar, to its right";
+if (Math.round(left.main.left - left.aside.right) !== 24) return `the default gap is ${left.main.left - left.aside.right}px`;
+const right = parts(".sidebar-layout-demo-right");
+if (right.aside.left < right.main.right || Math.abs(right.aside.width - 200) > 1) return "side=\"right\" does not put the sidebar at the right";
+if (Math.round(right.aside.left - right.main.right) !== 24) return `gap="lg" is ${right.aside.left - right.main.right}px`;
+if (!$(".sidebar-layout-demo-left").querySelector("aside.ui-sidebar-layout-aside")) return "the sidebar is not an <aside>";
+const narrow = parts(".sidebar-layout-demo-narrow");
+if (narrow.aside.top < narrow.main.bottom - 1) return "in a 400px box the sidebar does not go under the content";
+if (Math.abs(narrow.aside.width - narrow.main.width) > 1) return "stacked, the sidebar is not as wide as the content";

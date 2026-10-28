@@ -1,0 +1,248 @@
+// PnlChart: profit and loss day by day: the running total as a line, with the
+// drawdown (how far it has fallen from its best so far) shaded under that best, and
+// each day's result as a bar, green for a gain and red for a loss, in a pane below.
+// Above them: the total, the share of winning days, the best and worst days and the
+// largest drawdown. CSS only: hovering a day shows its result, the total and the
+// drawdown then, and screen readers get the numbers as a table.
+//
+//   <PnlChart label="Strategy P&L, Q3" days={[{ date: "2026-07-01", pnl: 1240 }, { date: "2026-07-02", pnl: -380 }]} prefix="$"/>
+//   <PnlChart label="Paper account" days={days} prefix="$" decimals={0} height={180} stats={false}/>
+//
+// days: a list of { date, pnl }, oldest first: date a date or a date-time (or any
+// label), pnl the day's profit (below 0 a loss). height: the total's pane in pixels
+// (220); bars_height: the daily bars' pane (90). stats: the figures above the chart
+// (true). prefix and suffix: around every amount ("$"); decimals: digits after the
+// point (2). label: what the chart shows; it names it for screen readers and captions
+// their table. show_label also writes it above the chart.
+
+let pnl_chart_css = css`
+.ui-pnl { --ui-pnl-line: light-dark(#2a78d6, #3987e5);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-pnl-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-pnl-up { --k: var(--ui-success); } .ui-pnl-down { --k: var(--ui-danger); }
+.ui-pnl-stats { display: flex; flex-wrap: wrap; gap: 8px 28px; margin: 0; }
+.ui-pnl-stats div { display: grid; gap: 2px; }
+.ui-pnl-stats dt { color: var(--ui-muted); font-size: 12px; }
+.ui-pnl-stats dd { margin: 0; font-size: 16px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-pnl-stats .ui-pnl-up dd, .ui-pnl-stats .ui-pnl-down dd { color: var(--k); }
+.ui-pnl-frame { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; padding-top: 8px; }
+.ui-pnl-plot { position: relative; }
+.ui-pnl-pane, .ui-pnl-cp, .ui-pnl-yp { position: relative; height: var(--h); }
+.ui-pnl-bpane, .ui-pnl-cb, .ui-pnl-yb { position: relative; height: var(--bh); margin-top: 26px; }
+.ui-pnl-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-pnl-zero { background: var(--ui-strong); }
+.ui-pnl-svg { position: absolute; z-index: 1; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.ui-pnl-total { fill: none; stroke: var(--ui-pnl-line); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.ui-pnl-peak { fill: none; stroke: var(--ui-danger); stroke-width: 1; stroke-dasharray: 3 3; opacity: .6; }
+.ui-pnl-dd { fill: var(--ui-danger); opacity: .14; }
+.ui-pnl-cols { position: absolute; inset: 0; display: flex; }
+.ui-pnl-col { position: relative; flex: 1; min-width: 0; }
+.ui-pnl-col::before { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: var(--ui-strong); opacity: 0; }
+.ui-pnl-col:hover::before { opacity: .9; }
+.ui-pnl-bar { position: absolute; left: 15%; right: 15%; min-height: 1px; border-radius: 1px; background: var(--k); opacity: .85; }
+.ui-pnl-col:hover .ui-pnl-bar { opacity: 1; }
+.ui-pnl-dot { position: absolute; z-index: 2; left: 50%; display: none; width: 7px; height: 7px; margin: -3.5px 0 0 -3.5px; border-radius: 50%;
+  background: var(--ui-pnl-line); box-shadow: 0 0 0 2px var(--ui-bg); }
+.ui-pnl-col:hover .ui-pnl-dot { display: block; }
+.ui-pnl-tip { position: absolute; z-index: 20; top: 0; left: calc(50% + 10px); display: none; min-width: 150px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-pnl-flip .ui-pnl-tip { left: auto; right: calc(50% + 10px); }
+.ui-pnl-col:hover .ui-pnl-tip { display: block; }
+.ui-pnl-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-pnl-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-pnl-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-pnl-tip .ui-pnl-up b, .ui-pnl-tip .ui-pnl-down b { color: var(--k); }
+.ui-pnl-y span { position: absolute; left: 0; transform: translateY(-50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-pnl-x { position: relative; height: 16px; margin-top: 6px; }
+.ui-pnl-x span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); white-space: nowrap; }
+.ui-pnl-x .ui-pnl-first { transform: none; }
+.ui-pnl-x .ui-pnl-end { transform: translateX(-100%); }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn pnl_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn pnl_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : pnl_chart_group(floor(n / 1000)) + "," + pnl_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn pnl_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${pnl_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${pnl_chart_group(floor(units / scale))}${tail}`
+}
+
+// A large number, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn pnl_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? pnl_chart_num(v)
+        : `${v < 0 ? "-" : ""}${pnl_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// A change in percent, signed, to two decimals: "+1.25%", "-0.40%".
+fn pnl_chart_signed(p: num) -> str = `${p > 0 ? "+" : (p < 0 && round(abs(p) * 100) > 0 ? "-" : "")}${pnl_chart_num(abs(p), 2)}%`
+
+// A coordinate out of 100 (or a length), to two decimals.
+fn pnl_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The axis from lo to hi, widened to round ticks: about `steps` steps of 1, 2, 2.5 or 5 x 10^n.
+fn pnl_chart_scale(lo: num, hi: num, steps: int = 5) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo) / 10) : hi - lo
+    let raw = span / steps
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+// A candle's time as it reads: "Mar 2, 2026" for a date, "Mar 2, 14:30" for a date-time.
+fn pnl_chart_when(t) -> str =
+    type_of(t) != "str" || !date.valid(t) ? str(t) : (len(t) > 10 ? date.format(t, "MMM D, HH:mm") : date.format(t, "MMM D, YYYY"))
+
+// Where the time axis is labelled: about `limit` of { i, text }, at the starts of years,
+// months or days when the times cross them ("2026", "Mar", "Mar 2"), else every few
+// candles ("14:30", "Mar 2").
+fn pnl_chart_ticks(times: list, limit: int) -> list {
+    let n = len(times)
+    let thin = (idx: list) => {
+        let step = ceil(len(idx) / limit)
+        range(len(idx)) | filter((k) => k % step == 0) | map((k) => idx[k])
+    }
+    let spaced = (fmt_at) => {
+        let step = ceil(n / limit)
+        range(n) | filter((i) => i % step == floor(step / 2)) | map((i) => { i, text: fmt_at(i) })
+    }
+    if n == 0 { return [] }
+    if !all(times, (t) => type_of(t) == "str" && date.valid(t)) { return spaced((i) => str(times[i])) }
+    let days = times | map((t) => slice(t, 0, 10))
+    let changes = (keys: list) => range(1, n) | filter((i) => keys[i] != keys[i - 1])
+    let day_starts = changes(days)
+    let month_starts = changes(days | map((d) => slice(d, 0, 7)))
+    let year_starts = changes(days | map((d) => slice(d, 0, 4)))
+    let picked = if any(times, (t) => len(t) > 10) {
+        len(day_starts) >= 3
+            ? thin(day_starts) | map((i) => { i, text: date.format(days[i], "MMM D") })
+            : spaced((i) => index_of(day_starts, i) != null ? date.format(days[i], "MMM D") : date.format(times[i], "HH:mm"))
+    } else if len(year_starts) >= 3 && len(month_starts) > limit * 2 {
+        thin(year_starts) | map((i) => { i, text: slice(days[i], 0, 4) })
+    } else if len(month_starts) >= 2 {
+        thin(month_starts) | map((i) => { i, text: index_of(year_starts, i) != null ? slice(days[i], 0, 4) : date.format(days[i], "MMM") })
+    } else {
+        spaced((i) => date.format(days[i], "MMM D"))
+    }
+    // Starts that fall close together (a short month) keep the first.
+    let gap = n / (limit * 1.5)
+    reduce(picked, [], (kept, t) => len(kept) == 0 || t.i - kept[-1].i >= gap ? kept + [t] : kept)
+}
+
+view PnlChart(days: list, height: int = 220, bars_height: int = 90, stats: bool = true, prefix: str = "", suffix: str = "",
+              decimals: int = 2, label: str = "Profit and loss", show_label: bool = false, class: str? = null) {
+    style global pnl_chart_css
+    let n = len(days)
+    let pnl = days | map((d) => d.pnl ?? 0)
+    let total = vec.cumsum([0] + pnl) | drop(1)
+    let peak = drop(reduce(total, [0], (acc, v) => acc + [v > acc[-1] ? v : acc[-1]]), 1)
+    let dd = for i in range(n) => total[i] - peak[i]
+    let sc = pnl_chart_scale(min([0] + total), max([0] + total), 4)
+    let bsc = pnl_chart_scale(min([0] + pnl), max([0] + pnl), 2)
+    let y = (v) => (sc.hi - v) * 100 / (sc.hi - sc.lo)
+    let by = (v) => (bsc.hi - v) * 100 / (bsc.hi - bsc.lo)
+    let x = (i) => (i + 0.5) * 100 / n
+    let pct = (v) => pnl_chart_pct(v)
+    let money = (v) => `${v < 0 ? "-" : (v > 0 ? "+" : "")}${prefix}${pnl_chart_num(abs(v), decimals)}${suffix}`
+    let plain = (v) => `${v < 0 ? "-" : ""}${prefix}${pnl_chart_num(abs(v), decimals)}${suffix}`
+    let tick = (t) => `${t < 0 ? "-" : ""}${prefix}${pnl_chart_short(abs(t))}`
+    let side = (v) => v >= 0 ? "ui-pnl-up" : "ui-pnl-down"
+    let pts = (vals: list, idx: list) => join(idx | map((i) => `${pct(x(i))},${pct(y(vals[i]))}`), " L")
+    let line = n == 0 ? "" : "M" + pts(total, range(n))
+    let shade = n == 0 ? "" : `M${pts(peak, range(n))} L${pts(total, reverse(range(n)))} Z`
+    let decided = pnl | filter((v) => v != 0)
+    let wins = len(pnl | filter((v) => v > 0))
+    let worst_dd = min([0] + dd)
+    let when = (d) => pnl_chart_when(d.date)
+    let figures = [
+        { name: "Total", value: n == 0 ? 0 : total[-1], signed: true },
+        { name: "Winning days", text: len(decided) == 0 ? "—" : `${round(wins * 100 / len(decided))}% (${wins} of ${len(decided)})` },
+        { name: "Best day", value: max([0] + pnl), signed: true },
+        { name: "Worst day", value: min([0] + pnl), signed: true },
+        { name: "Max drawdown", value: worst_dd, signed: true },
+    ]
+    let axis_width = max([4] + ((sc.ticks + bsc.ticks) | map((t) => len(tick(t)))))
+    <figure class={ui_cls(["ui-pnl", class])} aria-label={label} style={`--h: ${height}px; --bh: ${bars_height}px`}>
+        {show_label && <figcaption.ui-pnl-title>{label}</figcaption>}
+        {stats && <dl.ui-pnl-stats>
+            {for f in figures => <div class={f.value != null && f.value != 0 ? side(f.value) : null}>
+                <dt>{f.name}</dt><dd>{f.value != null ? money(f.value) : f.text}</dd>
+            </div>}
+        </dl>}
+        <div.ui-pnl-frame aria-hidden="true">
+            <div.ui-pnl-plot>
+                <div.ui-pnl-pane>
+                    {for t in sc.ticks => <span class={ui_cls(["ui-pnl-grid", t == 0 && "ui-pnl-zero"])} style={`top: ${pct(y(t))}%`}></span>}
+                    <svg.ui-pnl-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                        <path.ui-pnl-dd d={shade}/>
+                        {worst_dd < 0 && <path.ui-pnl-peak d={"M" + pts(peak, range(n))} vector-effect="non-scaling-stroke"/>}
+                        <path.ui-pnl-total d={line} vector-effect="non-scaling-stroke"/>
+                    </svg>
+                </div>
+                <div.ui-pnl-bpane>
+                    {for t in bsc.ticks => <span class={ui_cls(["ui-pnl-grid", t == 0 && "ui-pnl-zero"])} style={`top: ${pct(by(t))}%`}></span>}
+                </div>
+                <div.ui-pnl-cols>
+                    {for [i, d] in enumerate(days) => <div class={ui_cls(["ui-pnl-col", side(pnl[i]), n > 1 && i >= n / 2 && "ui-pnl-flip"])}>
+                        <div.ui-pnl-cp><span.ui-pnl-dot style={`top: ${pct(y(total[i]))}%`}></span></div>
+                        <div.ui-pnl-cb>
+                            <span.ui-pnl-bar style={`top: ${pct(by(pnl[i] > 0 ? pnl[i] : 0))}%; height: ${pct(abs(by(pnl[i]) - by(0)))}%`}></span>
+                        </div>
+                        <span.ui-pnl-tip>
+                            <strong>{when(d)}</strong>
+                            <p class={side(pnl[i])}>Day<b>{money(pnl[i])}</b></p>
+                            <p>Total<b>{money(total[i])}</b></p>
+                            <p class={dd[i] < 0 ? "ui-pnl-down" : null}>Drawdown<b>{dd[i] < 0 ? money(dd[i]) : "—"}</b></p>
+                        </span>
+                    </div>}
+                </div>
+            </div>
+            <div.ui-pnl-y style={`width: ${axis_width}ch`}>
+                <div.ui-pnl-yp>{for t in sc.ticks => <span style={`top: ${pct(y(t))}%`}>{tick(t)}</span>}</div>
+                <div.ui-pnl-yb>{for t in bsc.ticks => <span style={`top: ${pct(by(t))}%`}>{tick(t)}</span>}</div>
+            </div>
+            <div.ui-pnl-x>
+                {for t in pnl_chart_ticks(days | map((d) => d.date), 7) => <span
+                    class={ui_cls([x(t.i) < 4 && "ui-pnl-first", x(t.i) > 96 && "ui-pnl-end"])} style={`left: ${pct(x(t.i))}%`}>{t.text}</span>}
+            </div>
+            <span></span>
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col">Date</th><th scope="col">Day</th><th scope="col">Total</th><th scope="col">Drawdown</th></tr></thead>
+            <tbody>
+                {for [i, d] in enumerate(days) => <tr>
+                    <th scope="row">{when(d)}</th><td>{money(pnl[i])}</td><td>{plain(total[i])}</td><td>{plain(dd[i])}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

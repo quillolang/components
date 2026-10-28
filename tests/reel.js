@@ -1,0 +1,17 @@
+const eps = $("#reel-demo-episodes"), days = $("#reel-demo-days");
+if (!eps || !days) return "the two reels are missing";
+const cs = getComputedStyle(eps);
+if (cs.overflowX !== "auto" || !["x", "x proximity"].includes(cs.scrollSnapType)) return `the strip is overflow ${cs.overflowX}, snap ${cs.scrollSnapType}`;
+if (eps.scrollWidth <= eps.clientWidth + 10) return "twelve cards do not overflow the strip";
+const cards = [...eps.children];
+if (cards.length !== 12 || new Set(cards.map((c) => Math.round(c.getBoundingClientRect().top))).size !== 1) return "the cards are not all on one line";
+if (Math.abs(cards[0].getBoundingClientRect().width - 200) > 1) return `item_width="200px" gives ${cards[0].getBoundingClientRect().width}px`;
+if (getComputedStyle(cards[0]).scrollSnapAlign !== "start") return "the cards do not snap at their start";
+if (eps.getAttribute("role") !== "region" || eps.getAttribute("aria-label") !== "Episodes" || eps.tabIndex !== 0) return "a labelled reel is not a focusable region";
+eps.scrollTo({ left: 1000, behavior: "instant" }); await wait(100);
+if (eps.scrollLeft < 500) return "the strip did not scroll sideways";
+eps.scrollTo({ left: 0, behavior: "instant" });
+const ds = getComputedStyle(days);
+if (ds.scrollbarWidth !== "none") return `bar={false} leaves scrollbar-width ${ds.scrollbarWidth}`;
+if (getComputedStyle(days.querySelector(".ui-btn")).scrollSnapAlign !== "center" || ds.columnGap !== "8px") return "snap=\"center\" or gap=\"sm\" is not applied";
+if (ds.paddingLeft !== "4px" || ds.scrollPaddingLeft !== "4px") return "pad={4} is not kept by the snapping";

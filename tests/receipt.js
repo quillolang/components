@@ -1,0 +1,18 @@
+const r = $("#receipt-demo-cafe");
+if (r.getAttribute("aria-label") !== "Receipt 0042 from Corner Café") return "the receipt is not named";
+if (r.querySelector(".ui-receipt-store").textContent !== "Corner Café" || !r.querySelector(".ui-receipt-head").textContent.includes("Porto")) return "the head";
+const when = r.querySelector(".ui-receipt-meta time");
+if (when.getAttribute("datetime") !== "2026-10-28T09:14:00" || when.textContent !== "28 Oct 2026, 09:14") return `date: ${when.textContent}`;
+if (!r.querySelector(".ui-receipt-meta").textContent.includes("Rui") || !r.querySelector(".ui-receipt-meta").textContent.includes("Table4")) return "cashier and table";
+const rows = [...r.querySelectorAll(".ui-receipt-lines tr")].map((tr) => [...tr.children].map((c) => c.textContent.replace(/\s+/g, " ").trim()));
+if (rows.length !== 3 || rows[0][0] !== "2 × Flat white @ €3.50" || rows[0][1] !== "€7.00" || rows[1][0] !== "Croissant") return `lines: ${JSON.stringify(rows)}`;
+const dts = [...r.querySelectorAll(".ui-receipt-totals dt")].map((d) => d.textContent);
+const dds = [...r.querySelectorAll(".ui-receipt-totals dd")].map((d) => d.textContent);
+if (dts.join() !== "Subtotal,Discount,VAT 10%,Tip,Total,Cash,Change") return `totals: ${dts}`;
+if (dds.join() !== "€13.00,−€1.30,€1.17,€1.00,€13.87,€20.00,€6.13") return `amounts: ${dds}`;
+if (!r.querySelector(".ui-receipt-foot").textContent.includes("Wi-Fi") || getComputedStyle(r.querySelector(".ui-receipt-foot")).whiteSpace !== "pre-line") return "the footer";
+if (r.querySelector(".ui-receipt-code span").textContent !== "ORD-20261028-0042") return "the code";
+if (!getComputedStyle(r).fontFamily.match(/mono|Menlo|Consolas/i)) return "not monospace";
+const k = $("#receipt-demo-min");
+if (k.querySelector(".ui-receipt-meta time").textContent !== "28 Oct 2026" || k.querySelector(".ui-receipt-meta").textContent.includes("Receipt")) return "a plain date, no number";
+if (k.querySelector(".ui-receipt-paid") || k.querySelector(".ui-receipt-foot") || getComputedStyle(k.querySelector(".ui-receipt-code")).display !== "none") return "parts left out show";

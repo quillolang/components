@@ -1,0 +1,14 @@
+const short = $("#stacked-layout-demo-short"), long = $("#stacked-layout-demo-long");
+const sl = short.querySelector(".ui-stacked"), sr = short.getBoundingClientRect();
+const head = sl.querySelector("header.ui-stacked-header"), foot = sl.querySelector("footer.ui-stacked-footer"), main = sl.querySelector(".ui-stacked-main");
+if (!head || !foot || !main) return "the header, content and footer bands are missing";
+if (Math.abs(head.getBoundingClientRect().top - (sr.top + 1)) > 1) return "the header is not at the top";
+if (Math.abs(foot.getBoundingClientRect().bottom - (sr.bottom - 1)) > 1) return `with short content the footer is not at the bottom: ${foot.getBoundingClientRect().bottom} vs ${sr.bottom}`;
+if (main.getBoundingClientRect().top < head.getBoundingClientRect().bottom || main.getBoundingClientRect().bottom > foot.getBoundingClientRect().top) return "the content is not between the bands";
+if (getComputedStyle(main).paddingTop !== "16px") return "pad={16} is not applied";
+const ll = long.querySelector(".ui-stacked"), lh = ll.querySelector(".ui-stacked-header"), lf = ll.querySelector(".ui-stacked-footer");
+if (long.scrollHeight <= long.clientHeight) return "long content does not push the footer down";
+if (lf.getBoundingClientRect().top < long.getBoundingClientRect().bottom) return "with long content the footer is not below the box";
+long.scrollTop = 150; await wait(100);
+if (Math.abs(lh.getBoundingClientRect().top - (long.getBoundingClientRect().top + 1)) > 1) return "sticky={true} does not keep the header at the top while scrolling";
+long.scrollTop = 0;

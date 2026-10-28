@@ -1,0 +1,15 @@
+const names = $(".form-row-demo-names");
+const cols = (el) => getComputedStyle(el).gridTemplateColumns.split(" ").map(Number);
+const first = $("#form-row-demo-first").closest(".ui-text-field").getBoundingClientRect(), last = $("#form-row-demo-last").closest(".ui-text-field").getBoundingClientRect();
+if (!names || Math.abs(first.width - last.width) > 1) return `two fields do not get equal shares: ${first.width} and ${last.width}`;
+if (last.left <= first.right || last.left - first.right !== 12) return "the two fields are not side by side with the gap";
+const city = cols($(".form-row-demo-city"));
+if (city.length !== 2 || Math.abs(city[0] / city[1] - 3) > 0.2) return `columns [3, 1] gives ${city}`;
+const search = $(".form-row-demo-search");
+if (!search.classList.contains("ui-form-row-end")) return "align=end is not marked";
+const q = search.querySelector(".ui-text-field-box").getBoundingClientRect(), btn = search.querySelector("button").getBoundingClientRect();
+if (Math.abs(q.bottom - btn.bottom) > 2) return `the button is not level with the input: ${q.bottom} vs ${btn.bottom}`;
+if (btn.width > 200) return "an auto column is not as wide as its button";
+const three = $(".form-row-demo-three");
+const widths = [...three.children].map((c) => c.getBoundingClientRect().width);
+if (widths.length !== 3 || Math.abs(widths[0] - widths[2]) > 1 || getComputedStyle(three).columnGap !== "20px") return `three fields: ${widths}, gap ${getComputedStyle(three).columnGap}`;

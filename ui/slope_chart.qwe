@@ -1,0 +1,164 @@
+// SlopeChart: how each item changed between two moments, as a line from its value
+// then (left) to its value now (right), so rises, falls and changes of order show at
+// a glance. Each end is labelled with the item and its value, nudged apart where
+// they would overlap. CSS only: hovering a line picks it out; screen readers get the
+// numbers, and each change, as a table.
+//
+//   <SlopeChart label="Share of sales" start_label="2021" end_label="2025" suffix="%" items={[
+//       { label: "Online", start: 31, end: 52 }, { label: "Stores", start: 54, end: 38 }]}/>
+//   <SlopeChart label="Price per city" prefix="$" by_change={false} items={cities}/>
+//
+// items: a list of { label, start, end }. start_label, end_label: the two moments,
+// written above each side ("Before", "After"). by_change: rises are green, falls red
+// and the unchanged grey (true); false gives each item a colour of the chart palette.
+// change: the change in percent beside each end value (true). zero: the scale starts
+// at 0, so the slopes compare to the whole; otherwise it spans the values. prefix
+// and suffix: around every value shown ("$", "%"); decimals: digits after the point,
+// always, instead of up to two as needed. height: the plot's height in pixels (260).
+// label: what the chart shows; it names it for screen readers and captions their
+// table. show_label also writes it above.
+
+let slope_chart_css = css`
+.ui-slope {
+  --ui-slope-1: light-dark(#2a78d6, #3987e5); --ui-slope-2: light-dark(#eb6834, #d95926);
+  --ui-slope-3: light-dark(#1baf7a, #199e70); --ui-slope-4: light-dark(#eda100, #c98500);
+  --ui-slope-5: light-dark(#e87ba4, #d55181); --ui-slope-6: light-dark(#008300, #008300);
+  --ui-slope-7: light-dark(#6250d6, #9085e9); --ui-slope-8: light-dark(#e34948, #e66767);
+  --ui-slope-up: light-dark(#18794e, #4cc38a); --ui-slope-down: light-dark(#c62a2f, #ff6b6b); --ui-slope-flat: var(--ui-muted);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-slope-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-slope-s1 { --c: var(--ui-slope-1); } .ui-slope-s2 { --c: var(--ui-slope-2); } .ui-slope-s3 { --c: var(--ui-slope-3); }
+.ui-slope-s4 { --c: var(--ui-slope-4); } .ui-slope-s5 { --c: var(--ui-slope-5); } .ui-slope-s6 { --c: var(--ui-slope-6); }
+.ui-slope-s7 { --c: var(--ui-slope-7); } .ui-slope-s8 { --c: var(--ui-slope-8); }
+.ui-slope-up { --c: var(--ui-slope-up); } .ui-slope-down { --c: var(--ui-slope-down); } .ui-slope-flat { --c: var(--ui-slope-flat); }
+.ui-slope-wrap { padding: 0 clamp(90px, 26%, 170px); }
+.ui-slope-heads { display: flex; justify-content: space-between; margin: 0 -40px 8px; color: var(--ui-muted); font-weight: 600; }
+.ui-slope-heads span { width: 80px; text-align: center; }
+.ui-slope-plot { position: relative; margin: 8px 0; }
+.ui-slope-axis { position: absolute; top: -8px; bottom: -8px; width: 1px; background: var(--ui-border); }
+.ui-slope-item { position: absolute; inset: 0; pointer-events: none; transition: opacity .15s ease; }
+.ui-slope-plot:has(.ui-slope-item:hover) .ui-slope-item:not(:hover) { opacity: .18; }
+.ui-slope-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.ui-slope-line { fill: none; stroke: var(--c); stroke-width: 2; stroke-linecap: round; }
+.ui-slope-hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; }
+.ui-slope-item:hover .ui-slope-line { stroke-width: 3; }
+.ui-slope-dot { position: absolute; width: 8px; height: 8px; margin: -4px 0 0 -4px; border-radius: 50%;
+  background: var(--c); box-shadow: 0 0 0 2px var(--ui-bg); }
+.ui-slope-lab { position: absolute; display: flex; align-items: baseline; gap: 6px; max-width: clamp(84px, 26vw, 164px);
+  transform: translateY(-50%); pointer-events: auto; white-space: nowrap; }
+.ui-slope-lab.ui-slope-l { right: calc(100% + 10px); justify-content: flex-end; }
+.ui-slope-lab.ui-slope-r { left: calc(100% + 10px); }
+.ui-slope-lab b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-slope-name { overflow: hidden; color: var(--ui-muted); text-overflow: ellipsis; }
+.ui-slope-chg { color: var(--c); font-size: 11px; font-variant-numeric: tabular-nums; }
+@media (prefers-reduced-motion: reduce) { .ui-slope-item { transition: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn slope_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn slope_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : slope_chart_group(floor(n / 1000)) + "," + slope_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn slope_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${slope_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${slope_chart_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate or a percentage for CSS and SVG, to two decimals.
+fn slope_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// Label positions (from the top, in %) at least `gap` apart and within 0 to 100,
+// each as near its own y as that allows; in the order given.
+fn slope_chart_spread(ys: list, gap: num) -> list {
+    let n = len(ys)
+    let order = sort_by(range(n), (i) => ys[i])
+    let pos = order | map((i) => ys[i])
+    for k in range(1, n) {
+        if pos[k] < pos[k - 1] + gap { pos = set(pos, k, pos[k - 1] + gap) }
+    }
+    if n > 0 && pos[n - 1] > 100 { pos = set(pos, n - 1, 100) }
+    for k in reverse(range(n - 1)) {
+        if pos[k] > pos[k + 1] - gap { pos = set(pos, k, pos[k + 1] - gap) }
+    }
+    let out = ys
+    for [k, i] in enumerate(order) { out = set(out, i, pos[k]) }
+    out
+}
+
+view SlopeChart(items: list, start_label: str = "Before", end_label: str = "After", by_change: bool = true,
+                change: bool = true, zero: bool = false, prefix: str = "", suffix: str = "", decimals: int? = null,
+                height: int = 260, label: str = "Slope chart", show_label: bool = false, class: str? = null) {
+    style global slope_chart_css
+    let fmt = (v) => v == null ? "—" : `${v < 0 ? "-" : ""}${prefix}${slope_chart_num(abs(v), decimals)}${suffix}`
+    let shown = items | filter((it) => it.start != null && it.end != null)
+    let known = flatten(shown | map((it) => [it.start, it.end]))
+    let lo0 = len(known) == 0 ? 0 : min(known)
+    let hi0 = len(known) == 0 ? 1 : max(known)
+    let lo = zero && lo0 > 0 ? 0 : lo0
+    let hi = hi0 == lo ? lo + 1 : hi0
+    let y = (v) => (hi - v) * 100 / (hi - lo)
+    let gap = 16 * 100 / (height > 0 ? height : 260)
+    let left = slope_chart_spread(shown | map((it) => y(it.start)), gap)
+    let right = slope_chart_spread(shown | map((it) => y(it.end)), gap)
+    let pct_change = (it) => it.start == 0 ? null : (it.end - it.start) * 100 / abs(it.start)
+    let said = (it) => {
+        let p = pct_change(it)
+        p == null ? "" : `${p > 0 ? "+" : (p < 0 ? "-" : "")}${slope_chart_num(round(abs(p) * 10) / 10)}%`
+    }
+    let tone = (i, it) => by_change
+        ? (it.end > it.start ? "ui-slope-up" : (it.end < it.start ? "ui-slope-down" : "ui-slope-flat"))
+        : `ui-slope-s${i % 8 + 1}`
+    <figure class={ui_cls(["ui-slope", class])} aria-label={label}>
+        {show_label && <figcaption.ui-slope-title>{label}</figcaption>}
+        <div.ui-slope-wrap aria-hidden="true">
+            <div.ui-slope-heads><span>{start_label}</span><span>{end_label}</span></div>
+            <div.ui-slope-plot style={`height: ${height}px`}>
+                <span.ui-slope-axis style="left: 0"></span>
+                <span.ui-slope-axis style="right: 0"></span>
+                {for [i, it] in enumerate(shown) => {
+                    let d = `M0,${slope_chart_pct(y(it.start))} L100,${slope_chart_pct(y(it.end))}`
+                    <div class={`ui-slope-item ${tone(i, it)}`} data-label={str(it.label)}>
+                        <svg.ui-slope-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                            <path.ui-slope-line d={d} vector-effect="non-scaling-stroke"/>
+                            <path.ui-slope-hit d={d} vector-effect="non-scaling-stroke"/>
+                        </svg>
+                        <span.ui-slope-dot style={`left: 0; top: ${slope_chart_pct(y(it.start))}%`}></span>
+                        <span.ui-slope-dot style={`left: 100%; top: ${slope_chart_pct(y(it.end))}%`}></span>
+                        <span class="ui-slope-lab ui-slope-l" style={`top: ${slope_chart_pct(left[i])}%`} title={str(it.label)}>
+                            <span.ui-slope-name>{it.label}</span><b>{fmt(it.start)}</b>
+                        </span>
+                        <span class="ui-slope-lab ui-slope-r" style={`top: ${slope_chart_pct(right[i])}%`} title={str(it.label)}>
+                            <b>{fmt(it.end)}</b>{change && said(it) != "" && <span.ui-slope-chg>{said(it)}</span>}<span.ui-slope-name>{it.label}</span>
+                        </span>
+                    </div>
+                }}
+            </div>
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col"></th><th scope="col">{start_label}</th><th scope="col">{end_label}</th><th scope="col">Change</th></tr></thead>
+            <tbody>
+                {for it in items => <tr>
+                    <th scope="row">{it.label}</th><td>{fmt(it.start)}</td><td>{fmt(it.end)}</td>
+                    <td>{it.start != null && it.end != null ? `${it.end - it.start < 0 ? "-" : "+"}${prefix}${slope_chart_num(abs(it.end - it.start), decimals)}${suffix}` : "—"}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

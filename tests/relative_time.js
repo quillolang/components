@@ -1,0 +1,18 @@
+const live = $("#relative-time-demo-live time");
+if (!live || !live.classList.contains("ui-relative-time")) return "the live one is not a <time>";
+if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(live.getAttribute("datetime"))) return `datetime is ${live.getAttribute("datetime")}`;
+if (!live.getAttribute("title") || !/^\w+day \d+ \w+ \d{4}, \d\d:\d\d$/.test(live.getAttribute("title"))) return `the title is ${live.getAttribute("title")}`;
+const buttons = $$("#relative-time-demo-live button");
+buttons[0].click(); await wait();
+const n0 = parseInt(live.textContent);
+if (!/^1[2-4] seconds ago$/.test(live.textContent)) return `just saved reads "${live.textContent}"`;
+await wait(5600);
+const n1 = parseInt(live.textContent);
+if (!/^\d+ seconds ago$/.test(live.textContent) || n1 <= n0 || n1 > n0 + 7) return `after 5.6 s it reads "${live.textContent}" (was ${n0})`;
+buttons[1].click(); await wait();
+if (live.textContent !== "3 hours ago" || !live.getAttribute("aria-label").startsWith("3 hours ago (")) return `3 hours back reads "${live.textContent}"`;
+const fixed = [...$("#relative-time-demo-fixed").querySelectorAll("time")].map((t) => t.textContent);
+if (fixed.join("|") !== "5 minutes ago|yesterday|2 months ago|in 2 hours|1w|now") return `the fixed ones read ${fixed.join("|")}`;
+const f = $$("#relative-time-demo-fixed time");
+if (f[2].getAttribute("title") !== "Saturday 1 August 2026" || f[0].getAttribute("title") !== "Wednesday 28 October 2026, 13:55") return `titles: ${f[2].getAttribute("title")} / ${f[0].getAttribute("title")}`;
+if (f[5].hasAttribute("title") || f[5].hasAttribute("aria-label")) return "title={false} still has a title";

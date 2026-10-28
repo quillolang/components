@@ -1,0 +1,13 @@
+const marks = $$("mark.ui-mark");
+if (marks.length !== 9) return `expected 9 marks, found ${marks.length}`;
+const d = $("#mark-demo-default");
+if (d.tagName !== "MARK" || d.textContent !== "three results") return "a mark is not a <mark> with its text";
+const cs = (el) => getComputedStyle(el);
+if (cs(d).backgroundColor === "rgba(0, 0, 0, 0)") return "the default mark has no background";
+if (cs(d).color !== cs(d.parentElement).color) return "a mark changes the text colour";
+const s = $("#mark-demo-success");
+if (cs(s).backgroundColor === cs(d).backgroundColor) return "tone=success looks like the default";
+const tones = marks.slice(2, 7).map((m) => cs(m).backgroundColor);
+if (new Set(tones).size !== 5) return "the five tones are not five colours";
+const u = $("#mark-demo-underline");
+if (cs(u).backgroundColor !== "rgba(0, 0, 0, 0)" || cs(u).textDecorationLine !== "underline") return "variant=underline is not an underline without a background";

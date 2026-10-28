@@ -1,0 +1,221 @@
+// SankeyChart: flows from one set of things to the next as bands as wide as their
+// amounts (traffic from sources through pages to sign-ups, a budget from income to
+// spending). Nodes stand in columns, each as tall as what flows through it, and are
+// moved up and down so the bands cross as little as they can. CSS only: hovering a
+// band or a node shows its amounts; screen readers get every flow as a table.
+//
+//   <SankeyChart label="Where sign-ups come from" links={[
+//       { from: "Search", to: "Pricing", value: 420 }, { from: "Search", to: "Docs", value: 310 },
+//       { from: "Pricing", to: "Sign-up", value: 160 }, { from: "Docs", to: "Sign-up", value: 70 }]}/>
+//
+// links: a list of { from, to, value }, naming nodes by their labels; values of 0 or
+// less are left out, and so is a link that would loop back. nodes: the labels in
+// the order to stack them in their columns (by default as they first come in links).
+// A node's column is one past the furthest node flowing into it; nodes nothing
+// flows out of stand in the last column. Each node has a colour of its own (eight,
+// then they repeat) and its bands leave in it. height: the plot's height in pixels
+// (320). prefix and suffix: around every value shown ("$", " GB"); decimals: digits
+// after the point, always, instead of up to two as needed. label: what the chart
+// shows; it names it for screen readers and captions their table. show_label also
+// writes it above.
+
+let sankey_chart_css = css`
+.ui-sankey {
+  --ui-sankey-1: light-dark(#2a78d6, #3987e5); --ui-sankey-2: light-dark(#eb6834, #d95926);
+  --ui-sankey-3: light-dark(#1baf7a, #199e70); --ui-sankey-4: light-dark(#eda100, #c98500);
+  --ui-sankey-5: light-dark(#e87ba4, #d55181); --ui-sankey-6: light-dark(#008300, #008300);
+  --ui-sankey-7: light-dark(#6250d6, #9085e9); --ui-sankey-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-sankey-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-sankey-s1 { --c: var(--ui-sankey-1); } .ui-sankey-s2 { --c: var(--ui-sankey-2); } .ui-sankey-s3 { --c: var(--ui-sankey-3); }
+.ui-sankey-s4 { --c: var(--ui-sankey-4); } .ui-sankey-s5 { --c: var(--ui-sankey-5); } .ui-sankey-s6 { --c: var(--ui-sankey-6); }
+.ui-sankey-s7 { --c: var(--ui-sankey-7); } .ui-sankey-s8 { --c: var(--ui-sankey-8); }
+.ui-sankey-wrap { padding: 6px clamp(70px, 16%, 130px) 6px 0; }
+.ui-sankey-plot { position: relative; }
+.ui-sankey-svg { position: absolute; top: 0; bottom: 0; left: 6px; right: 6px; width: calc(100% - 12px); height: 100%; overflow: visible; }
+.ui-sankey-band { fill: var(--c); fill-opacity: .32; stroke: none; transition: fill-opacity .15s ease; }
+.ui-sankey-band:hover { fill-opacity: .6; }
+.ui-sankey-node { position: absolute; width: 12px; min-height: 2px; border-radius: 2px; background: var(--c); }
+.ui-sankey-node:hover { box-shadow: 0 0 0 2px var(--ui-fg); z-index: 5; }
+.ui-sankey-name { position: absolute; top: 50%; left: calc(100% + 6px); display: grid; transform: translateY(-50%);
+  white-space: nowrap; pointer-events: none; text-shadow: 0 0 3px var(--ui-bg), 0 0 2px var(--ui-bg); }
+.ui-sankey-name b { font-weight: 600; }
+.ui-sankey-name span { color: var(--ui-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.ui-sankey-tip { position: absolute; z-index: 20; display: none; min-width: 120px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-sankey-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-sankey-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-sankey-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-sankey-tip { top: 50%; left: calc(100% + 8px); transform: translateY(-50%); }
+.ui-sankey-last .ui-sankey-tip { left: auto; right: calc(100% + 8px); }
+.ui-sankey-node:hover .ui-sankey-tip { display: block; }
+.ui-sankey-node:hover .ui-sankey-name { visibility: hidden; }
+@media (prefers-reduced-motion: reduce) { .ui-sankey-band { transition: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn sankey_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn sankey_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : sankey_chart_group(floor(n / 1000)) + "," + sankey_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn sankey_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${sankey_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${sankey_chart_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate or a percentage for CSS and SVG, to two decimals.
+fn sankey_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The nodes laid out: { names, col (each name's column), cols (how many), y0 and y1 (each
+// node's top and bottom, 0 to 100), size (what flows through each) }, for links already
+// given as { s, t, value } by node index.
+fn sankey_chart_layout(names: list, links: list) -> map {
+    let n = len(names)
+    let col = for i in range(n) => 0
+    for pass in range(n) {
+        for l in links {
+            if col[l.t] < col[l.s] + 1 && col[l.s] + 1 < n { col = set(col, l.t, col[l.s] + 1) }
+        }
+    }
+    let ins = for i in range(n) => sum(links | filter((l) => l.t == i) | map((l) => l.value))
+    let outs = for i in range(n) => sum(links | filter((l) => l.s == i) | map((l) => l.value))
+    let size = for i in range(n) => ins[i] > outs[i] ? ins[i] : outs[i]
+    let last = max([0] + col)
+    col = for i in range(n) => outs[i] == 0 && ins[i] > 0 ? last : col[i]
+    let cols = last + 1
+    let members = for c in range(cols) => range(n) | filter((i) => col[i] == c)
+    let gap = 4
+    let scale0 = min(members | filter((ms) => len(ms) > 0) | map((ms) => {
+        let s = sum(ms | map((i) => size[i]))
+        s > 0 ? (100 - gap * (len(ms) - 1)) / s : 1000
+    }))
+    let ky = scale0 ?? 1
+    // Start each column spread evenly over the height.
+    let y0 = for i in range(n) => 0
+    for ms in members {
+        let used = sum(ms | map((i) => size[i] * ky)) + gap * (len(ms) - 1)
+        let at = (100 - used) / 2
+        for i in ms {
+            y0 = set(y0, i, at)
+            at += size[i] * ky + gap
+        }
+    }
+    // Then move nodes toward the middle of what they connect to, a few times each way,
+    // keeping them apart and inside.
+    for round_no in range(6) {
+        let order = round_no % 2 == 0 ? range(1, cols) : reverse(range(cols - 1))
+        for c in order {
+            for i in members[c] {
+                let near = links | filter((l) => (round_no % 2 == 0 && l.t == i) || (round_no % 2 == 1 && l.s == i))
+                let w = sum(near | map((l) => l.value))
+                if w > 0 {
+                    let mid = sum(near | map((l) => {
+                        let o = l.t == i ? l.s : l.t
+                        (y0[o] + size[o] * ky / 2) * l.value
+                    })) / w
+                    y0 = set(y0, i, mid - size[i] * ky / 2)
+                }
+            }
+            let ms = sort_by(members[c], (i) => y0[i])
+            let at = 0
+            for i in ms {
+                if y0[i] < at { y0 = set(y0, i, at) }
+                at = y0[i] + size[i] * ky + gap
+            }
+            let bottom = 100
+            for i in reverse(ms) {
+                if y0[i] + size[i] * ky > bottom { y0 = set(y0, i, bottom - size[i] * ky) }
+                bottom = y0[i] - gap
+            }
+        }
+    }
+    { names: names, col: col, cols: cols, ky: ky, size: size, y0: y0, y1: for i in range(n) => y0[i] + size[i] * ky }
+}
+
+view SankeyChart(links: list, nodes: list? = null, height: int = 320, prefix: str = "", suffix: str = "",
+                 decimals: int? = null, label: str = "Sankey chart", show_label: bool = false, class: str? = null) {
+    style global sankey_chart_css
+    let fmt = (v) => `${v < 0 ? "-" : ""}${prefix}${sankey_chart_num(abs(v), decimals)}${suffix}`
+    let given = links | filter((l) => l.value != null && l.value > 0 && str(l.from) != str(l.to))
+    let names = unique(((nodes ?? []) | map((x) => str(x))) + flatten(given | map((l) => [str(l.from), str(l.to)])))
+    let idx = (name) => index_of(names, name) ?? 0
+    let flows0 = given | map((l) => { s: idx(str(l.from)), t: idx(str(l.to)), value: l.value })
+    let lay0 = sankey_chart_layout(names, flows0)
+    // Links that would go back a column are left out.
+    let flows = flows0 | filter((l) => lay0.col[l.t] > lay0.col[l.s])
+    let lay = sankey_chart_layout(names, flows)
+    let n = len(names)
+    let x = (i) => lay.cols <= 1 ? 0 : lay.col[i] * 100 / (lay.cols - 1)
+    let mid_y = (i) => (lay.y0[i] + lay.y1[i]) / 2
+    // Where each link leaves its source and reaches its target: bands stacked in the
+    // order of the nodes at their other end.
+    let leave = for [k, l] in enumerate(flows) => {
+        let before = flows | filter((o) => o.s == l.s && (mid_y(o.t) < mid_y(l.t) || (mid_y(o.t) == mid_y(l.t) && index_of(flows, o) < k)))
+        lay.y0[l.s] + sum(before | map((o) => o.value)) * lay.ky
+    }
+    let reach = for [k, l] in enumerate(flows) => {
+        let before = flows | filter((o) => o.t == l.t && (mid_y(o.s) < mid_y(l.s) || (mid_y(o.s) == mid_y(l.s) && index_of(flows, o) < k)))
+        lay.y0[l.t] + sum(before | map((o) => o.value)) * lay.ky
+    }
+    let band = (k, l) => {
+        let w = l.value * lay.ky
+        let x0 = sankey_chart_pct(x(l.s))
+        let x1 = sankey_chart_pct(x(l.t))
+        let xm = sankey_chart_pct((x(l.s) + x(l.t)) / 2)
+        let a = sankey_chart_pct(leave[k])
+        let b = sankey_chart_pct(reach[k])
+        let a2 = sankey_chart_pct(leave[k] + w)
+        let b2 = sankey_chart_pct(reach[k] + w)
+        `M${x0},${a} C${xm},${a} ${xm},${b} ${x1},${b} L${x1},${b2} C${xm},${b2} ${xm},${a2} ${x0},${a2} Z`
+    }
+    let into = (i) => sum(flows | filter((l) => l.t == i) | map((l) => l.value))
+    let out_of = (i) => sum(flows | filter((l) => l.s == i) | map((l) => l.value))
+    <figure class={ui_cls(["ui-sankey", class])} aria-label={label}>
+        {show_label && <figcaption.ui-sankey-title>{label}</figcaption>}
+        <div.ui-sankey-wrap aria-hidden="true">
+            <div.ui-sankey-plot style={`height: ${height}px`}>
+                <svg.ui-sankey-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                    {for [k, l] in enumerate(flows) => <path class={`ui-sankey-band ui-sankey-s${l.s % 8 + 1}`} d={band(k, l)}>
+                        <title>{names[l.s]} → {names[l.t]}: {fmt(l.value)}</title>
+                    </path>}
+                </svg>
+                {for i in range(n) => lay.size[i] > 0 && <div
+                    class={ui_cls(["ui-sankey-node", `ui-sankey-s${i % 8 + 1}`, lay.cols > 1 && lay.col[i] == lay.cols - 1 && "ui-sankey-last"])}
+                    style={`left: calc(${sankey_chart_pct(x(i))} * (100% - 12px) / 100); top: ${sankey_chart_pct(lay.y0[i])}%; height: ${sankey_chart_pct(lay.y1[i] - lay.y0[i])}%`}
+                    data-name={names[i]}>
+                    <span.ui-sankey-name><b>{names[i]}</b><span>{fmt(lay.size[i])}</span></span>
+                    <span.ui-sankey-tip>
+                        <strong>{names[i]}</strong>
+                        {into(i) > 0 && <p>In<b>{fmt(into(i))}</b></p>}
+                        {out_of(i) > 0 && <p>Out<b>{fmt(out_of(i))}</b></p>}
+                        {into(i) > 0 && out_of(i) > 0 && into(i) != out_of(i) && <p>{into(i) > out_of(i) ? "Kept" : "Added"}<b>{fmt(abs(into(i) - out_of(i)))}</b></p>}
+                    </span>
+                </div>}
+            </div>
+        </div>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col">From</th><th scope="col">To</th><th scope="col">Value</th></tr></thead>
+            <tbody>
+                {for l in flows => <tr><td>{names[l.s]}</td><td>{names[l.t]}</td><td>{fmt(l.value)}</td></tr>}
+            </tbody>
+        </table>
+    </figure>
+}

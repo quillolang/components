@@ -1,0 +1,218 @@
+// LiveCandles: candles built as trades come in: each tick moves the open candle's
+// high, low and close (it grows in place), and a new candle starts each interval. The
+// last price is a line and a label coloured by its last move, with how long the open
+// candle has left; the oldest candles go as new ones come. A crosshair follows the
+// pointer, or the arrow keys when the chart has focus, with the candle's open, high,
+// low, close, volume and number of ticks.
+//
+//   component Live() {
+//       state ticks = []
+//       if running { every(250, () => { ticks = take_last(ticks + [next_tick()], 500) }) }
+//       <LiveCandles ticks={ticks} interval={5} prefix="$"/>
+//   }
+//
+// ticks: a list of { time, price, size }, oldest first: time in milliseconds since
+// 1970, size optional (it adds to the volume). Give a new list as ticks come; ticks
+// older than the candles shown can be dropped. interval: each candle's length in
+// seconds (60). limit: how many candles are shown (40). height: the price pane's
+// height in pixels (240). prefix and suffix: around every price ("$"); decimals: digits
+// after the point of prices (2). label: what screen readers call the chart.
+
+let live_candles_css = css`
+.ui-lvc { display: grid; gap: 8px; min-width: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-lvc-up { --k: var(--ui-success); } .ui-lvc-down { --k: var(--ui-danger); }
+.ui-lvc-read { display: flex; flex-wrap: wrap; gap: 2px 12px; min-height: 18px; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-lvc-read b { color: var(--ui-fg); font-weight: 600; }
+.ui-lvc-read .ui-lvc-up b, .ui-lvc-read .ui-lvc-down b { color: var(--k); }
+.ui-lvc-read .ui-lvc-when { color: var(--ui-fg); font-weight: 600; }
+.ui-lvc-live { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; }
+.ui-lvc-live::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--ui-danger); animation: ui-lvc-pulse 1.2s ease-in-out infinite; }
+@keyframes ui-lvc-pulse { 50% { opacity: .3; } }
+.ui-lvc-frame { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; padding-top: 10px; }
+.ui-lvc-plot { position: relative; outline: none; cursor: crosshair; }
+.ui-lvc-plot:focus-visible { box-shadow: var(--ui-focus); }
+.ui-lvc-pane { position: relative; height: var(--h); }
+.ui-lvc-vpane { position: relative; height: 48px; margin-top: 8px; border-top: 1px solid color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-lvc-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-lvc-cols { position: absolute; inset: 0; display: flex; }
+.ui-lvc-col { position: relative; flex: 1; min-width: 0; }
+.ui-lvc-cp { position: relative; height: var(--h); }
+.ui-lvc-cv { position: relative; height: 48px; margin-top: 8px; }
+.ui-lvc-wick { position: absolute; left: 50%; width: 1px; margin-left: -.5px; background: var(--k); transition: top .2s, height .2s; }
+.ui-lvc-body { position: absolute; left: 16%; right: 16%; min-height: 1px; border-radius: 1px; background: var(--k); transition: top .2s, height .2s; }
+.ui-lvc-vol { position: absolute; bottom: 0; left: 16%; right: 16%; min-height: 1px; background: var(--k); opacity: .35; transition: height .2s; }
+.ui-lvc-open .ui-lvc-body { box-shadow: 0 0 0 2px color-mix(in srgb, var(--k) 30%, transparent); }
+.ui-lvc-hover { background: color-mix(in srgb, var(--ui-subtle) 80%, transparent); }
+.ui-lvc-hover::before { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; border-left: 1px dashed var(--ui-muted); }
+.ui-lvc-last { position: absolute; z-index: 1; left: 0; right: 0; border-top: 1px dashed var(--k); transition: top .2s; pointer-events: none; }
+.ui-lvc-y { position: relative; }
+.ui-lvc-y > div { position: relative; height: var(--h); }
+.ui-lvc-y span { position: absolute; left: 0; transform: translateY(-50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-lvc-y .ui-lvc-tag { z-index: 1; left: -4px; display: grid; padding: 1px 5px; border-radius: 3px; background: var(--k); color: var(--ui-bg);
+  font-weight: 600; line-height: 1.25; transition: top .2s; }
+.ui-lvc-tag small { font-size: 10px; font-weight: 500; opacity: .85; }
+.ui-lvc-x { position: relative; height: 16px; margin-top: 6px; }
+.ui-lvc-x span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-lvc-empty { display: grid; place-items: center; height: var(--h); border: 1px dashed var(--ui-border); border-radius: var(--ui-radius-sm); color: var(--ui-muted); }
+@media (prefers-reduced-motion: reduce) {
+  .ui-lvc-wick, .ui-lvc-body, .ui-lvc-vol, .ui-lvc-last, .ui-lvc-y .ui-lvc-tag { transition: none; }
+  .ui-lvc-live::before { animation: none; }
+}
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn live_candles_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn live_candles_group(n: int) -> str =
+    n < 1000 ? str(n) : live_candles_group(floor(n / 1000)) + "," + live_candles_pad(n % 1000, 3)
+
+// A value as it reads, with commas and `places` digits after the point (up to two as
+// needed when that is null): 48210.5 is "48,210.50" with 2. Worked out in whole
+// numbers, so the server and the browser write the same text.
+fn live_candles_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 6 ? 6 : places))
+    let scale = [1, 10, 100, 1000, 10000, 100000, 1000000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${live_candles_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${live_candles_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate out of 100 (or a length), to two decimals.
+fn live_candles_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// The axis from lo to hi, widened to round ticks: about `steps` steps of 1, 2, 2.5 or 5 x 10^n.
+fn live_candles_scale(lo: num, hi: num, steps: int = 5) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo) / 10) : hi - lo
+    let raw = span / steps
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+// The candles of the ticks, one per `interval` seconds that had any: { start, open, high,
+// low, close, volume, count }, start in milliseconds.
+fn live_candles_build(ticks: list, interval: num) -> list {
+    let size = interval * 1000
+    let out = []
+    for t in ticks {
+        let b = floor(t.time / size)
+        if len(out) > 0 && out[-1].b == b {
+            let c = out[-1]
+            out = set(out, -1, { ...c, high: max([c.high, t.price]), low: min([c.low, t.price]), close: t.price,
+                                 volume: c.volume + (t.size ?? 0), count: c.count + 1 })
+        } else {
+            out = out | push({ b, start: b * size, open: t.price, high: t.price, low: t.price, close: t.price,
+                               volume: t.size ?? 0, count: 1 })
+        }
+    }
+    out
+}
+
+// Milliseconds as HH:MM:SS (UTC).
+fn live_candles_clock(ms: num) -> str = slice(date.from_ms(floor(ms / 1000) * 1000, "UTC"), 11, 19)
+
+component LiveCandles(ticks: list = [], interval: num = 60, limit: int = 40, height: int = 240, prefix: str = "",
+                      suffix: str = "", decimals: int = 2, label: str = "Live candles", class: str? = null) {
+    style global live_candles_css
+    state hover = null
+    let all_candles = live_candles_build(ticks, interval > 0 ? interval : 60)
+    let total = len(all_candles)
+    let keep = limit < 2 ? 2 : limit
+    let candles = drop(all_candles, total > keep ? total - keep : 0)
+    let n = len(candles)
+    let lows = candles | map((c) => c.low)
+    let highs = candles | map((c) => c.high)
+    let sc = live_candles_scale(n == 0 ? 0 : min(lows), n == 0 ? 1 : max(highs), 5)
+    let y = (v) => (sc.hi - v) * 100 / (sc.hi - sc.lo)
+    let pct = (v) => live_candles_pct(v)
+    let price = (v) => `${v < 0 ? "-" : ""}${prefix}${live_candles_num(abs(v), decimals)}${suffix}`
+    let tick = (t) => `${t < 0 ? "-" : ""}${prefix}${live_candles_num(abs(t))}`
+    let vtop = max([0.000001] + (candles | map((c) => c.volume)))
+    let last_tick = len(ticks) > 0 ? ticks[-1] : null
+    let prior = len(ticks) > 1 ? ticks[-2].price : null
+    let rising = last_tick == null || prior == null || last_tick.price >= prior
+    let open_one = n > 0 ? candles[-1] : null
+    let left = open_one != null ? ceil((open_one.start + interval * 1000 - last_tick.time) / 1000) : 0
+    let left_text = `${floor(left / 60)}:${left % 60 < 10 ? "0" : ""}${left % 60}`
+    let at = hover != null && hover < n ? hover : null
+    let shown = at != null ? candles[at] : open_one
+    let side = (c) => c.close >= c.open ? "ui-lvc-up" : "ui-lvc-down"
+    let every_nth = ceil(n / 6)
+    let axis_width = max([6] + (sc.ticks | map((t) => len(tick(t)))) + [last_tick != null ? len(price(last_tick.price)) + 2 : 0])
+    let point = (e) => {
+        let r = e.target.closest(".ui-lvc-plot").getBoundingClientRect()
+        let j = floor((e.clientX - r.left) * n / r.width)
+        hover = n == 0 ? null : (j < 0 ? 0 : (j >= n ? n - 1 : j))
+    }
+    <div class={ui_cls(["ui-lvc", class])} style={`--h: ${height}px`}>
+        <div.ui-lvc-read>
+            {shown != null && [
+                <span.ui-lvc-when>{at == null || at == n - 1 ? "Open candle" : "Candle"} {live_candles_clock(shown.start)}</span>,
+                <span>O <b>{price(shown.open)}</b></span>,
+                <span>H <b>{price(shown.high)}</b></span>,
+                <span>L <b>{price(shown.low)}</b></span>,
+                <span class={side(shown)}>C <b>{price(shown.close)}</b></span>,
+                <span>Vol <b>{live_candles_num(shown.volume)}</b></span>,
+                <span>{shown.count} {shown.count == 1 ? "tick" : "ticks"}</span>,
+            ]}
+            {last_tick != null && <span.ui-lvc-live>Closes in {left_text}</span>}
+        </div>
+        {n == 0 ? <div.ui-lvc-empty>Waiting for ticks…</div> : <div.ui-lvc-frame>
+            <div.ui-lvc-plot tabindex="0" role="img" aria-label={`${label}: ${n} candles of ${live_candles_num(interval)} seconds, last ${price(last_tick.price)}`}
+                 @pointermove={point} @pointerdown={point} @pointerleave={() => { hover = null }}
+                 @keydown={(e) => {
+                     if e.key == "ArrowLeft" || e.key == "ArrowRight" {
+                         e.preventDefault()
+                         let from = at ?? n
+                         let next = e.key == "ArrowLeft" ? from - 1 : from + 1
+                         hover = next < 0 ? 0 : (next >= n ? n - 1 : next)
+                     } else if e.key == "Escape" {
+                         hover = null
+                     }
+                 }}>
+                <div.ui-lvc-pane>
+                    {for t in sc.ticks => <span.ui-lvc-grid style={`top: ${pct(y(t))}%`}></span>}
+                    <span class={`ui-lvc-last ${rising ? "ui-lvc-up" : "ui-lvc-down"}`} style={`top: ${pct(y(last_tick.price))}%`}></span>
+                </div>
+                <div.ui-lvc-vpane></div>
+                <div.ui-lvc-cols aria-hidden="true">
+                    {for [i, c] in enumerate(candles) => <div key={c.b} data-start={c.start}
+                            class={ui_cls(["ui-lvc-col", side(c), i == n - 1 && "ui-lvc-open", at == i && "ui-lvc-hover"])}>
+                        <div.ui-lvc-cp>
+                            <span.ui-lvc-wick style={`top: ${pct(y(c.high))}%; height: ${pct(y(c.low) - y(c.high))}%`}></span>
+                            <span.ui-lvc-body style={`top: ${pct(y(max([c.open, c.close])))}%; height: ${pct(abs(y(c.open) - y(c.close)))}%`}></span>
+                        </div>
+                        <div.ui-lvc-cv><span.ui-lvc-vol style={`height: ${pct(c.volume * 100 / vtop)}%`}></span></div>
+                    </div>}
+                </div>
+            </div>
+            <div.ui-lvc-y style={`width: ${axis_width}ch`} aria-hidden="true">
+                <div>
+                    {for t in sc.ticks => !(abs(y(t) - y(last_tick.price)) * height < 2000) && <span style={`top: ${pct(y(t))}%`}>{tick(t)}</span>}
+                    <span class={`ui-lvc-tag ${rising ? "ui-lvc-up" : "ui-lvc-down"}`} style={`top: ${pct(y(last_tick.price))}%`}>
+                        {price(last_tick.price)}<small>{left_text}</small>
+                    </span>
+                </div>
+            </div>
+            <div.ui-lvc-x aria-hidden="true">
+                {for i in range(n) => (n - 1 - i) % every_nth == 0 && <span style={`left: ${pct((i + 0.5) * 100 / n)}%`}>{live_candles_clock(candles[i].start)}</span>}
+            </div>
+            <span></span>
+        </div>}
+    </div>
+}

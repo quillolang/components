@@ -1,0 +1,17 @@
+const nav = $("#jump-links-demo");
+if (!nav || nav.tagName !== "NAV" || nav.getAttribute("aria-label") !== "On this page") return "it is not a labelled <nav>";
+if (nav.querySelector(".ui-jump-title")?.textContent !== "Jump to") return "the title is missing";
+const links = [...nav.querySelectorAll("a.ui-jump-link")];
+if (links.length !== 6 || links[0].getAttribute("href") !== "#jump-demo-overview" || links[5].getAttribute("href") !== "#jump_links") return "the links do not go to the ids or hrefs";
+if (!document.getElementById("jump-demo-specs")) return "the section the link goes to is not on the page";
+const cur = links.filter((a) => a.hasAttribute("aria-current"));
+if (cur.length !== 1 || cur[0].textContent.trim() !== "Specs" || cur[0].getAttribute("aria-current") !== "location") return "the current link is not marked once";
+if (links[2].querySelector(".ui-jump-badge")?.textContent !== "128") return "the badge is missing";
+const tops = links.map((a) => Math.round(a.getBoundingClientRect().top));
+if (new Set(tops).size !== 1) return "the links are not in one row";
+if (getComputedStyle(cur[0]).backgroundColor === getComputedStyle(links[0]).backgroundColor) return "the current pill does not look it";
+const under = $("#jump-links-demo-underline");
+const uc = under.querySelector("[aria-current]");
+if (!uc?.textContent.includes("Reviews") || getComputedStyle(uc).boxShadow === getComputedStyle(under.querySelector("a")).boxShadow) return "the underline variant does not mark the current one";
+const narrow = $("#jump-links-demo-narrow").querySelector("ul");
+if (narrow.scrollWidth <= narrow.clientWidth + 1 || !["auto", "scroll"].includes(getComputedStyle(narrow).overflowX)) return "a narrow row does not scroll sideways";

@@ -1,0 +1,22 @@
+const chart = $("#org-chart-demo-full");
+if (chart.getAttribute("role") !== "group" || chart.getAttribute("aria-label") !== "Engineering") return "the chart is not a named group";
+const top = chart.querySelector(":scope > ul > li");
+if (top.querySelector(".ui-org-chart-name a")?.getAttribute("href") !== "#org_chart") return "href does not link the name";
+if (top.querySelector(".ui-org-chart-note").textContent !== "3 reports") return "the note";
+const level2 = [...top.querySelectorAll(":scope > ul > li")];
+if (level2.map((li) => li.querySelector(".ui-org-chart-name").textContent).join() !== "Grace Hopper,Alan Turing,Hedy Lamarr") return "the second level";
+const level3 = [...level2[0].querySelectorAll(":scope > ul > li .ui-org-chart-name")].map((n) => n.textContent);
+if (level3.join() !== "Jean Sammet,Frances Allen") return `Grace's reports: ${level3}`;
+if (!top.querySelector(".ui-sr").textContent.includes("3 reports") || level2[2].querySelector(".ui-sr")) return "screen readers hear how many report";
+const here = chart.querySelectorAll("[aria-current=true]");
+if (here.length !== 1 || !here[0].classList.contains("ui-org-chart-here") || !here[0].textContent.includes("Frances Allen")) return "highlight by id";
+if (level2[0].querySelector(".ui-avatar img")?.getAttribute("src") !== "https://i.pravatar.cc/80?img=47") return "the picture";
+// The lines: a middle child has a line on both sides, the first only to its right.
+const mid = getComputedStyle(level2[1], "::before"), first = getComputedStyle(level2[0], "::before");
+if (mid.borderTopStyle !== "solid" || first.borderTopStyle !== "none") return "the connecting lines";
+if (getComputedStyle(level2[0].querySelector("ul"), "::before").borderLeftStyle !== "solid") return "no line down to the reports";
+const onlyChild = $("#org-chart-demo-compact li li");
+if (getComputedStyle(onlyChild, "::before").display !== "none") return "an only child has side lines";
+if ($("#org-chart-demo-compact .ui-avatar")) return "compact still shows pictures";
+const boxes = [...level2].map((li) => li.querySelector(".ui-org-chart-box").getBoundingClientRect());
+if (!(boxes[0].right <= boxes[1].left && boxes[1].right <= boxes[2].left && Math.abs(boxes[0].top - boxes[2].top) < 1)) return "the reports are not side by side";

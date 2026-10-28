@@ -1,0 +1,18 @@
+const sizes = $$("#file-icon-demo-sizes .ui-file-icon");
+if (sizes.length !== 4) return `expected 4 icons, found ${sizes.length}`;
+const h = sizes.map((s) => Math.round(s.getBoundingClientRect().height));
+if (h.join() !== "24,36,52,72") return `heights are ${h}`;
+if (sizes[1].querySelector("text")?.textContent !== "PDF") return "the extension is not written on the icon";
+if (sizes[1].getAttribute("role") !== "img" || sizes[1].getAttribute("aria-label") !== "PDF file") return `the icon is named ${sizes[1].getAttribute("aria-label")}`;
+if (sizes[1].dataset.kind !== "pdf") return "pdf is not kind pdf";
+const rows = $$("#file-icon-demo-list li");
+const icons = rows.map((r) => r.querySelector(".ui-file-icon"));
+const ext = icons.map((i) => i.dataset.ext);
+if (ext.join() !== "xlsx,pdf,jpg,key,md,qwe,gz,m4a,mp4,,docx") return `extensions taken from names: ${ext}`;
+const kinds = icons.map((i) => i.dataset.kind);
+if (kinds.join() !== "sheet,pdf,image,slides,text,code,archive,audio,video,other,document") return `kinds: ${kinds}`;
+if (icons[0].querySelector("text").textContent !== "XLSX") return "a long extension is not written";
+if (icons[9].querySelector("text")) return "a file without an extension has a tag";
+if (icons[0].getAttribute("aria-hidden") !== "true") return "label \"\" does not hide the icon from screen readers";
+const fill = (i) => getComputedStyle(i.querySelector(".ui-file-icon-tag")).fill;
+if (fill(icons[0]) === fill(icons[1]) || fill(icons[1]) === fill(icons[2])) return "kinds share a colour";

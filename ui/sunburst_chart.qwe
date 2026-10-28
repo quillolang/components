@@ -1,0 +1,194 @@
+// SunburstChart: a hierarchy as rings, the top level around the middle and each
+// level's parts in the ring outside it, every arc as wide as its value (a budget by
+// department and team, disk use by folder). CSS only: hovering an arc names it in
+// the middle with its value and share; screen readers get every part as a table.
+//
+//   <SunburstChart label="Budget" prefix="$" items={[
+//       { label: "Engineering", children: [{ label: "Platform", value: 420 }, { label: "Apps", value: 380 }] },
+//       { label: "Sales", value: 310 }]}/>
+//
+// items: the top level, a list of { label, value, children }; a part with children
+// is as big as they are together (its own value is then not used), one without is
+// its value (0 or less is left out). Each top-level part has a colour of its own
+// (eight, then they repeat) and the parts under it lighter shades of it. Labels are
+// written on the arcs that have room. total_label: under the total in the middle
+// ("Total"). size: its width in pixels (300; it shrinks to fit). legend: the top
+// level beside it with values and shares (true). prefix and suffix: around every
+// value shown ("$", " GB"); decimals: digits after the point, always, instead of up
+// to two as needed. label: what it shows, for screen readers; show_label also
+// writes it above.
+
+let sunburst_chart_css = css`
+.ui-sunburst {
+  --ui-sunburst-1: light-dark(#2a78d6, #3987e5); --ui-sunburst-2: light-dark(#eb6834, #d95926);
+  --ui-sunburst-3: light-dark(#1baf7a, #199e70); --ui-sunburst-4: light-dark(#eda100, #c98500);
+  --ui-sunburst-5: light-dark(#e87ba4, #d55181); --ui-sunburst-6: light-dark(#008300, #008300);
+  --ui-sunburst-7: light-dark(#6250d6, #9085e9); --ui-sunburst-8: light-dark(#e34948, #e66767);
+  display: flex; flex-wrap: wrap; align-items: center; align-content: start; gap: 16px 28px; min-width: 0; margin: 0;
+  font: 13px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-sunburst-title { flex-basis: 100%; margin: 0; font-size: 14px; font-weight: 600; }
+.ui-sunburst-s1 { --c: var(--ui-sunburst-1); } .ui-sunburst-s2 { --c: var(--ui-sunburst-2); } .ui-sunburst-s3 { --c: var(--ui-sunburst-3); }
+.ui-sunburst-s4 { --c: var(--ui-sunburst-4); } .ui-sunburst-s5 { --c: var(--ui-sunburst-5); } .ui-sunburst-s6 { --c: var(--ui-sunburst-6); }
+.ui-sunburst-s7 { --c: var(--ui-sunburst-7); } .ui-sunburst-s8 { --c: var(--ui-sunburst-8); }
+.ui-sunburst-ring { flex: none; max-width: 100%; aspect-ratio: 1; }
+.ui-sunburst-ring svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.ui-sunburst-arc { fill: color-mix(in srgb, var(--c) var(--k, 100%), var(--ui-bg)); stroke: var(--ui-bg); stroke-width: .8;
+  transition: opacity .15s ease; }
+.ui-sunburst-ring svg:has(.ui-sunburst-arc:hover) .ui-sunburst-arc:not(:hover) { opacity: .45; }
+.ui-sunburst-d2 { --k: 78%; } .ui-sunburst-d3 { --k: 60%; } .ui-sunburst-d4 { --k: 46%; } .ui-sunburst-d5 { --k: 36%; }
+.ui-sunburst-text { fill: #fff; font: 600 6.5px var(--ui-font); text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+.ui-sunburst-text.ui-sunburst-dark { fill: var(--ui-fg); }
+.ui-sunburst-mid { text-anchor: middle; pointer-events: none; font-family: var(--ui-font); }
+.ui-sunburst-mid .ui-sunburst-big { fill: var(--ui-fg); font-size: 10px; font-weight: 650; }
+.ui-sunburst-mid .ui-sunburst-small { fill: var(--ui-muted); font-size: 7px; }
+.ui-sunburst-hover { visibility: hidden; }
+.ui-sunburst-ring svg:has(.ui-sunburst-arc:hover) .ui-sunburst-total { visibility: hidden; }
+.ui-sunburst-arc:hover + .ui-sunburst-hover { visibility: visible; }
+.ui-sunburst-legend { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 6px 10px; align-items: center;
+  flex: 1 1 200px; min-width: 0; max-width: 360px; margin: 0; padding: 0; list-style: none; }
+.ui-sunburst-legend li { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-items: center; }
+.ui-sunburst-key { width: 10px; height: 10px; border-radius: 3px; background: var(--c); }
+.ui-sunburst-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-sunburst-val { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-sunburst-pct { min-width: 3.2em; color: var(--ui-muted); text-align: right; font-variant-numeric: tabular-nums; }
+@media (prefers-reduced-motion: reduce) { .ui-sunburst-arc { transition: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn sunburst_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn sunburst_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : sunburst_chart_group(floor(n / 1000)) + "," + sunburst_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn sunburst_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${sunburst_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${sunburst_chart_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate or a percentage for CSS and SVG, to two decimals.
+fn sunburst_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// A share out of 100, to one decimal: "42%", "12.5%", "0.4%".
+fn sunburst_chart_share(p: num) -> str {
+    let tenths = round(p * 10)
+    `${floor(tenths / 10)}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}%`
+}
+
+// A part's size: its children's together, or its own value.
+fn sunburst_chart_size(node: map) -> num {
+    let kids = node.children ?? []
+    len(kids) > 0 ? sum(kids | map((k) => sunburst_chart_size(k))) : (node.value != null && node.value > 0 ? node.value : 0)
+}
+
+// How many levels deep the parts go (1 for a list without children).
+fn sunburst_chart_depth(nodes: list) -> int =
+    len(nodes) == 0 ? 0 : max(nodes | map((n) => 1 + sunburst_chart_depth(n.children ?? [])))
+
+// Every part with a size, flattened: { label, path, value, depth, a0, a1, top } where a0
+// and a1 are where its arc starts and ends, as shares of a turn, and top its top-level index.
+fn sunburst_chart_flat(nodes: list, a0: num, span: num, depth: int, path: list, top: int?) -> list {
+    let sizes = nodes | map((n) => sunburst_chart_size(n))
+    let total = sum(sizes)
+    let out = []
+    let at = a0
+    for [i, n] in enumerate(nodes) {
+        if sizes[i] > 0 {
+            let w = total > 0 ? span * sizes[i] / total : 0
+            let mine = path + [str(n.label)]
+            let t = top ?? i
+            out = out + [{ label: str(n.label), path: mine, value: sizes[i], depth: depth, a0: at, a1: at + w, top: t }]
+                + sunburst_chart_flat(n.children ?? [], at, w, depth + 1, mine, t)
+            at += w
+        }
+    }
+    out
+}
+
+// A coordinate to two decimals, for SVG.
+fn sunburst_chart_xy(a: num, r: num) -> str =
+    `${sunburst_chart_pct(100 + r * math.sin(2 * math.pi * a))},${sunburst_chart_pct(100 - r * math.cos(2 * math.pi * a))}`
+
+// A ring's piece from a0 to a1 (shares of a turn, from the top, clockwise), r0 to r1 out from the middle.
+fn sunburst_chart_arc(a0: num, a1: num, r0: num, r1: num) -> str {
+    let b = a1 - a0 >= 1 ? a0 + 0.99999 : a1
+    let big = b - a0 > 0.5 ? 1 : 0
+    `M${sunburst_chart_xy(a0, r1)} A${r1},${r1} 0 ${big} 1 ${sunburst_chart_xy(b, r1)} L${sunburst_chart_xy(b, r0)} A${r0},${r0} 0 ${big} 0 ${sunburst_chart_xy(a0, r0)} Z`
+}
+
+view SunburstChart(items: list, total_label: str = "Total", size: int = 300, legend: bool = true, prefix: str = "",
+                   suffix: str = "", decimals: int? = null, label: str = "Sunburst chart", show_label: bool = false,
+                   class: str? = null) {
+    style global sunburst_chart_css
+    let fmt = (v) => `${v < 0 ? "-" : ""}${prefix}${sunburst_chart_num(abs(v), decimals)}${suffix}`
+    let parts = sunburst_chart_flat(items, 0, 1, 1, [], null)
+    let total = sum(items | map((n) => sunburst_chart_size(n)))
+    let share = (v) => sunburst_chart_share(total > 0 ? v * 100 / total : 0)
+    let levels = sunburst_chart_depth(items)
+    let hole = 30
+    let band = levels == 0 ? 0 : (96 - hole) / levels
+    let r0 = (d) => hole + band * (d - 1)
+    // Room along the middle of an arc, in viewBox units, for its label.
+    let room = (p) => 2 * math.pi * (r0(p.depth) + band / 2) * (p.a1 - p.a0)
+    let short = (s: str, chars: int) => len(s) <= chars ? s : slice(s, 0, chars - 1) + "…"
+    <figure class={ui_cls(["ui-sunburst", class])} aria-label={`${label}, ${lower(total_label)} ${fmt(total)}`}>
+        {show_label && <figcaption.ui-sunburst-title>{label}</figcaption>}
+        <div.ui-sunburst-ring style={`width: ${size}px`} aria-hidden="true">
+            <svg viewBox="0 0 200 200">
+                {for p in parts => {
+                    let mid = (p.a0 + p.a1) / 2
+                    let fits = room(p) > 18 && band > 9
+                    [
+                        <path class={ui_cls(["ui-sunburst-arc", `ui-sunburst-s${p.top % 8 + 1}`, p.depth > 1 && `ui-sunburst-d${p.depth > 5 ? 5 : p.depth}`])}
+                              d={sunburst_chart_arc(p.a0, p.a1, r0(p.depth), r0(p.depth) + band)} data-value={str(p.value)}>
+                            <title>{join(p.path, " › ")}: {fmt(p.value)} ({share(p.value)})</title>
+                        </path>,
+                        <g class="ui-sunburst-mid ui-sunburst-hover">
+                            <text.ui-sunburst-big x="100" y="100.5">{share(p.value)}</text>
+                            <text.ui-sunburst-small x="100" y="109.5">{short(p.label, 16)}</text>
+                        </g>,
+                        fits && {
+                            let cx = sunburst_chart_pct(100 + (r0(p.depth) + band / 2) * math.sin(2 * math.pi * mid))
+                            let cy = sunburst_chart_pct(100 - (r0(p.depth) + band / 2) * math.cos(2 * math.pi * mid))
+                            // Along the arc, turned so it never reads upside down.
+                            let deg = mid * 360 + (mid > 0.25 && mid < 0.75 ? 180 : 0)
+                            <text class={ui_cls(["ui-sunburst-text", p.depth > 2 && "ui-sunburst-dark"])} x={cx} y={cy}
+                                  transform={`rotate(${sunburst_chart_pct(deg)} ${cx} ${cy})`}>{short(p.label, floor(room(p) / 4))}</text>
+                        }
+                    ]
+                }}
+                <g class="ui-sunburst-mid ui-sunburst-total">
+                    <text.ui-sunburst-big x="100" y="100.5">{fmt(total)}</text>
+                    <text.ui-sunburst-small x="100" y="109.5">{total_label}</text>
+                </g>
+            </svg>
+        </div>
+        {legend && <ul.ui-sunburst-legend aria-hidden="true">
+            {for p in parts | filter((q) => q.depth == 1) => <li class={`ui-sunburst-s${p.top % 8 + 1}`}>
+                <span.ui-sunburst-key></span><span.ui-sunburst-name>{p.label}</span>
+                <span.ui-sunburst-val>{fmt(p.value)}</span><span.ui-sunburst-pct>{share(p.value)}</span>
+            </li>}
+        </ul>}
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col">Part</th><th scope="col">Value</th><th scope="col">Share</th></tr></thead>
+            <tbody>
+                {for p in parts => <tr><th scope="row">{join(p.path, " › ")}</th><td>{fmt(p.value)}</td><td>{share(p.value)}</td></tr>}
+            </tbody>
+        </table>
+    </figure>
+}

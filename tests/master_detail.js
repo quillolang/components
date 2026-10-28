@@ -1,0 +1,34 @@
+const mail = $("#master-detail-demo-mail"), live = $("#master-detail-demo-people"), narrow = $("#master-detail-demo-narrow");
+if (!mail || !live || !narrow) return "the three are missing";
+const list = mail.querySelector("[role=listbox]"), opts = () => [...list.querySelectorAll("[role=option]")];
+if (list.getAttribute("aria-label") !== "Messages" || list.tabIndex !== 0 || opts().length !== 4) return "the list is not a focusable listbox of four";
+const pane = (id, root = mail) => root.querySelector(`[data-ui-md-pane="${id}"]`);
+if (opts()[0].getAttribute("aria-selected") !== "true" || pane("m1").hidden || !pane("m2").hidden) return "selected=\"m1\" does not pick the first and show its pane";
+if (!opts()[0].querySelector(".ui-mdetail-title").textContent.includes("Quarterly") || !opts()[0].querySelector(".ui-mdetail-meta") || !opts()[0].querySelector(".ui-mdetail-icon")) return "a row's title, meta or icon is missing";
+const back = mail.querySelector(".ui-mdetail-back");
+if (getComputedStyle(back).display !== "none") return "wide, the Back button shows";
+opts()[1].click(); await wait();
+if (opts()[1].getAttribute("aria-selected") !== "true" || opts()[0].getAttribute("aria-selected") !== "false") return "clicking the second did not mark it selected";
+if (!pane("m1").hidden || pane("m2").hidden) return "clicking the second did not show its pane and hide the first";
+if (mail.querySelector(".ui-mdetail-detail").getAttribute("aria-label") !== "Lunch on Thursday?") return "the detail is not named after the item";
+list.focus(); key(list, "ArrowDown"); await wait();
+if (list.getAttribute("aria-activedescendant") !== opts()[2].id) return "ArrowDown did not move the active row";
+key(list, "Enter"); await wait();
+if (pane("m3").hidden || opts()[2].getAttribute("aria-selected") !== "true") return "Enter did not pick the active row";
+key(list, "End"); key(list, " "); await wait();
+if (pane("m4").hidden || !pane("m3").hidden) return "End and Space did not pick the last";
+// on_select and children from state.
+const lo = [...live.querySelectorAll("[role=option]")], note = () => live.closest(".demo-stack").querySelector(".demo-note").textContent;
+if (!live.querySelector(".ui-mdetail-body h4")?.textContent.includes("Ada")) return "the children are not in the detail";
+lo[1].click(); await wait();
+if (note() !== "Showing Grace Hopper." || !live.querySelector(".ui-mdetail-body h4").textContent.includes("Grace")) return `on_select: ${note()}`;
+if (Math.abs(live.querySelector(".ui-mdetail-in").getBoundingClientRect().height - 220) > 1 || Math.abs(live.querySelector("[role=listbox]").getBoundingClientRect().width - 240) > 1) return "height and width are not applied";
+// Narrow: one at a time.
+const nl = narrow.querySelector("[role=listbox]"), nd = narrow.querySelector(".ui-mdetail-detail"), nb = narrow.querySelector(".ui-mdetail-back");
+if (getComputedStyle(nl).display !== "none" || getComputedStyle(nd).display === "none" || getComputedStyle(nb).display === "none") return "narrow with an item picked, the list still shows or Back is hidden";
+if (pane("m1", narrow).hidden === false || pane("m2", narrow).hidden) return "narrow, selected=\"m2\" does not show its pane";
+nb.click(); await wait();
+if (getComputedStyle(nl).display === "none" || getComputedStyle(nd).display !== "none") return "Back did not go to the list";
+if (!narrow.querySelector(".ui-mdetail-panes").hidden) return "with nothing picked, the panes are not hidden";
+[...nl.querySelectorAll("[role=option]")][0].click(); await wait();
+if (getComputedStyle(nl).display !== "none" || pane("m1", narrow).hidden || narrow.querySelector(".ui-mdetail-empty")) return "picking again did not show the detail";

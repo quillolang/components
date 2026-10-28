@@ -1,0 +1,47 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-gantt");
+if (charts.length !== 2) return `expected 2 gantt charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined|Invalid/.test(charts.map((c) => c.innerHTML).join(""))) return "a gantt chart has NaN, Infinity or undefined in it";
+const [site, year] = charts;
+if (site.getAttribute("aria-label") !== "Website relaunch") return "the label does not name the chart";
+const names = [...site.querySelectorAll(".ui-gantt-name")].map((n) => n.textContent);
+if (names.join() !== "Kick-off,Design,Research,Wireframes,Visual design,Build,Front end,Back end,Testing,Launch") return `rows: ${names}`;
+if (!site.querySelectorAll(".ui-gantt-name")[1].classList.contains("ui-gantt-gname")) return "a group's row is not a group name";
+// The chart runs from Mar 1 (a day before the first task) to Apr 29: 59 days.
+const ticks = [...site.querySelectorAll(".ui-gantt-axis span")].map((s) => s.textContent);
+if (ticks[0] !== "Mar 2" || ticks[1] !== "Mar 9") return `the weeks along the top: ${ticks}`;
+const bars = [...site.querySelectorAll(".ui-gantt-bar")];
+if (bars.length !== 6) return `6 tasks made ${bars.length} bars`;
+const research = bars[0];
+const p = (el, k) => parseFloat(el.style[k]);
+if (Math.abs(p(research, "left") - 1 / 59 * 100) > 0.01 || Math.abs(p(research, "width") - 10 / 59 * 100) > 0.01) return `Research (Mar 2 to 11, 10 days) is ${research.getAttribute("style")}`;
+const vd = bars[2];
+if (vd.querySelector(".ui-gantt-done").style.width !== "60%" || vd.querySelector(".ui-gantt-pct").textContent !== "60%") return "progress does not fill the bar";
+const tip = vd.querySelector(".ui-gantt-tip");
+if (getComputedStyle(tip).display !== "none") return "the tooltip shows before hover";
+if (tip.textContent !== "Visual designFromMar 18ToApr 3Days17Done60%") return `tooltip: ${tip.textContent}`;
+const spans = [...site.querySelectorAll(".ui-gantt-span")];
+if (spans.length !== 2) return "groups have no spanning bar";
+// Design: Mar 2 to Apr 3.
+if (Math.abs(p(spans[0], "left") - 1 / 59 * 100) > 0.01 || Math.abs(p(spans[0], "width") - 33 / 59 * 100) > 0.01) return "the group bar does not span its tasks";
+if (getComputedStyle(spans[0]).backgroundColor === getComputedStyle(spans[1]).backgroundColor) return "groups share a colour";
+if (getComputedStyle(bars[3]).backgroundColor !== getComputedStyle(bars[4]).backgroundColor) return "a group's tasks are not in its colour";
+const ms = site.querySelectorAll(".ui-gantt-ms");
+if (ms.length !== 2) return "milestones are not diamonds";
+if (ms[1].querySelector(".ui-gantt-tip").textContent !== "LaunchOnApr 27") return "a milestone's tooltip";
+const today = site.querySelector(".ui-gantt-today");
+if (!today || Math.abs(p(today, "left") - (24.5 / 59 * 100)) > 0.01) return "the today line is not in the middle of Mar 25";
+const trk = site.querySelectorAll(".ui-gantt-track"), tr = today.getBoundingClientRect();
+if (Math.abs(tr.bottom - trk[trk.length - 1].getBoundingClientRect().bottom) > 1) return "the today line does not reach the last row";
+const rowH = trk[2].getBoundingClientRect().height;
+if (Math.abs(rowH - 32) > 0.5) return `rows are ${rowH}px, not 32`;
+const rows = [...site.querySelectorAll("tbody tr")].map((r) => r.textContent);
+if (rows.length !== 8 || rows[0] !== "Kick-off (milestone)Mar 2Mar 21—" || rows[3] !== "Visual designDesignMar 18Apr 317" + "60%") return `the table: ${rows[0]} / ${rows[3]}`;
+if (!site.querySelector("caption").textContent.includes("today Mar 25")) return "the table does not say what today is";
+if (!site.querySelector(".ui-gantt-grid").hasAttribute("aria-hidden")) return "the drawing is not hidden from screen readers";
+// Months along the top over a longer span; no today line without today.
+const yt = [...year.querySelectorAll(".ui-gantt-axis span")].map((s) => s.textContent);
+if (yt[0] !== "Feb" || yt[1] !== "Mar") return `months along the top: ${yt}`;
+if (year.querySelector(".ui-gantt-today")) return "a today line without today";
+if (year.querySelectorAll(".ui-gantt-bar")[2].querySelector(".ui-gantt-done")) return "a task without progress is filled";
+if (Math.abs(year.querySelectorAll(".ui-gantt-track")[0].getBoundingClientRect().height - 28) > 0.5) return "row={28}";

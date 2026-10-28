@@ -1,0 +1,17 @@
+const sizes = $$("#thumbnail-demo-sizes .ui-thumbnail");
+if (sizes.length !== 6) return `expected 6 thumbnails, found ${sizes.length}`;
+const w = sizes.map((t) => Math.round(t.getBoundingClientRect().width));
+if (w.join() !== "32,48,64,96,128,40") return `sizes are ${w}`;
+if (sizes[0].querySelector("img")?.alt !== "Red") return "the alt is not on the image";
+const [square, circle, text, more, link] = $$("#thumbnail-demo-shapes .ui-thumbnail");
+if (getComputedStyle(square).borderRadius !== "0px") return "square still has rounded corners";
+if (getComputedStyle(circle).borderRadius !== "50%") return `circle has radius ${getComputedStyle(circle).borderRadius}`;
+if (text.querySelector(".ui-thumbnail-text")?.textContent !== "IMG_0412.jpg") return "the overlay text is missing";
+const veil = more.querySelector(".ui-thumbnail-more");
+if (!veil || veil.textContent !== "+3" || veil.getAttribute("aria-label") !== "and 3 more") return "the +N veil is wrong";
+if (link.tagName !== "A" || link.getAttribute("href") !== "https://quillolang.org" || link.getAttribute("aria-label") !== "Open the album") return "href does not make a labelled link";
+if (getComputedStyle(link.querySelector("img")).objectFit !== "contain") return "fit contain is not applied";
+const btns = $$("button.ui-thumbnail");
+if (btns.length !== 4 || btns[2].getAttribute("aria-label") !== "Pick colour 3") return "on_click does not make labelled buttons";
+btns[2].click(); await wait();
+if ($("#thumbnail-demo-picked").textContent !== "Picked: 3") return `on_click did not reach the note: ${$("#thumbnail-demo-picked").textContent}`;

@@ -1,0 +1,17 @@
+const cards = $$(".ui-profile-card");
+if (cards.length !== 3) return `expected 3 profile cards, found ${cards.length}`;
+const [ada, grace, linus] = cards;
+const link = ada.querySelector(".ui-profile-card-name a");
+if (!link || link.getAttribute("href") !== "#profile_card" || link.textContent !== "Ada Lovelace") return "href does not make the name a link";
+if (ada.querySelector(".ui-profile-card-handle")?.textContent !== "@ada") return "the handle is missing";
+if (!ada.querySelector(".ui-profile-card-where")?.textContent.includes("London")) return "the location is missing";
+if (ada.querySelector(".ui-avatar")?.getAttribute("aria-label") !== "Ada Lovelace" || ada.querySelector(".ui-avatar span").textContent !== "AL") return "no avatar with initials";
+const stats = [...ada.querySelectorAll(".ui-profile-card-stat")].map((s) => `${s.querySelector("dt").textContent}=${s.querySelector("dd").textContent}`);
+if (stats.join() !== "Posts=248,Followers=12.4k,Following=180") return `stats: ${stats}`;
+if (ada.querySelectorAll(".ui-profile-card-acts .ui-btn").length !== 2) return "the actions row does not hold the buttons";
+if (!ada.querySelector(".ui-profile-card-cover") || ada.querySelector(".ui-profile-card-cover img")) return "cover_band draws no plain band";
+if (grace.querySelector(".ui-profile-card-cover img")?.getAttribute("src") !== "https://picsum.photos/seed/sea/600/200") return "the cover image is missing";
+if (grace.querySelector(".ui-avatar img")?.getAttribute("src") !== "https://i.pravatar.cc/144?img=47") return "src does not reach the avatar";
+if (grace.querySelector(".ui-profile-card-name a")) return "no href makes a link anyway";
+if (!linus.classList.contains("ui-profile-card-row")) return "layout=row has no row class";
+if (getComputedStyle(linus.querySelector(".ui-profile-card-body")).display !== "grid") return "the row layout is not a grid";

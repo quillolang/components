@@ -1,0 +1,11 @@
+const tags = $(".cluster-demo-tags"), actions = $(".cluster-demo-actions"), title = $(".cluster-demo-title");
+if (!tags || !actions || !title) return "the three clusters are missing";
+const cs = getComputedStyle(tags);
+if (cs.display !== "flex" || cs.flexWrap !== "wrap" || cs.rowGap !== "8px" || cs.columnGap !== "8px") return `the tag row is ${cs.display} ${cs.flexWrap} gap ${cs.rowGap}`;
+const tops = new Set([...tags.children].map((t) => Math.round(t.getBoundingClientRect().top)));
+if (tops.size < 2) return "twenty tags did not wrap on to a second line";
+const ar = actions.getBoundingClientRect(), last = actions.lastElementChild.getBoundingClientRect();
+if (Math.abs(ar.right - last.right) > 1) return "justify=\"end\" does not put the buttons at the end";
+const [h, n] = title.children;
+if (Math.abs(h.getBoundingClientRect().left - title.getBoundingClientRect().left) > 1 || Math.abs(n.getBoundingClientRect().right - title.getBoundingClientRect().right) > 1) return "justify=\"between\" does not push the ends apart";
+if (getComputedStyle(title).alignItems !== "baseline") return "align=\"baseline\" is not applied";

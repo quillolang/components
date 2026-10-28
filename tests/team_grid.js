@@ -1,0 +1,17 @@
+const grids = $$("section.ui-team");
+if (grids.length !== 2) return `expected 2 grids, found ${grids.length}`;
+const [plain, cards] = grids;
+if (plain.id !== "team-grid-demo" || plain.querySelector("h2.ui-team-title")?.textContent !== "The team") return "the id or the heading is missing";
+const people = plain.querySelectorAll("ul.ui-team-grid > li.ui-team-person");
+if (people.length !== 4) return `4 people, found ${people.length}`;
+const [ada, grace, margaret, linus] = people;
+if (ada.querySelector("h3.ui-team-name")?.textContent !== "Ada Lovelace") return "the name is not an h3";
+if (ada.querySelector(".ui-avatar")?.textContent.trim() !== "AL" || !ada.querySelector(".ui-avatar").classList.contains("ui-avatar-xl")) return "the avatar is not the initials at xl";
+if (ada.querySelector(".ui-team-role")?.textContent !== "Founder") return "the role is missing";
+const links = ada.querySelectorAll(".ui-team-links a");
+if (links.length !== 2 || links[0].textContent !== "X" || links[0].getAttribute("href") !== "#team_grid") return "the links are wrong";
+if (ada.querySelector(".ui-team-links")?.getAttribute("aria-label") !== "Ada Lovelace's links") return "the links list is not named";
+if (margaret.querySelector(".ui-team-links") || linus.querySelector(".ui-team-bio")) return "missing links or bio still draw something";
+if (new Set([...people].map((p) => Math.round(p.getBoundingClientRect().top))).size !== 1) return "four at 200px wide do not fit one row";
+if (!cards.classList.contains("ui-team-cards") || getComputedStyle(cards.querySelector(".ui-team-person")).borderStyle !== "solid") return "cards are not bordered";
+if (!cards.querySelector(".ui-avatar").classList.contains("ui-avatar-lg")) return "size=lg does not reach the avatar";

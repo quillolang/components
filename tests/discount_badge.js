@@ -1,0 +1,15 @@
+const badges = $$(".ui-discount");
+if (badges.length !== 12) return `expected 12 badges, found ${badges.length}`;
+if (badges[0].textContent !== "−20%" || badges[0].getAttribute("aria-label") !== "20% off") return `percent reads "${badges[0].textContent}" / "${badges[0].getAttribute("aria-label")}"`;
+if (badges[1].textContent !== "Save $10") return `amount reads "${badges[1].textContent}"`;
+if (badges[2].textContent !== "Save €5") return `a text amount reads "${badges[2].textContent}"`;
+if (badges[3].textContent.replace(/\s/g, " ") !== "Save 7,50 €") return `de-DE EUR reads "${badges[3].textContent}"`;
+if (badges[4].textContent !== "2 for 1" || badges[4].hasAttribute("aria-label")) return "label is not shown as it is";
+const bg = (b) => getComputedStyle(b).backgroundColor;
+if (bg(badges[0]) === bg(badges[2]) || bg(badges[2]) === bg(badges[3])) return "tones do not change the colour";
+if (bg(badges[6]) === bg(badges[0]) || bg(badges[7]) === bg(badges[0])) return "soft and outline look like solid";
+if (getComputedStyle(badges[7]).borderTopColor === getComputedStyle(badges[0]).borderTopColor) return "outline has no border colour";
+if (parseFloat(getComputedStyle(badges[8]).height) >= parseFloat(getComputedStyle(badges[0]).height)) return "sm is not smaller";
+const box = badges[10].parentElement, br = box.getBoundingClientRect(), tl = badges[10].getBoundingClientRect(), brr = badges[11].getBoundingClientRect();
+if (getComputedStyle(badges[10]).position !== "absolute" || tl.left - br.left > 12 || tl.top - br.top > 12) return "corner top-left does not pin to the corner";
+if (br.right - brr.right > 12 || br.bottom - brr.bottom > 12) return "corner bottom-right does not pin to the corner";

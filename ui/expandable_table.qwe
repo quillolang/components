@@ -1,0 +1,130 @@
+// ExpandableTable: rows with more under them: a button at the start of each row
+// opens a panel below it with the row's detail: an order's note, a person's
+// address, a job's log.
+//
+//   <ExpandableTable id="orders" label="Orders" rows={orders} detail="note"
+//                    fields={[{ key: "email", label: "Email" }, { key: "shipped", label: "Shipped", format: "date" }]}
+//                    columns={[
+//                        { key: "number", label: "Order" },
+//                        { key: "total", label: "Total", format: "money" },
+//                    ]}/>
+//
+// rows: maps with the columns' fields and an id (unique; the row's place by
+// default). columns: { key, label, align?, format?, currency? } as in DataTable.
+// What a row's panel shows: fields, a list of { key, label, format? } shown as
+// labelled values from the row; and detail, the name of a field whose text is
+// shown as a paragraph. Inside one of your components, render (a function given the
+// row) gives the panel's markup instead. A row with nothing to show has no button.
+// expanded: the ids of the rows open at first. single: opening a row closes the
+// others. label: the table's name for screen readers. zebra: shades every other
+// row. on_toggle(id, open): inside one of your components, called when a row is
+// opened or closed. The button says what it does and which row (aria-expanded,
+// aria-controls), and the panel is a row of the table, so screen readers follow.
+
+let expandable_table_css = css`
+.ui-expandable { min-width: 0; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-expandable table { width: 100%; border-collapse: separate; border-spacing: 0; }
+.ui-expandable th, .ui-expandable td { padding: 8px 14px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--ui-border); }
+.ui-expandable thead th { background: var(--ui-subtle); color: var(--ui-muted); font-size: 12px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+.ui-expandable tbody tr:last-child td { border-bottom: 0; }
+.ui-expandable .ui-expandable-right { text-align: right; font-variant-numeric: tabular-nums; }
+.ui-expandable-btn-cell { width: 1%; padding-right: 0; }
+.ui-expandable-btn { display: inline-grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-muted); cursor: pointer; }
+.ui-expandable-btn:hover { border-color: var(--ui-strong); color: var(--ui-fg); }
+.ui-expandable-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-expandable-btn svg { width: 12px; height: 12px; transition: transform .15s; }
+.ui-expandable-btn[aria-expanded="true"] { background: var(--ui-accent-soft); border-color: var(--ui-accent); color: var(--ui-accent); }
+.ui-expandable-btn[aria-expanded="true"] svg { transform: rotate(90deg); }
+.ui-expandable-open td { background: color-mix(in srgb, var(--ui-accent-soft) 40%, var(--ui-surface)); border-bottom-color: transparent; }
+.ui-expandable-zebra tbody tr.ui-expandable-row:nth-of-type(even) td { background: color-mix(in srgb, var(--ui-subtle) 55%, transparent); }
+.ui-expandable tbody tr.ui-expandable-row:hover td { background: var(--ui-subtle); }
+.ui-expandable-panel td { padding: 4px 14px 16px 54px; white-space: normal; background: color-mix(in srgb, var(--ui-accent-soft) 40%, var(--ui-surface)); }
+.ui-expandable-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, max-content)); gap: 8px 28px; margin: 0; }
+.ui-expandable-fields div { display: grid; gap: 1px; }
+.ui-expandable-fields dt { color: var(--ui-muted); font-size: 12px; font-weight: 500; }
+.ui-expandable-fields dd { margin: 0; }
+.ui-expandable-text { margin: 0; max-width: 64ch; color: var(--ui-fg); }
+.ui-expandable-fields + .ui-expandable-text { margin-top: 10px; }
+.ui-expandable-empty td { padding: 28px 14px; text-align: center; color: var(--ui-muted); }
+@media (prefers-reduced-motion: reduce) { .ui-expandable-btn svg { transition: none; } }
+`
+
+fn expandable_table_fmt(v, format: str? = null, currency: str = "$") -> str {
+    if v == null { return "—" }
+    if format == "date" { return type_of(v) == "str" && date.valid(v) ? date.format(v, "MMM D, YYYY") : str(v) }
+    if type_of(v) != "int" && type_of(v) != "float" { return str(v) }
+    let sign = v < 0 ? "-" : ""
+    match format {
+        "money" => `${sign}${currency}${format_number(abs(v), "en-US", 2)}`
+        "percent" => `${format_number(round(v * 1000) / 10, "en-US")}%`
+        _ => format_number(v, "en-US")
+    }
+}
+
+fn expandable_table_right(c: map) -> bool =
+    c.align == "right" || (c.align == null && (c.format == "number" || c.format == "money" || c.format == "percent"))
+
+component ExpandableTable(id: str, columns: list = [], rows: list = [], fields: list = [], detail: str? = null,
+                          render = null, expanded: list = [], single: bool = false, label: str? = null,
+                          zebra: bool = false, empty: str = "Nothing to show.", on_toggle = null, class: str? = null) {
+    style global expandable_table_css
+    state open = expanded | map((x) => str(x))
+    let rid = (i: int, r: map) => r.id != null ? str(r.id) : str(i)
+    let has_more = (r: map) => render != null || len(fields) > 0 || (detail != null && r[detail] != null && r[detail] != "")
+    // The rows shown, each followed by its panel when open: { key, row, open, first, panel }.
+    let shown = flatten(for [i, r] in enumerate(rows) => {
+        let key = rid(i, r)
+        let is_open = index_of(open, key) != null
+        let first = columns[0] != null ? expandable_table_fmt(r[columns[0].key], columns[0].format, columns[0].currency ?? "$") : key
+        [{ key, row: r, open: is_open, first, panel: false }] + (is_open ? [{ key, row: r, open: true, first, panel: true }] : [])
+    })
+    let toggle = (key: str) => {
+        let now_open = index_of(open, key) == null
+        open = now_open ? (single ? [key] : push(open, key)) : open | filter((x) => x != key)
+        on_toggle && on_toggle(key, now_open)
+    }
+    <div class={ui_cls(["ui-expandable", zebra && "ui-expandable-zebra", class])} id={id}>
+        <table aria-label={label}>
+            <thead>
+                <tr>
+                    <th scope="col" class="ui-expandable-btn-cell"><span.ui-sr>Details</span></th>
+                    {for c in columns => <th scope="col" class={expandable_table_right(c) ? "ui-expandable-right" : null}>{c.label ?? c.key}</th>}
+                </tr>
+            </thead>
+            <tbody>
+                {len(rows) == 0 && <tr.ui-expandable-empty><td colspan={str(len(columns) + 1)}>{empty}</td></tr>}
+                {for x in shown => x.panel
+                    ? <tr.ui-expandable-panel key={`${x.key}-panel`} id={`${id}-panel-${x.key}`}>
+                          <td colspan={str(len(columns) + 1)}>
+                              {render != null
+                                  ? render(x.row)
+                                  : [
+                                      len(fields) > 0 && <dl.ui-expandable-fields>
+                                          {for f in fields => <div>
+                                              <dt>{f.label ?? f.key}</dt>
+                                              <dd>{expandable_table_fmt(x.row[f.key], f.format, f.currency ?? "$")}</dd>
+                                          </div>}
+                                      </dl>,
+                                      detail != null && x.row[detail] != null && x.row[detail] != "" && <p.ui-expandable-text>{str(x.row[detail])}</p>,
+                                  ]}
+                          </td>
+                      </tr>
+                    : <tr key={x.key} class={ui_cls(["ui-expandable-row", x.open && "ui-expandable-open"])} data-id={x.key}>
+                          <td class="ui-expandable-btn-cell">
+                              {has_more(x.row) && <button.ui-expandable-btn type="button" aria-expanded={x.open ? "true" : "false"}
+                                      aria-controls={`${id}-panel-${x.key}`} aria-label={`${x.open ? "Hide" : "Show"} details of ${x.first}`}
+                                      @click={() => { toggle(x.key) }}>
+                                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                                       stroke-linejoin="round" aria-hidden="true"><path d="M4.5 2.5L8 6l-3.5 3.5"/></svg>
+                              </button>}
+                          </td>
+                          {for c in columns => <td class={expandable_table_right(c) ? "ui-expandable-right" : null}>
+                              {expandable_table_fmt(x.row[c.key], c.format, c.currency ?? "$")}
+                          </td>}
+                      </tr>}
+            </tbody>
+        </table>
+    </div>
+}

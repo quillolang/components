@@ -1,0 +1,130 @@
+// LogViewer: log lines in a dark, monospaced box, each level in its colour, with
+// buttons that show or hide each level (and say how many lines it has), a search
+// that keeps matching lines and marks the match, line wrapping, and following the
+// end as lines come.
+//
+//   <LogViewer id="api-log" label="API log" lines={log_text_lines}/>
+//   <LogViewer id="jobs" lines={[{ time: "09:00:01", level: "info", message: "Job started", source: "worker-2" }]}/>
+//
+// lines: strings or maps. A string is read as "<time> <LEVEL> <message>" (or
+// "<LEVEL> <message>", or "[LEVEL] ..."), the level being TRACE, DEBUG, INFO,
+// WARN (WARNING), ERROR or FATAL in any case; a line it cannot read is shown as it
+// is, at no level. A map is { message, level?, time?, source? }. levels: the
+// levels shown at first (all of them). height: the box's height ("320px").
+// wrap: long lines wrap (false: they scroll sideways); a button flips it.
+// follow: keeps the end in view as lines are added (true), unless the reader has
+// scrolled up. numbers: line numbers down the left (true). label: the log's
+// name for screen readers. id: a prefix for its ids, unique on the page. The box
+// is role="log", so screen readers hear lines added at the end.
+
+let log_viewer_css = css`
+.ui-logviewer { display: grid; gap: 8px; min-width: 0; font: 13px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-logviewer-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ui-logviewer-lvl { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 9px; border: 1px solid var(--ui-border);
+  border-radius: 999px; background: var(--ui-surface); color: var(--ui-muted); font: 500 12px/1 var(--ui-font); cursor: pointer; --t: var(--ui-muted); }
+.ui-logviewer-lvl::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--t); opacity: .4; }
+.ui-logviewer-lvl[aria-pressed="true"] { border-color: color-mix(in srgb, var(--t) 45%, var(--ui-border)); color: var(--ui-fg);
+  background: color-mix(in srgb, var(--t) 10%, var(--ui-surface)); }
+.ui-logviewer-lvl[aria-pressed="true"]::before { opacity: 1; }
+.ui-logviewer-lvl:focus-visible, .ui-logviewer-wrapbtn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-logviewer-lvl b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-logviewer-debug, .ui-logviewer-trace { --t: var(--ui-muted); }
+.ui-logviewer-info { --t: var(--ui-info); }
+.ui-logviewer-warn { --t: var(--ui-warning); }
+.ui-logviewer-error, .ui-logviewer-fatal { --t: var(--ui-danger); }
+.ui-logviewer-search { flex: 1 1 160px; max-width: 260px; height: 30px; margin-left: auto; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 13px/1 var(--ui-font); }
+.ui-logviewer-search:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-logviewer-wrapbtn { height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-muted); font: 500 12px/1 var(--ui-font); cursor: pointer; }
+.ui-logviewer-wrapbtn[aria-pressed="true"] { color: var(--ui-fg); background: var(--ui-subtle); }
+.ui-logviewer-box { overflow: auto; padding: 8px 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-bg); color: var(--ui-fg); font: 12.5px/1.6 var(--ui-mono); }
+.ui-logviewer-box:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-logviewer-line { display: flex; gap: 10px; padding: 0 12px; white-space: pre; }
+.ui-logviewer-wrap .ui-logviewer-line { white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-logviewer-line:hover { background: var(--ui-subtle); }
+.ui-logviewer-line.ui-logviewer-error, .ui-logviewer-line.ui-logviewer-fatal { background: color-mix(in srgb, var(--ui-danger) 10%, transparent); }
+.ui-logviewer-line.ui-logviewer-warn { background: color-mix(in srgb, var(--ui-warning) 8%, transparent); }
+.ui-logviewer-n { flex: none; min-width: 3ch; color: var(--ui-muted); opacity: .6; text-align: right; user-select: none; -webkit-user-select: none; }
+.ui-logviewer-time { flex: none; color: var(--ui-muted); }
+.ui-logviewer-tag { flex: none; width: 5ch; color: var(--t); font-weight: 700; }
+.ui-logviewer-src { flex: none; color: var(--ui-accent); }
+.ui-logviewer-msg { min-width: 0; }
+.ui-logviewer-box mark { border-radius: 2px; background: color-mix(in srgb, var(--ui-warning) 40%, transparent); color: inherit; }
+.ui-logviewer-none { padding: 18px 12px; color: var(--ui-muted); font-family: var(--ui-font); text-align: center; }
+.ui-logviewer-foot { color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+`
+
+let log_viewer_levels = ["trace", "debug", "info", "warn", "error", "fatal"]
+
+// A line as { time, level, message, source }: level is one of the six, or "".
+fn log_viewer_parse(line) -> map {
+    if type_of(line) == "map" {
+        let lv = lower(str(line.level ?? ""))
+        return { time: line.time, level: lv == "warning" ? "warn" : (index_of(log_viewer_levels, lv) != null ? lv : ""),
+                 message: str(line.message ?? ""), source: line.source }
+    }
+    let m = re.find(str(line), "^(?:(\\S+)\\s+)??\\[?(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\\]?:?\\s+(.*)$", "i")
+    if m == null { return { time: null, level: "", message: str(line), source: null } }
+    let lv = lower(m.groups[1])
+    { time: m.groups[0], level: lv == "warning" ? "warn" : lv, message: m.groups[2], source: null }
+}
+
+// The text cut where it matches the needle (lower case): [{ text, hit }].
+fn log_viewer_parts(text: str, needle: str) -> list {
+    if needle == "" { return [{ text, hit: false }] }
+    let at = index_of(lower(text), needle)
+    if at == null { return [{ text, hit: false }] }
+    let n = len(needle)
+    [{ text: slice(text, 0, at), hit: false }, { text: slice(text, at, at + n), hit: true }] + log_viewer_parts(slice(text, at + n, len(text)), needle)
+}
+
+component LogViewer(id: str, lines: list = [], levels: list? = null, height: str = "320px", wrap: bool = false,
+                    follow: bool = true, numbers: bool = true, label: str? = null, class: str? = null) {
+    style global log_viewer_css
+    state on = levels ?? log_viewer_levels
+    state query = ""
+    state wrapped = wrap
+    state stuck = true          // the box is scrolled to its end
+    state box = null            // the box, once on the page
+    // New lines: back to the end once they are on the page, if it was there.
+    if follow && stuck && box != null && len(lines) > 0 {
+        js("queueMicrotask", () => { box.scrollTop = box.scrollHeight })
+    }
+    let parsed = for [i, l] in enumerate(lines) => { ...log_viewer_parse(l), n: i + 1 }
+    let present = log_viewer_levels | filter((lv) => any(parsed, (p) => p.level == lv))
+    let needle = lower(trim(query))
+    let shown = parsed
+        | filter((p) => p.level == "" || index_of(on, p.level) != null)
+        | filter((p) => needle == "" || contains(lower(p.message), needle) || contains(lower(p.source ?? ""), needle))
+    let count_of = (lv: str) => count(parsed, (p) => p.level == lv)
+    <div class={ui_cls(["ui-logviewer", wrapped && "ui-logviewer-wrap", class])} id={id}>
+        <div.ui-logviewer-bar role="group" aria-label="Levels">
+            {for lv in present => <button type="button" class={`ui-logviewer-lvl ui-logviewer-${lv}`} aria-pressed={index_of(on, lv) != null ? "true" : "false"}
+                    data-level={lv}
+                    @click={() => { on = index_of(on, lv) != null ? on | filter((x) => x != lv) : push(on, lv) }}>
+                {upper(lv)} <b>{count_of(lv)}</b>
+            </button>}
+            <input.ui-logviewer-search type="search" placeholder="Search" value={query} aria-label={label != null ? `Search ${lower(label)}` : "Search the log"}
+                   aria-controls={`${id}-box`} @input={(e) => { query = e.value }}/>
+            <button.ui-logviewer-wrapbtn type="button" aria-pressed={wrapped ? "true" : "false"} @click={() => { wrapped = !wrapped }}>Wrap</button>
+        </div>
+        <div.ui-logviewer-box id={`${id}-box`} role="log" aria-label={label} tabindex="0" style={`height: ${height}`}
+             @scroll={(e) => { stuck = e.scrollTop + e.clientHeight >= e.scrollHeight - 8 }}
+             @mount={(el) => {
+                 box = el
+                 if follow { el.scrollTop = el.scrollHeight }
+             }}>
+            {len(shown) == 0 && <div.ui-logviewer-none>{len(parsed) == 0 ? "No lines yet." : "No line matches."}</div>}
+            {for p in shown => <div key={p.n} class={ui_cls(["ui-logviewer-line", p.level != "" && `ui-logviewer-${p.level}`])} data-n={p.n}>
+                {numbers && <span.ui-logviewer-n aria-hidden="true">{p.n}</span>}
+                {p.time != null && <span.ui-logviewer-time>{p.time}</span>}
+                {p.level != "" && <span.ui-logviewer-tag>{upper(p.level)}</span>}
+                {p.source != null && <span.ui-logviewer-src>{p.source}</span>}
+                <span.ui-logviewer-msg>{for part in log_viewer_parts(p.message, needle) => part.hit ? <mark>{part.text}</mark> : part.text}</span>
+            </div>}
+        </div>
+        <div.ui-logviewer-foot aria-live="polite">{len(shown) == len(parsed) ? `${len(parsed)} lines` : `${len(shown)} of ${len(parsed)} lines`}</div>
+    </div>
+}

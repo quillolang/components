@@ -1,0 +1,14 @@
+const name = $("#fieldset-demo-name"), notify = $("#fieldset-demo-notify"), card = $("#fieldset-demo-card");
+if (!name || name.tagName !== "FIELDSET") return "it is not a <fieldset>";
+const legend = name.querySelector("legend");
+if (!legend || !legend.textContent.startsWith("Your name") || !legend.querySelector(".ui-fieldset-req")) return "the legend with its required mark is missing";
+const desc = name.querySelector(".ui-fieldset-desc");
+if (!desc || name.getAttribute("aria-describedby") !== desc.id) return "the description does not describe the fieldset";
+const [first, last] = name.querySelectorAll(".ui-fieldset-fields > *");
+const fr = first.getBoundingClientRect(), lr = last.getBoundingClientRect();
+if (Math.abs(fr.top - lr.top) > 1 || lr.left <= fr.right || Math.abs(fr.width - lr.width) > 1) return "layout=\"grid\" does not put the two fields side by side, equal";
+const boxes = [...notify.querySelectorAll(".ui-fieldset-fields > *")];
+if (boxes.length !== 3 || new Set(boxes.map((b) => Math.round(b.getBoundingClientRect().top))).size !== 1) return "layout=\"inline\" does not put the boxes in a row";
+if (!card.disabled || !card.querySelector("input").matches(":disabled")) return "disabled={true} does not disable the fields";
+if (getComputedStyle(card).borderTopWidth !== "1px") return "bordered={true} draws no box";
+if (!card.closest("form")) return "the demo's fieldsets are not in a form";

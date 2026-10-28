@@ -1,0 +1,32 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-wfallc");
+if (charts.length !== 2) return `expected 2 waterfall charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a chart has NaN, Infinity or undefined in it";
+const [cash, heads] = charts;
+const bars = [...cash.querySelectorAll(".ui-wfallc-bar")];
+if (bars.length !== 9) return `start, 7 steps and an end made ${bars.length} bars, not 9`;
+const kinds = bars.map((b) => b.className.replace("ui-wfallc-bar ui-wfallc-", ""));
+if (kinds.join() !== "total,up,up,down,total,down,down,up,total") return `the bars' kinds: ${kinds}`;
+// Each floating bar begins where the one before ended.
+const r = bars.map((b) => b.getBoundingClientRect());
+if (Math.abs(r[1].bottom - r[0].top) > 1) return "the first rise does not start at the top of the start bar";
+if (Math.abs(r[3].top - r[2].top) > 1) return "a fall does not start at the level the rise reached";
+if (bars[4].dataset.from !== "0" || bars[4].dataset.to !== "79300") return `the subtotal runs ${bars[4].dataset.from} to ${bars[4].dataset.to}`;
+if (bars[8].dataset.to !== "37100") return `the end total is ${bars[8].dataset.to}`;
+const up = getComputedStyle(bars[1]).backgroundColor, down = getComputedStyle(bars[3]).backgroundColor, total = getComputedStyle(bars[0]).backgroundColor;
+if (new Set([up, down, total]).size !== 3) return "rises, falls and totals share a colour";
+const steps = cash.querySelectorAll(".ui-wfallc-step");
+if (steps.length !== 8) return "the bars are not joined by steps";
+if (Math.abs(steps[0].getBoundingClientRect().top - r[0].top) > 1) return "a step is not at the level its bar ended";
+const vals = [...cash.querySelectorAll(".ui-wfallc-val")].map((v) => v.textContent);
+if (vals.join() !== "$42k,+$31.5k,+$8.2k,-$2.4k,$79.3k,-$38.8k,-$6.5k,+$3.1k,$37.1k") return `value labels: ${vals}`;
+if (!cash.querySelectorAll(".ui-wfallc-val")[3].classList.contains("ui-wfallc-under")) return "a fall's label is not under it";
+const tip = cash.querySelectorAll(".ui-wfallc-tip")[5];
+if (getComputedStyle(tip).display !== "none") return "the tooltip shows before hover";
+if (tip.textContent !== "PayrollChange-$38,800Running total$40,500") return `tooltip: ${tip.textContent}`;
+if (cash.querySelectorAll(".ui-wfallc-x .ui-wfallc-sum").length !== 3) return "totals' labels are not marked";
+if (cash.querySelectorAll("tbody tr")[1].textContent !== "Sales+$31,500$73,500") return `the table: ${cash.querySelectorAll("tbody tr")[1].textContent}`;
+
+const hx = [...heads.querySelectorAll(".ui-wfallc-x span")].map((s) => s.textContent);
+if (hx.join() !== "Jan 1,Hired,Left,Moved in,Moved out,Dec 31") return `labels: ${hx}`;
+if (heads.querySelectorAll(".ui-wfallc-bar")[5].dataset.to !== "30") return "the end total is not 24 + 11 - 4 + 2 - 3";

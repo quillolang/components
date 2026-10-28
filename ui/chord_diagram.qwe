@@ -1,0 +1,154 @@
+// ChordDiagram: flows between groups around a circle (people moving between
+// regions, customers switching brands): each group an arc as long as what leaves
+// it, and a ribbon for each pair, as wide at each end as what goes that way. CSS
+// only: hovering a group's arc keeps only its ribbons, hovering a ribbon picks it
+// out, and screen readers get the flows as a table.
+//
+//   <ChordDiagram label="Moves between teams" names={["Sales", "Support", "Product"]}
+//                 matrix={[[0, 4, 2], [6, 0, 3], [1, 5, 0]]}/>
+//
+// names: the groups, clockwise from the top. matrix: a row per group, of what flows
+// from it to each group (matrix[i][j] from names[i] to names[j]; the diagonal is
+// what stays). Each group has a colour of its own (eight, then they repeat), and a
+// ribbon takes the colour of the side that sends more. Up to eight groups are
+// picked out on hover. size: its width in pixels (360; it shrinks to fit). prefix
+// and suffix: around every value shown ("$", "k"); decimals: digits after the
+// point, always, instead of up to two as needed. label: what it shows; it names it
+// for screen readers and captions their table. show_label also writes it above.
+
+let chord_diagram_css = css`
+.ui-chord {
+  --ui-chord-1: light-dark(#2a78d6, #3987e5); --ui-chord-2: light-dark(#eb6834, #d95926);
+  --ui-chord-3: light-dark(#1baf7a, #199e70); --ui-chord-4: light-dark(#eda100, #c98500);
+  --ui-chord-5: light-dark(#e87ba4, #d55181); --ui-chord-6: light-dark(#008300, #008300);
+  --ui-chord-7: light-dark(#6250d6, #9085e9); --ui-chord-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-chord-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-chord-s1 { --c: var(--ui-chord-1); } .ui-chord-s2 { --c: var(--ui-chord-2); } .ui-chord-s3 { --c: var(--ui-chord-3); }
+.ui-chord-s4 { --c: var(--ui-chord-4); } .ui-chord-s5 { --c: var(--ui-chord-5); } .ui-chord-s6 { --c: var(--ui-chord-6); }
+.ui-chord-s7 { --c: var(--ui-chord-7); } .ui-chord-s8 { --c: var(--ui-chord-8); }
+.ui-chord-box { max-width: 100%; aspect-ratio: 1; margin: 0 auto; }
+.ui-chord-box svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.ui-chord-arc { fill: var(--c); stroke: var(--ui-bg); stroke-width: .5; }
+.ui-chord-rib { fill: var(--c); fill-opacity: .6; stroke: var(--ui-bg); stroke-width: .4; transition: opacity .15s ease; }
+.ui-chord-name { fill: var(--ui-fg); font: 500 11px var(--ui-font); dominant-baseline: central; }
+.ui-chord-box svg:has(.ui-chord-rib:hover) .ui-chord-rib:not(:hover) { opacity: .12; }
+.ui-chord-box svg:has(.ui-chord-g1:hover) .ui-chord-rib:not(.ui-chord-t1),
+.ui-chord-box svg:has(.ui-chord-g2:hover) .ui-chord-rib:not(.ui-chord-t2),
+.ui-chord-box svg:has(.ui-chord-g3:hover) .ui-chord-rib:not(.ui-chord-t3),
+.ui-chord-box svg:has(.ui-chord-g4:hover) .ui-chord-rib:not(.ui-chord-t4),
+.ui-chord-box svg:has(.ui-chord-g5:hover) .ui-chord-rib:not(.ui-chord-t5),
+.ui-chord-box svg:has(.ui-chord-g6:hover) .ui-chord-rib:not(.ui-chord-t6),
+.ui-chord-box svg:has(.ui-chord-g7:hover) .ui-chord-rib:not(.ui-chord-t7),
+.ui-chord-box svg:has(.ui-chord-g8:hover) .ui-chord-rib:not(.ui-chord-t8) { opacity: .08; }
+@media (prefers-reduced-motion: reduce) { .ui-chord-rib { transition: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn chord_diagram_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn chord_diagram_group(n: int) -> str =
+    n < 1000 ? str(n) : chord_diagram_group(floor(n / 1000)) + "," + chord_diagram_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn chord_diagram_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${chord_diagram_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${chord_diagram_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate or a percentage for CSS and SVG, to two decimals.
+fn chord_diagram_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// A point at `turn` (a share of a turn, clockwise from the top), r from the middle.
+fn chord_diagram_xy(turn: num, r: num) -> str =
+    `${chord_diagram_pct(r * math.sin(2 * math.pi * turn))},${chord_diagram_pct(-r * math.cos(2 * math.pi * turn))}`
+
+// An arc of the ring from a0 to a1, r0 to r1 out.
+fn chord_diagram_band(a0: num, a1: num, r0: num, r1: num) -> str {
+    let big = a1 - a0 > 0.5 ? 1 : 0
+    `M${chord_diagram_xy(a0, r1)} A${r1},${r1} 0 ${big} 1 ${chord_diagram_xy(a1, r1)} L${chord_diagram_xy(a1, r0)} A${r0},${r0} 0 ${big} 0 ${chord_diagram_xy(a0, r0)} Z`
+}
+
+// A ribbon from the piece s0..s1 of the circle to the piece t0..t1, through the middle.
+fn chord_diagram_ribbon(s0: num, s1: num, t0: num, t1: num, r: num) -> str {
+    let sb = s1 - s0 > 0.5 ? 1 : 0
+    let tb = t1 - t0 > 0.5 ? 1 : 0
+    `M${chord_diagram_xy(s0, r)} A${r},${r} 0 ${sb} 1 ${chord_diagram_xy(s1, r)} Q0,0 ${chord_diagram_xy(t0, r)} A${r},${r} 0 ${tb} 1 ${chord_diagram_xy(t1, r)} Q0,0 ${chord_diagram_xy(s0, r)} Z`
+}
+
+view ChordDiagram(names: list, matrix: list, size: int = 360, prefix: str = "", suffix: str = "", decimals: int? = null,
+                  label: str = "Chord diagram", show_label: bool = false, class: str? = null) {
+    style global chord_diagram_css
+    let n = len(names)
+    let fmt = (v) => `${v < 0 ? "-" : ""}${prefix}${chord_diagram_num(abs(v), decimals)}${suffix}`
+    let at = (i, j) => {
+        let v = (matrix[i] ?? [])[j]
+        v != null && v > 0 ? v : 0
+    }
+    let rows = for i in range(n) => sum(for j in range(n) => at(i, j))
+    let cols = for j in range(n) => sum(for i in range(n) => at(i, j))
+    let total = sum(rows)
+    let pad = n > 1 ? 0.025 : 0
+    let room = 1 - pad * n
+    let unit = total > 0 ? room / total : 0
+    let starts = for i in range(n) => i * pad + sum(for q in range(i) => rows[q]) * unit + pad / 2
+    // Where the piece of group i for its flow to j starts, round the circle.
+    let piece = (i, j) => starts[i] + sum(for q in range(j) => at(i, q)) * unit
+    let r = 100
+    let pairs = flatten(for i in range(n) => for j in range(i, n) => [i, j]) | filter((p) => at(p[0], p[1]) > 0 || at(p[1], p[0]) > 0)
+    <figure class={ui_cls(["ui-chord", class])} aria-label={label}>
+        {show_label && <figcaption.ui-chord-title>{label}</figcaption>}
+        <div.ui-chord-box style={`width: ${size}px`} aria-hidden="true">
+            <svg viewBox="-150 -150 300 300">
+                {for p in pairs => {
+                    let i = p[0]
+                    let j = p[1]
+                    let lead = at(i, j) >= at(j, i) ? i : j
+                    <path class={ui_cls(["ui-chord-rib", `ui-chord-s${lead % 8 + 1}`, `ui-chord-t${i + 1}`, i != j && `ui-chord-t${j + 1}`])}
+                          d={chord_diagram_ribbon(piece(i, j), piece(i, j) + at(i, j) * unit, piece(j, i), piece(j, i) + at(j, i) * unit, r)}
+                          data-from={names[i]} data-to={names[j]}>
+                        <title>{i == j ? `${names[i]}, staying: ${fmt(at(i, i))}` : `${names[i]} → ${names[j]}: ${fmt(at(i, j))}; ${names[j]} → ${names[i]}: ${fmt(at(j, i))}`}</title>
+                    </path>
+                }}
+                {for i in range(n) => rows[i] > 0 && {
+                    let mid = starts[i] + rows[i] * unit / 2
+                    let right = mid < 0.5
+                    [
+                        <path class={`ui-chord-arc ui-chord-g${i + 1} ui-chord-s${i % 8 + 1}`}
+                              d={chord_diagram_band(starts[i], starts[i] + rows[i] * unit, r + 3, r + 14)}>
+                            <title>{names[i]}: out {fmt(rows[i])}, in {fmt(cols[i])}</title>
+                        </path>,
+                        <text.ui-chord-name x={chord_diagram_pct((r + 20) * math.sin(2 * math.pi * mid))}
+                              y={chord_diagram_pct(-(r + 20) * math.cos(2 * math.pi * mid))}
+                              text-anchor={abs(mid - 0.5) < 0.02 || mid < 0.02 || mid > 0.98 ? "middle" : (right ? "start" : "end")}>{names[i]}</text>
+                    ]
+                }}
+            </svg>
+        </div>
+        <table.ui-sr>
+            <caption>{label}: from each row to each column</caption>
+            <thead><tr><th scope="col">From</th>{for nm in names => <th scope="col">To {nm}</th>}<th scope="col">Out</th></tr></thead>
+            <tbody>
+                {for i in range(n) => <tr>
+                    <th scope="row">{names[i]}</th>
+                    {for j in range(n) => <td>{fmt(at(i, j))}</td>}
+                    <td>{fmt(rows[i])}</td>
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

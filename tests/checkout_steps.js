@@ -1,0 +1,18 @@
+const lists = $$("ol.ui-checkout-steps");
+if (lists.length !== 4) return `expected 4, found ${lists.length}`;
+const [a, b, c, d] = lists;
+const steps = (l) => [...l.querySelectorAll(".ui-checkout-step")];
+const labels = (l) => steps(l).map((s) => s.querySelector(".ui-checkout-label").firstChild.textContent);
+if (labels(a).join() !== "Cart,Details,Payment,Done") return `the defaults: ${labels(a)}`;
+if (a.getAttribute("aria-label") !== "Checkout") return "no name";
+if (steps(a).map((s) => s.className.replace("ui-checkout-step ", "")).join() !== "ui-checkout-done,ui-checkout-current,ui-checkout-coming,ui-checkout-coming") return "the phases are wrong";
+if (steps(a)[1].getAttribute("aria-current") !== "step" || steps(a)[0].hasAttribute("aria-current")) return "aria-current is not on the current step";
+if (!steps(a)[0].querySelector(".ui-checkout-mark svg") || steps(a)[1].querySelector(".ui-checkout-mark").textContent.trim() !== "2") return "done shows no check, or the current no number";
+if (!steps(a)[0].querySelector(".ui-sr")?.textContent.includes("done")) return "screen readers are not told a step is done";
+const seps = [...a.querySelectorAll(".ui-checkout-sep")];
+if (seps.length !== 3 || !seps[0].classList.contains("ui-checkout-sep-done") || seps[1].classList.contains("ui-checkout-sep-done")) return "the lines between are not coloured up to the current step";
+const links = steps(b).map((s) => s.querySelector("a")?.getAttribute("href") ?? "-");
+if (links.join() !== "#cart_item,#checkout_steps,-,-") return `done steps with an href are not links: ${links}`;
+if (steps(c).every((s) => s.classList.contains("ui-checkout-done")) !== true) return "current = len(steps) does not mark all done";
+if (!c.classList.contains("ui-checkout-dots") || parseFloat(getComputedStyle(c.querySelector(".ui-checkout-mark")).width) >= 20) return "numbers={false} does not shrink to dots";
+if (steps(d).map((s) => s.getBoundingClientRect().top).some((t, i, ts) => t !== ts[0])) return "the steps are not in one row";

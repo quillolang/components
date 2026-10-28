@@ -1,0 +1,16 @@
+const line = $("#hashtag-demo-line");
+const tags = [...line.querySelectorAll("a.ui-hashtag")];
+if (tags.length !== 3) return `expected 3 hashtags in the line, found ${tags.length}`;
+if (tags[0].textContent.trim() !== "#quillo" || tags[0].getAttribute("href") !== "/tags/quillo") return `the first tag is ${tags[0].textContent} → ${tags[0].getAttribute("href")}`;
+if (tags[1].querySelector(".ui-hashtag-count")?.textContent !== "310" || tags[1].querySelector(".ui-hashtag-count").getAttribute("aria-label") !== "310 posts") return "the count is not shown and named";
+if (tags[2].getAttribute("href") !== "/tags/release%20notes" || !tags[2].classList.contains("ui-hashtag-neutral") || !tags[2].classList.contains("ui-hashtag-sm")) return `the third tag: ${tags[2].getAttribute("href")} ${tags[2].className}`;
+const list = $("nav.ui-hashtag-list");
+if (!list || list.getAttribute("aria-label") !== "Trending" || list.querySelector("h3").textContent !== "Trending") return "the list is not a nav named by its title";
+const items = [...list.querySelectorAll(".ui-hashtag-item")];
+if (items.length !== 4) return `expected 4 trending tags, found ${items.length}`;
+if (items[0].querySelector("a").getAttribute("href") !== "#hashtag-quillo") return "base is not used for the list's links";
+if (items[3].querySelector("a").getAttribute("href") !== "#hashtag") return "a tag's own href is not used";
+const posts = items.map((i) => i.querySelector(".ui-hashtag-posts").textContent.trim());
+if (posts.join("|") !== "2.4K posts|1.2M posts|980 posts|310 posts") return `the counts read ${posts.join("|")}`;
+if (items[0].querySelector("[aria-label=rising]") === null || items[2].querySelector("[aria-label=falling]") === null || items[1].querySelector(".ui-hashtag-trend")) return "the trend arrows are wrong";
+if (!getComputedStyle(items[2], "::before").content.includes("counter(")) return "the rank is not counted";

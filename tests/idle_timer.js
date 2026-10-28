@@ -1,0 +1,23 @@
+// alone: it listens to the whole page (input anywhere wakes it)
+const note = () => $(".demo-note").textContent.split("Events: ")[1] ?? "";
+document.dispatchEvent(new Event("mousemove")); await wait(100);
+if (document.querySelector(".ui-idle")) return "the warning shows right after input";
+for (let i = 0; i < 70 && !document.querySelector(".ui-idle"); i++) await wait(100);
+const dlg = document.querySelector(".ui-idle");
+if (!dlg) return "no warning after 4 seconds without input";
+if (dlg.getAttribute("role") !== "alertdialog" || dlg.getAttribute("aria-labelledby") !== "ui-idle-title") return "the warning is not an alertdialog";
+if (dlg.querySelector(".ui-idle-title").textContent !== "Still reading?") return "the title";
+const left = Number(dlg.querySelector(".ui-idle-text b")?.textContent);
+if (!(left >= 1 && left <= 4)) return `the seconds left: ${dlg.querySelector(".ui-idle-text").textContent}`;
+if (!note().includes("warned")) return `on_warn did not reach the note: ${note()}`;
+await wait(1100);
+const left2 = Number(dlg.querySelector(".ui-idle-text b")?.textContent);
+if (!(left2 < left)) return "the seconds do not count down";
+dlg.querySelector(".ui-idle-btn").click(); await wait();
+if (document.querySelector(".ui-idle")) return "the button did not close the warning";
+if (!note().includes("warned, back")) return `on_active: ${note()}`;
+for (let i = 0; i < 100 && !note().includes("idle"); i++) await wait(100);
+if (!note().includes("warned, back, warned, idle")) return `on_idle: ${note()}`;
+if (document.querySelector(".ui-idle")) return "the warning stays after idle";
+document.dispatchEvent(new Event("mousemove")); await wait(100);
+if (!note().endsWith("idle, back.")) return `input after idle: ${note()}`;

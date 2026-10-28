@@ -1,0 +1,13 @@
+const bands = $$("dl.ui-stats-band");
+if (bands.length !== 3) return `expected 3 bands, found ${bands.length}`;
+const [subtle, accent, plain] = bands;
+if (subtle.id !== "stats-band-demo" || !subtle.classList.contains("ui-stats-band-subtle")) return "the id or the default tone is missing";
+const cells = subtle.querySelectorAll(":scope > div");
+if (cells.length !== 4) return `4 stats, found ${cells.length}`;
+if (cells[1].querySelector("dd.ui-stats-band-value")?.textContent !== "99.99%" || cells[1].querySelector("dt.ui-stats-band-label")?.textContent !== "Uptime") return "value and label are not dd and dt";
+if (cells[1].querySelector(".ui-stats-band-note")?.textContent !== "last 90 days" || cells[0].querySelector(".ui-stats-band-note")) return "the note is wrong";
+if (new Set([...cells].map((c) => Math.round(c.getBoundingClientRect().top))).size !== 1) return "four stats do not fit in one row";
+if (parseFloat(getComputedStyle(cells[0].querySelector(".ui-stats-band-value")).fontSize) < 28) return "the number is not big";
+if (getComputedStyle(accent).backgroundColor === getComputedStyle(subtle).backgroundColor) return "accent is not filled";
+if (!accent.classList.contains("ui-stats-band-cols") || accent.style.getPropertyValue("--ui-stats-cols") !== "3") return "columns={3} is not set";
+if (getComputedStyle(plain).paddingTop !== "0px") return "plain still pads a band";

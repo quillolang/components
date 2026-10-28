@@ -1,0 +1,14 @@
+const nav = $("#sitemap-list-demo");
+if (!nav || nav.tagName !== "NAV" || nav.getAttribute("aria-label") !== "Site map") return "it is not a labelled <nav>";
+const top = [...nav.querySelectorAll(".ui-sitemap-cols > ul > li")];
+if (top.length !== 3) return `expected 3 sections, found ${top.length}`;
+if (top[0].querySelector(":scope > a")?.getAttribute("href") !== "#docs") return "a section with an href is not a link";
+if (top[2].querySelector(":scope > span.ui-sitemap-text")?.textContent !== "Company" || top[2].querySelector(":scope > a")) return "a section without an href is not plain text";
+const values = [...nav.querySelectorAll("a")].find((a) => a.textContent === "Values");
+if (!values || values.closest("ul").parentElement.closest("ul").parentElement.closest("ul") !== nav.querySelector(".ui-sitemap-cols > ul")) return "Values is not nested three levels down";
+const cur = nav.querySelectorAll("[aria-current=page]");
+if (cur.length !== 1 || cur[0].textContent !== "Components" || cur[0].closest("li").parentElement.closest("li") === null) return "the current page (the nested one) is not marked once";
+const lefts = top.map((li) => Math.round(li.getBoundingClientRect().left));
+if (new Set(lefts).size !== 3) return `the sections are not in three columns: ${lefts}`;
+const d = top[0].querySelector(":scope > a").getBoundingClientRect(), i = top[0].querySelector(":scope > ul a").getBoundingClientRect();
+if (i.left <= d.left) return "children are not indented";

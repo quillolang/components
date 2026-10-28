@@ -1,0 +1,35 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-sbarc");
+if (charts.length !== 2) return `expected 2 stacked bar charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a chart has NaN, Infinity or undefined in it";
+const [rev, tickets] = charts;
+if (rev.querySelector("figcaption")?.textContent !== "Revenue by channel") return "show_label does not write the label";
+if (rev.querySelectorAll(".ui-sbarc-legend li").length !== 3) return "three series have no legend of three";
+const cols = rev.querySelectorAll(".ui-sbarc-col");
+if (cols.length !== 6) return `6 labels made ${cols.length} bars`;
+const segs = [...cols[0].querySelectorAll(".ui-sbarc-seg")];
+if (segs.length !== 3) return "a bar is not three parts";
+const ticks = [...rev.querySelectorAll(".ui-sbarc-y span")].map((s) => s.textContent);
+if (ticks.join() !== "$0,$50k,$100k,$150k") return `the axis ticks: ${ticks}`;
+// Jan: 42,100 from 0, then 30,500 from 42,100 on an axis to 150,000.
+if (segs[1].style.getPropertyValue("--a").trim() !== "28.07%") return `the second part starts at ${segs[1].style.getPropertyValue("--a")}`;
+const r0 = segs[0].getBoundingClientRect(), r1 = segs[1].getBoundingClientRect();
+if (Math.abs(r0.top - r1.bottom) > 0.6) return "the second part does not sit on the first";
+if (!segs[1].classList.contains("ui-sbarc-on") || segs[0].classList.contains("ui-sbarc-on")) return "only parts on another have a gap";
+if (!segs[2].classList.contains("ui-sbarc-top") || segs[0].classList.contains("ui-sbarc-top")) return "only the top part is rounded";
+if (getComputedStyle(segs[2]).borderTopLeftRadius !== "4px") return "the top part has no rounded corner";
+if (new Set(segs.map((s) => getComputedStyle(s).backgroundColor)).size !== 3) return "the parts share a colour";
+if (cols[0].querySelector(".ui-sbarc-val").textContent !== "$80,800") return `the total reads ${cols[0].querySelector(".ui-sbarc-val").textContent}`;
+const tip = cols[0].querySelector(".ui-sbarc-tip");
+if (getComputedStyle(tip).display !== "none") return "the tooltip shows before hover";
+if (tip.textContent !== "JanPartners$8,200Stores$30,500Online$42,100Total$80,800") return `the tooltip: ${tip.textContent}`;
+if (rev.querySelectorAll("thead th").length !== 5) return "the table has no column per series and total";
+
+const tcols = tickets.querySelectorAll(".ui-sbarc-col");
+const tops = [...tcols].map((c) => { const s = [...c.querySelectorAll(".ui-sbarc-seg")].pop(); return parseFloat(s.style.getPropertyValue("--a")) + parseFloat(s.style.getPropertyValue("--b")); });
+if (tops.some((t) => Math.abs(t - 100) > 0.02)) return `percent bars do not all reach 100%: ${tops}`;
+if ([...tickets.querySelectorAll(".ui-sbarc-y span")].map((s) => s.textContent).join() !== "0%,25%,50%,75%,100%") return "the percent axis";
+if (tickets.querySelector(".ui-sbarc-val")) return "percent has value labels";
+const ttip = tcols[0].querySelector(".ui-sbarc-tip").textContent;
+if (ttip !== "SupportRequest3014%Bug6429.9%Question12056.1%Total214100%") return `the percent tooltip: ${ttip}`;
+if (tickets.querySelector("tbody td").textContent !== "120 (56.1%)") return "the table has no shares";

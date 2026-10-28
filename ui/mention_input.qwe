@@ -1,0 +1,156 @@
+// MentionInput: a box for a comment or a message that offers people when @ is
+// typed: "@an" lists Ana and Andrei, the arrow keys move, Enter or a click puts
+// "@ana " in, and typing on filters. It is a real <textarea> named `name`, so a
+// plain <form> sends the text with the handles in it; the handles mentioned also
+// go in `name`_mentions, comma-separated, so the route can notify them.
+//
+//   <MentionInput name="comment" label="Comment" people={[{ handle: "ana", name: "Ana Lopes" }, { handle: "ben", name: "Ben Oduya" }]}/>
+//   <MentionInput name="reply" people={team} rows={3} on_change={(t, who) => { text = t; mentioned = who }}/>
+//
+// people: a list of { handle, name, avatar? }: the handle is what goes in the text
+// (letters, digits, _ and .), the name is matched too, the avatar a picture's URL.
+// trigger: the one character that starts a mention ("@"; "#" or "+" work too). limit: at most this many
+// offered (6). value, rows (3), placeholder, name, label, hint, error, required,
+// disabled and field (the box's id, "mention-input-" + name by default) as for
+// every field.
+// on_change(text, mentions): inside one of your components, given the text as it
+// is typed and the handles mentioned in it, in order, each once.
+
+let mention_input_css = css`
+.ui-mention-input { position: relative; display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-mention-input-label { font-size: 13px; font-weight: 500; }
+.ui-mention-input-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-mention-input-box { position: relative; }
+.ui-mention-input-box textarea {
+  display: block; box-sizing: border-box; width: 100%; min-height: 38px; margin: 0; padding: 8px 12px; resize: vertical;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 14px/1.5 var(--ui-font); transition: border-color .15s, box-shadow .15s;
+}
+.ui-mention-input-box textarea::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-mention-input-box textarea:hover { border-color: var(--ui-strong); }
+.ui-mention-input-box textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-mention-input-box textarea:disabled { opacity: .55; cursor: not-allowed; }
+.ui-mention-input-pop {
+  position: absolute; z-index: 20; top: 100%; left: 0; width: 280px; max-width: 100%; margin: 4px 0 0; padding: 4px; list-style: none;
+  max-height: 240px; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow);
+}
+.ui-mention-input-pop[hidden] { display: none; }
+.ui-mention-input-opt { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-radius: 4px; cursor: pointer; }
+.ui-mention-input-opt[aria-selected="true"] { background: var(--ui-accent-soft); }
+.ui-mention-input-avatar {
+  flex: none; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; overflow: hidden;
+  background: var(--ui-subtle); color: var(--ui-muted); font: 600 11px var(--ui-font); text-transform: uppercase;
+}
+.ui-mention-input-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.ui-mention-input-who { display: grid; min-width: 0; line-height: 1.25; }
+.ui-mention-input-who b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-mention-input-who span { font-size: 12px; color: var(--ui-muted); }
+.ui-mention-input-opt[aria-selected="true"] .ui-mention-input-who span { color: var(--ui-accent); }
+.ui-mention-input-invalid .ui-mention-input-box textarea { border-color: var(--ui-danger); }
+.ui-mention-input-hint, .ui-mention-input-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-mention-input-error { color: var(--ui-danger); }
+@media (prefers-reduced-motion: reduce) { .ui-mention-input-box textarea { transition: none; } }
+`
+
+// The mention being typed before the caret: { start, text } (start is where the
+// trigger is), or null when the caret is not in one.
+fn mention_input_at(text: str, caret: int, trigger: str) {
+    let before = slice(text, 0, caret)
+    let m = re.find(before, `(?:^|\\s)[${trigger}]([A-Za-z0-9_.]*)$`)
+    if m == null { return null }
+    let start = m.start + (len(m.text) - len(m.groups[0]) - 1)
+    { start, text: m.groups[0] }
+}
+
+// The handles mentioned in `text`, in order, each once.
+fn mention_input_handles(text: str, people: list, trigger: str) -> list {
+    let found = re.find_all(text, `(?:^|\\s)[${trigger}]([A-Za-z0-9_.]+)`)
+        | map((m) => m.groups[0])
+    unique(found | filter((h) => any(people, (p) => lower(p.handle) == lower(h))))
+}
+
+component MentionInput(name: str? = null, label: str? = null, value: str = "", people: list = [], trigger: str = "@",
+                       limit: int = 6, rows: int = 3, placeholder: str? = null, hint: str? = null, error: str? = null,
+                       required: bool = false, disabled: bool = false, field: str? = null, on_change = null, class: str? = null) {
+    style global mention_input_css
+    state text = value
+    state caret = 0
+    state open = false
+    state active = 0
+    let id = field ?? `mention-input-${name ?? re.replace(lower(label ?? "text"), "[^a-z0-9]+", "-")}`
+    let typing = open ? mention_input_at(text, caret, trigger) : null
+    let needle = typing != null ? lower(typing.text) : ""
+    let shown = typing == null ? [] : take(people | filter((p) => starts_with(lower(p.handle), needle) || starts_with(lower(p.name), needle)
+                                                        || any(split(lower(p.name), " "), (w) => starts_with(w, needle))), limit)
+    let listed = len(shown) > 0
+    let act = active < len(shown) ? active : 0
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
+    let mentions = mention_input_handles(text, people, trigger)
+    let tell = (t: str) => { on_change && on_change(t, mention_input_handles(t, people, trigger)) }
+    let put = (e, p) => {
+        let at = mention_input_at(text, caret, trigger)
+        if at == null { return null }
+        let next = slice(text, 0, at.start) + trigger + p.handle + " " + slice(text, caret)
+        let pos = at.start + len(trigger) + len(p.handle) + 1
+        text = next
+        caret = pos
+        open = false
+        let box = e.target.closest(".ui-mention-input").querySelector("textarea")
+        box.value = next
+        box.focus()
+        box.setSelectionRange(pos, pos)
+        tell(next)
+    }
+    <div class={ui_cls(["ui-mention-input", error != null && "ui-mention-input-invalid", class])}>
+        {label != null && <label.ui-mention-input-label for={id}>
+            {label}{required && <span.ui-mention-input-req aria-hidden="true">*</span>}
+        </label>}
+        <div.ui-mention-input-box>
+            <textarea id={id} name={name} value={text} rows={rows} placeholder={placeholder} required={required} disabled={disabled}
+                      role="combobox" aria-autocomplete="list" aria-expanded={listed ? "true" : "false"} aria-controls={`${id}-list`}
+                      aria-activedescendant={listed ? `${id}-opt-${act}` : null} aria-haspopup="listbox"
+                      aria-invalid={error != null ? "true" : null} aria-describedby={described != "" ? described : null}
+                      @input={(e) => {
+                          text = e.value
+                          caret = e.target.selectionStart ?? len(e.value)
+                          open = true
+                          active = 0
+                          tell(e.value)
+                      }}
+                      @click={(e) => { caret = e.target.selectionStart ?? 0 }}
+                      @keyup={(e) => {
+                          if e.key == "ArrowLeft" || e.key == "ArrowRight" || e.key == "Home" || e.key == "End" { caret = e.target.selectionStart ?? 0 }
+                      }}
+                      @blur={() => { open = false }}
+                      @keydown={(e) => {
+                          let n = len(shown)
+                          if listed && (e.key == "ArrowDown" || e.key == "ArrowUp") {
+                              e.preventDefault()
+                              active = e.key == "ArrowDown" ? (act + 1) % n : (act + n - 1) % n
+                          }
+                          if listed && (e.key == "Enter" || e.key == "Tab") {
+                              e.preventDefault()
+                              put(e, shown[act])
+                          }
+                          if e.key == "Escape" && listed {
+                              e.preventDefault()
+                              open = false
+                          }
+                      }}></textarea>
+            <ul.ui-mention-input-pop id={`${id}-list`} role="listbox" aria-label="People" hidden={!listed}>
+                {for [i, p] in enumerate(shown) => <li.ui-mention-input-opt key={p.handle} id={`${id}-opt-${i}`} role="option"
+                        aria-selected={i == act ? "true" : "false"}
+                        @mousedown={(e) => { e.preventDefault() }} @click={(e) => { put(e, p) }}>
+                    <span.ui-mention-input-avatar aria-hidden="true">
+                        {p.avatar != null ? <img src={p.avatar} alt=""/> : slice(p.name ?? p.handle, 0, 1)}
+                    </span>
+                    <span.ui-mention-input-who><b>{p.name ?? p.handle}</b><span>{trigger}{p.handle}</span></span>
+                </li>}
+            </ul>
+        </div>
+        {name != null && <input type="hidden" name={`${name}_mentions`} value={join(mentions, ",")}/>}
+        {hint != null && <p.ui-mention-input-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-mention-input-error id={`${id}-error`} role="alert">{error}</p>}
+    </div>
+}

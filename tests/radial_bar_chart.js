@@ -1,0 +1,31 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-radial");
+if (charts.length !== 2) return `expected 2 radial bar charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a chart has NaN, Infinity or undefined in it";
+const [goals, sales] = charts;
+if (goals.getAttribute("aria-label") !== "Goals reached today" || goals.querySelector("figcaption")?.textContent !== "Goals reached today") return "the label";
+const arcs = [...goals.querySelectorAll(".ui-radial-arc")];
+if (arcs.length !== 5) return `5 items made ${arcs.length} arcs`;
+const len = (a) => Number(a.getAttribute("stroke-dasharray").split(" ")[0]);
+// limit={100} over 270 degrees: 82 is 82% of three quarters of the ring.
+if (len(arcs[0]) !== 61.5 || len(arcs[2]) !== 75) return `arc lengths: ${arcs.map(len)}`;
+const radii = arcs.map((a) => Number(a.getAttribute("r")));
+if (!radii.every((r, i) => i === 0 || r < radii[i - 1])) return "the first item is not on the outside ring";
+const tracks = goals.querySelectorAll(".ui-radial-track");
+if (tracks.length !== 5 || tracks[0].getAttribute("stroke-dasharray") !== "75 100") return "the tracks do not go three quarters round";
+if (new Set(arcs.map((a) => getComputedStyle(a).stroke)).size !== 5) return "rings share a colour";
+if (arcs[0].querySelector("title").textContent !== "Steps: 82%") return "arcs have no title";
+const names = [...goals.querySelectorAll(".ui-radial-name")].map((t) => t.textContent).join();
+if (names !== "Steps,Exercise,Stand,Water,Sleep") return `ring labels: ${names}`;
+const ring = goals.querySelector(".ui-radial-ring").getBoundingClientRect();
+if (Math.round(ring.width) !== 210) return `size={210} is ${ring.width}px`;
+const li = [...goals.querySelectorAll(".ui-radial-legend li")];
+if (li.length !== 5 || li[0].textContent !== "Steps82%") return `legend: ${li.map((l) => l.textContent)}`;
+if (getComputedStyle(li[0].querySelector(".ui-radial-key")).backgroundColor !== getComputedStyle(arcs[0]).stroke) return "the legend's key is not its ring's colour";
+if (!goals.querySelector(".ui-radial-ring").hasAttribute("aria-hidden")) return "the drawing is not hidden from screen readers";
+// The highest value fills a whole circle with turn={360}.
+const s = [...sales.querySelectorAll(".ui-radial-arc")];
+if (len(s[0]) !== 100 || Math.abs(len(s[3]) - 8400 / 48200 * 100) > 0.01) return `turn={360}: ${s.map(len)}`;
+if (sales.querySelector(".ui-radial-track").hasAttribute("stroke-dasharray")) return "a whole-circle track is dashed";
+if (sales.querySelector(".ui-radial-name")) return "labels are drawn over whole circles";
+if (sales.querySelectorAll(".ui-radial-val")[2].textContent !== "$27,150") return "prefix in the legend";

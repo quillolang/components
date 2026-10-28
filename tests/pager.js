@@ -1,0 +1,14 @@
+const [both, first, last] = $$("nav.ui-pager");
+if (!both || both.getAttribute("aria-label") !== "Pages") return "the pager is not a labelled <nav>";
+const links = [...both.querySelectorAll("a")];
+if (links.length !== 2 || links[0].rel !== "prev" || links[1].rel !== "next") return "the two links are not rel=prev and rel=next";
+if (links[0].getAttribute("href") !== "#pager-install" || links[1].querySelector(".ui-pager-title")?.textContent !== "Your first program, with routes and views") return "the hrefs or titles are wrong";
+if (links[0].querySelector(".ui-pager-word")?.textContent !== "Previous" || links[1].querySelector(".ui-pager-word")?.textContent !== "Next") return "the small words are wrong";
+if (links[1].querySelector(".ui-pager-hint")?.textContent !== "Chapter 3 · 12 min") return "the hint is not shown";
+const [a, b] = links.map((l) => l.getBoundingClientRect());
+if (b.left <= a.right || Math.abs(a.top - b.top) > 1) return "the links are not side by side";
+const only = first.querySelectorAll("a");
+if (only.length !== 1 || only[0].rel !== "next" || only[0].querySelector(".ui-pager-word")?.textContent !== "Start reading") return "a pager with only next is wrong";
+const n = only[0].getBoundingClientRect(), f = first.getBoundingClientRect();
+if (n.left < f.left + f.width / 2) return "a lone next link is not on the right";
+if (last.querySelectorAll("a").length !== 1 || last.querySelector("a").rel !== "prev" || last.querySelector(".ui-pager-word").textContent !== "Back to") return "a pager with only prev is wrong";

@@ -1,0 +1,12 @@
+const col = $("#spacer-demo-column"), row = $("#spacer-demo-row");
+const vs = [...col.querySelectorAll(".ui-spacer")];
+if (vs.length !== 3) return `expected 3 spacers in the column, found ${vs.length}`;
+const hs = vs.map((s) => getComputedStyle(s).height);
+if (hs.join() !== "16px,32px,50px") return `heights are ${hs}`;
+if (vs[0].tagName !== "DIV" || vs[0].getAttribute("aria-hidden") !== "true") return "a spacer is not a hidden <div>";
+const blocks = [...col.children].filter((c) => !c.classList.contains("ui-spacer"));
+if (Math.round(blocks[1].getBoundingClientRect().top - blocks[0].getBoundingClientRect().bottom) !== 16) return "the first gap is not 16px";
+const [h, grow] = row.querySelectorAll(".ui-spacer");
+if (h.tagName !== "SPAN" || getComputedStyle(h).width !== "8px") return `the horizontal spacer is ${h.tagName} ${getComputedStyle(h).width} wide`;
+const last = row.lastElementChild.getBoundingClientRect(), rr = row.getBoundingClientRect();
+if (Math.abs(last.right - rr.right) > 1 || grow.getBoundingClientRect().width < 100) return "grow={true} does not push the last block to the end";

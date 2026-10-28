@@ -1,0 +1,285 @@
+// InteractiveLineChart: lines for one or more series that can be explored: a
+// crosshair follows the pointer with every series' value in a tooltip, the legend's
+// items hide and show their series, dragging across the plot zooms into that range
+// (Reset zoom goes back), and the keyboard does the same: with the plot focused,
+// the arrow keys move the crosshair, Home and End go to the ends, + and − zoom in
+// and out around it, and Escape hides it. Screen readers hear the values where the
+// crosshair is, and get every number as a table.
+//
+//   <InteractiveLineChart label="Visitors" labels={days} series={[
+//       { name: "Web", values: web }, { name: "App", values: app }]}/>
+//   <InteractiveLineChart label="Revenue" labels={months} prefix="$" series={revenue}
+//                         on_zoom={(first, last) => { shown = `${first} to ${last}` }}/>
+//
+// labels: the x axis, in order (only some are written under it when there are
+// many). series: a list of { name, values } (up to eight, each in a colour of its
+// own), one value per label; a null leaves a gap. prefix and suffix: around every
+// value shown ("$", " ms"; the axis takes the prefix); decimals: digits after the
+// point, always, instead of up to two as needed. zero: the axis starts at 0;
+// otherwise it spans the values shown. height: the plot's height in pixels (260).
+// label: what the chart shows; it names it for screen readers and captions their
+// table. show_label also writes it above. on_zoom(first, last): inside one of your
+// components, given the first and last labels shown after each zoom or reset.
+
+let interactive_line_chart_css = css`
+.ui-iline {
+  --ui-iline-1: light-dark(#2a78d6, #3987e5); --ui-iline-2: light-dark(#eb6834, #d95926);
+  --ui-iline-3: light-dark(#1baf7a, #199e70); --ui-iline-4: light-dark(#eda100, #c98500);
+  --ui-iline-5: light-dark(#e87ba4, #d55181); --ui-iline-6: light-dark(#008300, #008300);
+  --ui-iline-7: light-dark(#6250d6, #9085e9); --ui-iline-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-iline-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-iline-s1 { --c: var(--ui-iline-1); } .ui-iline-s2 { --c: var(--ui-iline-2); } .ui-iline-s3 { --c: var(--ui-iline-3); }
+.ui-iline-s4 { --c: var(--ui-iline-4); } .ui-iline-s5 { --c: var(--ui-iline-5); } .ui-iline-s6 { --c: var(--ui-iline-6); }
+.ui-iline-s7 { --c: var(--ui-iline-7); } .ui-iline-s8 { --c: var(--ui-iline-8); }
+.ui-iline-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ui-iline-item { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); cursor: pointer; }
+.ui-iline-item[aria-pressed="false"] { color: var(--ui-muted); text-decoration: line-through; }
+.ui-iline-item[aria-pressed="false"] .ui-iline-key { background: var(--ui-strong); }
+.ui-iline-item:hover { border-color: var(--ui-strong); }
+.ui-iline-key { width: 12px; height: 3px; border-radius: 2px; background: var(--c); }
+.ui-iline-reset { margin-left: auto; height: 26px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); cursor: pointer; }
+.ui-iline-reset:hover { border-color: var(--ui-strong); }
+.ui-iline-item:focus-visible, .ui-iline-reset:focus-visible, .ui-iline-plot:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-iline-frame { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; padding-top: 8px; }
+.ui-iline-y { position: relative; min-width: 24px; }
+.ui-iline-y span { position: absolute; right: 0; transform: translateY(50%); color: var(--ui-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-iline-plot { position: relative; border-radius: 2px; cursor: crosshair; touch-action: none; user-select: none; }
+.ui-iline-grid { position: absolute; left: 0; right: 0; height: 1px; background: color-mix(in srgb, var(--ui-border) 70%, transparent); pointer-events: none; }
+.ui-iline-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.ui-iline-line { fill: none; stroke: var(--c); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.ui-iline-cross { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--ui-fg); opacity: .45; pointer-events: none; }
+.ui-iline-dot { position: absolute; width: 8px; height: 8px; margin: -4px 0 0 -4px; border-radius: 50%; background: var(--c);
+  box-shadow: 0 0 0 2px var(--ui-bg); pointer-events: none; }
+.ui-iline-pick { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb, var(--ui-accent) 14%, transparent);
+  border-inline: 1px solid var(--ui-accent); pointer-events: none; }
+.ui-iline-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ui-muted); pointer-events: none; }
+.ui-iline-tip { position: absolute; z-index: 20; display: none; min-width: 120px; padding: 7px 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  box-shadow: var(--ui-shadow); color: var(--ui-fg); font-size: 12px; pointer-events: none; }
+.ui-iline-tip strong { display: block; margin-bottom: 3px; font-weight: 600; white-space: nowrap; }
+.ui-iline-tip p { display: flex; align-items: center; gap: 6px; margin: 2px 0 0; color: var(--ui-muted); white-space: nowrap; }
+.ui-iline-tip b { margin-left: auto; padding-left: 12px; color: var(--ui-fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-iline-tip { display: block; top: 0; transform: translateX(10px); }
+.ui-iline-tip.ui-iline-flip { transform: translateX(calc(-100% - 10px)); }
+.ui-iline-tip .ui-iline-key { width: 8px; height: 8px; border-radius: 50%; }
+.ui-iline-x { position: relative; height: 16px; margin-top: 6px; }
+.ui-iline-x span { position: absolute; top: 0; transform: translateX(-50%); color: var(--ui-muted); white-space: nowrap; }
+.ui-iline-x .ui-iline-first { transform: none; }
+.ui-iline-x .ui-iline-last { transform: translateX(-100%); }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn interactive_line_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn interactive_line_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : interactive_line_chart_group(floor(n / 1000)) + "," + interactive_line_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn interactive_line_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${interactive_line_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${interactive_line_chart_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate or a percentage for CSS and SVG, to two decimals.
+fn interactive_line_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// An axis tick, short: 1500 is "1.5k", 2000000 is "2M", 0.25 is "0.25".
+fn interactive_line_chart_short(v: num) -> str {
+    let a = abs(v)
+    let unit = a >= 1000000000 ? 1000000000 : (a >= 1000000 ? 1000000 : (a >= 1000 ? 1000 : 1))
+    let tenths = round(a * 10 / unit)
+    let mark = unit == 1000000000 ? "B" : (unit == 1000000 ? "M" : "k")
+    unit == 1 ? interactive_line_chart_num(v)
+        : `${v < 0 ? "-" : ""}${interactive_line_chart_group(floor(tenths / 10))}${tenths % 10 != 0 ? `.${tenths % 10}` : ""}${mark}`
+}
+
+// The axis from lo to hi, widened to round ticks: about `steps` steps of 1, 2, 2.5 or 5 x 10^n.
+fn interactive_line_chart_scale(lo: num, hi: num, steps: int = 4) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo)) : hi - lo
+    let raw = span / steps
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+component InteractiveLineChart(labels: list, series: list, prefix: str = "", suffix: str = "", decimals: int? = null,
+                               zero: bool = false, height: int = 260, label: str = "Line chart", show_label: bool = false,
+                               on_zoom = null, class: str? = null) {
+    style global interactive_line_chart_css
+    let n = len(labels)
+    state hidden = []
+    state lo = 0
+    state hi = n > 0 ? n - 1 : 0
+    state cursor = null
+    state drag_from = null
+    state drag_to = null
+    let fmt = (v) => v == null ? "—" : `${v < 0 ? "-" : ""}${prefix}${interactive_line_chart_num(abs(v), decimals)}${suffix}`
+    let shown = range(len(series)) | filter((j) => index_of(hidden, series[j].name) == null)
+    let span = hi - lo
+    let known = flatten(shown | map((j) => range(lo, hi + 1) | map((i) => series[j].values[i]))) | filter((v) => v != null)
+    let lo0 = len(known) == 0 ? 0 : min(known)
+    let hi0 = len(known) == 0 ? 1 : max(known)
+    let sc = interactive_line_chart_scale(zero && lo0 > 0 ? 0 : lo0, zero && hi0 < 0 ? 0 : hi0)
+    let top = (v) => (sc.hi - v) * 100 / (sc.hi - sc.lo)
+    let x = (i) => span == 0 ? 50 : (i - lo) * 100 / span
+    let every_nth = ceil((span + 1) / 8)
+    let path = (j) => {
+        let vals = series[j].values
+        let starts = range(lo, hi + 1) | filter((i) => vals[i] != null && (i == lo || vals[i - 1] == null))
+        join(for st in starts => {
+            let run = range(st, (find(range(st, hi + 1), (k) => k == hi || vals[k + 1] == null) ?? st) + 1)
+            "M" + join(run | map((i) => `${interactive_line_chart_pct(x(i))},${interactive_line_chart_pct(top(vals[i]))}`), " L")
+                + (len(run) == 1 ? " l0.01,0" : "")
+        }, " ")
+    }
+    let clamp = (i) => i < lo ? lo : (i > hi ? hi : i)
+    // The label index under the pointer.
+    let under = (e) => {
+        let r = e.target.closest(".ui-iline-plot").getBoundingClientRect()
+        clamp(lo + round((e.clientX - r.left) / r.width * span))
+    }
+    let zoom_to = (a: int, b: int) => {
+        let first = a < 0 ? 0 : a
+        let last = b > n - 1 ? n - 1 : b
+        if last > first {
+            lo = first
+            hi = last
+            if cursor != null { cursor = clamp(cursor) }
+            on_zoom && on_zoom(labels[first], labels[last])
+        }
+    }
+    let said = cursor == null ? "" : `${labels[cursor]}: ${join(shown | map((j) => `${series[j].name} ${fmt(series[j].values[cursor])}`), ", ")}`
+    <figure class={ui_cls(["ui-iline", class])} aria-label={label}>
+        {show_label && <figcaption.ui-iline-title>{label}</figcaption>}
+        <div.ui-iline-bar>
+            {for [j, s] in enumerate(series) => <button type="button" class={`ui-iline-item ui-iline-s${j % 8 + 1}`} key={s.name}
+                    aria-pressed={index_of(hidden, s.name) == null ? "true" : "false"}
+                    @click={() => { hidden = index_of(hidden, s.name) == null ? hidden + [s.name] : hidden | filter((h) => h != s.name) }}>
+                <span.ui-iline-key aria-hidden="true"></span>{s.name}
+            </button>}
+            {(lo > 0 || hi < n - 1) && <button.ui-iline-reset type="button" @click={() => {
+                lo = 0
+                hi = n - 1
+                on_zoom && on_zoom(labels[0], labels[n - 1])
+            }}>Reset zoom</button>}
+        </div>
+        <div.ui-iline-frame>
+            <div.ui-iline-y style={`height: ${height}px`} aria-hidden="true">
+                {for t in sc.ticks => <span style={`bottom: ${interactive_line_chart_pct(100 - top(t))}%`}>{t < 0 ? "-" : ""}{prefix}{interactive_line_chart_short(abs(t))}</span>}
+            </div>
+            <div.ui-iline-plot style={`height: ${height}px`} tabindex="0" role="group"
+                 aria-label={`${label}: ${labels[lo] ?? ""} to ${labels[hi] ?? ""}. Arrow keys move the crosshair, + and - zoom, Escape hides it.`}
+                 @pointermove={(e) => {
+                     let i = under(e)
+                     cursor = i
+                     if drag_from != null { drag_to = i }
+                 }}
+                 @pointerleave={() => { if drag_from == null { cursor = null } }}
+                 @pointerdown={(e) => {
+                     if e.button == 0 {
+                         e.preventDefault()
+                         e.target.closest(".ui-iline-plot").setPointerCapture(e.pointerId)
+                         e.target.closest(".ui-iline-plot").focus()
+                         drag_from = under(e)
+                         drag_to = drag_from
+                     }
+                 }}
+                 @pointerup={() => {
+                     if drag_from != null {
+                         let a = drag_from < drag_to ? drag_from : drag_to
+                         let b = drag_from < drag_to ? drag_to : drag_from
+                         drag_from = null
+                         drag_to = null
+                         zoom_to(a, b)
+                     }
+                 }}
+                 @pointercancel={() => { drag_from = null }}
+                 @keydown={(e) => {
+                     let at = cursor ?? (e.key == "ArrowLeft" || e.key == "End" ? hi + 1 : lo - 1)
+                     let next = match e.key {
+                         "ArrowRight" => clamp(at + 1)
+                         "ArrowLeft" => clamp(at - 1)
+                         "Home" => lo
+                         "End" => hi
+                         _ => null
+                     }
+                     if next != null {
+                         e.preventDefault()
+                         cursor = next
+                     } else if e.key == "+" || e.key == "=" {
+                         e.preventDefault()
+                         let c = cursor ?? round((lo + hi) / 2)
+                         let half = floor(span / 4) > 1 ? floor(span / 4) : 1
+                         zoom_to(c - half < lo ? lo : c - half, c + half > hi ? hi : c + half)
+                     } else if e.key == "-" || e.key == "_" {
+                         e.preventDefault()
+                         let grow = ceil((span + 1) / 2)
+                         let a = lo - grow < 0 ? 0 : lo - grow
+                         let b = hi + grow > n - 1 ? n - 1 : hi + grow
+                         if a != lo || b != hi {
+                             lo = a
+                             hi = b
+                             on_zoom && on_zoom(labels[a], labels[b])
+                         }
+                     } else if e.key == "Escape" {
+                         cursor = null
+                     }
+                 }}>
+                {for t in sc.ticks => <span.ui-iline-grid style={`top: ${interactive_line_chart_pct(top(t))}%`}></span>}
+                <svg.ui-iline-svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                    {for j in shown => <path class={`ui-iline-line ui-iline-s${j % 8 + 1}`} key={series[j].name} d={path(j)}
+                                             vector-effect="non-scaling-stroke"/>}
+                </svg>
+                {len(shown) == 0 && <span.ui-iline-empty>Every series is hidden</span>}
+                {drag_from != null && drag_to != drag_from && <span.ui-iline-pick
+                    style={`left: ${interactive_line_chart_pct(x(drag_from < drag_to ? drag_from : drag_to))}%; width: ${interactive_line_chart_pct(abs(x(drag_to) - x(drag_from)))}%`}></span>}
+                {cursor != null && [
+                    <span.ui-iline-cross style={`left: ${interactive_line_chart_pct(x(cursor))}%`}></span>,
+                    for j in shown => series[j].values[cursor] != null && <span class={`ui-iline-dot ui-iline-s${j % 8 + 1}`}
+                        style={`left: ${interactive_line_chart_pct(x(cursor))}%; top: ${interactive_line_chart_pct(top(series[j].values[cursor]))}%`}></span>,
+                    <span class={ui_cls(["ui-iline-tip", x(cursor) > 55 && "ui-iline-flip"])} style={`left: ${interactive_line_chart_pct(x(cursor))}%`} aria-hidden="true">
+                        <strong>{labels[cursor]}</strong>
+                        {for j in shown => <p><span class={`ui-iline-key ui-iline-s${j % 8 + 1}`}></span>{series[j].name}<b>{fmt(series[j].values[cursor])}</b></p>}
+                    </span>
+                ]}
+            </div>
+            <span></span>
+            <div.ui-iline-x aria-hidden="true">
+                {for i in range(lo, hi + 1) => (i - lo) % every_nth == 0 && <span
+                    class={ui_cls([span > 0 && i == lo && "ui-iline-first", span > 0 && i == hi && "ui-iline-last"])}
+                    style={`left: ${interactive_line_chart_pct(x(i))}%`}>{labels[i]}</span>}
+            </div>
+        </div>
+        <p.ui-sr aria-live="polite">{said}</p>
+        <table.ui-sr>
+            <caption>{label}</caption>
+            <thead><tr><th scope="col"></th>{for s in series => <th scope="col">{s.name}</th>}</tr></thead>
+            <tbody>
+                {for i in range(n) => <tr><th scope="row">{labels[i]}</th>{for s in series => <td>{fmt(s.values[i])}</td>}</tr>}
+            </tbody>
+        </table>
+    </figure>
+}

@@ -1,0 +1,165 @@
+// VideoPlayer: a <video> with the kit's own controls: play and pause, a seek
+// bar, the time, volume and mute, full screen, and the keyboard (Space or K
+// plays and pauses, the left and right arrows seek 5 seconds, up and down set
+// the volume, M mutes, F goes full screen). A big play button sits on the
+// poster until it starts. Screen readers get each control by name and the
+// seek bar as a slider that says the time.
+//
+//   <VideoPlayer src="/media/intro.mp4" poster="/media/intro.jpg" label="Product tour"/>
+//   <VideoPlayer sources={[{ src: "/m/a.webm", type: "video/webm" }, { src: "/m/a.mp4", type: "video/mp4" }]}
+//                track="/m/a.vtt" muted={true} loop={true} on_end={() => { done = true }}/>
+//
+// src: the video; or sources, a list of { src, type } for the browser to pick
+// from. poster: a picture shown before it starts. label: what the player is
+// called ("Video"). ratio: its shape ("16/9"). muted, loop, autoplay: as on
+// <video> (autoplay needs muted in most browsers). track: a captions file (WebVTT)
+// and track_lang its language ("en"). preload: "metadata" (default), "auto" or
+// "none". on_play(), on_pause(), on_end(): inside one of your components.
+
+let video_player_css = css`
+.ui-video-player { position: relative; overflow: hidden; width: 100%; border-radius: var(--ui-radius); background: #000; color: #fff; font: 13px/1 var(--ui-font); outline: none; }
+.ui-video-player:focus-visible { box-shadow: var(--ui-focus); }
+.ui-video-player video { display: block; width: 100%; aspect-ratio: var(--r, 16/9); object-fit: contain; background: #000; }
+.ui-video-player:fullscreen video { height: 100%; aspect-ratio: auto; }
+.ui-video-player-big {
+  position: absolute; top: 50%; left: 50%; display: grid; place-items: center; width: 72px; height: 72px; padding: 0; transform: translate(-50%, -50%);
+  border: 0; border-radius: 50%; background: rgba(0, 0, 0, .55); color: #fff; cursor: pointer; transition: background .15s, transform .15s;
+}
+.ui-video-player-big:hover { background: var(--ui-accent); transform: translate(-50%, -50%) scale(1.06); }
+.ui-video-player-big:focus-visible { outline: none; box-shadow: 0 0 0 3px #fff; }
+.ui-video-player-big svg { width: 32px; height: 32px; margin-left: 4px; }
+.ui-video-player-started .ui-video-player-big { display: none; }
+.ui-video-player-bar {
+  position: absolute; inset: auto 0 0 0; display: flex; align-items: center; gap: 6px; padding: 24px 10px 8px;
+  background: linear-gradient(to top, rgba(0, 0, 0, .75), transparent); transition: opacity .25s;
+}
+.ui-video-player-started.ui-video-player-playing:not(:hover):not(:focus-within) .ui-video-player-bar { opacity: 0; }
+.ui-video-player-btn { display: grid; place-items: center; flex: none; width: 34px; height: 34px; padding: 0; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: #fff; cursor: pointer; }
+.ui-video-player-btn:hover { background: rgba(255, 255, 255, .18); }
+.ui-video-player-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px #fff; }
+.ui-video-player-btn svg { width: 20px; height: 20px; }
+.ui-video-player-time { flex: none; min-width: 84px; padding: 0 4px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-video-player-seek, .ui-video-player-vol { appearance: none; height: 20px; margin: 0; background: transparent; cursor: pointer; }
+.ui-video-player-seek { flex: 1; min-width: 60px; }
+.ui-video-player-vol { width: 70px; }
+.ui-video-player-seek::-webkit-slider-runnable-track, .ui-video-player-vol::-webkit-slider-runnable-track { height: 4px; border-radius: 999px; background: linear-gradient(to right, #fff var(--f, 0%), rgba(255, 255, 255, .35) var(--f, 0%)); }
+.ui-video-player-seek::-moz-range-track, .ui-video-player-vol::-moz-range-track { height: 4px; border-radius: 999px; background: rgba(255, 255, 255, .35); }
+.ui-video-player-seek::-moz-range-progress, .ui-video-player-vol::-moz-range-progress { height: 4px; border-radius: 999px; background: #fff; }
+.ui-video-player-seek::-webkit-slider-thumb, .ui-video-player-vol::-webkit-slider-thumb { appearance: none; width: 12px; height: 12px; margin-top: -4px; border-radius: 50%; background: #fff; }
+.ui-video-player-seek::-moz-range-thumb, .ui-video-player-vol::-moz-range-thumb { width: 12px; height: 12px; border: 0; border-radius: 50%; background: #fff; }
+.ui-video-player-seek:focus-visible, .ui-video-player-vol:focus-visible { outline: none; box-shadow: 0 0 0 2px #fff; border-radius: 999px; }
+.ui-video-player-vol-box { display: flex; align-items: center; }
+@media (max-width: 480px) { .ui-video-player-vol { display: none; } .ui-video-player-time { min-width: 0; } }
+@media (prefers-reduced-motion: reduce) { .ui-video-player-big, .ui-video-player-bar { transition: none; } }
+`
+
+// Seconds as "m:ss", or "h:mm:ss" from an hour.
+fn video_player_time(s: num) -> str {
+    let t = floor(s)
+    let h = floor(t / 3600)
+    let m = floor(t % 3600 / 60)
+    let sec = t % 60
+    let two = (n: int) => n < 10 ? `0${n}` : str(n)
+    h > 0 ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`
+}
+
+component VideoPlayer(src: str? = null, sources: list = [], poster: str? = null, label: str = "Video", ratio: str = "16/9",
+                      muted: bool = false, loop: bool = false, autoplay: bool = false, track: str? = null,
+                      track_lang: str = "en", preload: str = "metadata", on_play = null, on_pause = null, on_end = null,
+                      class: str? = null) {
+    style global video_player_css
+    state el = null
+    state box = null
+    state playing = false
+    state started = false
+    state time = 0
+    state dur = 0
+    state vol = 1
+    state quiet = muted
+    state full = false
+    let total = dur > 0 ? dur : 0
+    let fill = total > 0 ? round(time * 100 / total, 2) : 0
+    let toggle = () => {
+        if el != null {
+            // The browser may refuse to play (no click on the page yet, sound not allowed): the button stays Play.
+            if playing { el.pause() } else { el.play().catch((_ = null) => { playing = false }) }
+        }
+    }
+    let go_full = () => {
+        if full { js("document.exitFullscreen").catch((_ = null) => { full = false }) } else { box.requestFullscreen().catch((_ = null) => { full = false }) }
+    }
+    let seek = (to: num) => {
+        if el != null && total > 0 { el.currentTime = to < 0 ? 0 : to > total ? total : to }
+    }
+    let set_vol = (v: num) => {
+        if el != null {
+            el.volume = v < 0 ? 0 : v > 1 ? 1 : v
+            if v > 0 { el.muted = false }
+        }
+    }
+    <div class={ui_cls(["ui-video-player", started && "ui-video-player-started", playing && "ui-video-player-playing", class])}
+         style={`--r: ${ratio}`} role="region" aria-label={label} tabindex="0"
+         @mount={(b) => { box = b }}
+         @fullscreenchange={() => { full = js("document.fullscreenElement") != null }}
+         @keydown={(e) => {
+             let tag = e.target.tagName
+             if tag != "INPUT" || (e.key != "ArrowLeft" && e.key != "ArrowRight" && e.key != "ArrowUp" && e.key != "ArrowDown") {
+                 let done = match e.key {
+                     " " | "k" | "K" => { toggle(); true }
+                     "ArrowLeft" => { seek(time - 5); true }
+                     "ArrowRight" => { seek(time + 5); true }
+                     "ArrowUp" => { set_vol(vol + 0.1); true }
+                     "ArrowDown" => { set_vol(vol - 0.1); true }
+                     "m" | "M" => { if el != null { el.muted = !quiet }; true }
+                     "f" | "F" => { go_full(); true }
+                     _ => false
+                 }
+                 if done { e.preventDefault() }
+             }
+         }}>
+        <video src={src} poster={poster} muted={muted} loop={loop} autoplay={autoplay} preload={preload} playsinline={true}
+               @mount={(v) => { el = v; if v.duration > 0 && math.isfinite(v.duration) { dur = v.duration } }}
+               @click={toggle}
+               @loadedmetadata={(e) => { dur = math.isfinite(e.duration) ? e.duration : 0; vol = e.volume; quiet = e.muted }}
+               @durationchange={(e) => { dur = math.isfinite(e.duration) ? e.duration : 0 }}
+               @timeupdate={(e) => { time = e.currentTime }}
+               @play={() => { playing = true; started = true; on_play && on_play() }}
+               @pause={() => { playing = false; on_pause && on_pause() }}
+               @ended={() => { playing = false; on_end && on_end() }}
+               @volumechange={(e) => { vol = e.volume; quiet = e.muted }}>
+            {for s in sources => <source key={s.src} src={s.src} type={get(s, "type")}/>}
+            {track != null && <track kind="captions" src={track} srclang={track_lang} label="Captions"/>}
+        </video>
+        <button.ui-video-player-big type="button" aria-label="Play" @click={toggle}>
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4v16l14-8z"/></svg>
+        </button>
+        <div.ui-video-player-bar>
+            <button.ui-video-player-btn type="button" aria-label={playing ? "Pause" : "Play"} @click={toggle}>
+                {playing
+                    ? <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>
+                    : <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4v16l14-8z"/></svg>}
+            </button>
+            <span.ui-video-player-time aria-hidden="true">{video_player_time(time)} / {video_player_time(total)}</span>
+            <input.ui-video-player-seek type="range" min="0" max={total} step="0.1" value={time} aria-label="Seek" disabled={total == 0}
+                   aria-valuetext={`${video_player_time(time)} of ${video_player_time(total)}`} style={`--f: ${fill}%`}
+                   @input={(e) => { seek(float(e.value)) }}/>
+            <div.ui-video-player-vol-box>
+                <button.ui-video-player-btn type="button" aria-label={quiet || vol == 0 ? "Unmute" : "Mute"} aria-pressed={quiet ? "true" : "false"}
+                        @click={() => { if el != null { el.muted = !quiet } }}>
+                    {quiet || vol == 0
+                        ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4V5ZM23 9l-6 6M17 9l6 6"/></svg>
+                        : <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4V5ZM19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>}
+                </button>
+                <input.ui-video-player-vol type="range" min="0" max="1" step="0.05" value={quiet ? 0 : vol} aria-label="Volume"
+                       aria-valuetext={`${round((quiet ? 0 : vol) * 100)}%`} style={`--f: ${round((quiet ? 0 : vol) * 100)}%`}
+                       @input={(e) => { set_vol(float(e.value)) }}/>
+            </div>
+            <button.ui-video-player-btn type="button" aria-label={full ? "Exit full screen" : "Full screen"}
+                    @click={go_full}>
+                {full
+                    ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3"/></svg>
+                    : <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>}
+            </button>
+        </div>
+    </div>
+}

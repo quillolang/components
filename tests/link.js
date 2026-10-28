@@ -1,0 +1,15 @@
+const docs = $("#link-demo-docs"), ext = $("#link-demo-ext"), same = $("#link-demo-same");
+if (!docs || docs.tagName !== "A" || docs.getAttribute("href") !== "/docs") return "the link is not an <a> with its href";
+if (docs.querySelector("svg") || docs.target || docs.rel) return "a same-site link has an icon, a target or a rel";
+if (!ext.querySelector("svg.ui-link-ext") || ext.target !== "_blank" || !ext.rel.includes("noopener")) return "an external link has no icon, new tab or rel";
+if (!ext.textContent.includes("opens in a new tab") || ext.querySelector("svg").getAttribute("aria-hidden") !== "true") return "an external link is not announced";
+if (!same.querySelector("svg.ui-link-ext") || same.target || same.textContent.includes("opens in")) return "new_tab={false} still opens a tab, or lost the icon";
+const cs = (el) => getComputedStyle(el);
+if (cs(docs).textDecorationLine !== "underline") return "the default link is not underlined";
+if (cs($("#link-demo-hover")).textDecorationLine !== "none") return "underline=hover is underlined at rest";
+const text = docs.parentElement;
+if (cs(docs).color === cs(text).color) return "the link is not in the accent colour";
+if (cs($("#link-demo-inherit")).color !== cs($("#link-demo-inherit").parentElement).color) return "tone=inherit does not inherit";
+const dl = $("#link-demo-download");
+if (dl.getAttribute("download") !== "hello.txt") return "download is not on the link";
+if ($$("a.ui-link").length < 9) return "some links are missing";

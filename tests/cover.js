@@ -1,0 +1,13 @@
+const hero = $("#cover-demo-hero"), plain = $("#cover-demo-plain");
+if (!hero || !plain) return "the two covers are missing";
+const hr = hero.getBoundingClientRect();
+if (Math.abs(hr.height - 360) > 1) return `height="360px" gives ${hr.height}px`;
+const top = hero.querySelector(".ui-cover-top").getBoundingClientRect(), main = hero.querySelector(".ui-cover-main").getBoundingClientRect(), bottom = hero.querySelector(".ui-cover-bottom").getBoundingClientRect();
+if (Math.abs(top.top - hr.top - 24) > 1) return "the top slot is not at the top";
+if (Math.abs(bottom.bottom - (hr.bottom - 24)) > 1) return "the bottom slot is not at the bottom";
+if (Math.abs((main.top - top.bottom) - (bottom.top - main.bottom)) > 1) return `the middle has ${main.top - top.bottom}px above and ${bottom.top - main.bottom}px below`;
+if (getComputedStyle(hero.querySelector("h2")).textAlign !== "center") return "text={true} does not centre the text";
+if (!hero.classList.contains("ui-cover-subtle")) return "tone=\"subtle\" is missing";
+const pr = plain.getBoundingClientRect(), pm = plain.querySelector(".ui-cover-main").getBoundingClientRect();
+if (Math.abs(pr.height - 200) > 1 || Math.abs((pm.top + pm.height / 2) - (pr.top + pr.height / 2)) > 1) return "without top and bottom, the middle is not centred";
+if (plain.querySelector(".ui-cover-top") || plain.querySelector(".ui-cover-bottom")) return "empty top and bottom slots are rendered";

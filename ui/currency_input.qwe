@@ -1,0 +1,163 @@
+// CurrencyInput: an amount of money, with the currency's symbol in the box and
+// thousands separated as it is typed ("1234567.5" shows as "1,234,567.5", and
+// "1,234,567.50" once the box is left). Only digits and a decimal mark get in,
+// with as many decimals as the currency has. The amount goes in a hidden input
+// named `name` as plain digits with a point ("1234567.50"), so a plain <form>
+// sends what `dec()` or `money.of()` read.
+//
+//   <CurrencyInput name="price" label="Price" value={19.99} currency="USD"/>
+//   <CurrencyInput name="budget" label="Budget" currency="EUR" locale="de" placeholder="0,00"/>
+//   <CurrencyInput name="fee" label="Fee" currency="JPY" on_change={(n) => { fee = n }}/>
+//
+// value: the amount to start with, a number or text such as "1234.5". currency: the
+// ISO code ("USD"); its symbol is shown ($, €, £, ¥, ₹, ...; the code for others)
+// and sets the decimals (2; 0 for JPY and KRW). decimals: another number of them.
+// locale: how the digits are grouped: "en" (1,234.56; the default), "de", "es",
+// "it", "nl", "pt" (1.234,56), "fr" (1 234,56) or "ch" (1'234.56). negative: minus
+// amounts may be typed (false). symbol_after: the symbol at the end, as in "12,50 €".
+// name, label, placeholder, hint, error, required, disabled, field (the box's id,
+// "currency-input-" + name by default) and size ("sm" or "md") as for every field.
+// on_change(amount): inside one of your components, given the amount as a number
+// (null when the box is emptied) as it is typed.
+
+let currency_input_css = css`
+.ui-currency-input { display: grid; gap: 6px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-currency-input-label { font-size: 13px; font-weight: 500; }
+.ui-currency-input-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-currency-input-box {
+  display: flex; align-items: center; gap: 8px; width: 220px; max-width: 100%; height: 38px; padding: 0 12px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  transition: border-color .15s, box-shadow .15s;
+}
+.ui-currency-input-box:hover { border-color: var(--ui-strong); }
+.ui-currency-input-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-currency-input-box input {
+  flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: none; background: transparent; text-align: right;
+  color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums;
+}
+.ui-currency-input-box input::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-currency-input-symbol { flex: none; color: var(--ui-muted); font-weight: 500; user-select: none; }
+.ui-currency-input-code { flex: none; color: var(--ui-muted); font-size: 11px; font-weight: 600; letter-spacing: .04em; user-select: none; }
+.ui-currency-input-sm .ui-currency-input-box { height: 30px; width: 180px; padding: 0 10px; }
+.ui-currency-input-sm .ui-currency-input-box input { font-size: 13px; }
+.ui-currency-input-invalid .ui-currency-input-box, .ui-currency-input-invalid .ui-currency-input-box:hover { border-color: var(--ui-danger); }
+.ui-currency-input-hint, .ui-currency-input-error { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-currency-input-error { color: var(--ui-danger); }
+.ui-currency-input-disabled { opacity: .55; }
+.ui-currency-input-disabled input { cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) { .ui-currency-input-box { transition: none; } }
+`
+
+let currency_input_symbols = { USD: "$", EUR: "€", GBP: "£", JPY: "¥", CNY: "¥", INR: "₹", KRW: "₩", BRL: "R$", CAD: "CA$",
+                               AUD: "A$", NZD: "NZ$", MXN: "MX$", CHF: "CHF", SEK: "kr", NOK: "kr", DKK: "kr", PLN: "zł",
+                               CZK: "Kč", HUF: "Ft", TRY: "₺", RUB: "₽", ILS: "₪", ZAR: "R", SGD: "S$", HKD: "HK$", THB: "฿",
+                               PHP: "₱", VND: "₫", NGN: "₦", UAH: "₴" }
+
+// How many decimals a currency has (2 for most).
+fn currency_input_places(code: str) -> int = contains(["JPY", "KRW", "VND", "HUF", "CLP", "ISK", "UGX"], upper(code)) ? 0 : 2
+
+// The separators a locale writes: { group, point }.
+fn currency_input_seps(locale: str) = match lower(slice(locale, 0, 2)) {
+    "en" => { group: ",", point: "." }
+    "fr" => { group: " ", point: "," }
+    "ch" => { group: "'", point: "." }
+    "de" | "es" | "it" | "nl" | "pt" | "da" | "sv" | "nb" | "fi" | "pl" | "cs" | "tr" | "id" => { group: ".", point: "," }
+    _ => { group: ",", point: "." }
+}
+
+// What was typed, as { neg, whole, frac, point }: the sign, the digits before and after
+// the decimal mark (at most `places` of them), and whether a mark was typed.
+fn currency_input_parse(text: str, mark: str, places: int, negative: bool) {
+    let t = trim(text)
+    let neg = negative && starts_with(t, "-")
+    let at = index_of(t, mark) ?? (mark != "." ? index_of(t, ".") : null)
+    let head = re.replace(at == null ? t : slice(t, 0, at), "[^0-9]", "")
+    let tail = at == null ? "" : slice(re.replace(slice(t, at + 1), "[^0-9]", ""), 0, places)
+    let stripped = re.replace(head, "^0+", "")
+    { neg, whole: stripped == "" && head != "" ? "0" : stripped, frac: tail, point: at != null && places > 0 }
+}
+
+// "1234567" grouped by threes: "1,234,567".
+fn currency_input_group(digits: str, sep: str) -> str {
+    let n = len(digits)
+    let head = n % 3
+    let parts = (head > 0 ? [slice(digits, 0, head)] : []) + (range(floor(n / 3)) | map((i) => slice(digits, head + i * 3, head + i * 3 + 3)))
+    join(parts, sep)
+}
+
+// The box's text from the parts: "-1,234.5"; with `pad`, the decimals filled: "-1,234.50".
+fn currency_input_show(p, seps, places: int, pad: bool) -> str {
+    if p.whole == "" && p.frac == "" { return "" }
+    let whole = currency_input_group(p.whole == "" ? "0" : p.whole, seps.group)
+    let frac = pad && places > 0 ? p.frac + repeat("0", places - len(p.frac)) : p.frac
+    `${p.neg ? "-" : ""}${whole}${(p.point && !pad) || len(frac) > 0 ? seps.point : ""}${frac}`
+}
+
+// The plain amount a form sends: "-1234.50", or "" for nothing.
+fn currency_input_plain(p, places: int) -> str {
+    if p.whole == "" && p.frac == "" { return "" }
+    let frac = places > 0 ? p.frac + repeat("0", places - len(p.frac)) : ""
+    `${p.neg ? "-" : ""}${p.whole == "" ? "0" : p.whole}${places > 0 ? "." : ""}${frac}`
+}
+
+// Where the caret goes in `shown`: after the n-th digit (the sign and the mark count too).
+fn currency_input_caret(chars: list, n: int, mark: str) -> int {
+    let r = reduce(enumerate(chars), { seen: 0, at: 0 }, (acc, pair) =>
+        acc.seen < n && (re.test(pair[1], "[0-9]") || pair[1] == mark || pair[1] == "-") ? { seen: acc.seen + 1, at: pair[0] + 1 } : acc)
+    r.at
+}
+
+component CurrencyInput(name: str? = null, label: str? = null, value: num | str | null = null, currency: str = "USD",
+                        locale: str = "en", decimals: int? = null, negative: bool = false, symbol_after: bool = false,
+                        placeholder: str? = null, hint: str? = null, error: str? = null, required: bool = false,
+                        disabled: bool = false, field: str? = null, size: str = "md", on_change = null, class: str? = null) {
+    style global currency_input_css
+    let code = upper(currency)
+    let places = decimals ?? currency_input_places(code)
+    let seps = currency_input_seps(locale)
+    let symbol = currency_input_symbols[code] ?? code
+    state parts = currency_input_parse(value == null ? "" : str(value), ".", places, true)
+    state text = currency_input_show(currency_input_parse(value == null ? "" : str(value), ".", places, true), currency_input_seps(locale), places, true)
+    let id = field ?? `currency-input-${name ?? re.replace(lower(label ?? "amount"), "[^a-z0-9]+", "-")}`
+    let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
+    let plain = currency_input_plain(parts, places)
+    let set_parts = (p) => {
+        let before = currency_input_plain(parts, places)
+        parts = p
+        let after = currency_input_plain(p, places)
+        if after != before { on_change && on_change(after == "" ? null : float(after)) }
+    }
+    <div class={ui_cls(["ui-currency-input", size == "sm" && "ui-currency-input-sm", error != null && "ui-currency-input-invalid",
+                        disabled && "ui-currency-input-disabled", class])}>
+        {label != null && <label.ui-currency-input-label for={id}>
+            {label}{required && <span.ui-currency-input-req aria-hidden="true">*</span>}
+        </label>}
+        <div.ui-currency-input-box>
+            {!symbol_after && <span.ui-currency-input-symbol aria-hidden="true">{symbol}</span>}
+            <input type="text" id={id} value={text} inputmode="decimal" autocomplete="off" placeholder={placeholder}
+                   required={required} disabled={disabled} aria-label={label == null ? `Amount in ${code}` : null}
+                   aria-invalid={error != null ? "true" : null} aria-describedby={described != "" ? described : null}
+                   @input={(e) => {
+                       let raw = e.value
+                       let at = e.target.selectionStart ?? len(raw)
+                       let typed_before = len(re.replace(slice(raw, 0, at), currency_input_noise(seps.point), ""))
+                       let p = currency_input_parse(raw, seps.point, places, negative)
+                       let shown = currency_input_show(p, seps, places, false)
+                       text = shown
+                       e.target.value = shown
+                       let caret = currency_input_caret(split(shown, ""), typed_before, seps.point)
+                       e.target.setSelectionRange(caret, caret)
+                       set_parts(p)
+                   }}
+                   @blur={() => { text = currency_input_show(parts, seps, places, true) }}/>
+            {symbol_after ? <span.ui-currency-input-symbol aria-hidden="true">{symbol}</span>
+                          : <span.ui-currency-input-code aria-hidden="true">{code}</span>}
+        </div>
+        {name != null && <input type="hidden" name={name} value={plain}/>}
+        {hint != null && <p.ui-currency-input-hint id={`${id}-hint`}>{hint}</p>}
+        {error != null && <p.ui-currency-input-error id={`${id}-error`} role="alert">{error}</p>}
+    </div>
+}
+
+// A pattern matching everything but digits, the sign and the decimal mark.
+fn currency_input_noise(mark: str) -> str = mark == "." ? "[^0-9.\\-]" : `[^0-9.\\-${mark}]`

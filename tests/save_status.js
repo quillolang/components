@@ -1,0 +1,18 @@
+const saved = $("#save-status-demo-saved"), saving = $("#save-status-demo-saving"), unsaved = $("#save-status-demo-unsaved"), error = $("#save-status-demo-error");
+if (!saved || saved.getAttribute("role") !== "status" || saved.querySelector(".ui-savest-word").textContent !== "Saved") return "saved";
+if (saved.querySelector(".ui-savest-time")?.textContent !== "14:02") return `the ISO time is not shown as its clock time: ${saved.querySelector(".ui-savest-time")?.textContent}`;
+if (saving.querySelector(".ui-savest-word").textContent !== "Saving…" || getComputedStyle(saving.querySelector(".ui-savest-icon")).animationName !== "ui-savest-turn") return "saving does not turn";
+if (unsaved.querySelector(".ui-savest-word").textContent !== "Unsaved changes") return "unsaved";
+if (error.getAttribute("role") !== "alert" || error.querySelector(".ui-savest-word").textContent !== "Could not save") return "error is not an alert";
+if (error.querySelector(".ui-savest-action")?.textContent !== "Retry") return "the action button";
+if (new Set([saved, saving, unsaved, error].map((s) => getComputedStyle(s.querySelector(".ui-savest-icon")).color)).size < 3) return "the icons do not take their tone";
+const small = $$(".ui-savest").find((s) => s.classList.contains("ui-savest-sm"));
+if (!small || small.querySelector(".ui-savest-word").textContent !== "All changes saved" || small.querySelector(".ui-savest-time").textContent !== "just now") return "words and a text time";
+const live = $("#save-status-demo-live");
+if (live.querySelector(".ui-savest-word").textContent !== "Saved" || live.querySelector(".ui-savest-action")) return "the live one starts saved without an action";
+type($("textarea"), "changed"); await wait();
+if (live.querySelector(".ui-savest-word").textContent !== "Unsaved changes" || live.querySelector(".ui-savest-action")?.textContent !== "Save now") return `typing did not make it unsaved: ${live.textContent}`;
+live.querySelector(".ui-savest-action").click(); await wait();
+if (live.querySelector(".ui-savest-word").textContent !== "Saving…" || !$(".demo-note").textContent.includes("Saved 1 time")) return "on_click did not run";
+$("#save-status-demo-finish").click(); await wait();
+if (live.querySelector(".ui-savest-word").textContent !== "Saved" || live.querySelector(".ui-savest-time")?.textContent !== "14:02") return "it did not go back to saved";

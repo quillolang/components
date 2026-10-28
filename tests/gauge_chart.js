@@ -1,0 +1,35 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-gaugec");
+if (charts.length !== 3) return `expected 3 gauges, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a gauge has NaN, Infinity or undefined in it";
+const [cpu, resp, score] = charts;
+const meter = cpu.querySelector("[role=meter]");
+if (!meter || meter.getAttribute("aria-valuenow") !== "72" || meter.getAttribute("aria-valuemin") !== "0" || meter.getAttribute("aria-valuemax") !== "100") return "no meter with the value and its range";
+if (meter.getAttribute("aria-valuetext") !== "72%, warning") return `aria-valuetext: ${meter.getAttribute("aria-valuetext")}`;
+if (meter.getAttribute("aria-label") !== "CPU load") return "the meter is not named";
+const bands = [...cpu.querySelectorAll(".ui-gaugec-band")];
+if (bands.map((b) => b.classList[1]).join() !== "ui-gaugec-good,ui-gaugec-warning,ui-gaugec-bad") return "the default bands are not good, warning and bad";
+if (new Set(bands.map((b) => getComputedStyle(b).stroke)).size !== 3) return "the bands share a colour";
+// The first band starts at the left end, (-100, 0).
+if (!bands[0].getAttribute("d").startsWith("M-100,0 A100,100 0 0 1 ")) return `the first band: ${bands[0].getAttribute("d")}`;
+const needle = cpu.querySelector(".ui-gaugec-needle");
+if (needle.style.getPropertyValue("--turn").trim() !== "129.6deg") return `72% turns the needle ${needle.style.getPropertyValue("--turn")}, not 129.6deg`;
+await wait(800);
+const m = new DOMMatrix(getComputedStyle(needle).transform);
+if (Math.abs(Math.atan2(m.b, m.a) * 180 / Math.PI - 129.6) > 0.5) return "the needle does not swing to its place";
+const tip = needle.querySelector("path").getBoundingClientRect(), hub = cpu.querySelector(".ui-gaugec-hub").getBoundingClientRect();
+if (!(tip.right > hub.right && tip.top < hub.top)) return "the needle does not point up and right";
+if (cpu.querySelector(".ui-gaugec-value").textContent !== "72%") return "the value is not written";
+const state = cpu.querySelector(".ui-gaugec-state");
+if (!state || state.textContent !== "Warning" || !state.classList.contains("ui-gaugec-warning")) return "the band is not named under the value";
+if (cpu.querySelector(".ui-gaugec-name").textContent !== "CPU load") return "the label is not under the value";
+if ([...cpu.querySelectorAll(".ui-gaugec-end")].map((t) => t.textContent).join() !== "0,100") return "the ends are not labelled";
+if (bands[1].querySelector("title").textContent !== "Warning: 60% – 85%") return "bands have no title";
+
+if (resp.querySelector(".ui-gaugec-state").textContent !== "Slow") return "named bands";
+if ([...resp.querySelectorAll(".ui-gaugec-end")].map((t) => t.textContent).join() !== "0,1k") return "high={1000}";
+if (Math.round(resp.querySelector("svg").getBoundingClientRect().width) !== 220) return "size={220}";
+if (resp.querySelectorAll("tbody tr").length !== 3 || resp.querySelector("tbody tr").textContent !== "Fast0 ms300 ms") return "the screen reader table";
+if (score.querySelector(".ui-gaugec-value").textContent !== "8.6") return "decimals={1}";
+if (score.querySelector("[role=meter]").getAttribute("aria-valuetext") !== "8.6, promoter") return "the score's band";
+if (getComputedStyle(score.querySelectorAll(".ui-gaugec-band")[1]).stroke === getComputedStyle(score.querySelectorAll(".ui-gaugec-band")[2]).stroke) return "neutral is not its own colour";

@@ -1,0 +1,126 @@
+// AvailabilityGrid: days across and hours down, each cell a slot to mark as available
+// by clicking it (again to unmark), or by pressing on one and dragging across others
+// to paint them; the arrow keys move between cells and Space or Enter toggles one.
+// The slots marked go in a hidden input named `name`, so a plain <form> sends them.
+//
+//   <AvailabilityGrid name="slots" days={["Mon", "Tue", "Wed", "Thu", "Fri"]} from_hour={9} to_hour={17}/>
+//   <AvailabilityGrid days={["2026-11-02", "2026-11-03"]} value={picked} on_change={(slots) => { picked = slots }}/>
+//
+// days: the columns, each a name ("Mon") or a date ("YYYY-MM-DD", shown as its weekday
+// and day). from_hour, to_hour: the rows (9 to 17, a slot each hour); step: minutes a
+// slot lasts (60; 30 gives half hours). value: the slots marked to start with, each
+// "<day>-HH:MM" ("Mon-09:00"). name: what a <form> gets them as, comma-separated.
+// label: what screen readers call the grid ("Availability"); each cell is named by its
+// day and time and says whether it is marked. disabled: nothing can be changed.
+// legend: false drops the "Available" / "Not available" key under it.
+// on_change(slots): inside one of your components, the slots marked, in day and time
+// order, after each change.
+
+let availability_grid_css = css`
+.ui-availability-grid { display: grid; gap: 10px; min-width: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); user-select: none; }
+.ui-availability-grid-table { display: grid; grid-template-columns: 52px repeat(var(--ag-days), minmax(36px, 1fr)); gap: 2px; overflow-x: auto; }
+.ui-availability-grid-head { display: grid; justify-items: center; align-content: end; gap: 1px; padding: 2px 0 4px; color: var(--ui-muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.ui-availability-grid-head b { color: var(--ui-fg); font-size: 14px; letter-spacing: 0; }
+.ui-availability-grid-hour { align-self: start; padding: 3px 6px 0 0; color: var(--ui-muted); text-align: right; font-variant-numeric: tabular-nums; }
+.ui-availability-grid-cell {
+  height: 28px; margin: 0; padding: 0; border: 1px solid var(--ui-border); border-radius: 4px; background: var(--ui-surface); cursor: pointer;
+  transition: background .1s, border-color .1s;
+}
+.ui-availability-grid-cell:hover { border-color: var(--ui-accent); }
+.ui-availability-grid-cell:focus-visible { outline: none; box-shadow: var(--ui-focus); position: relative; z-index: 1; }
+.ui-availability-grid-cell[aria-pressed="true"] { background: var(--ui-accent); border-color: var(--ui-accent); }
+.ui-availability-grid-cell:disabled { cursor: not-allowed; opacity: .6; }
+.ui-availability-grid-half .ui-availability-grid-cell { height: 18px; }
+.ui-availability-grid-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; color: var(--ui-muted); }
+.ui-availability-grid-key { display: inline-flex; align-items: center; gap: 6px; }
+.ui-availability-grid-key i { width: 14px; height: 14px; border: 1px solid var(--ui-border); border-radius: 3px; background: var(--ui-surface); }
+.ui-availability-grid-key i.ui-availability-grid-on { background: var(--ui-accent); border-color: var(--ui-accent); }
+.ui-availability-grid-count { margin-left: auto; }
+@media (prefers-reduced-motion: reduce) { .ui-availability-grid-cell { transition: none; } }
+`
+
+// "HH:MM" from minutes since midnight.
+fn availability_grid_clock(m: int) -> str {
+    let two = (n: int) => n < 10 ? `0${n}` : str(n)
+    `${two(floor(m / 60))}:${two(m % 60)}`
+}
+
+// A day as it heads its column: a date gives its weekday and day number, a name itself.
+fn availability_grid_head(d: str) -> map =
+    re.test(d, "^\\d{4}-\\d{2}-\\d{2}$") ? { top: date.format(d, "ddd"), big: str(date.parts(d).day), said: date.format(d, "dddd D MMMM") }
+                                          : { top: d, big: null, said: d }
+
+component AvailabilityGrid(days: list = ["Mon", "Tue", "Wed", "Thu", "Fri"], from_hour: int = 9, to_hour: int = 17, step: int = 60,
+                           value: list = [], name: str? = null, label: str = "Availability", disabled: bool = false,
+                           legend: bool = true, on_change = null, class: str? = null) {
+    style global availability_grid_css
+    state picked = value
+    state painting = null
+    let times = range(0, floor((to_hour - from_hour) * 60 / step)) | map((i) => from_hour * 60 + i * step)
+    // One flat, keyed list (each row's hour, then its cells), so a cell keeps its element and focus as it changes.
+    let cells = flatten(times | enumerate | map((p) => [{ t: p[1] }] + (days | enumerate | map((q) =>
+        { t: p[1], ti: p[0], d: q[1], di: q[0], slot: `${q[1]}-${availability_grid_clock(p[1])}` }))))
+    let order = (s: str) => {
+        let i = days | enumerate | find((p) => starts_with(s, `${p[1]}-`))
+        (i != null ? i[0] : 99) * 10000 + (int(slice(s, len(s) - 5, len(s) - 3)) ?? 0) * 60 + (int(slice(s, len(s) - 2, len(s))) ?? 0)
+    }
+    let change = (next: list) => {
+        picked = next | unique | sort_by(order)
+        on_change && on_change(picked)
+    }
+    let mark = (slot: str, on: bool) => {
+        if on && !contains(picked, slot) { change(picked | push(slot)) }
+        if !on && contains(picked, slot) { change(picked | filter((s) => s != slot)) }
+    }
+    let move = (e, dd: int, dt: int) => {
+        let cell = e.target
+        let d = (int(cell.dataset.d) ?? 0) + dd
+        let t = (int(cell.dataset.t) ?? 0) + dt
+        if d >= 0 && d < len(days) && t >= 0 && t < len(times) {
+            e.preventDefault()
+            let next = cell.closest(".ui-availability-grid-table").querySelector(`[data-d="${d}"][data-t="${t}"]`)
+            if next != null { next.focus() }
+        }
+    }
+    <div class={ui_cls(["ui-availability-grid", step < 60 && "ui-availability-grid-half", class])} role="group" aria-label={label}
+         style={`--ag-days: ${len(days)}`}
+         @pointerup={() => { painting = null }} @pointerleave={() => { painting = null }}>
+        <div.ui-availability-grid-table>
+            <div></div>
+            {for d in days => {
+                let h = availability_grid_head(d)
+                <div.ui-availability-grid-head key={d} aria-hidden="true"><span>{h.top}</span>{h.big != null && <b>{h.big}</b>}</div>
+            }}
+            {for c in cells => {
+                let k = c.slot ?? `h${c.t}`
+                c.slot == null
+                    ? <div.ui-availability-grid-hour key={k} aria-hidden="true">{availability_grid_clock(c.t)}</div>
+                    : {
+                        let on = contains(picked, c.slot)
+                        let slot = c.slot
+                        <button.ui-availability-grid-cell key={k} type="button" data-d={c.di} data-t={c.ti} data-slot={slot} disabled={disabled}
+                                aria-pressed={on ? "true" : "false"}
+                                aria-label={`${availability_grid_head(c.d).said} ${availability_grid_clock(c.t)}`}
+                                @pointerdown={(e) => { if !disabled && e.button == 0 { e.preventDefault(); painting = !on; mark(slot, !on); e.target.focus() } }}
+                                @pointerenter={() => { if painting != null && !disabled { mark(slot, painting) } }}
+                                @click={(e) => { if e.detail == 0 && !disabled { mark(slot, !on) } }}
+                                @keydown={(e) => {
+                                    match e.key {
+                                        "ArrowRight" => move(e, 1, 0)
+                                        "ArrowLeft" => move(e, -1, 0)
+                                        "ArrowDown" => move(e, 0, 1)
+                                        "ArrowUp" => move(e, 0, -1)
+                                        _ => null
+                                    }
+                                }}></button>
+                    }
+            }}
+        </div>
+        {legend && <div.ui-availability-grid-foot>
+            <span.ui-availability-grid-key><i.ui-availability-grid-on aria-hidden="true"></i> Available</span>
+            <span.ui-availability-grid-key><i aria-hidden="true"></i> Not available</span>
+            <span.ui-availability-grid-count aria-live="polite">{len(picked)} {len(picked) == 1 ? "slot" : "slots"} marked</span>
+        </div>}
+        {name != null && <input type="hidden" name={name} value={join(picked, ",")}/>}
+    </div>
+}

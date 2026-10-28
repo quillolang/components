@@ -1,0 +1,115 @@
+// CameraCapture: takes a photo with the device's camera: a button asks for the
+// camera, its picture shows live, "Take photo" keeps a still, "Retake" goes back.
+// The photo is a data URL (JPEG) in a hidden input named `name`, so a plain
+// <form method="post"> sends it. Without a camera, or when the person says no,
+// it says so instead, and nothing is sent.
+//
+//   <form method="post" action="/badge"><CameraCapture name="photo" label="Your badge photo"/></form>
+//   <CameraCapture facing="environment" width={1280} on_capture={(url) => { photo = url }}/>
+//
+// name: the hidden input's name ("photo"). label: what the camera's view is
+// called ("Camera"). facing: "user" (the front camera, default) or "environment"
+// (the back). width: the photo's width in pixels (640); its height follows the
+// camera's shape. quality: the JPEG's quality, 0 to 1 (0.9). mirror: shows the
+// front camera mirrored, as people expect a mirror to look (true); the photo is not.
+// on_capture(url): inside one of your components, called with the photo's data
+// URL, or null when it is retaken. The camera is turned off once the photo is
+// taken, and when the component leaves the page.
+// The page must be served over https (or from localhost) for a browser to give a camera.
+
+let camera_capture_css = css`
+.ui-camera-capture { display: grid; gap: 10px; max-width: 480px; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-camera-capture-view {
+  position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 4 / 3; border-radius: var(--ui-radius);
+  background: var(--ui-subtle); color: var(--ui-muted); text-align: center;
+}
+.ui-camera-capture-view video, .ui-camera-capture-view img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.ui-camera-capture-mirror video { transform: scaleX(-1); }
+.ui-camera-capture-view video[hidden], .ui-camera-capture-view img[hidden] { display: none; }
+.ui-camera-capture-msg { display: grid; justify-items: center; gap: 8px; max-width: 80%; padding: 16px; }
+.ui-camera-capture-msg svg { width: 32px; height: 32px; }
+.ui-camera-capture-bad { color: var(--ui-danger); }
+.ui-camera-capture-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-camera-capture canvas { display: none; }
+`
+
+component CameraCapture(name: str = "photo", label: str = "Camera", facing: str = "user", width: int = 640, quality: num = 0.9,
+                        mirror: bool = true, on_capture = null, class: str? = null) {
+    style global camera_capture_css
+    state status = "idle"    // idle, starting, live, taken, none (no camera), denied
+    state stream = null
+    state video = null
+    state canvas = null
+    state photo = null
+    let stop = () => {
+        if stream != null {
+            for t in js("Array.from", stream.getTracks()) { t.stop() }
+            stream = null
+        }
+    }
+    // The camera's answer comes later (the browser may ask first): .then keeps it a Promise wherever start is called.
+    let start = () => {
+        let md = js("navigator.mediaDevices")
+        if md == null || is_err(md) {
+            status = "none"
+        } else {
+            status = "starting"
+            js("navigator.mediaDevices.getUserMedia", { video: { facingMode: facing, width: { ideal: width } }, audio: false }).then(
+                (s) => {
+                    stream = s
+                    status = "live"
+                    video.srcObject = s
+                    video.play().catch((_ = null) => { status = "live" })
+                },
+                (e) => { status = e.name == "NotAllowedError" || e.name == "SecurityError" ? "denied" : "none" })
+        }
+    }
+    let take = () => {
+        let vw = video.videoWidth
+        let vh = video.videoHeight
+        if vw > 0 {
+            canvas.width = width
+            canvas.height = round(width * vh / vw)
+            canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height)
+            photo = canvas.toDataURL("image/jpeg", quality)
+            status = "taken"
+            stop()
+            on_capture && on_capture(photo)
+        }
+    }
+    <div class={ui_cls(["ui-camera-capture", class])}>
+        <div class={ui_cls(["ui-camera-capture-view", mirror && facing == "user" && "ui-camera-capture-mirror"])} role="region" aria-label={label}
+             @mount={(_el) => { () => stop() }}>
+            <video muted={true} playsinline={true} autoplay={true} hidden={status != "live"} aria-label="The camera's picture"
+                   @mount={(el) => { video = el }}></video>
+            <img src={photo ?? ""} alt="The photo taken" hidden={status != "taken"}/>
+            {status != "live" && status != "taken" && <div class={ui_cls(["ui-camera-capture-msg", (status == "none" || status == "denied") && "ui-camera-capture-bad"])}
+                    role={status == "none" || status == "denied" ? "alert" : "status"}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                     aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2v11ZM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"/></svg>
+                <span>{match status {
+                    "starting" => "Asking for the camera…"
+                    "none" => "No camera was found on this device, or this page cannot use one."
+                    "denied" => "The camera was not allowed. Allow it in the browser's settings to take a photo."
+                    _ => "The camera is off."
+                }}</span>
+            </div>}
+        </div>
+        <canvas @mount={(el) => { canvas = el }}></canvas>
+        <div.ui-camera-capture-bar>
+            {status == "live"
+                ? [<button type="button" class="ui-btn ui-btn-solid" @click={take}>Take photo</button>,
+                   <button type="button" class="ui-btn ui-btn-ghost" @click={() => { stop(); status = "idle" }}>Turn off</button>]
+                : status == "taken"
+                    ? <button type="button" class="ui-btn ui-btn-outline" @click={() => {
+                          photo = null
+                          on_capture && on_capture(null)
+                          start()
+                      }}>Retake</button>
+                    : <button type="button" class="ui-btn ui-btn-solid" disabled={status == "starting"} @click={start}>
+                          {status == "none" || status == "denied" ? "Try again" : "Turn on the camera"}
+                      </button>}
+        </div>
+        <input type="hidden" name={name} value={photo ?? ""}/>
+    </div>
+}

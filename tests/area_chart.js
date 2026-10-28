@@ -1,0 +1,40 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const charts = $$("figure.ui-areac");
+if (charts.length !== 3) return `expected 3 area charts, found ${charts.length}`;
+if (/NaN|Infinity|undefined/.test(charts.map((c) => c.innerHTML).join(""))) return "a chart has NaN, Infinity or undefined in it";
+const [sessions, devices, storage] = charts;
+if (sessions.getAttribute("aria-label") !== "Sessions per day") return "the label does not name the chart";
+const fill = sessions.querySelector(".ui-areac-fill");
+if (!fill || !fill.getAttribute("d").endsWith("Z")) return "the single series has no closed fill";
+const ticks = [...sessions.querySelectorAll(".ui-areac-y span")].map((s) => s.textContent);
+if (ticks.join() !== "0,1k,2k,3k") return `the axis ticks: ${ticks}`;
+if (sessions.querySelector(".ui-areac-legend")) return "one series has a legend";
+const cols = sessions.querySelectorAll(".ui-areac-col");
+if (cols.length !== 12) return "not a hover column per label";
+const tip = cols[9].querySelector(".ui-areac-tip");
+if (getComputedStyle(tip).display !== "none") return "the tooltip shows before hover";
+if (tip.textContent !== "Oct 10Sessions per day2,040") return `tooltip: ${tip.textContent}`;
+if (!cols[9].classList.contains("ui-areac-flip")) return "right-hand tooltips do not open to the left";
+
+if (devices.querySelectorAll(".ui-areac-legend li").length !== 3) return "three series have no legend of three";
+const lines = [...devices.querySelectorAll(".ui-areac-line")];
+const pts = (p) => p.getAttribute("d").split(/ ?[ML]/).filter(Boolean).map((q) => q.split(",").map(Number));
+// The axis reaches 15k (13,400 rounded up); the stack's top at Jun is 13,400.
+const top = pts(lines[2]);
+if (Math.abs(top[5][1] - (100 - 13400 * 100 / 15000)) > 0.02) return `the stack's top is drawn at ${top[5][1]}`;
+const mid = pts(lines[1]);
+if (Math.abs(mid[0][1] - (100 - 9100 * 100 / 15000)) > 0.02) return "the second series does not sit on the first";
+const band = devices.querySelectorAll(".ui-areac-fill")[1].getAttribute("d");
+if ((band.match(/L/g) || []).length !== 11) return `a stacked band is not drawn between two edges: ${band}`;
+const dtip = devices.querySelectorAll(".ui-areac-col")[0].querySelector(".ui-areac-tip").textContent;
+if (dtip !== "JanDesktop5,200Mobile3,900Tablet800Total9,900") return `the stacked tooltip lists ${dtip}`;
+if (devices.querySelectorAll("thead th").length !== 5) return "the stacked table has no total column";
+if (Number(getComputedStyle(devices.querySelector(".ui-areac-fill")).opacity) < 0.4) return "stacked fills are not solid enough";
+
+const gap = storage.querySelectorAll(".ui-areac-line")[0].getAttribute("d");
+if ((gap.match(/M/g) || []).length !== 2) return `a null does not break the area: ${gap}`;
+if (storage.querySelectorAll(".ui-areac-col")[4].querySelectorAll(".ui-areac-dot").length !== 1) return "the missing value has a dot";
+if (!storage.querySelectorAll(".ui-areac-col")[4].querySelector(".ui-areac-tip").textContent.includes("This week—")) return "the missing value is not a dash";
+if (storage.querySelector("tbody td").textContent !== "41.5 GB") return "the table's values have no suffix";
+const colors = [...storage.querySelectorAll(".ui-areac-line")].map((l) => getComputedStyle(l).stroke);
+if (new Set(colors).size !== 2) return "the series share a colour";

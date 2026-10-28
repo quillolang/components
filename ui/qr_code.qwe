@@ -1,0 +1,353 @@
+// QrCode: a QR code drawn as SVG from text: a link, a ticket's code, Wi-Fi details.
+// The encoder is written here in Quillo, so it needs no library and draws the
+// same on the server and in the browser: byte mode (any text, as UTF-8), error
+// correction level M (about 15% of the code can be damaged), versions 1 to 10,
+// so up to 213 bytes; the mask is picked by the standard's penalty rules.
+//
+//   <QrCode text="https://quillolang.org"/>
+//   <QrCode text={ticket.code} size={120} label="Ticket code" caption={ticket.code}/>
+//
+// text: what it encodes. size: its width and height in px (160). label: what
+// screen readers hear ("QR code: " and the text by default). caption: a line of
+// text under it. quiet: the light margin around it, in modules (4, as the standard
+// asks). themed: false (default) keeps it dark on light whatever the page's theme,
+// which every scanner reads; true follows the theme (light on dark in dark mode).
+// mask: 0 to 7 to fix the mask instead of picking it (quicker for long text).
+// Text too long for version 10 shows a message instead.
+// qr_code_matrix(text, mask) gives { size, dark } (dark a list of 0 and 1, row by
+// row), or null when the text is too long, for drawing it some other way.
+
+let qr_code_css = css`
+.ui-qr-code { display: inline-grid; justify-items: center; gap: 6px; margin: 0; color: var(--ui-fg); font: 12px/1.3 var(--ui-mono); }
+.ui-qr-code svg { display: block; background: var(--ui-surface); border-radius: 4px; }
+.ui-qr-code figcaption { color: var(--ui-muted); letter-spacing: .04em; overflow-wrap: anywhere; text-align: center; }
+.ui-qr-code-error { display: grid; place-items: center; padding: 12px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius-sm);
+  color: var(--ui-danger); font: 13px/1.4 var(--ui-font); text-align: center; }
+`
+
+// For each version, 1 to 10, at level M: error correction codewords per block, and
+// the blocks as [how many, data codewords each].
+let qr_code_table = [
+    { ec: 10, groups: [[1, 16]] }, { ec: 16, groups: [[1, 28]] }, { ec: 26, groups: [[1, 44]] },
+    { ec: 18, groups: [[2, 32]] }, { ec: 24, groups: [[2, 43]] }, { ec: 16, groups: [[4, 27]] },
+    { ec: 18, groups: [[4, 31]] }, { ec: 22, groups: [[2, 38], [2, 39]] }, { ec: 22, groups: [[3, 36], [2, 37]] },
+    { ec: 26, groups: [[4, 43], [1, 44]] },
+]
+
+// The centres of the alignment patterns, by version.
+let qr_code_align = [[], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50]]
+
+// Format information for level M and masks 0 to 7, and version information for 7 to 10 (BCH coded).
+let qr_code_formats = ["101010000010010", "101000100100101", "101111001111100", "101101101001011",
+                       "100010111111001", "100000011001110", "100111110010111", "100101010100000"]
+let qr_code_versions = ["000111110010010100", "001000010110111100", "001001101010011001", "001010010011010011"]
+
+let qr_code_pow2 = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+
+// a XOR b, for numbers that are not negative (Quillo has no bit operators).
+fn qr_code_xor(a: int, b: int) -> int {
+    let x = a
+    let y = b
+    let r = 0
+    let bit = 1
+    while x > 0 || y > 0 {
+        if x % 2 != y % 2 { r = r + bit }
+        x = floor(x / 2)
+        y = floor(y / 2)
+        bit = bit * 2
+    }
+    r
+}
+
+// GF(256) with the polynomial 0x11d: powers of 2 (twice over, so a sum of two logs
+// needs no wrapping) and their logs.
+fn qr_code_gf() -> map {
+    let exp = []
+    let lg = for i in range(0, 256) => 0
+    let x = 1
+    let i = 0
+    while i < 255 {
+        exp = push(exp, x)
+        lg = set(lg, x, i)
+        x = x * 2
+        if x >= 256 { x = qr_code_xor(x, 285) }
+        i = i + 1
+    }
+    { exp: exp + exp, log: lg }
+}
+
+let qr_code_field = qr_code_gf()
+
+fn qr_code_mul(a: int, b: int) -> int =
+    a == 0 || b == 0 ? 0 : qr_code_field.exp[qr_code_field.log[a] + qr_code_field.log[b]]
+
+// The Reed-Solomon generator polynomial of degree n, highest power first.
+fn qr_code_generator(n: int) -> list {
+    let g = [1]
+    let i = 0
+    while i < n {
+        let a = qr_code_field.exp[i]
+        let next = []
+        let j = 0
+        while j <= len(g) {
+            next = push(next, qr_code_xor(j < len(g) ? g[j] : 0, j > 0 ? qr_code_mul(g[j - 1], a) : 0))
+            j = j + 1
+        }
+        g = next
+        i = i + 1
+    }
+    g
+}
+
+// The error correction codewords of a block: the remainder of dividing by the generator.
+fn qr_code_ec(data: list, gen: list) -> list {
+    let n = len(gen) - 1
+    let res = data + (for i in range(0, n) => 0)
+    let i = 0
+    while i < len(data) {
+        let c = res[i]
+        if c != 0 {
+            let j = 0
+            while j <= n {
+                res = set(res, i + j, qr_code_xor(res[i + j], qr_code_mul(gen[j], c)))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    slice(res, len(data), len(res))
+}
+
+let qr_code_hex = "0123456789ABCDEF"
+let qr_code_ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+// The text's UTF-8 bytes, read from its URL encoding (which writes each byte as %XX
+// except letters, digits and - _ . ~).
+fn qr_code_bytes(text: str) -> list {
+    let enc = url_encode(text)
+    let out = []
+    let i = 0
+    while i < len(enc) {
+        if enc[i] == "%" {
+            out = push(out, index_of(qr_code_hex, upper(enc[i + 1])) * 16 + index_of(qr_code_hex, upper(enc[i + 2])))
+            i = i + 3
+        } else {
+            out = push(out, (index_of(qr_code_ascii, enc[i]) ?? 31) + 32)
+            i = i + 1
+        }
+    }
+    out
+}
+
+// The bits of a number, most significant first.
+fn qr_code_bits(value: int, count: int) -> list = for i in range(0, count) => floor(value / qr_code_pow2[count - 1 - i]) % 2
+
+// The smallest version (1 to 10) the bytes fit in, or null.
+fn qr_code_version(n: int) -> int? =
+    find(range(1, 11), (v) => 4 + (v < 10 ? 8 : 16) + 8 * n <= 8 * sum(qr_code_table[v - 1].groups | map((g) => g[0] * g[1])))
+
+// The codewords to place: data (with mode, length, terminator and padding) and error
+// correction, interleaved block by block.
+fn qr_code_codewords(bytes: list, v: int) -> list {
+    let cfg = qr_code_table[v - 1]
+    let cap = sum(cfg.groups | map((g) => g[0] * g[1]))
+    let head = qr_code_bits(4, 4) + qr_code_bits(len(bytes), v < 10 ? 8 : 16) + flatten(bytes | map((b) => qr_code_bits(b, 8)))
+    let ended = head + (for i in range(0, min([4, cap * 8 - len(head)])) => 0)
+    let bits = ended + (for i in range(0, (8 - len(ended) % 8) % 8) => 0)
+    let words = for i in range(0, floor(len(bits) / 8)) => sum(for j in range(0, 8) => bits[i * 8 + j] * qr_code_pow2[7 - j])
+    let data = words + (for i in range(0, cap - len(words)) => i % 2 == 0 ? 236 : 17)
+    let sizes = flatten(cfg.groups | map((g) => for i in range(0, g[0]) => g[1]))
+    let blocks = for [i, s] in enumerate(sizes) => slice(data, sum(take(sizes, i)), sum(take(sizes, i)) + s)
+    let gen = qr_code_generator(cfg.ec)
+    let ecs = blocks | map((b) => qr_code_ec(b, gen))
+    flatten(for i in range(0, max(sizes)) => blocks | filter((b) => i < len(b)) | map((b) => b[i]))
+        + flatten(for i in range(0, cfg.ec) => ecs | map((b) => b[i]))
+}
+
+// The function patterns of a version: { n, dark, fixed }, as lists of 0 and 1 row by row.
+fn qr_code_base(v: int) -> map {
+    let n = 17 + 4 * v
+    let dark = for i in range(0, n * n) => 0
+    let fixed = for i in range(0, n * n) => 0
+    let i = 0
+    while i < n {
+        dark = set(set(dark, 6 * n + i, (i + 1) % 2), i * n + 6, (i + 1) % 2)
+        fixed = set(set(fixed, 6 * n + i, 1), i * n + 6, 1)
+        i = i + 1
+    }
+    for corner in [[0, 0], [0, n - 7], [n - 7, 0]] => {
+        let dr = -1
+        while dr <= 7 {
+            let dc = -1
+            while dc <= 7 {
+                let r = corner[0] + dr
+                let c = corner[1] + dc
+                if r >= 0 && r < n && c >= 0 && c < n {
+                    let d = max([abs(dr - 3), abs(dc - 3)])
+                    dark = set(dark, r * n + c, d != 2 && d != 4 ? 1 : 0)
+                    fixed = set(fixed, r * n + c, 1)
+                }
+                dc = dc + 1
+            }
+            dr = dr + 1
+        }
+    }
+    let centres = qr_code_align[v - 1]
+    let last = len(centres) - 1
+    for [a, cr] in enumerate(centres) => for [b, cc] in enumerate(centres) => {
+        if !((a == 0 && b == 0) || (a == 0 && b == last) || (a == last && b == 0)) {
+            let dr = -2
+            while dr <= 2 {
+                let dc = -2
+                while dc <= 2 {
+                    dark = set(dark, (cr + dr) * n + cc + dc, max([abs(dr), abs(dc)]) != 1 ? 1 : 0)
+                    fixed = set(fixed, (cr + dr) * n + cc + dc, 1)
+                    dc = dc + 1
+                }
+                dr = dr + 1
+            }
+        }
+    }
+    // The format information's places (written for each mask), and the dark module.
+    i = 0
+    while i < 9 {
+        fixed = set(set(fixed, 8 * n + i, 1), i * n + 8, 1)
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        fixed = set(set(fixed, 8 * n + n - 1 - i, 1), (n - 1 - i) * n + 8, 1)
+        i = i + 1
+    }
+    dark = set(dark, (n - 8) * n + 8, 1)
+    if v >= 7 {
+        let s = qr_code_versions[v - 7]
+        i = 0
+        while i < 18 {
+            let bit = int(s[17 - i])
+            let a = n - 11 + i % 3
+            let b = floor(i / 3)
+            dark = set(set(dark, b * n + a, bit), a * n + b, bit)
+            fixed = set(set(fixed, b * n + a, 1), a * n + b, 1)
+            i = i + 1
+        }
+    }
+    { n, dark, fixed }
+}
+
+// Whether a mask flips the module at row r, column c.
+fn qr_code_flips(mask: int, r: int, c: int) -> bool =
+    match mask {
+        0 => (r + c) % 2 == 0
+        1 => r % 2 == 0
+        2 => c % 3 == 0
+        3 => (r + c) % 3 == 0
+        4 => (floor(r / 2) + floor(c / 3)) % 2 == 0
+        5 => (r * c) % 2 + (r * c) % 3 == 0
+        6 => ((r * c) % 2 + (r * c) % 3) % 2 == 0
+        _ => ((r + c) % 2 + (r * c) % 3) % 2 == 0
+    }
+
+// The modules with a mask applied to the data and its format information written.
+fn qr_code_masked(base: map, data: list, mask: int) -> list {
+    let n = base.n
+    let dark = for [k, d] in enumerate(data) => base.fixed[k] == 0 && qr_code_flips(mask, floor(k / n), k % n) ? 1 - d : d
+    let s = qr_code_formats[mask]
+    let i = 0
+    while i < 15 {
+        let bit = int(s[14 - i])
+        let r1 = i <= 5 ? i : (i == 6 ? 7 : 8)
+        let c1 = i <= 7 ? 8 : (i == 8 ? 7 : 14 - i)
+        let r2 = i <= 7 ? 8 : n - 15 + i
+        let c2 = i <= 7 ? n - 1 - i : 8
+        dark = set(set(dark, r1 * n + c1, bit), r2 * n + c2, bit)
+        i = i + 1
+    }
+    dark
+}
+
+// How bad a masked code is to read, by the standard's four rules (lower is better).
+fn qr_code_penalty(dark: list, n: int) -> int {
+    let rows = for r in range(0, n) => join(slice(dark, r * n, r * n + n) | map((d) => str(d)), "")
+    let cols = for c in range(0, n) => join(for r in range(0, n) => str(dark[r * n + c]), "")
+    let lines = rows + cols
+    let runs = sum(lines | map((l) => sum(re.find_all(l, "0{5,}|1{5,}") | map((m) => len(m.text) - 2))))
+    let finders = sum(lines | map((l) => len(split(l, "10111010000")) + len(split(l, "00001011101")) - 2)) * 40
+    let boxes = 0
+    let r = 0
+    while r < n - 1 {
+        let c = 0
+        while c < n - 1 {
+            let k = r * n + c
+            let d = dark[k]
+            if dark[k + 1] == d && dark[k + n] == d && dark[k + n + 1] == d { boxes = boxes + 3 }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    let total = n * n
+    let k = ceil(abs(sum(dark) * 20 - total * 10) / total) - 1
+    runs + finders + boxes + k * 10
+}
+
+// The QR code of a text: { size, dark } (dark row by row, 1 for a dark module), or
+// null when it is too long. mask: 0 to 7, or -1 to pick the best.
+fn qr_code_matrix(text: str, mask: int = -1) {
+    let bytes = qr_code_bytes(text)
+    let v = qr_code_version(len(bytes))
+    if v == null { return null }
+    let base = qr_code_base(v)
+    let n = base.n
+    let words = qr_code_codewords(bytes, v)
+    let bits = flatten(words | map((w) => qr_code_bits(w, 8)))
+    let dark = base.dark
+    let i = 0
+    let right = n - 1
+    while right >= 1 {
+        if right == 6 { right = 5 }
+        let up = floor((right + 1) / 2) % 2 == 0
+        let vert = 0
+        while vert < n {
+            let j = 0
+            while j < 2 {
+                let k = (up ? n - 1 - vert : vert) * n + right - j
+                if base.fixed[k] == 0 {
+                    if i < len(bits) { dark = set(dark, k, bits[i]) }
+                    i = i + 1
+                }
+                j = j + 1
+            }
+            vert = vert + 1
+        }
+        right = right - 2
+    }
+    let best = mask >= 0 && mask <= 7 ? mask
+        : first(sort_by(range(0, 8), (m) => qr_code_penalty(qr_code_masked(base, dark, m), n)))
+    { size: n, dark: qr_code_masked(base, dark, best) }
+}
+
+// The dark modules as one SVG path, a rectangle per run along each row.
+fn qr_code_path(m: map, quiet: int) -> str {
+    let n = m.size
+    join(flatten(for r in range(0, n) => {
+        let row = join(slice(m.dark, r * n, r * n + n) | map((d) => str(d)), "")
+        re.find_all(row, "1+") | map((run) => `M${run.start + quiet} ${r + quiet}h${len(run.text)}v1h-${len(run.text)}z`)
+    }), "")
+}
+
+view QrCode(text: str, size: int = 160, label: str? = null, caption: str? = null, quiet: int = 4, themed: bool = false,
+            mask: int = -1, id: str? = null, class: str? = null) {
+    style global qr_code_css
+    let m = qr_code_matrix(text, mask)
+    <figure class={ui_cls(["ui-qr-code", !themed && "ui-light", class])} id={id}>
+        {m == null
+            ? <div.ui-qr-code-error role="img" aria-label={label ?? "QR code"} style={`width: ${size}px; min-height: ${size}px`}>
+                  Too long for a QR code: {len(qr_code_bytes(text))} bytes, 213 at most.
+              </div>
+            : <svg width={size} height={size} viewBox={`0 0 ${m.size + 2 * quiet} ${m.size + 2 * quiet}`} role="img"
+                   aria-label={label ?? `QR code: ${text}`} shape-rendering="crispEdges" data-version={(m.size - 17) / 4}>
+                  <path fill="currentColor" d={qr_code_path(m, quiet)}/>
+              </svg>}
+        {caption != null && <figcaption>{caption}</figcaption>}
+    </figure>
+}

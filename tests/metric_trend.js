@@ -1,0 +1,15 @@
+const m = (id) => $(`#metric-trend-demo-${id}`);
+const change = (id) => m(id).querySelector(".ui-metrictrend-change")?.textContent.replace(/\s+/g, "");
+if (m("revenue").getAttribute("aria-label") !== "Revenue: $48,210, up 12.5%") return `the revenue is said as "${m("revenue").getAttribute("aria-label")}"`;
+if (!m("revenue").classList.contains("ui-metrictrend-good") || change("revenue") !== "+12.5%" || m("revenue").dataset.way !== "up") return `a rise: ${change("revenue")}`;
+if (!m("latency").classList.contains("ui-metrictrend-bad") || change("latency") !== "+18ms") return 'good="down" does not make a rise bad';
+if (m("users").querySelector(".ui-metrictrend-value").textContent !== "1,284" || change("users") !== "-2%") return `worked out: ${m("users").textContent}`;
+if (!m("users").classList.contains("ui-metrictrend-bad") || m("users").getAttribute("aria-label") !== "Active users: 1,284, down 2%") return `a fall: ${m("users").getAttribute("aria-label")}`;
+if (!m("flat").classList.contains("ui-metrictrend-flat") || m("flat").getAttribute("aria-label") !== "Open tickets: 37, unchanged") return "no change";
+if (!m("pill").classList.contains("ui-metrictrend-pill") || !m("pill").classList.contains("ui-metrictrend-lg")) return "variant and size";
+if (getComputedStyle(m("pill").querySelector(".ui-metrictrend-change")).backgroundColor === "rgba(0, 0, 0, 0)") return "the pill has no background";
+if (!m("cost").classList.contains("ui-metrictrend-good") || change("cost") !== "-8.3%") return `a fall that is good: ${change("cost")}`;
+if (m("inline").querySelector(".ui-metrictrend-value") || change("inline") !== "-3%") return "without a value only the change shows";
+if (!m("revenue").querySelector("svg path")) return "no arrow";
+const storage = [...$$(".ui-metrictrend")].find((e) => e.getAttribute("aria-label")?.startsWith("Storage"));
+if (!storage.classList.contains("ui-metrictrend-flat")) return 'good="none" is coloured';

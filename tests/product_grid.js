@@ -1,0 +1,15 @@
+const grid = $("ul.ui-product-grid");
+if (!grid || grid.getAttribute("aria-label") !== "Products") return "no named grid";
+const cards = [...grid.querySelectorAll("article.ui-product")];
+if (cards.length !== 6) return `expected 6 cards, found ${cards.length}`;
+if (cards.map((c) => c.dataset.product).join() !== "1,2,3,4,5,6") return `ids: ${cards.map((c) => c.dataset.product)}`;
+if (cards[0].querySelector(".ui-product-name").textContent !== "Trail runner" || !cards[0].querySelector(".ui-price-off")) return "the records' fields do not reach the cards";
+if (!cards[0].classList.contains("ui-product-sm")) return "card_size=sm is not passed on";
+const tops = cards.map((c) => Math.round(c.getBoundingClientRect().top));
+if (new Set(tops).size < 2 || tops[0] !== tops[1]) return `the cards are not in a grid: ${tops}`;
+if (cards[3].querySelector(".ui-product-btn").disabled !== true) return "stock=out does not reach the card";
+cards[4].querySelector(".ui-product-btn").click(); await wait();
+const note = $(".demo-note").textContent;
+if (!note.includes('Added "Day pack, 22 l"')) return `on_add was not given the product: ${note}`;
+const empty = $(".ui-product-grid-empty");
+if (!empty || empty.textContent !== "No products" || empty.getAttribute("role") !== "status") return "an empty list does not say so";

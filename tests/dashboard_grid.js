@@ -1,0 +1,17 @@
+const grid = $("#dashboard-grid-demo.ui-dash");
+if (!grid) return "the grid with its id is missing";
+if (getComputedStyle(grid).gridTemplateColumns.split(" ").length !== 12) return `12 columns, found ${getComputedStyle(grid).gridTemplateColumns}`;
+const cells = grid.querySelectorAll(":scope > .ui-dash-cell");
+if (cells.length !== 6) return `6 cells, found ${cells.length}`;
+const [rev, orders, activity, visitors, conv, recent] = cells;
+const w = (c) => c.getBoundingClientRect().width, top = (c) => Math.round(c.getBoundingClientRect().top);
+const gw = w(grid);
+if (Math.abs(w(rev) / gw - 8 / 12) > 0.03) return `span=8 is ${Math.round(w(rev) / gw * 100)}% wide`;
+if (Math.abs(w(orders) / gw - 4 / 12) > 0.03) return `span=4 is ${Math.round(w(orders) / gw * 100)}% wide`;
+if (Math.abs(w(recent) / gw - 1) > 0.01) return "span=12 is not full width";
+if (top(rev) !== top(orders)) return "8 + 4 are not on one row";
+if (top(activity) !== top(visitors) || top(visitors) !== top(conv)) return "4 + 4 + 4 are not on one row";
+if (activity.getBoundingClientRect().bottom <= visitors.getBoundingClientRect().bottom + 20) return "rows={2} does not make the activity cell taller";
+if (top(recent) <= top(visitors)) return "the last cell is not on its own row";
+if (Math.abs(w(rev) - w(orders) - (w(rev) - w(orders))) !== 0 || !cells[0].querySelector(".ui-widget")) return "widgets are not inside the cells";
+if (Math.round(rev.getBoundingClientRect().height) !== Math.round(orders.getBoundingClientRect().height)) return "cells in a row do not stretch to the tallest";

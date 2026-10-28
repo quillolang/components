@@ -1,0 +1,63 @@
+if (document.documentElement.scrollWidth > innerWidth) return "widens the page";
+const fig = $("figure.ui-iline");
+if (!fig) return "no interactive line chart";
+if (/NaN|Infinity|undefined/.test(fig.innerHTML)) return "the chart has NaN, Infinity or undefined in it";
+const note = () => $(".demo-note").textContent;
+const plot = fig.querySelector(".ui-iline-plot");
+if (plot.tabIndex !== 0 || !plot.getAttribute("aria-label").includes("Aug 1 to Sep 29")) return "the plot is not focusable with a name saying its range";
+const items = [...fig.querySelectorAll(".ui-iline-item")];
+if (items.length !== 3 || items.some((b) => b.getAttribute("aria-pressed") !== "true")) return "the legend is not three pressed buttons";
+if (fig.querySelectorAll(".ui-iline-line").length !== 3) return "not a line per series";
+if (fig.querySelector(".ui-iline-reset")) return "Reset zoom shows before zooming";
+// The crosshair follows the pointer.
+plot.scrollIntoView({ block: "center" });
+const r = plot.getBoundingClientRect();
+const pe = (t, frac, extra = {}) => plot.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, pointerId: 1, button: 0, isPrimary: true,
+    clientX: r.left + r.width * frac, clientY: r.top + r.height / 2, ...extra }));
+plot.setPointerCapture = () => {};
+pe("pointermove", 10 / 59); await wait();
+const tip = fig.querySelector(".ui-iline-tip");
+if (!tip || !fig.querySelector(".ui-iline-cross")) return "moving the pointer shows no crosshair";
+const rows = [...fig.querySelectorAll("tbody tr")];
+if (tip.querySelector("strong").textContent !== "Aug 11") return `the crosshair is at ${tip.querySelector("strong").textContent}, not Aug 11`;
+const vals = [...rows[10].querySelectorAll("td")].map((td) => td.textContent);
+if ([...tip.querySelectorAll("b")].map((b) => b.textContent).join() !== vals.join()) return `the tooltip's values: ${tip.textContent}`;
+if (fig.querySelectorAll(".ui-iline-dot").length !== 3) return "no dot per series on the crosshair";
+if (!fig.querySelector("p.ui-sr[aria-live]").textContent.startsWith("Aug 11: Web ")) return "screen readers are not told the values";
+pe("pointerleave", 0); await wait();
+if (fig.querySelector(".ui-iline-tip")) return "the crosshair stays after the pointer leaves";
+// The keyboard moves it.
+plot.focus(); key(plot, "Home"); await wait();
+if (fig.querySelector(".ui-iline-tip strong")?.textContent !== "Aug 1") return "Home does not go to the first label";
+key(plot, "ArrowRight"); key(plot, "ArrowRight"); await wait();
+if (fig.querySelector(".ui-iline-tip strong")?.textContent !== "Aug 3") return "ArrowRight does not move the crosshair";
+key(plot, "End"); await wait();
+const endTip = fig.querySelector(".ui-iline-tip");
+if (endTip.querySelector("strong").textContent !== "Sep 29" || !endTip.classList.contains("ui-iline-flip")) return "End, and the tooltip opening to the left";
+key(plot, "Escape"); await wait();
+if (fig.querySelector(".ui-iline-tip")) return "Escape does not hide the crosshair";
+// A legend item hides its series.
+items[0].click(); await wait();
+if (items[0].getAttribute("aria-pressed") !== "false" || fig.querySelectorAll(".ui-iline-line").length !== 2) return "the legend does not hide Web";
+if (fig.querySelector(".ui-iline-y span:last-child").textContent === "3k") return "the axis does not fit the series shown";
+items[0].click(); await wait();
+if (fig.querySelectorAll(".ui-iline-line").length !== 3) return "the legend does not show Web again";
+// Dragging zooms.
+pe("pointerdown", 10 / 59); pe("pointermove", 20 / 59); await wait(50);
+if (!fig.querySelector(".ui-iline-pick")) return "dragging shows no selection";
+pe("pointerup", 20 / 59); await wait();
+const xs = [...fig.querySelectorAll(".ui-iline-x span")].map((s) => s.textContent);
+if (xs[0] !== "Aug 11" || xs[xs.length - 1] !== "Aug 21") return `the zoomed range shows ${xs}`;
+const d = fig.querySelector(".ui-iline-line").getAttribute("d");
+if ((d.match(/L/g) || []).length !== 10) return "the zoomed line does not have 11 points";
+if (!note().includes("Aug 11 to Aug 21")) return `on_zoom did not reach the note: ${note()}`;
+const reset = fig.querySelector(".ui-iline-reset");
+if (!reset) return "no Reset zoom after zooming";
+key(plot, "-"); await wait();
+if (!note().includes("Aug 5 to Aug 27")) return `- did not zoom out: ${note()}`;
+reset.click(); await wait();
+if (!note().includes("Aug 1 to Sep 29") || fig.querySelector(".ui-iline-reset")) return "Reset zoom does not go back";
+key(plot, "+"); await wait();
+if (note().includes("Aug 1 to Sep 29")) return "+ does not zoom in";
+fig.querySelector(".ui-iline-reset").click(); await wait();
+if (rows.length !== 60 || fig.querySelectorAll("thead th").length !== 4) return "the screen reader table";

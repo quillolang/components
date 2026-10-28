@@ -1,0 +1,156 @@
+// BumpChart: how a set of items rank over time, a line per item moving between
+// places, with each place numbered on its point and the item named at both ends.
+// CSS only: hovering an item's line or name picks it out; screen readers get the
+// rankings as a table.
+//
+//   <BumpChart label="League table" labels={["Wk 1", "Wk 2", "Wk 3"]} series={[
+//       { name: "Lions", values: [1, 1, 2] }, { name: "Hawks", values: [2, 3, 1] }, { name: "Bears", values: [3, 2, 3] }]}/>
+//   <BumpChart label="Browser share" labels={years} series={browsers} ranked={false} suffix="%"/>
+//
+// labels: the moments, in order, written above. series: a list of { name, values },
+// one value per label (up to eight colours, then they repeat); a null leaves the
+// item out at that moment, and its line breaks. ranked: the values are places
+// already, 1 the top (true); false ranks them at each moment, the highest first,
+// and shows the values on hover. row: the room each place takes, in pixels (34).
+// prefix, suffix and decimals: for the values when ranked is false. label: what the
+// chart shows; it names it for screen readers and captions their table. show_label
+// also writes it above.
+
+let bump_chart_css = css`
+.ui-bump {
+  --ui-bump-1: light-dark(#2a78d6, #3987e5); --ui-bump-2: light-dark(#eb6834, #d95926);
+  --ui-bump-3: light-dark(#1baf7a, #199e70); --ui-bump-4: light-dark(#eda100, #c98500);
+  --ui-bump-5: light-dark(#e87ba4, #d55181); --ui-bump-6: light-dark(#008300, #008300);
+  --ui-bump-7: light-dark(#6250d6, #9085e9); --ui-bump-8: light-dark(#e34948, #e66767);
+  display: grid; gap: 10px; min-width: 0; margin: 0; font: 12px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-bump-title { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-bump-s1 { --c: var(--ui-bump-1); } .ui-bump-s2 { --c: var(--ui-bump-2); } .ui-bump-s3 { --c: var(--ui-bump-3); }
+.ui-bump-s4 { --c: var(--ui-bump-4); } .ui-bump-s5 { --c: var(--ui-bump-5); } .ui-bump-s6 { --c: var(--ui-bump-6); }
+.ui-bump-s7 { --c: var(--ui-bump-7); } .ui-bump-s8 { --c: var(--ui-bump-8); }
+.ui-bump-wrap { padding: 0 clamp(70px, 18%, 130px); }
+.ui-bump-heads { position: relative; height: 16px; margin-bottom: 4px; color: var(--ui-muted); font-weight: 600; }
+.ui-bump-heads span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
+.ui-bump-plot { position: relative; }
+.ui-bump-row { position: absolute; left: -12px; right: -12px; height: 1px; background: color-mix(in srgb, var(--ui-border) 50%, transparent); }
+.ui-bump-item { position: absolute; inset: 0; pointer-events: none; transition: opacity .15s ease; }
+.ui-bump-plot:has(.ui-bump-item:hover) .ui-bump-item:not(:hover) { opacity: .15; }
+.ui-bump-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.ui-bump-line { fill: none; stroke: var(--c); stroke-width: 3; stroke-linecap: round; }
+.ui-bump-hit { fill: none; stroke: transparent; stroke-width: 16; pointer-events: stroke; }
+.ui-bump-pt { position: absolute; display: grid; place-items: center; width: 20px; height: 20px; margin: -10px 0 0 -10px;
+  border-radius: 50%; background: var(--c); box-shadow: 0 0 0 2px var(--ui-bg); color: #fff; font-size: 10px; font-weight: 700;
+  font-variant-numeric: tabular-nums; pointer-events: auto; }
+.ui-bump-pt i { position: absolute; bottom: calc(100% + 6px); left: 50%; display: none; padding: 3px 7px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); box-shadow: var(--ui-shadow); color: var(--ui-fg);
+  font-style: normal; font-weight: 600; transform: translateX(-50%); white-space: nowrap; }
+.ui-bump-pt:hover i { display: block; }
+.ui-bump-name { position: absolute; max-width: clamp(60px, 16vw, 120px); overflow: hidden; color: var(--ui-fg); font-weight: 500;
+  text-overflow: ellipsis; transform: translateY(-50%); white-space: nowrap; pointer-events: auto; }
+.ui-bump-name.ui-bump-l { right: calc(100% + 16px); text-align: right; }
+.ui-bump-name.ui-bump-r { left: calc(100% + 16px); }
+.ui-bump-name::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 2px; background: var(--c); }
+.ui-bump-l::before { display: none; }
+@media (prefers-reduced-motion: reduce) { .ui-bump-item { transition: none; } }
+`
+
+// n (a whole number, 0 or more) with at least `width` digits.
+fn bump_chart_pad(n: int, width: int) -> str {
+    let s = str(n)
+    len(s) < width ? repeat("0", width - len(s)) + s : s
+}
+
+// A whole number with commas: 1234567 is "1,234,567".
+fn bump_chart_group(n: int) -> str =
+    n < 1000 ? str(n) : bump_chart_group(floor(n / 1000)) + "," + bump_chart_pad(n % 1000, 3)
+
+// A value as it reads, with commas: `places` digits after the point, or up to two as
+// needed when that is null: 48210 is "48,210", 6350.5 is "6,350.5" ("6,350.50" with 2).
+// Worked out in whole numbers, so the server and the browser write the same text.
+fn bump_chart_num(v: num, places: int? = null) -> str {
+    let digits = places == null ? 2 : (places < 0 ? 0 : (places > 4 ? 4 : places))
+    let scale = [1, 10, 100, 1000, 10000][digits]
+    let units = round(abs(v) * scale)
+    let frac = units % scale
+    let tail = digits == 0 || (places == null && frac == 0) ? ""
+        : (places == null && frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${bump_chart_pad(frac, digits)}`)
+    `${v < 0 && units > 0 ? "-" : ""}${bump_chart_group(floor(units / scale))}${tail}`
+}
+
+// A coordinate or a percentage for CSS and SVG, to two decimals.
+fn bump_chart_pct(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// Places at one moment: the place (1 the top) of each value, the highest first; null stays null.
+fn bump_chart_rank(vals: list) -> list {
+    let order = reverse(sort_by(range(len(vals)) | filter((i) => vals[i] != null), (i) => vals[i]))
+    for i in range(len(vals)) => vals[i] == null ? null : (index_of(order, i) ?? 0) + 1
+}
+
+view BumpChart(labels: list, series: list, ranked: bool = true, row: int = 34, prefix: str = "", suffix: str = "",
+               decimals: int? = null, label: str = "Bump chart", show_label: bool = false, class: str? = null) {
+    style global bump_chart_css
+    let m = len(labels)
+    let k = len(series)
+    let fmt = (v) => v == null ? "—" : `${v < 0 ? "-" : ""}${prefix}${bump_chart_num(abs(v), decimals)}${suffix}`
+    // ranks[j][i]: series j's place at moment i.
+    let by_moment = for i in range(m) => bump_chart_rank(for s in series => s.values[i])
+    let ranks = for j in range(k) => for i in range(m) => ranked ? series[j].values[i] : by_moment[i][j]
+    let places0 = max([1] + (flatten(ranks) | filter((r) => r != null)))
+    let places = places0 > k ? places0 : k
+    let x = (i) => m == 1 ? 50 : i * 100 / (m - 1)
+    let y = (r) => (r - 0.5) * 100 / places
+    let runs = (rs) => {
+        let starts = range(m) | filter((i) => rs[i] != null && (i == 0 || rs[i - 1] == null))
+        for st in starts => range(st, (find(range(st, m), (q) => q == m - 1 || rs[q + 1] == null) ?? st) + 1)
+    }
+    // A run as a curve: level at each point, turning half way between.
+    let curve = (rs, r) => {
+        let p = (i) => `${bump_chart_pct(x(i))},${bump_chart_pct(y(rs[i]))}`
+        `M${p(r[0])}` + join(for q in range(1, len(r)) => {
+            let mid = bump_chart_pct((x(r[q - 1]) + x(r[q])) / 2)
+            ` C${mid},${bump_chart_pct(y(rs[r[q - 1]]))} ${mid},${bump_chart_pct(y(rs[r[q]]))} ${p(r[q])}`
+        }, "")
+    }
+    let starts_at = (rs) => find(range(m), (i) => rs[i] != null)
+    let ends_at = (rs) => find(reverse(range(m)), (i) => rs[i] != null)
+    <figure class={ui_cls(["ui-bump", class])} aria-label={label}>
+        {show_label && <figcaption.ui-bump-title>{label}</figcaption>}
+        <div.ui-bump-wrap aria-hidden="true">
+            <div.ui-bump-heads>{for i in range(m) => <span style={`left: ${bump_chart_pct(x(i))}%`}>{labels[i]}</span>}</div>
+            <div.ui-bump-plot style={`height: ${places * row}px`}>
+                {for r in range(1, places + 1) => <span.ui-bump-row style={`top: ${bump_chart_pct(y(r))}%`}></span>}
+                {for [j, s] in enumerate(series) => {
+                    let rs = ranks[j]
+                    let f = starts_at(rs)
+                    let l = ends_at(rs)
+                    <div class={`ui-bump-item ui-bump-s${j % 8 + 1}`} data-name={str(s.name)}>
+                        <svg.ui-bump-svg viewBox="0 0 100 100" preserveAspectRatio="none">
+                            {for r in runs(rs) => len(r) > 1 && [
+                                <path.ui-bump-line d={curve(rs, r)} vector-effect="non-scaling-stroke"/>,
+                                <path.ui-bump-hit d={curve(rs, r)} vector-effect="non-scaling-stroke"/>
+                            ]}
+                        </svg>
+                        {for i in range(m) => rs[i] != null && <span.ui-bump-pt
+                            style={`left: ${bump_chart_pct(x(i))}%; top: ${bump_chart_pct(y(rs[i]))}%`}>
+                            {rs[i]}<i>{s.name} · {labels[i]}{ranked ? "" : `: ${fmt(s.values[i])}`}</i>
+                        </span>}
+                        {f == 0 && <span class="ui-bump-name ui-bump-l" style={`top: ${bump_chart_pct(y(rs[f]))}%`} title={str(s.name)}>{s.name}</span>}
+                        {l != null && <span class="ui-bump-name ui-bump-r" style={`top: ${bump_chart_pct(y(rs[l]))}%`} title={str(s.name)}>{s.name}</span>}
+                    </div>
+                }}
+            </div>
+        </div>
+        <table.ui-sr>
+            <caption>{label}{ranked ? ", places" : ""}</caption>
+            <thead><tr><th scope="col"></th>{for l in labels => <th scope="col">{l}</th>}</tr></thead>
+            <tbody>
+                {for [j, s] in enumerate(series) => <tr>
+                    <th scope="row">{s.name}</th>
+                    {for i in range(m) => <td>{ranks[j][i] == null ? "—" : (ranked ? str(ranks[j][i]) : `${ranks[j][i]} (${fmt(s.values[i])})`)}</td>}
+                </tr>}
+            </tbody>
+        </table>
+    </figure>
+}

@@ -1,0 +1,138 @@
+// ImageCrop: a picture with a crop box over it, to drag and resize by its
+// corners, with what is outside it dimmed. The crop is kept in the picture's
+// own pixels in four hidden inputs, `name`_x, `name`_y, `name`_w and `name`_h,
+// so a plain <form> sends it and the server can cut it with image.convert. With
+// the keyboard: Tab to the box, the arrow keys move it, Shift with the arrows
+// resizes it.
+//
+//   <form method="post" action="/avatar">
+//       <ImageCrop name="crop" src="/uploads/me.jpg" ratio={1} alt="Your photo"/>
+//   </form>
+//   route POST /avatar { form: { crop_x: int, crop_y: int, crop_w: int, crop_h: int } } =
+//       image.convert("uploads/me.jpg", "uploads/me-sq.jpg", { crop: { x: crop_x, y: crop_y, w: crop_w, h: crop_h }, width: 400 })
+//
+// src, alt: the picture. name: the start of the hidden inputs' names ("crop").
+// ratio: the box's shape as width / height (16 / 9, 1...); null lets it be any.
+// crop: where the box starts, { x, y, w, h } in the picture's pixels; a centred
+// box over most of it by default. min: the box's least side, in the picture's
+// pixels (32). label: what screen readers call the box ("Crop area").
+// on_change(crop): inside one of your components, called with { x, y, w, h } in
+// pixels after each drag or key. The picture's size is read when it loads.
+
+let image_crop_css = css`
+.ui-image-crop { display: grid; gap: 8px; font: 13px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-image-crop-frame { position: relative; overflow: hidden; width: 100%; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); touch-action: none; user-select: none; }
+.ui-image-crop-frame img { display: block; width: 100%; height: auto; pointer-events: none; -webkit-user-drag: none; }
+.ui-image-crop-box {
+  position: absolute; left: var(--x); top: var(--y); width: var(--w); height: var(--h); border: 1.5px solid #fff; cursor: move; outline: none;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, .5);
+}
+.ui-image-crop-box:focus-visible { border-color: var(--ui-accent); box-shadow: 0 0 0 9999px rgba(0, 0, 0, .5), var(--ui-focus); }
+.ui-image-crop-box::before, .ui-image-crop-box::after { content: ""; position: absolute; pointer-events: none; border: 0 solid rgba(255, 255, 255, .45); }
+.ui-image-crop-box::before { inset: 0 33.33%; border-width: 0 1px; }
+.ui-image-crop-box::after { inset: 33.33% 0; border-width: 1px 0; }
+.ui-image-crop-handle { position: absolute; z-index: 1; width: 16px; height: 16px; border: 2px solid var(--ui-accent); border-radius: 3px; background: #fff; }
+.ui-image-crop-nw { left: -8px; top: -8px; cursor: nwse-resize; }
+.ui-image-crop-ne { right: -8px; top: -8px; cursor: nesw-resize; }
+.ui-image-crop-sw { left: -8px; bottom: -8px; cursor: nesw-resize; }
+.ui-image-crop-se { right: -8px; bottom: -8px; cursor: nwse-resize; }
+.ui-image-crop-size { color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+`
+
+fn image_crop_clamp(v: num, lo: num, hi: num) -> num = v < lo ? lo : v > hi ? hi : v
+
+// A box moved or resized: s is the box when the drag began ({ x, y, w, h }, fractions of the
+// picture), mode "move" or a corner ("nw", "ne", "sw", "se"), dx and dy the pointer's move in
+// fractions; mw and mh the least width and height; k the height a width of 1 takes (null: any).
+fn image_crop_drag(s, mode: str, dx: num, dy: num, mw: num, mh: num, k: num?) {
+    if mode == "move" {
+        return { x: image_crop_clamp(s.x + dx, 0, 1 - s.w), y: image_crop_clamp(s.y + dy, 0, 1 - s.h), w: s.w, h: s.h }
+    }
+    let west = contains(mode, "w")
+    let north = contains(mode, "n")
+    let x1 = west ? image_crop_clamp(s.x + dx, 0, s.x + s.w - mw) : s.x
+    let x2 = west ? s.x + s.w : image_crop_clamp(s.x + s.w + dx, s.x + mw, 1)
+    let y1 = north ? image_crop_clamp(s.y + dy, 0, s.y + s.h - mh) : s.y
+    let y2 = north ? s.y + s.h : image_crop_clamp(s.y + s.h + dy, s.y + mh, 1)
+    if k == null { return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 } }
+    // Held to its shape: the width leads, the height follows, both shrunk to fit the room.
+    let room_h = north ? s.y + s.h : 1 - s.y
+    let room_w = west ? s.x + s.w : 1 - s.x
+    let w = min([x2 - x1, room_h / k, room_w])
+    let h = w * k
+    { x: west ? s.x + s.w - w : s.x, y: north ? s.y + s.h - h : s.y, w, h }
+}
+
+component ImageCrop(src: str, alt: str = "", name: str = "crop", ratio: num? = null, crop: map? = null, min: int = 32,
+                    label: str = "Crop area", on_change = null, class: str? = null) {
+    style global image_crop_css
+    state nat_w = 0
+    state nat_h = 0
+    state box = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }
+    state frame = null
+    state drag = null
+    let k = ratio != null && nat_w > 0 ? nat_w / nat_h / ratio : null
+    let mw = nat_w > 0 ? min / nat_w : 0.05
+    let mh = nat_h > 0 ? min / nat_h : 0.05
+    let px = nat_w > 0
+        ? { x: round(box.x * nat_w), y: round(box.y * nat_h), w: round(box.w * nat_w), h: round(box.h * nat_h) }
+        : null
+    let tell = () => { if px != null && on_change != null { on_change(px) } }
+    // The picture's size, once known: the box starts where `crop` says, or centred, held to its ratio.
+    let start = (w: num, h: num) => {
+        if w > 0 && nat_w == 0 {
+            nat_w = w
+            nat_h = h
+            let kk = ratio != null ? w / h / ratio : null
+            box = crop != null
+                ? { x: crop.x / w, y: crop.y / h, w: crop.w / w, h: crop.h / h }
+                : kk == null ? { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }
+                : (0.8 * kk <= 0.8 ? { x: 0.1, y: (1 - 0.8 * kk) / 2, w: 0.8, h: 0.8 * kk }
+                                   : { x: (1 - 0.8 / kk) / 2, y: 0.1, w: 0.8 / kk, h: 0.8 })
+        }
+    }
+    let begin = (e, mode: str) => {
+        if e.button == 0 {
+            e.preventDefault()
+            e.stopPropagation()
+            e.target.setPointerCapture(e.pointerId)
+            drag = { mode, sx: e.clientX, sy: e.clientY, s: box }
+        }
+    }
+    <div class={ui_cls(["ui-image-crop", class])}>
+        <div.ui-image-crop-frame @mount={(el) => { frame = el }}
+             @pointermove={(e) => {
+                 if drag != null {
+                     let r = frame.getBoundingClientRect()
+                     box = image_crop_drag(drag.s, drag.mode, (e.clientX - drag.sx) / r.width, (e.clientY - drag.sy) / r.height, mw, mh, k)
+                 }
+             }}
+             @pointerup={() => { if drag != null { drag = null; tell() } }}
+             @pointercancel={() => { drag = null }}>
+            <img src={src} alt={alt} draggable="false"
+                 @mount={(el) => { if el.complete { start(el.naturalWidth, el.naturalHeight) } }}
+                 @load={(e) => { start(e.target.naturalWidth, e.target.naturalHeight) }}/>
+            <div.ui-image-crop-box role="group" tabindex="0" aria-label={label}
+                 aria-description={px != null ? `${px.w} by ${px.h} pixels, at ${px.x}, ${px.y}. Arrow keys move it; Shift and the arrows resize it.` : null}
+                 style={`--x: ${round(box.x * 100, 3)}%; --y: ${round(box.y * 100, 3)}%; --w: ${round(box.w * 100, 3)}%; --h: ${round(box.h * 100, 3)}%`}
+                 @pointerdown={(e) => { begin(e, "move") }}
+                 @keydown={(e) => {
+                     let dx = match e.key { "ArrowLeft" => -0.02, "ArrowRight" => 0.02, _ => 0 }
+                     let dy = match e.key { "ArrowUp" => -0.02, "ArrowDown" => 0.02, _ => 0 }
+                     if dx != 0 || dy != 0 {
+                         e.preventDefault()
+                         box = image_crop_drag(box, e.shiftKey ? "se" : "move", dx, dy, mw, mh, k)
+                         tell()
+                     }
+                 }}>
+                {for c in ["nw", "ne", "sw", "se"] => <span key={c} class={`ui-image-crop-handle ui-image-crop-${c}`} data-corner={c} aria-hidden="true"
+                        @pointerdown={(e) => { begin(e, c) }}></span>}
+            </div>
+        </div>
+        <span.ui-image-crop-size aria-hidden="true">{px != null ? `${px.w} × ${px.h} px at ${px.x}, ${px.y}` : "Loading…"}</span>
+        <input type="hidden" name={`${name}_x`} value={px != null ? px.x : ""}/>
+        <input type="hidden" name={`${name}_y`} value={px != null ? px.y : ""}/>
+        <input type="hidden" name={`${name}_w`} value={px != null ? px.w : ""}/>
+        <input type="hidden" name={`${name}_h`} value={px != null ? px.h : ""}/>
+    </div>
+}

@@ -1,0 +1,14 @@
+const m = $("#masonry-demo-notes");
+if (!m) return "the masonry is missing";
+const cards = [...m.querySelectorAll(":scope > .ui-card")];
+if (cards.length !== 9) return `expected 9 cards, found ${cards.length}`;
+if (getComputedStyle(m).columnCount !== "3") return `columns={3} gives column-count ${getComputedStyle(m).columnCount}`;
+const lefts = [...new Set(cards.map((c) => Math.round(c.getBoundingClientRect().left)))].sort((a, b) => a - b);
+if (lefts.length !== 3) return `the cards sit at ${lefts.length} left edges, not 3 columns`;
+const mr = m.getBoundingClientRect();
+if (Math.abs(cards[0].getBoundingClientRect().width - (mr.width - 32) / 3) > 1) return `a card is ${cards[0].getBoundingClientRect().width}px wide in a ${mr.width}px box with two 16px gaps`;
+const first = cards.filter((c) => Math.round(c.getBoundingClientRect().left) === lefts[0]);
+if (first.length < 2 || first[1].getBoundingClientRect().top <= first[0].getBoundingClientRect().bottom) return "the first column is not filled from the top";
+if (Math.round(first[1].getBoundingClientRect().top - first[0].getBoundingClientRect().bottom) !== 16) return "the gap between cards in a column is not 16px";
+const heights = new Set(cards.map((c) => Math.round(c.getBoundingClientRect().height)));
+if (heights.size < 3) return "the demo's cards are all the same height";
