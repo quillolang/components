@@ -1,0 +1,25 @@
+const maps = $$(".ui-map-view");
+if (maps.length !== 2) return `${maps.length} maps`;
+if (maps[0].getAttribute("role") !== "region" || maps[0].getAttribute("aria-label") !== "Places to stay") return "the map is not a named region";
+for (let i = 0; i < 20 && !maps[0].querySelector(".ui-map-view-label"); i++) await wait(150);
+const labels = () => [...maps[0].querySelectorAll(".ui-map-view-label")];
+if (labels().map((l) => l.textContent).join() !== "€95,€140,€70,<b>€45</b>") return `labels: ${labels().map((l) => l.textContent)}`;
+if (labels()[3].querySelector("b")) return "a label's text was taken as HTML";
+if (labels()[0].getAttribute("title") !== "Alfama flat with river view") return "a marker's title is not said";
+if (!maps[0].querySelector(".leaflet-tile-pane")) return "no tiles";
+const note = () => maps[0].closest(".demo-stack").querySelector(".demo-note").textContent;
+labels()[1].dispatchEvent(new MouseEvent("click", { bubbles: true })); await wait();
+if (note() !== "Picked Tiled house in Graça.") return `a click on a marker: ${note()}`;
+if (!labels()[1].classList.contains("ui-map-view-picked")) return "the picked marker is not shown picked";
+$(".map-view-demo-cheap").click(); await wait();
+if (labels().length !== 3 || labels().some((l) => l.textContent === "€140")) return `new markers are not drawn: ${labels().map((l) => l.textContent)}`;
+labels()[0].focus(); key(labels()[0], "Enter"); await wait();
+// The pin, moved by a click on the map.
+const pinMap = maps[1];
+if (!pinMap.querySelector(".ui-map-view-pin") || !pinMap.querySelector(".ui-map-view-dot-warning")) return "no pin, or no warning dot";
+const pinNote = () => pinMap.closest(".demo-stack").querySelectorAll(".demo-note")[1].textContent;
+const before = pinNote();
+const box = pinMap.querySelector(".leaflet-container").getBoundingClientRect();
+pinMap.querySelector(".leaflet-container").dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: box.left + 40, clientY: box.top + 40 }));
+await wait();
+if (pinNote() === before) return "a click on the map did not move the pin";
