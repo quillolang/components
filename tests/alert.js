@@ -17,3 +17,4 @@ const own = byText("Placed straight in a page");
 if (own.getAttribute("role") !== "status") return "DismissibleAlert has no role";
 own.querySelector(".ui-alert-x").click(); await wait();
 if (byText("Placed straight in a page")) return "DismissibleAlert did not hide itself";
+if (!$("#alert-demo-sent")?.classList.contains("ui-alert-success")) return "id does not reach the alert";

@@ -27,3 +27,9 @@ if (note !== "Showing people aged 39 to 70.") return `on_change: ${note}`;
 const km = $("input[name=rs-demo-km_max]");
 if (km.getAttribute("aria-valuetext") !== "10.5 km") return `format: ${km.getAttribute("aria-valuetext")}`;
 if (!$("input[name=rs-demo-off_min]").closest("fieldset").disabled) return "disabled is not passed";
+// on_commit: once a thumb is let go, not at each step.
+const live = alo.closest(".demo-stack").querySelectorAll(".demo-note")[1];
+ahi.value = "75"; ahi.dispatchEvent(new Event("input", { bubbles: true })); await wait();
+if (!live.textContent.startsWith("Searched for 39 to 70")) return `on_commit ran during a drag: ${live.textContent}`;
+ahi.dispatchEvent(new Event("change", { bubbles: true })); await wait();
+if (live.textContent !== "Searched for 39 to 75, once let go.") return `on_commit: ${live.textContent}`;

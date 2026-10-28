@@ -1,0 +1,16 @@
+const sail = $$(".ui-time-slots")[0];
+const slot = (id) => sail.querySelector(`[data-slot="${id}"] input`);
+if (sail.getAttribute("role") !== "radiogroup" || sail.querySelector("legend").textContent !== "Sunset sail") return "not a named radio group";
+const metas = [...sail.querySelectorAll(".ui-time-slots-meta")].map((m) => m.textContent);
+if (metas.join("|") !== "7 left · 10% rain|Full|2 left · 80% rain: may be wet|9 left") return `places left: ${metas.join("|")}`;
+if (!slot(32).disabled || slot(31).disabled) return "a full time can be chosen, or an open one cannot";
+if (!sail.querySelector('[data-slot="33"]').classList.contains("ui-time-slots-warning")) return "the warning tone is not shown";
+const note = () => sail.closest(".demo-stack").querySelector(".demo-note").textContent;
+slot(33).click(); await wait();
+if (!slot(33).checked || note() !== "Time 33 chosen.") return `choosing: ${note()}`;
+slot(32).click(); await wait();
+if (slot(32).checked || note() !== "Time 33 chosen.") return "a full time was chosen";
+const form = $$(".ui-time-slots")[1];
+if (!form.querySelector('input[value="b"]').checked || !form.querySelector('input[value="c"]').disabled) return "value or disabled is not passed";
+if (new FormData(form.closest("form")).get("ts-demo-class") !== "b") return "a form does not send the time chosen";
+if ($$(".ui-time-slots")[2].querySelector(".ui-time-slots-empty")?.textContent !== "No times on these days.") return "no slots does not say so";

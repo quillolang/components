@@ -1,8 +1,8 @@
 # Quillo UI
 
-101 UI components for [Quillo](https://quillolang.org), each one `.qwe` file you
+107 UI components for [Quillo](https://quillolang.org), each one `.qwe` file you
 copy into your program: buttons, forms, sign-in, date pickers, dialogs, tabs, editable
-and virtual tables, a JSON table, charts, toasts and more. They
+and virtual tables, a JSON table, charts, a map, a payment card, toasts and more. They
 come with their styles, follow the system's light or dark theme, and work with the
 keyboard and screen readers. Most are views that need no JavaScript at all; the rest
 are components that run in the browser.
@@ -83,13 +83,13 @@ page's font, background and colour too.
 
 | Group | Components |
 |---|---|
-| Layout | Container, Stack, Grid, Card, Divider, Navbar, AppShell, Splitter, Carousel, Toolbar |
+| Layout | Container, Stack, Grid, Card, Divider, Navbar, AppShell, Splitter, Carousel, Toolbar, ActionBar |
 | Actions | Button, IconButton, ButtonGroup, CopyButton, DropdownMenu, SplitButton, ToggleButton |
-| Forms | TextField, TextArea, Select, Checkbox, RadioGroup, Switch, Slider, NumberInput, SearchInput, PasswordInput, FileDrop, TagInput, Combobox, AuthForm, DatePicker, DateRangePicker, TimeInput, ColorPicker, RangeSlider, Rating, OtpInput, MultiSelect, InlineEdit, ChipGroup, FileUpload, FilterBar, TransferList, KeyValueEditor |
+| Forms | TextField, TextArea, Select, Checkbox, RadioGroup, Switch, Slider, NumberInput, SearchInput, PasswordInput, FileDrop, TagInput, Combobox, AuthForm, DatePicker, DateRangePicker, TimeInput, ColorPicker, RangeSlider, Rating, OtpInput, MultiSelect, InlineEdit, ChipGroup, FileUpload, FilterBar, TransferList, KeyValueEditor, TimeSlots, GuestPicker, CardInput |
 | Feedback | Alert, Badge, Spinner, Progress, Skeleton, EmptyState, Tooltip, Notices, Banner, Meter, ProgressRing, Countdown, StatusDot |
 | Overlays | Modal, Drawer, Popover, ConfirmButton, CommandPalette, Lightbox, Sheet, HoverCard |
 | Navigation | Tabs, Breadcrumbs, Pagination, Steps, Accordion, SegmentedControl, SideNav, TreeView, TableOfContents, ContextMenu, BackToTop |
-| Data | Avatar, DataTable, Stat, Timeline, DescriptionList, Tag, Sparkline, EditableTable, VirtualTable, VirtualList, SearchList, MatchHighlight, FileList, JsonViewer, JsonTable, KanbanBoard, DiffView, CodeBlock, ChatThread, AvatarStack, BarChart, LineChart, DonutChart, CalendarHeatmap |
+| Data | Avatar, DataTable, Stat, Timeline, DescriptionList, Tag, Sparkline, EditableTable, VirtualTable, VirtualList, SearchList, MatchHighlight, FileList, JsonViewer, JsonTable, KanbanBoard, DiffView, CodeBlock, ChatThread, AvatarStack, BarChart, LineChart, DonutChart, CalendarHeatmap, MonthCalendar, PriceBreakdown |
 
 Some files bring a companion: `AccordionItem`, `AvatarGroup`, `CarouselSlide`,
 `CheckboxGroup`, `DescriptionItem`, `DismissibleAlert`, `SkeletonCard`, `Tab`, `TabBar`,
