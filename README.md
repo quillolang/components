@@ -17,7 +17,9 @@ scripts/build.sh && quillo run gallery.qwe --watch     # then open http://localh
 ## Getting them
 
 **The whole kit, one file.** [`quillo-ui.qwe`](quillo-ui.qwe) has every component and
-`ui_css`, all their styles:
+`ui_css`, the theme every page needs (and the styles of `notify` and `ask`). Each
+component brings its own CSS (`style global` in its body), which Quillo sends only to
+the pages that show it, as a sheet the browser keeps:
 
 ```sh
 curl -O https://quillolang.org/components/quillo-ui.qwe
@@ -36,7 +38,8 @@ route GET / =
 ```
 
 **Only what you use.** Each component is its own file in [`ui/`](ui), and every one
-needs [`ui/theme.qwe`](ui/theme.qwe). Put `theme_css` first, then each one's `_css`:
+needs [`ui/theme.qwe`](ui/theme.qwe). Put `theme_css` in the page's style; each component
+brings its own:
 
 ```sh
 mkdir -p ui && cd ui
@@ -50,8 +53,10 @@ use "ui/theme.qwe"
 use "ui/button.qwe"
 use "ui/modal.qwe"
 
-let styles = theme_css + button_css + modal_css
+route GET / = <html><head><style>{theme_css}</style></head><body class="ui-root">...</body></html>
 ```
+
+They need a Quillo with `style global` (0.5.0 from 2026-10-28 on).
 
 **With git.** Clone it, or add it as a submodule and keep it up to date:
 
@@ -119,13 +124,18 @@ uses `match_highlight.qwe`. One needs a library: `map_view.qwe` draws with
 - **Names.** Everything a file declares starts with its name (`modal_css`,
   `Modal`), and its CSS classes with `ui-`, so files never clash with each other or
   with your program.
+- **Styles travel with them.** Each component's body starts with `style global
+  <file>_css`: a page is sent the CSS of the components it shows (and of those it can
+  come to show in the browser), not the whole kit's. `global` keeps the selectors as
+  written, so a rule may style what you pass in (`.ui-card-body > :first-child`).
 
 ## Writing one
 
 Each component is three files, named by its slug (`data_table`):
 
 - `ui/<slug>.qwe`: a comment saying what it is, an example and what each prop does;
-  `let <slug>_css = css`...``; then the `view` or `component`.
+  `let <slug>_css = css`...``; then the `view` or `component`, whose body starts with
+  `style global <slug>_css`.
 - `demos/<slug>.qwe`: `view <Name>Demo()` showing it, and a line adding it to the
   gallery: `ui_gallery = ui_gallery | push({ slug, name, group, summary, demo })`.
 - `tests/<slug>.js`: what [`tests/browser.mjs`](tests/browser.mjs) runs in the

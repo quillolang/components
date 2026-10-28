@@ -2,7 +2,9 @@
 # Makes the two files put together from the others:
 #
 #   quillo-ui.qwe   every component in one file (theme.qwe first), and `ui_css`,
-#                   all their styles: the file to download for the whole kit
+#                   the theme every page needs: the file to download for the whole
+#                   kit. Each component brings its own CSS (`style global`), which
+#                   Quillo sends only to the pages that show it
 #   demos.qwe       the gallery's examples (demos/_demo.qwe first)
 #
 # and stops if two files declare the same name, since `use` puts every file in
@@ -33,16 +35,9 @@ ui_files="ui/theme.qwe $(ls ui/*.qwe | grep -v '^ui/theme.qwe$')"
         cat "$f"
     done
     echo
-    printf 'let ui_css = '
-    first=1
-    for f in $ui_files; do
-        for v in $(grep -oE '^let [a-z_]+_css = css`' "$f" | awk '{print $2}'); do
-            [ $first = 1 ] || printf ' +\n    '
-            printf '%s' "$v"
-            first=0
-        done
-    done
-    echo
+    # The page's own sheet: the theme, and the notices' styles, for markup the
+    # runtime makes on any page. Components bring theirs.
+    echo 'let ui_css = theme_css + notices_css'
 } > "$tmp/quillo-ui.qwe"
 demo_files="demos/_demo.qwe $(ls demos/*.qwe | grep -v '^demos/_demo.qwe$')"
 {
