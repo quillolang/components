@@ -1,0 +1,48 @@
+const txt = (el) => el?.textContent.replace(/\s+/g, " ").trim();
+const sp = (t) => t.replace(/\s+/g, " ");
+const c = $("#fare-calendar-demo");
+const day = (d) => c.querySelector(`[data-day="${d}"]`);
+const note = () => $("#fare-calendar-demo-note").textContent;
+if (c.getAttribute("aria-labelledby") !== "fare-calendar-depart-month" || txt($("#fare-calendar-depart-month")) !== "Cheapest fares, November 2026") return `heading: ${txt($("#fare-calendar-depart-month"))}`;
+if (txt(c.querySelector(".ui-farecal-from")) !== "From $79") return `from: ${txt(c.querySelector(".ui-farecal-from"))}`;
+const cells = [...c.querySelector(".ui-farecal-grid").children];
+if (cells.slice(0, 7).map(txt).join() !== "Mon,Tue,Wed,Thu,Fri,Sat,Sun") return "weekdays from Monday";
+if (cells.slice(7, 13).some((x) => x.tagName !== "SPAN") || cells[13] !== day("2026-11-01")) return "1 November 2026 is a Sunday: six blanks first";
+if (c.querySelectorAll(".ui-farecal-day").length !== 30) return "thirty days";
+if (txt(day("2026-11-10")) !== "10 $79" || !day("2026-11-10").classList.contains("ui-farecal-best") || day("2026-11-10").getAttribute("aria-label") !== "Tuesday 10 November, $79, lowest fare") return `the cheapest day: ${day("2026-11-10").getAttribute("aria-label")}`;
+if (c.querySelectorAll(".ui-farecal-best").length !== 1) return "one lowest day";
+if (txt(day("2026-11-04")) !== "4 $94.50") return "a fare with cents keeps them";
+if (!day("2026-11-03").classList.contains("ui-farecal-low") || !day("2026-11-27").classList.contains("ui-farecal-high") || !day("2026-11-06").classList.contains("ui-farecal-mid")) return "the price tiers";
+if (getComputedStyle(day("2026-11-03").querySelector("span")).color === getComputedStyle(day("2026-11-27").querySelector("span")).color) return "cheap and dear look the same";
+if (day("2026-11-25").getAttribute("aria-disabled") !== "true" || day("2026-11-25").getAttribute("aria-label") !== "Wednesday 25 November, no flights" || txt(day("2026-11-25")) !== "25 –") return "a day without flights";
+if (day("2026-11-01").getAttribute("aria-disabled") !== "true") return "a day without a fare";
+// Picking.
+day("2026-11-25").click(); await wait();
+if (day("2026-11-25").getAttribute("aria-pressed") !== "false" || note() !== "Pick a day: on_pick gets it and its fare.") return "a day without flights was picked";
+day("2026-11-17").click(); await wait();
+if (day("2026-11-17").getAttribute("aria-pressed") !== "true" || txt(c.querySelector(".ui-farecal-picked")) !== "Tuesday 17 November · $92") return `picked: ${txt(c.querySelector(".ui-farecal-picked"))}`;
+if (note() !== "on_pick: 2026-11-17 at 92.00") return `on_pick: ${note()}`;
+if (c.querySelector('input[type=hidden]').name !== "depart" || c.querySelector('input[type=hidden]').value !== "2026-11-17") return "the form field";
+// Keys: one tab stop, moving by day and week.
+if (c.querySelectorAll('.ui-farecal-day[tabindex="0"]').length !== 1 || day("2026-11-17").tabIndex !== 0) return "the picked day should be the tab stop";
+day("2026-11-17").focus(); key(day("2026-11-17"), "ArrowDown"); await wait();
+if (document.activeElement !== day("2026-11-24") || day("2026-11-24").tabIndex !== 0) return "ArrowDown does not go a week on";
+key(day("2026-11-24"), "ArrowRight"); await wait();
+if (document.activeElement !== day("2026-11-25")) return "ArrowRight does not go to a day without flights";
+key(day("2026-11-25"), "ArrowDown"); await wait();
+if (document.activeElement !== day("2026-11-25")) return "ArrowDown leaves the month";
+// Months.
+const [before, after] = c.querySelectorAll(".ui-farecal-nav");
+if (before.disabled || after.disabled) return "October and December have fares";
+after.click(); await wait();
+if (txt($("#fare-calendar-depart-month")) !== "Cheapest fares, December 2026" || txt(c.querySelector(".ui-farecal-from")) !== "From $88" || !after.disabled) return `December: ${txt(c.querySelector(".ui-farecal-from"))}`;
+if (c.querySelectorAll(".ui-farecal-day").length !== 31 || day("2026-12-02")?.classList.contains("ui-farecal-best") !== true) return "December's days";
+before.click(); await wait(); before.click(); await wait();
+if (txt($("#fare-calendar-depart-month")) !== "Cheapest fares, October 2026" || !before.disabled) return "October";
+if (day("2026-10-30").getAttribute("aria-disabled") !== "true" || !sp(day("2026-10-30").getAttribute("aria-label")).includes("past") || day("2026-10-31").getAttribute("aria-disabled")) return "a day before today is past";
+if (txt(c.querySelector(".ui-farecal-from")) !== "From $139") return `October's lowest counts past days: ${txt(c.querySelector(".ui-farecal-from"))}`;
+const e = $("#fare-calendar-demo-eur");
+if ([...e.querySelector(".ui-farecal-grid").children].slice(0, 7).map(txt).join() !== "Sun,Mon,Tue,Wed,Thu,Fri,Sat") return "week_start={0}";
+if (e.querySelector('[data-day="2026-12-01"]') !== e.querySelector(".ui-farecal-grid").children[9]) return "1 December 2026 is a Tuesday: two blanks with Sunday first";
+if (e.querySelector('[data-day="2026-12-10"]').getAttribute("aria-pressed") !== "true" || txt(e.querySelector(".ui-farecal-picked")) !== "Thursday 10 December · 71,00 €") return "value";
+if (txt(e.querySelector('[data-day="2026-12-08"]')) !== "8 59,90 €" || e.querySelectorAll(".ui-farecal-nav:disabled").length !== 2) return "euros with cents, and nowhere to go";

@@ -1,10 +1,13 @@
 # Quillo UI
 
-531 UI components for [Quillo](https://quillolang.org), each one `.qwe` file you
+577 UI components for [Quillo](https://quillolang.org), each one `.qwe` file you
 copy into your program: layout, typography, buttons, forms, sign-in, date pickers,
 dialogs, navigation, tables, cards, media, commerce, finance (banking, loans,
-co-operatives, forex), marketing, dashboard, social and scheduling pieces, and 65
-charts from bar charts to candlesticks and a stock chart. They
+co-operatives, forex), news (story headers, live blogs, election results, fact checks),
+travel (flight search, seat maps, fare calendars, hotels, itineraries), blogging (post
+headers, series, archives, a publish panel), a JSON table that exports to nine
+formats, marketing, dashboard, social and scheduling pieces, and 65 charts from bar
+charts to candlesticks and a stock chart. They
 come with their styles, follow the system's light or dark theme, and work with the
 keyboard and screen readers. Most are views that need no JavaScript at all; the rest
 are components that run in the browser.
@@ -88,7 +91,7 @@ page's font, background and colour too.
 
 ## The components
 
-531 components in 17 groups: 466 for pages, forms, apps and finance, and 65 charts,
+577 components in 20 groups: 512 for pages, forms, apps, finance, news, travel and blogging, and 65 charts,
 from bar and line charts to candlesticks, an order book and a stock chart.
 
 | Group | Components |
@@ -100,11 +103,14 @@ from bar and line charts to candlesticks, an order book and a stock chart.
 | Feedback (28) | Alert, Badge, Banner, Coachmark, ConnectionStatus, CookieConsent, Countdown, EmptyState, ErrorPage, InlineMessage, LoadingDots, LoadingOverlay, Meter, NewBadge, Notices, NotificationDot, Progress, ProgressRing, ResultPage, SaveStatus, Skeleton, SkeletonTable, SkeletonText, Snackbar, Spinner, StatusDot, Tooltip, UploadProgress |
 | Overlays (20) | AlertDialog, ChatWidget, CommandPalette, ConfirmButton, Drawer, Flyout, FullscreenModal, HoverCard, Lightbox, Modal, NotificationCenter, Popover, PromptDialog, QuickView, SearchOverlay, ShareSheet, Sheet, ShortcutsDialog, SpotlightTour, Toast |
 | Navigation (36) | Accordion, AlphabetIndex, BackToTop, BottomNav, Breadcrumbs, CollapsibleNav, ContextMenu, DirectoryNav, FilterTabs, FooterNav, IconTabs, JumpLinks, LanguageSwitcher, LinkList, MegaMenu, Menu, MobileNav, NavLink, NavSearch, NotificationBell, Pager, Pagination, ProgressNav, ScrollTabs, Scrollspy, SegmentedControl, SideNav, SitemapList, SkipLink, Steps, Subnav, TableOfContents, Tabs, TreeView, UserMenu, VerticalTabs |
-| Data (72) | ActivityFeed, ArticleCard, AuditLog, Avatar, AvatarStack, Barcode, BoardingPass, Changelog, ChatThread, CodeBlock, ComparisonTable, ContactCard, CsvTable, DataGrid, DataList, DataTable, DescriptionList, DiffView, EditableTable, EmailPreview, ExpandableTable, FeedItem, FileList, FilePreview, FlowSteps, FolderGrid, GroupedTable, IdCard, Invoice, JsonTable, JsonViewer, KanbanBoard, KpiCard, Leaderboard, ListGroup, LogViewer, MapView, MatchHighlight, MetricTrend, MilestoneList, MonthCalendar, NewsList, NotificationList, OrgChart, PivotTable, PriceBreakdown, ProfileCard, ProgressList, PropertyGrid, QrCode, RankingList, RatingSummary, Receipt, RecordCard, ReviewCard, ReviewList, Roadmap, Scorecard, SearchList, SelectableTable, Stat, StatGroup, Tag, TagCloud, TeamCard, TerminalOutput, TestimonialCard, Ticket, Timeline, TreeTable, VirtualList, VirtualTable |
+| Data (73) | ActivityFeed, ArticleCard, AuditLog, Avatar, AvatarStack, Barcode, BoardingPass, Changelog, ChatThread, CodeBlock, ComparisonTable, ContactCard, CsvTable, DataGrid, DataList, DataTable, DescriptionList, DiffView, EditableTable, EmailPreview, ExpandableTable, FeedItem, FileList, FilePreview, FlowSteps, FolderGrid, GroupedTable, IdCard, Invoice, JsonExportTable, JsonTable, JsonViewer, KanbanBoard, KpiCard, Leaderboard, ListGroup, LogViewer, MapView, MatchHighlight, MetricTrend, MilestoneList, MonthCalendar, NewsList, NotificationList, OrgChart, PivotTable, PriceBreakdown, ProfileCard, ProgressList, PropertyGrid, QrCode, RankingList, RatingSummary, Receipt, RecordCard, ReviewCard, ReviewList, Roadmap, Scorecard, SearchList, SelectableTable, Stat, StatGroup, Tag, TagCloud, TeamCard, TerminalOutput, TestimonialCard, Ticket, Timeline, TreeTable, VirtualList, VirtualTable |
 | Charts (65) | AreaChart, BarChart, BollingerChart, BoxPlot, BrushChart, BubbleChart, BulletChart, BumpChart, CalendarHeatmap, CandlestickChart, ChordDiagram, ComboChart, DepthChart, DonutChart, DotPlot, FunnelChart, GanttChart, GaugeChart, GroupedBarChart, HeatmapChart, HeikinAshiChart, Histogram, HorizontalBarChart, InteractiveLineChart, LineBreakChart, LineChart, LiveCandles, LollipopChart, MacdChart, MarimekkoChart, MarketHeatmap, NetworkGraph, OhlcChart, OrderBook, ParallelCoordinates, ParetoChart, PieChart, PnlChart, PolarAreaChart, PortfolioAllocation, PriceTicker, RadarChart, RadialBarChart, RangeChart, RealtimeChart, RenkoChart, RsiChart, SankeyChart, ScatterChart, SlopeChart, SmallMultiples, Sparkline, StackedBarChart, StepChart, StockChart, StreamGraph, SunburstChart, SymbolCard, TradeFeed, Treemap, ViolinPlot, VolumeProfile, WaffleChart, Watchlist, WaterfallChart |
 | Media (24) | AudioPlayer, CameraCapture, CoverImage, EmbedFrame, Figure, FileIcon, Icon, IconGrid, Image, ImageCompare, ImageCrop, ImageGallery, ImageHotspots, LogoCloud, Marquee, MediaCard, PdfViewer, Playlist, Thumbnail, Ticker, VideoPlayer, VolumeControl, YouTubeEmbed, ZoomImage |
 | Commerce (25) | AddressCard, CartItem, CartSummary, CheckoutSteps, CouponInput, DeliveryEstimate, DiscountBadge, MiniCart, OrderHistory, OrderTracker, PaymentMethods, PlanToggle, Price, PriceTag, PricingCard, PricingTable, ProductCard, ProductGallery, ProductGrid, ShippingOptions, StockStatus, SubscriptionCard, TrustBadges, VariantPicker, WishlistButton |
 | Finance (40) | AccountCard, AccountDetails, AccountPicker, AmortizationTable, AssemblyNotice, BankStatement, BillList, CardControls, ChequeView, CollateralList, CoopBallot, CreditScore, CrossRates, CurrencyConverter, CurrencyPairCard, CurrencyStrength, CurrencyWallet, DividendStatement, FxPositions, FxQuoteTicket, FxRateTable, LoanApplicationSteps, LoanCalculator, LoanCommitteeQueue, LoanEligibility, LoanOffers, LoanSummary, MemberCard, MembershipApplication, PatronageRefundCalc, PayeeList, PaymentHistory, RateAlerts, RemittanceQuote, RepaymentSchedule, SavingsGoal, ShareCapitalLedger, ShareCertificate, TransactionList, TransferForm |
+| News (15) | AdSlot, ArticleHeader, BreakingNews, CorrectionNotice, ElectionResults, FactCheck, GiftArticle, KeyPoints, LiveBlog, MatchScore, NewsQuiz, PaywallMeter, SeatChart, SectionFront, WeatherStrip |
+| Travel (15) | BaggageSelector, CarRentalCard, EntryRequirements, FareCalendar, FareOptions, FlightResult, FlightSearch, FlightStatus, HotelCard, LayoverTimeline, PackingList, RoomPicker, SeatMap, TourCard, TripItinerary |
+| Blogging (15) | AuthorBio, Blogroll, ClapButton, FeedSubscribe, PostArchive, PostHeader, PostStats, PostUpdates, PublishPanel, ReaderSettings, RelatedPosts, SeoPreview, SeriesNav, ShareLinks, Sidenote |
 | Marketing (12) | AnnouncementBar, BlogList, CtaSection, Faq, FeatureGrid, FeatureList, Hero, HowItWorks, SocialLinks, StatsBand, TeamGrid, Testimonials |
 | Dashboard (13) | ApiKeyField, DangerZone, DashboardGrid, OnboardingChecklist, PermissionsMatrix, QuickActions, QuotaBar, ServerStatus, SessionList, SettingsSection, TokenList, UsageMeter, Widget |
 | Social (13) | ChatInput, Comment, CommentThread, Hashtag, MessageBubble, PostCard, PostComposer, ProfileHeader, Reactions, ReplyBox, StoryRing, TypingIndicator, UserBadge |
@@ -116,7 +122,7 @@ from bar and line charts to candlesticks, an order book and a stock chart.
 Every component has a group and tags. A tag is a category that cuts across the groups:
 `forms` is on every input and button, `chart` on every chart, `no-js` on every view that
 adds no JavaScript and `interactive` on every component that runs in the browser. The
-most used: `no-js` (336), `interactive` (186), `forms` (136), `data` (122), `chart` (69), `input` (61), `list` (60), `navigation` (50), `layout` (48), `card` (45), `finance` (40), `dashboard` (40), `commerce` (40), `button` (36), `social` (35), `feedback` (35), `text` (34), `media` (33), `user` (30), `table` (30), `marketing` (30), `document` (29), `typography` (28), `status` (27).
+most used: `no-js` (366), `interactive` (208), `forms` (147), `data` (125), `list` (72), `chart` (72), `input` (61), `card` (56), `navigation` (52), `layout` (50), `commerce` (48), `dashboard` (41), `finance` (40), `button` (37), `social` (37), `feedback` (36), `text` (34), `media` (34), `typography` (32), `table` (32), `user` (31), `marketing` (31), `status` (30), `document` (29).
 
 The gallery and [quillolang.org/components](https://quillolang.org/components/) search
 them by name, summary and tag, and filter by group and tags (`/?q=date`,

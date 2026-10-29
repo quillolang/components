@@ -1,0 +1,28 @@
+const s = $("section#related-posts-demo.ui-brel");
+if (!s || s.getAttribute("aria-labelledby") !== "related-posts-demo-title" || $("#related-posts-demo-title").textContent !== "Read next") return "the section is not named by its heading";
+const items = [...s.querySelectorAll("li.ui-brel-item")];
+if (items.length !== 3) return `limit 3 shows ${items.length}`;
+const names = items.map((i) => i.querySelector("h3.ui-brel-name a").textContent);
+if (names.join("|") !== "Styles that travel with their components|Streaming the slow parts of a page|One file to deploy") return `the order: ${names}`;
+if (items.map((i) => i.dataset.shared).join() !== "2,1,0") return "shared counts";
+const shared = [...items[0].querySelectorAll(".ui-brel-tags li.ui-brel-shared")];
+if (shared.length !== 2 || !shared[0].querySelector(".ui-sr")) return "the shared tags are not marked, for screen readers too";
+if (items[2].querySelector(".ui-brel-shared")) return "a tag not shared is marked";
+if (items[0].querySelector("time").textContent !== "Sep 2, 2026" || items[0].querySelector("time").getAttribute("datetime") !== "2026-09-02") return "the date";
+if (!items[0].querySelector(".ui-brel-meta").textContent.includes("5 min read")) return "the reading time";
+if (items[0].querySelector("img").alt !== "Two shapes on purple" || items[1].querySelector("img").alt !== "") return "the pictures' alt";
+const tops = new Set(items.map((i) => Math.round(i.getBoundingClientRect().top)));
+if (tops.size !== 1) return "the cards are not side by side";
+// The title's link covers the card: a click on the picture follows it.
+items[1].scrollIntoView({ block: "center" }); await wait(50);
+const r = items[1].querySelector(".ui-brel-pic").getBoundingClientRect();
+const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+if (hit !== items[1].querySelector(".ui-brel-name a")) return `the picture is not covered by the link: ${hit?.className}`;
+const l = $("#related-posts-demo-list");
+if (!l.classList.contains("ui-brel-list") || $("#related-posts-demo-list-title").textContent !== "More from the blog") return "the list layout";
+const rows = [...l.querySelectorAll("li.ui-brel-item")];
+if (rows.length !== 2 || rows[0].querySelector("h3").textContent !== "Week notes: 43") return "with no tags the order given is kept";
+const blank = rows[0].querySelector(".ui-brel-blank");
+if (!blank || blank.getAttribute("aria-hidden") !== "true") return "a post with no picture has no stand-in in a list";
+if (!(rows[1].querySelector(".ui-brel-pic").getBoundingClientRect().right <= rows[1].querySelector(".ui-brel-text").getBoundingClientRect().left)) return "in a list the picture is not at the side";
+if (rows[0].querySelector(".ui-brel-meta").textContent !== "Oct 24, 2026") return "a post with no reading time";

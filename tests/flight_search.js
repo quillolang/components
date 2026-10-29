@@ -1,0 +1,53 @@
+const txt = (el) => el?.textContent.replace(/\s+/g, " ").trim();
+const f = $("#flight-search-demo");
+const from = $("#flight-search-trip-from"), to = $("#flight-search-trip-to"), out = $("#flight-search-trip-depart"), back = $("#flight-search-trip-back");
+const note = () => $("#flight-search-demo-note").textContent;
+if (f.tagName !== "FORM" || f.getAttribute("role") !== "search" || f.getAttribute("aria-label") !== "Search flights") return "the form";
+if (from.value !== "LHR" || to.value !== "LIS" || out.value !== "2026-11-05" || back.value !== "2026-11-12" || out.min !== "2026-10-30") return "the starting values";
+if (from.labels[0]?.textContent !== "From" || from.name !== "trip_from" || back.name !== "trip_return") return "labels and names";
+if (from.getAttribute("list") !== "flight-search-trip-airports" || document.getElementById("flight-search-trip-airports").options.length !== 8) return "the airports offered";
+if (txt(f.querySelector(".ui-fsearch-people")) !== "2 adults, 1 child") return `travellers: ${txt(f.querySelector(".ui-fsearch-people"))}`;
+f.querySelector(".ui-fsearch-swap").click(); await wait();
+if (from.value !== "LIS" || to.value !== "LHR") return `swap: ${from.value} ${to.value}`;
+if (f.querySelector(".ui-fsearch-swap").getAttribute("aria-label") !== "Swap from and to") return "the swap button is not named";
+// Travellers: infants are kept to the adults, nine at most.
+const who = f.querySelector(".ui-fsearch-who");
+who.querySelector("summary").click(); await wait();
+if (!who.open) return "the travellers panel does not open";
+const row = (k) => who.querySelector(`[data-kind="${k}"]`);
+const more = (k) => row(k).querySelectorAll(".ui-fsearch-step")[1], less = (k) => row(k).querySelectorAll(".ui-fsearch-step")[0];
+more("infants").click(); await wait(); more("infants").click(); await wait();
+if (row("infants").querySelector("output").textContent !== "2" || !more("infants").disabled) return "infants are not kept to the adults";
+less("adults").click(); await wait();
+if (row("adults").querySelector("output").textContent !== "1" || row("infants").querySelector("output").textContent !== "1" || !less("adults").disabled) return "fewer adults leaves too many infants";
+if (txt(f.querySelector(".ui-fsearch-people")) !== "1 adult, 1 child, 1 infant") return `summary: ${txt(f.querySelector(".ui-fsearch-people"))}`;
+for (let i = 0; i < 9; i++) { if (!more("children").disabled) more("children").click(); await wait(30); }
+if (row("children").querySelector("output").textContent !== "8" || !more("adults").disabled) return "more than nine seats";
+for (let i = 0; i < 7; i++) { less("children").click(); await wait(30); }
+key(who, "Escape"); await wait();
+if (who.open) return "Escape does not close the panel";
+const fd = Object.fromEntries(new FormData(f));
+if (fd.trip_adults !== "1" || fd.trip_children !== "1" || fd.trip_infants !== "1" || fd.trip_trip !== "return" || fd.trip_cabin !== "economy") return `the form holds ${JSON.stringify(fd)}`;
+// Checks before searching.
+type(to, "lis"); await wait();
+f.querySelector(".ui-fsearch-go").click(); await wait();
+const errs = [...f.querySelectorAll(".ui-fsearch-errors li")].map(txt);
+if (errs.join("|") !== "Where you fly to must not be where you fly from." || to.getAttribute("aria-invalid") !== "true" || f.querySelector(".ui-fsearch-errors").getAttribute("role") !== "alert") return `same airport: ${errs}`;
+if (note() !== "Search: on_search gets the query.") return "a search with a problem went";
+type(to, "OPO"); type(back, "2026-11-01"); await wait();
+if (txt(f.querySelector(".ui-fsearch-errors")) !== "The way back cannot be before the way out." || back.getAttribute("aria-invalid") !== "true" || to.getAttribute("aria-invalid")) return `dates: ${txt(f.querySelector(".ui-fsearch-errors"))}`;
+type(back, "2026-11-12"); await wait();
+if (f.querySelector(".ui-fsearch-errors")) return "the error stays once fixed";
+const cabin = f.querySelector(".ui-fsearch-cabin"); cabin.value = "premium"; cabin.dispatchEvent(new Event("change", { bubbles: true })); await wait();
+f.querySelector(".ui-fsearch-go").click(); await wait();
+if (note() !== "on_search: return LIS to OPO, 2026-11-05 to 2026-11-12, 1+1+1, premium") return `on_search: ${note()}`;
+f.querySelector('input[value="oneway"]').click(); await wait();
+if (!f.classList.contains("ui-fsearch-oneway") || !back.disabled) return "one way keeps the return date";
+f.querySelector(".ui-fsearch-go").click(); await wait();
+if (!note().startsWith("on_search: oneway LIS to OPO, 2026-11-05 to -,")) return `one way: ${note()}`;
+const g = $("#flight-search-demo-get");
+if (g.getAttribute("action") !== "#flights" || g.getAttribute("method") !== "get" || !g.querySelector('input[value="oneway"]').checked || g.querySelector(".ui-fsearch-cabin").value !== "business") return "the plain form";
+g.querySelector(".ui-fsearch-go").click(); await wait();
+const ge = [...g.querySelectorAll(".ui-fsearch-errors li")].map((l) => l.dataset.field);
+if (ge.join() !== "from,to,depart") return `an empty search: ${ge}`;
+if (location.hash === "#flights") return "an empty search was sent";

@@ -1,0 +1,42 @@
+const g = $("#gift-article-demo");
+const btn = g.querySelector(".ui-gift-open");
+if (!btn || btn.textContent.trim() !== "Gift this article" || btn.getAttribute("aria-expanded") !== "false" || g.querySelector(".ui-gift-panel")) return "the closed button";
+btn.click(); await wait();
+const p = g.querySelector(".ui-gift-panel");
+if (!p || btn.getAttribute("aria-expanded") !== "true" || btn.getAttribute("aria-controls") !== p.id) return "the button does not open the panel";
+if (p.getAttribute("aria-labelledby") !== "gift-article-demo-title") return "the panel's name";
+const text = () => p.querySelector(".ui-gift-text").textContent.replace(/\s+/g, " ").trim();
+if (!text().startsWith("You have 8 of 10 gift articles left this month.")) return `it says "${text()}"`;
+if (p.querySelectorAll(".ui-gift-meter span").length !== 10 || p.querySelectorAll(".ui-gift-meter .ui-gift-used").length !== 2) return "the meter";
+p.querySelector(".ui-gift-make").click(); await wait(200);
+const input = p.querySelector(".ui-gift-link input");
+if (!input || !/^https:\/\/ledger\.example\/2026\/10\/29\/river\?gift=[0-9a-f]{12}$/.test(input.value)) return `the link: ${input?.value}`;
+if (!input.readOnly || document.activeElement !== input) return "the link is not read-only and focused";
+if (!text().startsWith("You have 7 of 10")) return "making a link does not count one off";
+const mail = p.querySelector(".ui-gift-mail").getAttribute("href");
+if (!mail.startsWith("mailto:?subject=The%20river%20that%20ran%20out%20of%20water&body=") || !decodeURIComponent(mail).includes(input.value)) return `the email: ${mail}`;
+const real = navigator.clipboard.writeText;
+let copied = null;
+navigator.clipboard.writeText = async (t) => { copied = t; };
+try {
+    p.querySelector(".ui-gift-copy").click(); await wait(150);
+    if (copied !== input.value || p.querySelector(".ui-gift-copy").textContent !== "Copied" || p.querySelector('[role="status"]').textContent !== "Link copied.") return "Copy";
+} finally { navigator.clipboard.writeText = real; }
+const first = input.value;
+p.querySelector(".ui-gift-make").click(); await wait(200);
+if (p.querySelector(".ui-gift-link input").value === first || !text().startsWith("You have 6 of 10")) return "another link";
+// Escape closes it and gives the focus back to the button.
+p.querySelector(".ui-gift-make").focus();
+p.querySelector(".ui-gift-make").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await wait(200);
+if (g.querySelector(".ui-gift-panel") || btn.getAttribute("aria-expanded") !== "false" || document.activeElement !== btn) return "Escape";
+btn.click(); await wait();
+if (!g.querySelector(".ui-gift-text").textContent.includes("6 of 10")) return "the count is lost when it opens again";
+g.querySelector(".ui-gift-x").click(); await wait(200);
+if (g.querySelector(".ui-gift-panel") || document.activeElement !== btn) return "× does not close it";
+const l = $("#gift-article-demo-last");
+l.querySelector(".ui-gift-open").click(); await wait();
+l.querySelector(".ui-gift-make").click(); await wait(200);
+if (l.querySelector(".ui-gift-link input").value !== "https://ledger.example/2026/10/30/budget?gift=DESK1") return "on_gift's link";
+if ($("#gift-article-demo-note").textContent !== "on_gift made 1 link") return "on_gift";
+if (l.querySelector(".ui-gift-make") || l.querySelector(".ui-gift-none").textContent !== "You have given all 10 gift articles this month. More come on Dec 1.") return "none left";
+l.querySelector(".ui-gift-x").click(); await wait(100);

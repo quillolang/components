@@ -1,0 +1,42 @@
+const s = $("section#feed-subscribe-demo.ui-bfeed");
+if (!s || s.getAttribute("aria-labelledby") !== "feed-subscribe-demo-title" || $("#feed-subscribe-demo-title").textContent !== "Follow this blog") return "the section and its heading";
+const feeds = [...s.querySelectorAll("li.ui-bfeed-feed")];
+if (feeds.length !== 3) return `${feeds.length} feeds`;
+const kinds = feeds.map((f) => f.querySelector(".ui-bfeed-kind").textContent);
+if (kinds.join() !== "RSS,Atom,JSON Feed") return `kinds: ${kinds}`;
+const box = $("#feed-subscribe-demo-feed-2");
+if (!box.readOnly || box.value !== "https://blog.example.com/tags/quillo/feed.xml" || feeds[1].querySelector("label").getAttribute("for") !== box.id) return "the address box and its label";
+const real = navigator.clipboard.writeText;
+let copied = null;
+navigator.clipboard.writeText = async (t) => { copied = t; };
+try {
+    const btn = feeds[1].querySelector("button.ui-bfeed-copy");
+    if (btn.getAttribute("aria-label") !== "Copy the address of Only the Quillo posts") return "the copy button's name";
+    btn.click(); await wait(150);
+    if (copied !== "https://blog.example.com/tags/quillo/feed.xml") return `copied ${copied}`;
+    if (!btn.classList.contains("ui-bfeed-ok") || getComputedStyle(btn.querySelector(".ui-bfeed-done")).visibility !== "visible") return "it does not say Copied";
+    if (s.querySelector('[role="status"]').textContent !== "Copied the feed's address.") return "screen readers are not told";
+    if (feeds[0].querySelector(".ui-bfeed-ok")) return "another feed says Copied";
+    let n = 0;
+    while (btn.classList.contains("ui-bfeed-ok") && n++ < 30) await wait(100);
+    if (btn.classList.contains("ui-bfeed-ok") || s.querySelector('[role="status"]').textContent !== "") return "Copied does not go";
+    navigator.clipboard.writeText = async () => { throw new DOMException("no", "NotAllowedError"); };
+    feeds[2].querySelector("button").click(); await wait(150);
+    const third = $("#feed-subscribe-demo-feed-3");
+    if (!feeds[2].querySelector(".ui-bfeed-bad-note") || document.activeElement !== third || third.selectionEnd - third.selectionStart !== third.value.length) return "a refused copy does not select the address";
+} finally {
+    navigator.clipboard.writeText = real;
+}
+const readers = [...s.querySelectorAll(".ui-bfeed-readers a")];
+if (readers.map((a) => a.textContent).join() !== "Feedly,Inoreader,NewsBlur") return "the readers";
+if (readers[0].getAttribute("href") !== "https://feedly.com/i/subscription/feed/https%3A%2F%2Fblog.example.com%2Ffeed.xml" || readers[0].target !== "_blank") return `Feedly: ${readers[0].href}`;
+const what = s.querySelector("details.ui-bfeed-what");
+if (what.open || what.querySelector("summary").textContent !== "What is a feed?") return "the explanation";
+what.querySelector("summary").click(); await wait(50);
+if (!what.querySelector("p").checkVisibility()) return "the explanation does not open";
+what.open = false;
+const form = s.querySelector("form.ui-bfeed-email");
+const email = $("#feed-subscribe-demo-email");
+if (form.getAttribute("action") !== "#feed_subscribe" || form.method !== "post" || email.name !== "email" || email.type !== "email" || !email.required) return "the email form";
+if (form.querySelector("label").textContent !== "Or get each new post by email" || form.querySelector("label").htmlFor !== email.id) return "the email's label";
+if (form.checkValidity()) return "an empty email can be sent";
