@@ -1,0 +1,134 @@
+// AccountDetails: what to give someone so they can pay you: the account's name
+// and number, the IBAN in groups of four, the BIC/SWIFT, the sort code or the
+// routing number, each with a button that copies it (the IBAN without its
+// spaces), and one that copies them all. An IBAN whose check digits do not add
+// up is flagged, so a typo is caught before it is shared.
+//
+//   <AccountDetails name="Dana Whitfield" bank="Fernway Credit Union" number="40031204" sort_code="601422"
+//                   iban="GB98FERN60142240031204" bic="FERNGB2P" currency="GBP"/>
+//   <AccountDetails name="Northwind Ltd" number="4400 1234 5678" routing="011000015" bank="Harbor Bank"/>
+//
+// name: the account holder's name, as the payer must write it. number: the
+// account number. iban: shown grouped by four ("GB98 FERN 6014 ..."), copied
+// without spaces; checked by its check digits (mod 97). bic: the BIC or SWIFT
+// code. sort_code: six digits, shown as "60-14-22". routing: an ABA routing
+// number. bank, bank_address: the bank, shown and copied with the rest. currency:
+// the account's currency, a line of its own. reference: what the payer should
+// write as the reference. title: the heading ("Account details"; null for none).
+// copy_all: the Copy all button (true). id: the element's id.
+
+let account_details_css = css`
+.ui-acdet { display: grid; gap: 12px; align-content: start; min-width: 0; max-width: 520px; padding: 18px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.4 var(--ui-font); }
+.ui-acdet-top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; }
+.ui-acdet-title { margin: 0; font-size: 16px; font-weight: 600; }
+.ui-acdet-bank { margin: 2px 0 0; color: var(--ui-muted); font-size: 13px; }
+.ui-acdet-list { margin: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-acdet-row { display: flex; align-items: center; gap: 12px; padding: 9px 8px 9px 12px; }
+.ui-acdet-row + .ui-acdet-row { border-top: 1px solid var(--ui-border); }
+.ui-acdet-row > div { display: grid; flex: 1; gap: 1px; min-width: 0; }
+.ui-acdet-row dt { color: var(--ui-muted); font-size: 12px; }
+.ui-acdet-row dd { margin: 0; font-weight: 500; overflow-wrap: anywhere; }
+.ui-acdet-code dd { font-family: var(--ui-mono); font-size: 14px; letter-spacing: .03em; }
+.ui-acdet-bad dd { color: var(--ui-danger); }
+.ui-acdet-warn { display: block; color: var(--ui-danger); font-family: var(--ui-font); font-size: 12px; font-weight: 500; letter-spacing: 0; }
+.ui-acdet-copy { flex: none; display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 12px var(--ui-font); cursor: pointer; transition: border-color .15s, color .15s; }
+.ui-acdet-copy:hover { border-color: var(--ui-strong); color: var(--ui-accent); }
+.ui-acdet-copy:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-acdet-copy svg { width: 13px; height: 13px; }
+.ui-acdet-ok { border-color: var(--ui-success); color: var(--ui-success); }
+.ui-acdet-fail { border-color: var(--ui-danger); color: var(--ui-danger); }
+.ui-acdet-all { height: 32px; padding: 0 12px; background: var(--ui-subtle); }
+@media (prefers-reduced-motion: reduce) { .ui-acdet-copy { transition: none; } }
+`
+
+let account_details_letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+// An IBAN without spaces, in capitals.
+fn account_details_compact(iban: str) -> str = upper(re.replace(iban, "[^0-9A-Za-z]", ""))
+
+// An IBAN in groups of four: "GB98 FERN 6014 2240 0312 04".
+fn account_details_grouped(iban: str) -> str {
+    let c = account_details_compact(iban)
+    join(range(ceil(len(c) / 4)) | map((i) => slice(c, i * 4, i * 4 + 4)), " ")
+}
+
+// Whether an IBAN's check digits add up (ISO 13616: mod 97 of the moved, numbered letters is 1).
+fn account_details_iban_ok(iban: str) -> bool {
+    let c = account_details_compact(iban)
+    if len(c) < 15 || len(c) > 34 || !re.test(c, "^[A-Z]{2}[0-9]{2}[A-Z0-9]+$") { return false }
+    let moved = split(slice(c, 4) + slice(c, 0, 4), "")
+    let r = reduce(moved, 0, (acc, ch) => {
+        let letter = index_of(account_details_letters, ch)
+        letter != null ? (acc * 100 + letter + 10) % 97 : (acc * 10 + int(ch)) % 97
+    })
+    r == 1
+}
+
+// A sort code as "60-14-22", from six digits written any way.
+fn account_details_sort_code(code: str) -> str {
+    let d = re.replace(code, "[^0-9]", "")
+    len(d) == 6 ? `${slice(d, 0, 2)}-${slice(d, 2, 4)}-${slice(d, 4, 6)}` : code
+}
+
+component AccountDetails(name: str? = null, number: str? = null, iban: str? = null, bic: str? = null, sort_code: str? = null,
+                         routing: str? = null, bank: str? = null, bank_address: str? = null, currency: str? = null,
+                         reference: str? = null, title: str? = "Account details", copy_all: bool = true,
+                         id: str? = null, class: str? = null) {
+    style global account_details_css
+    state copied = ""    // the key of the row just copied, "all", or ""
+    state result = ""    // "ok" or "bad"
+    if copied != "" { every(1800, () => { copied = "" }) }
+    let iban_ok = iban == null || account_details_iban_ok(iban)
+    let rows = [
+        name != null && { key: "name", label: "Account name", what: "account name", shown: name, copy: name, code: false },
+        number != null && { key: "number", label: "Account number", what: "account number", shown: number, copy: re.replace(number, "\\s", ""), code: true },
+        sort_code != null && { key: "sort_code", label: "Sort code", what: "sort code", shown: account_details_sort_code(sort_code), copy: account_details_sort_code(sort_code), code: true },
+        routing != null && { key: "routing", label: "Routing number (ABA)", what: "routing number", shown: routing, copy: re.replace(routing, "\\s", ""), code: true },
+        iban != null && { key: "iban", label: "IBAN", what: "IBAN", shown: account_details_grouped(iban), copy: account_details_compact(iban), code: true },
+        bic != null && { key: "bic", label: "BIC / SWIFT", what: "BIC", shown: upper(bic), copy: upper(re.replace(bic, "\\s", "")), code: true },
+        reference != null && { key: "reference", label: "Reference", what: "reference", shown: reference, copy: reference, code: false },
+        currency != null && { key: "currency", label: "Currency", what: "currency", shown: upper(currency), copy: upper(currency), code: true },
+    ] | filter((r) => r != false)
+    let all_text = join((bank != null ? [`Bank: ${bank}${bank_address != null ? ", " + bank_address : ""}`] : [])
+        + (rows | map((r) => `${r.label}: ${r.shown}`)), "\n")
+    let copy = (key: str, text: str) => {
+        copied = key
+        if js("isSecureContext") != true { result = "bad" } else {
+            // The promise's callbacks are given undefined, which is no argument: hence `= null`.
+            js("navigator.clipboard.writeText", text).then((_ = null) => { result = "ok" }, (_ = null) => { result = "bad" })
+        }
+    }
+    let said = (key: str) => copied == key ? (result == "ok" ? "Copied" : result == "bad" ? "Could not copy" : "Copy") : "Copy"
+    let state_class = (key: str) => copied == key && result != "" ? `ui-acdet-${result == "ok" ? "ok" : "fail"}` : null
+    let base = id ?? "account-details"
+    <section class={ui_cls(["ui-acdet", class])} id={id} aria-labelledby={title != null ? `${base}-title` : null} aria-label={title == null ? "Account details" : null}>
+        {(title != null || bank != null || copy_all) && <div.ui-acdet-top>
+            <div>
+                {title != null && <h3.ui-acdet-title id={`${base}-title`}>{title}</h3>}
+                {bank != null && <p.ui-acdet-bank>{bank}{bank_address != null && `, ${bank_address}`}</p>}
+            </div>
+            {copy_all && <button class={ui_cls(["ui-acdet-copy", "ui-acdet-all", state_class("all")])} type="button" data-copy={all_text}
+                                 @click={() => copy("all", all_text)}>{said("all") == "Copy" ? "Copy all" : said("all")}</button>}
+        </div>}
+        <dl.ui-acdet-list>
+            {for r in rows => <div class={ui_cls(["ui-acdet-row", r.code && "ui-acdet-code", r.key == "iban" && !iban_ok && "ui-acdet-bad"])} key={r.key} data-row={r.key}>
+                <div>
+                    <dt id={`${base}-${r.key}`}>{r.label}</dt>
+                    <dd>{r.shown}{r.key == "iban" && !iban_ok && <span.ui-acdet-warn>The check digits do not match: check this IBAN.</span>}</dd>
+                </div>
+                <button class={ui_cls(["ui-acdet-copy", state_class(r.key)])} type="button" data-copy={r.copy}
+                        aria-label={`${said(r.key)} ${r.what}`}
+                        @click={() => copy(r.key, r.copy)}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        {copied == r.key && result == "ok" ? <path d="M20 6 9 17l-5-5"/>
+                            : <path d="M10 8h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2ZM4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2"/>}
+                    </svg>
+                    <span aria-hidden="true">{said(r.key)}</span>
+                </button>
+            </div>}
+        </dl>
+        <p.ui-sr role="status">{copied != "" && result == "ok" ? "Copied" : copied != "" && result == "bad" ? "Could not copy" : ""}</p>
+    </section>
+}

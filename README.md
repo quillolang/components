@@ -1,9 +1,10 @@
 # Quillo UI
 
-491 UI components for [Quillo](https://quillolang.org), each one `.qwe` file you
+531 UI components for [Quillo](https://quillolang.org), each one `.qwe` file you
 copy into your program: layout, typography, buttons, forms, sign-in, date pickers,
-dialogs, navigation, tables, cards, media, commerce, marketing, dashboard, social and
-scheduling pieces, and 65 charts from bar charts to candlesticks and a stock chart. They
+dialogs, navigation, tables, cards, media, commerce, finance (banking, loans,
+co-operatives, forex), marketing, dashboard, social and scheduling pieces, and 65
+charts from bar charts to candlesticks and a stock chart. They
 come with their styles, follow the system's light or dark theme, and work with the
 keyboard and screen readers. Most are views that need no JavaScript at all; the rest
 are components that run in the browser.
@@ -87,7 +88,7 @@ page's font, background and colour too.
 
 ## The components
 
-491 components in 16 groups: 426 for pages, forms and apps, and 65 charts,
+531 components in 17 groups: 466 for pages, forms, apps and finance, and 65 charts,
 from bar and line charts to candlesticks, an order book and a stock chart.
 
 | Group | Components |
@@ -103,6 +104,7 @@ from bar and line charts to candlesticks, an order book and a stock chart.
 | Charts (65) | AreaChart, BarChart, BollingerChart, BoxPlot, BrushChart, BubbleChart, BulletChart, BumpChart, CalendarHeatmap, CandlestickChart, ChordDiagram, ComboChart, DepthChart, DonutChart, DotPlot, FunnelChart, GanttChart, GaugeChart, GroupedBarChart, HeatmapChart, HeikinAshiChart, Histogram, HorizontalBarChart, InteractiveLineChart, LineBreakChart, LineChart, LiveCandles, LollipopChart, MacdChart, MarimekkoChart, MarketHeatmap, NetworkGraph, OhlcChart, OrderBook, ParallelCoordinates, ParetoChart, PieChart, PnlChart, PolarAreaChart, PortfolioAllocation, PriceTicker, RadarChart, RadialBarChart, RangeChart, RealtimeChart, RenkoChart, RsiChart, SankeyChart, ScatterChart, SlopeChart, SmallMultiples, Sparkline, StackedBarChart, StepChart, StockChart, StreamGraph, SunburstChart, SymbolCard, TradeFeed, Treemap, ViolinPlot, VolumeProfile, WaffleChart, Watchlist, WaterfallChart |
 | Media (24) | AudioPlayer, CameraCapture, CoverImage, EmbedFrame, Figure, FileIcon, Icon, IconGrid, Image, ImageCompare, ImageCrop, ImageGallery, ImageHotspots, LogoCloud, Marquee, MediaCard, PdfViewer, Playlist, Thumbnail, Ticker, VideoPlayer, VolumeControl, YouTubeEmbed, ZoomImage |
 | Commerce (25) | AddressCard, CartItem, CartSummary, CheckoutSteps, CouponInput, DeliveryEstimate, DiscountBadge, MiniCart, OrderHistory, OrderTracker, PaymentMethods, PlanToggle, Price, PriceTag, PricingCard, PricingTable, ProductCard, ProductGallery, ProductGrid, ShippingOptions, StockStatus, SubscriptionCard, TrustBadges, VariantPicker, WishlistButton |
+| Finance (40) | AccountCard, AccountDetails, AccountPicker, AmortizationTable, AssemblyNotice, BankStatement, BillList, CardControls, ChequeView, CollateralList, CoopBallot, CreditScore, CrossRates, CurrencyConverter, CurrencyPairCard, CurrencyStrength, CurrencyWallet, DividendStatement, FxPositions, FxQuoteTicket, FxRateTable, LoanApplicationSteps, LoanCalculator, LoanCommitteeQueue, LoanEligibility, LoanOffers, LoanSummary, MemberCard, MembershipApplication, PatronageRefundCalc, PayeeList, PaymentHistory, RateAlerts, RemittanceQuote, RepaymentSchedule, SavingsGoal, ShareCapitalLedger, ShareCertificate, TransactionList, TransferForm |
 | Marketing (12) | AnnouncementBar, BlogList, CtaSection, Faq, FeatureGrid, FeatureList, Hero, HowItWorks, SocialLinks, StatsBand, TeamGrid, Testimonials |
 | Dashboard (13) | ApiKeyField, DangerZone, DashboardGrid, OnboardingChecklist, PermissionsMatrix, QuickActions, QuotaBar, ServerStatus, SessionList, SettingsSection, TokenList, UsageMeter, Widget |
 | Social (13) | ChatInput, Comment, CommentThread, Hashtag, MessageBubble, PostCard, PostComposer, ProfileHeader, Reactions, ReplyBox, StoryRing, TypingIndicator, UserBadge |
@@ -114,11 +116,11 @@ from bar and line charts to candlesticks, an order book and a stock chart.
 Every component has a group and tags. A tag is a category that cuts across the groups:
 `forms` is on every input and button, `chart` on every chart, `no-js` on every view that
 adds no JavaScript and `interactive` on every component that runs in the browser. The
-most used: `no-js` (310), `interactive` (172), `forms` (123), `data` (114), `chart` (65), `input` (60), `list` (55), `navigation` (50), `layout` (48), `commerce` (40), `button` (36), `card` (36), `dashboard` (36), `social` (35), `feedback` (35), `text` (34), `media` (33), `marketing` (30), `user` (29), `typography` (28), `status` (26), `link` (26), `image` (26), `page` (25).
+most used: `no-js` (336), `interactive` (186), `forms` (136), `data` (122), `chart` (69), `input` (61), `list` (60), `navigation` (50), `layout` (48), `card` (45), `finance` (40), `dashboard` (40), `commerce` (40), `button` (36), `social` (35), `feedback` (35), `text` (34), `media` (33), `user` (30), `table` (30), `marketing` (30), `document` (29), `typography` (28), `status` (27).
 
 The gallery and [quillolang.org/components](https://quillolang.org/components/) search
 them by name, summary and tag, and filter by group and tags (`/?q=date`,
-`/?tag=chart,trading`); "/" goes to the search box.
+`/?tag=chart,trading`, `/?tag=finance,loans`); "/" goes to the search box.
 
 ### Files that need another
 

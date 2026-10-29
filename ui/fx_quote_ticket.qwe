@@ -1,0 +1,201 @@
+// FxQuoteTicket: an order ticket for a currency deal: buy or sell the base currency,
+// the amount, the rate quoted (the ask to buy, the bid to sell) with a countdown
+// until the quote runs out, what it comes to in the other currency, and Confirm.
+// When the quote runs out it is quoted again (on_requote), or the ticket says so,
+// keeps Confirm from going and offers a new quote. It is a real <form>: without
+// on_confirm, Confirm posts side, amount, pair and rate to `action`.
+//
+//   <FxQuoteTicket pair="EUR/USD" bid={1.08421m} ask={1.08429m} amount={250000} seconds={15} action="/deals"/>
+//   <FxQuoteTicket pair="USD/JPY" bid={bid} ask={ask} side="sell" on_requote={(side) => desk_quote("USD/JPY")}
+//                  on_confirm={(deal) => { booked = deal }}/>
+//
+// pair: "EUR/USD", base over quote; the amount is in the base. bid and ask: the quote
+// (decimals best; numbers are read as decimals). side: "buy" (default) or "sell", to
+// start with. amount: to start with (100000). seconds: how long a quote stands (15).
+// decimals: digits of the rate (5, or 3 when the quote is JPY). locale: how amounts are
+// written ("en-US"). action: where the form posts (this page). requote_href: the link
+// offered when a quote ran out with no on_requote (this page again, for a fresh one).
+// name: put before the fields' names ("fx" makes fx_side, fx_amount, ...) and their ids.
+// on_requote(side): inside one of your components, called when the quote runs out
+// with "buy" or "sell"; give back { bid, ask } for a new quote (null leaves it run
+// out). on_confirm(deal): instead of posting, given { pair, side, amount, rate,
+// counter, base, quote } (decimals: counter is the amount in the quote currency); the
+// ticket then shows what was done, with a button for another deal.
+
+let fx_quote_ticket_css = css`
+.ui-fxticket { display: grid; gap: 14px; min-width: 0; max-width: 380px; margin: 0; padding: 18px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); font: 14px/1.4 var(--ui-font); color: var(--ui-fg);
+  font-variant-numeric: tabular-nums; }
+.ui-fxticket-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.ui-fxticket .ui-fxticket-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-fxticket-quote-no { color: var(--ui-muted); font-size: 12px; }
+.ui-fxticket-sides { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 0; padding: 3px; border: 0; border-radius: var(--ui-radius-sm);
+  background: var(--ui-subtle); }
+.ui-fxticket-sides legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.ui-fxticket-side { position: relative; display: grid; gap: 1px; padding: 7px 10px; border-radius: calc(var(--ui-radius-sm) - 2px); cursor: pointer;
+  text-align: center; color: var(--ui-muted); transition: background .15s, color .15s; }
+.ui-fxticket-side input { position: absolute; opacity: 0; pointer-events: none; }
+.ui-fxticket-side b { font-size: 13px; font-weight: 650; }
+.ui-fxticket-side span { font-size: 15px; font-weight: 600; }
+.ui-fxticket-side:has(input:checked) { background: var(--ui-surface); color: var(--ui-fg); box-shadow: 0 1px 2px rgb(0 0 0 / .08); }
+.ui-fxticket-side:has(input[value="buy"]:checked) b { color: var(--ui-success); }
+.ui-fxticket-side:has(input[value="sell"]:checked) b { color: var(--ui-danger); }
+.ui-fxticket-side:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-fxticket-field { display: grid; gap: 6px; }
+.ui-fxticket-label { font-size: 13px; font-weight: 500; color: var(--ui-muted); }
+.ui-fxticket-box { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); transition: border-color .15s, box-shadow .15s; }
+.ui-fxticket-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-fxticket-box input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: none; background: transparent; color: var(--ui-fg);
+  font: 600 16px var(--ui-font); font-variant-numeric: tabular-nums; text-align: right; }
+.ui-fxticket-box small { color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-fxticket-invalid .ui-fxticket-box { border-color: var(--ui-danger); }
+.ui-fxticket-rate { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 12px; padding: 12px 14px;
+  border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-fxticket-rate dt { color: var(--ui-muted); font-size: 12px; }
+.ui-fxticket-rate dd { margin: 0; text-align: right; font-weight: 600; }
+.ui-fxticket-price { font-size: 20px; }
+.ui-fxticket-counter { font-size: 18px; }
+.ui-fxticket-timer { display: grid; gap: 6px; }
+.ui-fxticket-timer-text { display: flex; justify-content: space-between; color: var(--ui-muted); font-size: 12px; }
+.ui-fxticket-timer-text b { color: var(--ui-fg); font-weight: 600; }
+.ui-fxticket-bar { height: 4px; overflow: hidden; border-radius: 2px; background: var(--ui-border); }
+.ui-fxticket-bar span { display: block; height: 100%; background: var(--ui-accent); transition: width 1s linear; }
+.ui-fxticket-late .ui-fxticket-bar span { background: var(--ui-warning); }
+.ui-fxticket-expired .ui-fxticket-price, .ui-fxticket-expired .ui-fxticket-counter { color: var(--ui-muted); text-decoration: line-through; }
+.ui-fxticket-gone { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-fg); font-size: 13px; }
+.ui-fxticket-gone a { color: var(--ui-accent); font-weight: 600; }
+.ui-fxticket-confirm { height: 42px; border: 0; border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg);
+  font: 600 15px var(--ui-font); cursor: pointer; }
+.ui-fxticket-confirm:hover:not(:disabled) { filter: brightness(1.08); }
+.ui-fxticket-confirm:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-fxticket-confirm:disabled { opacity: .45; cursor: not-allowed; }
+.ui-fxticket-done { display: grid; gap: 10px; padding: 14px; border-radius: var(--ui-radius-sm); background: var(--ui-success-soft); }
+.ui-fxticket-done p { margin: 0; }
+.ui-fxticket-done button { justify-self: start; padding: 6px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-fxticket-done button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) { .ui-fxticket-bar span, .ui-fxticket-side, .ui-fxticket-box { transition: none; } }
+`
+
+// An amount in a currency, to its minor units: "$108,429.00", "¥15,624,000".
+fn fx_quote_ticket_money(amount: dec, code: str, locale: str) -> str {
+    let m = money.of(amount, code, "half_up")
+    type_of(m) == "error" ? `${format_number(round(amount, 2, "half_up"), locale, 2)} ${code}` : money.format(m, locale)
+}
+
+// What was typed as a decimal above 0 ("250,000" is 250000m), or null.
+fn fx_quote_ticket_read(text: str) {
+    let t = re.replace(trim(text), "[,\\s_]", "")
+    if t == "" { return null }
+    let d = dec(t)
+    is_err(d) || d <= 0 ? null : d
+}
+
+component FxQuoteTicket(pair: str, bid, ask, side: str = "buy", amount = 100000, seconds: int = 15, decimals: int? = null,
+                        locale: str = "en-US", action: str? = null, requote_href: str = "", name: str? = null,
+                        on_requote = null, on_confirm = null, class: str? = null) {
+    style global fx_quote_ticket_css
+    let parts = split(upper(pair), "/")
+    let base = parts[0]
+    let quote = len(parts) > 1 ? parts[1] : parts[0]
+    let places = decimals ?? (contains(["JPY", "HUF", "KRW", "INR", "PHP", "THB"], quote) ? 3 : 5)
+    let field = (f: str) => name != null ? `${name}_${f}` : f
+    let id = `fx-quote-ticket-${name ?? lower(replace(pair, "/", ""))}`
+    state b = dec(bid)
+    state a = dec(ask)
+    state dir = side == "sell" ? "sell" : "buy"
+    state text = str(amount)
+    state target = now() + seconds * 1000
+    state at = now()
+    state quote_no = 1
+    state done = null
+    let left = target > at ? ceil((target - at) / 1000) : 0
+    let expired = left <= 0
+    if !expired && done == null {
+        every(1000, () => {
+            at = now()
+            if at >= target && on_requote != null {
+                let q = on_requote(dir)
+                if q != null {
+                    b = dec(q.bid)
+                    a = dec(q.ask)
+                    target = now() + seconds * 1000
+                    quote_no += 1
+                }
+            }
+        })
+    }
+    let value = fx_quote_ticket_read(text)
+    let rate = dir == "buy" ? a : b
+    let counter = value != null ? value * rate : null
+    let rate_text = (r: dec) => format_number(round(r, places, "half_up"), locale, places)
+    <form class={ui_cls(["ui-fxticket", expired && "ui-fxticket-expired", !expired && left <= 5 && "ui-fxticket-late",
+                         value == null && "ui-fxticket-invalid", class])}
+          method="post" action={action} aria-labelledby={`${id}-title`} data-quote={quote_no}>
+        <div.ui-fxticket-head>
+            <h3.ui-fxticket-title id={`${id}-title`}>{pair}</h3>
+            <span.ui-fxticket-quote-no>Quote {quote_no}</span>
+        </div>
+        {done != null
+            ? <div.ui-fxticket-done role="status">
+                  <p>{done.side == "buy" ? "Bought" : "Sold"} <b>{fx_quote_ticket_money(done.amount, base, locale)}</b> at {rate_text(done.rate)}
+                     {" for "}<b>{fx_quote_ticket_money(done.counter, quote, locale)}</b>.</p>
+                  <button type="button" @click={() => {
+                      done = null
+                      target = now() + seconds * 1000
+                      at = now()
+                  }}>New deal</button>
+              </div>
+            : [
+                <fieldset.ui-fxticket-sides>
+                    <legend>Side</legend>
+                    <label.ui-fxticket-side>
+                        <input type="radio" name={field("side")} value="sell" checked={dir == "sell"} @change={() => { dir = "sell" }}/>
+                        <b>Sell {base}</b><span>{rate_text(b)}</span>
+                    </label>
+                    <label.ui-fxticket-side>
+                        <input type="radio" name={field("side")} value="buy" checked={dir == "buy"} @change={() => { dir = "buy" }}/>
+                        <b>Buy {base}</b><span>{rate_text(a)}</span>
+                    </label>
+                </fieldset>,
+                <div.ui-fxticket-field>
+                    <label.ui-fxticket-label for={`${id}-amount`}>Amount in {base}</label>
+                    <div.ui-fxticket-box>
+                        <input type="text" id={`${id}-amount`} name={field("amount")} value={text} inputmode="decimal" autocomplete="off"
+                               aria-invalid={value == null ? "true" : null} @input={(e) => { text = e.value }}/>
+                        <small aria-hidden="true">{base}</small>
+                    </div>
+                </div>,
+                <dl.ui-fxticket-rate>
+                    <dt>Rate, {dir == "buy" ? "you buy" : "you sell"} {base}</dt>
+                    <dd.ui-fxticket-price data-rate={str(rate)}>{rate_text(rate)}</dd>
+                    <dt>{dir == "buy" ? "You pay" : "You get"}</dt>
+                    <dd.ui-fxticket-counter>{counter != null ? fx_quote_ticket_money(counter, quote, locale) : "—"}</dd>
+                </dl>,
+                <div.ui-fxticket-timer role="timer" aria-label="Time left on the quote">
+                    <div.ui-fxticket-timer-text aria-hidden="true">
+                        <span>{expired ? "Quote ran out" : "Quote stands for"}</span><b data-left={left}>{left} s</b>
+                    </div>
+                    <div.ui-fxticket-bar aria-hidden="true"><span style={`width: ${seconds > 0 ? floor(left * 100 / seconds) : 0}%`}></span></div>
+                    <span.ui-sr aria-live="polite">{expired ? "The quote ran out." : (left == 5 ? "5 seconds left on the quote." : "")}</span>
+                </div>,
+                expired ? <p.ui-fxticket-gone>The quote ran out. <a href={requote_href}>Get a new quote</a></p> : null,
+                <input type="hidden" name={field("pair")} value={pair}/>,
+                <input type="hidden" name={field("rate")} value={str(rate)}/>,
+                <button.ui-fxticket-confirm type="submit" disabled={expired || value == null}
+                        @click={(e) => {
+                            if expired || value == null {
+                                e.preventDefault()
+                            } else if on_confirm != null {
+                                e.preventDefault()
+                                let deal = { pair, side: dir, amount: value, rate, counter: value * rate, base, quote }
+                                done = deal
+                                on_confirm(deal)
+                            }
+                        }}>
+                    Confirm {dir == "buy" ? "buy" : "sell"}{value != null ? ` ${fx_quote_ticket_money(value, base, locale)}` : ""}
+                </button>,
+              ]}
+    </form>
+}

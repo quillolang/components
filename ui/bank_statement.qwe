@@ -1,0 +1,169 @@
+// BankStatement: an account's statement for a period, as it should print: the
+// bank and the account holder, the period, the opening balance, every
+// transaction with the balance after it, the closing balance, and the totals
+// paid in and out. The totals and the balances are worked out here, exactly, from
+// the opening balance and the amounts.
+//
+//   <BankStatement start="2026-10-01" end="2026-10-31" opening={1824.6m} number="0012004821"
+//                  bank={{ name: "Fernway Credit Union", lines: ["40 Quay Street", "Port Ellis PE1 4AA"] }}
+//                  holder={{ name: "Dana Whitfield", lines: ["12 Orchard Row", "Port Ellis PE3 9QT"] }}
+//                  items={[{ date: "2026-10-02", description: "Salary, Northwind Ltd", amount: 3200m },
+//                          { date: "2026-10-03", description: "Linden Court Lettings", reference: "Rent", amount: -1450m }]}/>
+//
+// start, end: the period, ISO dates. opening: the balance at its start, a number
+// or decimal. items: the transactions, oldest first, a list of { date,
+// description, amount, reference? }: amount below 0 is money out; reference, a
+// second line. bank: { name, lines?, phone?, website? }, the address a line each;
+// holder: { name, lines? }. account_name: the account's name ("Everyday
+// checking"); number: its number, shown whole (mask: true shows only the last
+// four); iban, bic, sort_code: shown under it when given. statement: its number
+// ("No. 10"); issued: the ISO date it was made. currency ("USD") and locale
+// ("en-US"): how amounts and dates are written. title: "Statement". It prints on
+// white without its border, the table's head on every page. id: the element's id.
+
+let bank_statement_css = css`
+.ui-bstmt { display: grid; gap: 24px; min-width: 0; padding: 32px 36px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.5 var(--ui-font); }
+.ui-bstmt-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px 32px; padding-bottom: 18px; border-bottom: 2px solid var(--ui-fg); }
+.ui-bstmt-bank { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
+.ui-bstmt-dim { margin: 0; color: var(--ui-muted); }
+.ui-bstmt-title { margin: 0; font-size: 22px; font-weight: 700; text-align: right; }
+.ui-bstmt-period { margin: 2px 0 0; text-align: right; font-weight: 500; }
+.ui-bstmt-meta { margin: 0; color: var(--ui-muted); text-align: right; }
+.ui-bstmt-parties { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px 28px; }
+.ui-bstmt-parties address { font-style: normal; }
+.ui-bstmt-parties h4, .ui-bstmt-sum h4 { margin: 0 0 4px; color: var(--ui-muted); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+.ui-bstmt-parties p { margin: 0; }
+.ui-bstmt-strong { font-weight: 600; }
+.ui-bstmt-acct dl { display: grid; grid-template-columns: auto 1fr; gap: 0 12px; margin: 0; }
+.ui-bstmt-acct dt { color: var(--ui-muted); }
+.ui-bstmt-acct dd { margin: 0; font-family: var(--ui-mono); font-size: 12px; line-height: 1.7; }
+.ui-bstmt-sum { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-border); overflow: hidden; }
+.ui-bstmt-sum > div { padding: 10px 14px; background: var(--ui-surface); }
+.ui-bstmt-sum p { margin: 0; font-size: 16px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-bstmt-sum .ui-bstmt-in p { color: var(--ui-success); }
+.ui-bstmt-scroll { overflow-x: auto; }
+.ui-bstmt table { width: 100%; border-collapse: collapse; }
+.ui-bstmt th { padding: 7px 8px; border-bottom: 1px solid var(--ui-fg); color: var(--ui-muted); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; text-align: left; }
+.ui-bstmt td { padding: 7px 8px; border-bottom: 1px solid var(--ui-border); vertical-align: top; }
+.ui-bstmt .ui-bstmt-num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ui-bstmt-date { white-space: nowrap; color: var(--ui-muted); }
+.ui-bstmt-ref { display: block; color: var(--ui-muted); font-size: 12px; }
+.ui-bstmt-edge td { background: var(--ui-subtle); font-weight: 600; }
+.ui-bstmt-neg { color: var(--ui-danger); }
+.ui-bstmt-foot { margin: 0; color: var(--ui-muted); font-size: 11px; }
+@media (max-width: 560px) { .ui-bstmt { padding: 20px 16px; } .ui-bstmt-title, .ui-bstmt-period, .ui-bstmt-meta { text-align: left; } }
+@media print {
+  .ui-bstmt { padding: 0; border: 0; border-radius: 0; background: #fff; color: #000; }
+  .ui-bstmt-scroll { overflow: visible; }
+  .ui-bstmt tr { break-inside: avoid; }
+  .ui-bstmt thead { display: table-header-group; }
+  .ui-bstmt-edge td, .ui-bstmt-sum > div { background: #fff; }
+}
+`
+
+// An amount as text in its currency.
+fn bank_statement_money(amount, currency: str, locale: str) -> str {
+    let m = money.of(dec(amount), currency, "half_up")
+    is_err(m) ? str(amount) : money.format(m, locale)
+}
+
+// The statement's figures: { rows (each item with amt and after), credits, debits, closing, ins, outs }.
+fn bank_statement_figures(opening, items: list) {
+    let start = { bal: dec(opening), rows: [], credits: 0m, debits: 0m, ins: 0, outs: 0 }
+    reduce(items, start, (acc, t) => {
+        let amt = dec(t.amount)
+        let bal = acc.bal + amt
+        { bal, rows: push(acc.rows, merge(t, { amt, after: bal })),
+          credits: amt > 0 ? acc.credits + amt : acc.credits, debits: amt < 0 ? acc.debits - amt : acc.debits,
+          ins: amt > 0 ? acc.ins + 1 : acc.ins, outs: amt < 0 ? acc.outs + 1 : acc.outs }
+    })
+}
+
+view BankStatement(start: str, end: str, opening = 0, items: list = [], bank: map? = null, holder: map? = null,
+                   account_name: str? = null, number: str? = null, mask: bool = false, iban: str? = null, bic: str? = null,
+                   sort_code: str? = null, statement: str? = null, issued: str? = null, currency: str = "USD",
+                   locale: str = "en-US", title: str = "Statement", id: str? = null, class: str? = null) {
+    style global bank_statement_css
+    let code = upper(currency)
+    let f = bank_statement_figures(opening, items)
+    let money_of = (x) => bank_statement_money(x, code, locale)
+    let day = (d) => date.format(d, { locale, style: "medium" })
+    let last4 = number != null ? slice(re.replace(number, "[^0-9A-Za-z]", ""), -4) : ""
+    <article class={ui_cls(["ui-bstmt", class])} id={id} aria-label={`${title}, ${day(start)} to ${day(end)}`}>
+        <header.ui-bstmt-head>
+            <div>
+                {bank != null && [<p.ui-bstmt-bank>{bank.name}</p>,
+                    for l in bank.lines ?? [] => <p.ui-bstmt-dim key={l}>{l}</p>,
+                    bank.phone != null && <p.ui-bstmt-dim>{bank.phone}</p>,
+                    bank.website != null && <p.ui-bstmt-dim>{bank.website}</p>]}
+            </div>
+            <div>
+                <h2.ui-bstmt-title>{title}</h2>
+                <p.ui-bstmt-period><time datetime={start}>{date.format(start, { locale, style: "long" })}</time> to <time datetime={end}>{date.format(end, { locale, style: "long" })}</time></p>
+                {(statement != null || issued != null) && <p.ui-bstmt-meta>
+                    {statement}{statement != null && issued != null && " · "}{issued != null && `Issued ${day(issued)}`}
+                </p>}
+            </div>
+        </header>
+        <div.ui-bstmt-parties>
+            {holder != null && <address>
+                <h4>Account holder</h4>
+                <p.ui-bstmt-strong>{holder.name}</p>
+                {for l in holder.lines ?? [] => <p key={l}>{l}</p>}
+            </address>}
+            <div.ui-bstmt-acct>
+                <h4>Account</h4>
+                {account_name != null && <p.ui-bstmt-strong>{account_name}</p>}
+                <dl>
+                    {number != null && [<dt>Number</dt>, <dd>{mask ? `•••• ${last4}` : number}</dd>]}
+                    {sort_code != null && [<dt>Sort code</dt>, <dd>{sort_code}</dd>]}
+                    {iban != null && [<dt>IBAN</dt>, <dd>{iban}</dd>]}
+                    {bic != null && [<dt>BIC</dt>, <dd>{bic}</dd>]}
+                    <dt>Currency</dt><dd>{code}</dd>
+                </dl>
+            </div>
+        </div>
+        <section.ui-bstmt-sum aria-label="Summary">
+            <div.ui-bstmt-open><h4>Opening balance</h4><p>{money_of(opening)}</p></div>
+            <div.ui-bstmt-in><h4>Paid in ({f.ins})</h4><p>{money_of(f.credits)}</p></div>
+            <div.ui-bstmt-out><h4>Paid out ({f.outs})</h4><p>{money_of(f.debits)}</p></div>
+            <div.ui-bstmt-close><h4>Closing balance</h4><p class={f.bal < 0 ? "ui-bstmt-neg" : null}>{money_of(f.bal)}</p></div>
+        </section>
+        <div.ui-bstmt-scroll>
+            <table>
+                <caption class="ui-sr">Transactions, {day(start)} to {day(end)}</caption>
+                <thead><tr>
+                    <th scope="col">Date</th>
+                    <th scope="col">Description</th>
+                    <th.ui-bstmt-num scope="col">Paid out</th>
+                    <th.ui-bstmt-num scope="col">Paid in</th>
+                    <th.ui-bstmt-num scope="col">Balance</th>
+                </tr></thead>
+                <tbody>
+                    <tr.ui-bstmt-edge>
+                        <td.ui-bstmt-date><time datetime={start}>{day(start)}</time></td>
+                        <td>Opening balance</td><td></td><td></td>
+                        <td.ui-bstmt-num>{money_of(opening)}</td>
+                    </tr>
+                    {for [i, t] in enumerate(f.rows) => <tr key={i}>
+                        <td.ui-bstmt-date><time datetime={t.date}>{day(t.date)}</time></td>
+                        <td>{t.description}{t.reference != null && <span.ui-bstmt-ref>{t.reference}</span>}</td>
+                        <td.ui-bstmt-num>{t.amt < 0 ? money_of(-t.amt) : ""}</td>
+                        <td.ui-bstmt-num>{t.amt > 0 ? money_of(t.amt) : ""}</td>
+                        <td class={ui_cls(["ui-bstmt-num", t.after < 0 && "ui-bstmt-neg"])}>{money_of(t.after)}</td>
+                    </tr>}
+                    <tr.ui-bstmt-edge>
+                        <td.ui-bstmt-date><time datetime={end}>{day(end)}</time></td>
+                        <td>Closing balance</td>
+                        <td.ui-bstmt-num>{money_of(f.debits)}</td>
+                        <td.ui-bstmt-num>{money_of(f.credits)}</td>
+                        <td class={ui_cls(["ui-bstmt-num", f.bal < 0 && "ui-bstmt-neg"])}>{money_of(f.bal)}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        {bank != null && <p.ui-bstmt-foot>Please check this statement and tell {bank.name} at once about anything you do not recognise.</p>}
+    </article>
+}

@@ -1,0 +1,126 @@
+// BillList: the bills coming up, soonest first: each one's payee, due date and
+// amount, whether autopay will pay it, and a Pay button. Overdue bills are marked
+// in red and those due within a week in amber ("Due in 3 days"); paid ones say
+// so. The heading counts what is still to pay and adds it up.
+//
+//   <BillList today="2026-10-29" bills={[
+//       { id: "b1", payee: "City Power & Light", due: "2026-10-27", amount: 88.15m, href: "/pay/b1" },
+//       { id: "b2", payee: "Streamly", category: "Subscription", due: "2026-11-02", amount: 12.99m, autopay: true },
+//       { id: "b3", payee: "Linden Court Lettings", due: "2026-11-01", amount: 1450m, paid: true }]}/>
+//   <BillList bills={bills} on_pay={(id) => { paying = id }}/>
+//
+// bills: a list of { id, payee, due, amount, category?, autopay?, paid?, href? }:
+// due an ISO date; amount a number or decimal; autopay, paid booleans; href where
+// its Pay link goes. today: the ISO date they are counted from (the server's
+// today, in UTC, by default). soon: how many days ahead counts as due soon (7).
+// on_pay(id): inside one of your components, called by a Pay button for a bill
+// without href. pay_label: the button's text ("Pay"). label: the heading
+// ("Upcoming bills"; null for none). currency ("USD") and locale ("en-US"): how
+// amounts and dates are written. id: the element's id.
+
+let bill_list_css = css`
+.ui-bills { display: grid; gap: 10px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-bills-top { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; }
+.ui-bills-title { margin: 0; font-size: 16px; font-weight: 600; }
+.ui-bills-total { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-bills-total b { color: var(--ui-fg); font-variant-numeric: tabular-nums; }
+.ui-bills-total .ui-bills-late { color: var(--ui-danger); font-weight: 600; }
+.ui-bills-list { margin: 0; padding: 0; list-style: none; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); overflow: hidden; }
+.ui-bills-item { --s: var(--ui-border); display: flex; align-items: center; gap: 12px; padding: 12px 14px 12px 11px; border-left: 3px solid var(--s); }
+.ui-bills-item + .ui-bills-item { border-top: 1px solid var(--ui-border); }
+.ui-bills-overdue { --s: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger-soft) 45%, var(--ui-surface)); }
+.ui-bills-today, .ui-bills-soon { --s: var(--ui-warning); }
+.ui-bills-paid { --s: var(--ui-success); }
+.ui-bills-cal { flex: none; display: grid; justify-items: center; width: 42px; padding: 3px 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); line-height: 1.1; }
+.ui-bills-cal small { color: var(--ui-muted); font-size: 10px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
+.ui-bills-cal b { font-size: 16px; font-variant-numeric: tabular-nums; }
+.ui-bills-what { display: grid; flex: 1; gap: 2px; min-width: 0; }
+.ui-bills-payee { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-bills-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; color: var(--ui-muted); font-size: 12px; }
+.ui-bills-when { font-weight: 500; }
+.ui-bills-overdue .ui-bills-when { color: var(--ui-danger); }
+.ui-bills-today .ui-bills-when, .ui-bills-soon .ui-bills-when { color: var(--ui-warning); }
+.ui-bills-paid .ui-bills-when { color: var(--ui-success); }
+.ui-bills-auto { padding: 0 7px; border-radius: 999px; background: var(--ui-subtle); font-size: 11px; font-weight: 500; line-height: 18px; }
+.ui-bills-auto-on { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-bills-amount { flex: none; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-bills-paid .ui-bills-amount { color: var(--ui-muted); text-decoration: line-through; font-weight: 500; }
+.ui-bills-pay { flex: none; display: inline-flex; align-items: center; height: 30px; padding: 0 13px; border: 1px solid transparent; border-radius: var(--ui-radius-sm);
+  background: var(--ui-accent); color: var(--ui-accent-fg); font: 500 13px var(--ui-font); text-decoration: none; cursor: pointer; }
+.ui-bills-pay:hover { background: color-mix(in srgb, var(--ui-accent) 88%, #000); }
+.ui-bills-pay:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-bills-pay-soft { border-color: var(--ui-border); background: var(--ui-surface); color: var(--ui-fg); }
+.ui-bills-pay-soft:hover { border-color: var(--ui-strong); background: var(--ui-surface); }
+.ui-bills-done { flex: none; width: 58px; color: var(--ui-success); font-size: 13px; font-weight: 600; text-align: center; }
+.ui-bills-empty { margin: 0; padding: 24px 14px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius); color: var(--ui-muted); text-align: center; }
+@media (max-width: 480px) { .ui-bills-cal { display: none; } }
+`
+
+// An amount as text in its currency.
+fn bill_list_money(amount, currency: str, locale: str) -> str {
+    let m = money.of(dec(amount), currency, "half_up")
+    is_err(m) ? str(amount) : money.format(m, locale)
+}
+
+// A bill's state on `today`: { kind, text }, kind one of paid, overdue, today, soon, later.
+fn bill_list_state(b, today: str, soon: int, locale: str) {
+    if b.paid ?? false { return { kind: "paid", text: "Paid" } }
+    let days = date.days_between(today, b.due)
+    if days < 0 { return { kind: "overdue", text: `Overdue by ${-days} ${days == -1 ? "day" : "days"}` } }
+    if days == 0 { return { kind: "today", text: "Due today" } }
+    if days == 1 { return { kind: "soon", text: "Due tomorrow" } }
+    if days <= soon { return { kind: "soon", text: `Due in ${days} days` } }
+    { kind: "later", text: `Due ${date.format(b.due, { locale, style: "medium" })}` }
+}
+
+view BillList(bills: list = [], today: str? = null, soon: int = 7, on_pay = null, pay_label: str = "Pay",
+              label: str? = "Upcoming bills", currency: str = "USD", locale: str = "en-US", id: str? = null, class: str? = null) {
+    style global bill_list_css
+    let code = upper(currency)
+    let day = today ?? date.today()
+    let sorted = sort_by(bills, (b) => b.due)
+    let unpaid = filter(sorted, (b) => !(b.paid ?? false))
+    let late = count(unpaid, (b) => b.due < day)
+    let owed = sum(unpaid | map((b) => dec(b.amount)))
+    <section class={ui_cls(["ui-bills", class])} id={id} aria-label={label ?? "Bills"}>
+        {label != null && <div.ui-bills-top>
+            <h3.ui-bills-title>{label}</h3>
+            {len(unpaid) > 0 && <p.ui-bills-total>
+                {len(unpaid)} to pay, <b>{bill_list_money(owed, code, locale)}</b>
+                {late > 0 && [", ", <span.ui-bills-late>{late} overdue</span>]}
+            </p>}
+        </div>}
+        {len(sorted) == 0
+            ? <p.ui-bills-empty>No bills coming up.</p>
+            : <ul.ui-bills-list>
+                {for b in sorted {
+                    let st = bill_list_state(b, day, soon, locale)
+                    let auto = b.autopay ?? false
+                    let p = date.parts(b.due)
+                    let bid = str(b.id)
+                    <li class={`ui-bills-item ui-bills-${st.kind}`} key={bid} data-bill={bid}>
+                        <time.ui-bills-cal datetime={b.due} aria-hidden="true">
+                            <small>{date.format(b.due, { locale, pattern: "MMM" })}</small><b>{p.day}</b>
+                        </time>
+                        <div.ui-bills-what>
+                            <span.ui-bills-payee>{b.payee}</span>
+                            <span.ui-bills-meta>
+                                <span.ui-bills-when>{st.text}</span>
+                                <span.ui-sr>, {date.format(b.due, { locale, style: "long" })}</span>
+                                {b.category != null && <span>{b.category}</span>}
+                                {st.kind != "paid" && <span class={ui_cls(["ui-bills-auto", auto && "ui-bills-auto-on"])}>{auto ? "Autopay on" : "Autopay off"}</span>}
+                            </span>
+                        </div>
+                        <span.ui-bills-amount>{bill_list_money(b.amount, code, locale)}</span>
+                        {st.kind == "paid"
+                            ? <span.ui-bills-done aria-hidden="true">✓</span>
+                            : b.href != null
+                                ? <a class={ui_cls(["ui-bills-pay", auto && "ui-bills-pay-soft"])} href={b.href} aria-label={`${pay_label} ${b.payee}`}>{pay_label}</a>
+                                : <button class={ui_cls(["ui-bills-pay", auto && "ui-bills-pay-soft"])} type="button" aria-label={`${pay_label} ${b.payee}`}
+                                          @click={() => { on_pay && on_pay(b.id) }}>{pay_label}</button>}
+                    </li>
+                }}
+            </ul>}
+    </section>
+}

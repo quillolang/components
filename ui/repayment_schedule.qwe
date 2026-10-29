@@ -1,0 +1,181 @@
+// RepaymentSchedule: a loan's installments, past and to come: each one's due date
+// and amount, and whether it is paid (when, and how much), due, or overdue, with
+// the days late and the penalty they have run up. The next one to pay (the oldest
+// unpaid) has a pay button: a real <form method="post"> sending its number and what
+// it comes to, so it works without JavaScript. A line above sums up what is
+// overdue and what is next.
+//
+//   <RepaymentSchedule today="2026-10-29" penalty_rate={0.05} grace_days={3} pay_action="/loans/0937/pay"
+//                      installments={[{ due: "2026-09-24", amount: 318.77, paid: 318.77, paid_on: "2026-09-22" },
+//                                     { due: "2026-10-24", amount: 318.77 },
+//                                     { due: "2026-11-24", amount: 318.77 }]}/>
+//
+// installments: a list of { due, amount, paid?, paid_on?, n?, penalty?, note? }: due an
+// ISO date, amount what is owed (a number or a decimal), paid what was paid of it
+// (0), paid_on when; n its number (its place, from 1, by default); penalty what it
+// owes for being late, when the lender worked it out (else it is worked out here).
+// today: the date it is counted from (today's, in UTC). penalty_rate: percent of
+// what is overdue charged a day (0), and penalty_fee a fee once late (0), both
+// after grace_days days (0). pay_action: where the pay form posts (none, no
+// button), with `installment` (n) and `amount` (what is owed with its penalty);
+// pay_label: the button's text before the amount ("Pay"). past: how many paid
+// installments to show, the latest (all). currency: ISO code ("USD"); locale: how
+// amounts and dates are written (the program's; en-US). summary: false leaves out
+// the line above. label: the table's caption, for screen readers ("Repayment
+// schedule"). id, class.
+
+let repayment_schedule_css = css`
+.ui-repayment { display: grid; gap: 12px; min-width: 0; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-repayment-sum { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; margin: 0; overflow: hidden;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-border); }
+.ui-repayment-sum > div { padding: 12px 14px; background: var(--ui-surface); }
+.ui-repayment-sum dt { color: var(--ui-muted); font-size: 12px; font-weight: 500; }
+.ui-repayment-sum dd { margin: 2px 0 0; font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-repayment-sum dd small { display: block; color: var(--ui-muted); font-size: 12px; font-weight: 400; }
+.ui-repayment-sum .ui-repayment-alarm dd { color: var(--ui-danger); }
+.ui-repayment-scroll { overflow-x: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-repayment table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-repayment th, .ui-repayment td { padding: 10px 14px; text-align: left; vertical-align: middle; white-space: nowrap; }
+.ui-repayment thead th { color: var(--ui-muted); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
+  background: var(--ui-subtle); border-bottom: 1px solid var(--ui-border); }
+.ui-repayment tbody tr + tr > * { border-top: 1px solid color-mix(in srgb, var(--ui-border) 70%, transparent); }
+.ui-repayment .ui-repayment-num { text-align: right; }
+.ui-repayment tbody th { color: var(--ui-muted); font-weight: 500; }
+.ui-repayment-row-paid td { color: var(--ui-muted); }
+.ui-repayment-row-overdue { background: color-mix(in srgb, var(--ui-danger-soft) 60%, transparent); }
+.ui-repayment-row-next { box-shadow: inset 3px 0 0 var(--ui-accent); }
+.ui-repayment-row-overdue.ui-repayment-row-next { box-shadow: inset 3px 0 0 var(--ui-danger); }
+.ui-repayment-badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-repayment-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.ui-repayment-paid { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-repayment-due { background: var(--ui-info-soft); color: var(--ui-info); }
+.ui-repayment-overdue { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-repayment-extra { display: block; margin-top: 2px; color: var(--ui-muted); font-size: 12px; }
+.ui-repayment-penalty { color: var(--ui-danger); font-weight: 600; }
+.ui-repayment form { margin: 0; }
+.ui-repayment-pay { display: inline-flex; align-items: center; height: 32px; padding: 0 12px; border: 0; border-radius: var(--ui-radius-sm);
+  background: var(--ui-accent); color: var(--ui-accent-fg); font: 600 13px var(--ui-font); font-variant-numeric: tabular-nums; cursor: pointer; }
+.ui-repayment-row-overdue .ui-repayment-pay { background: var(--ui-danger); color: #fff; }
+.ui-repayment-pay:hover { filter: brightness(1.08); }
+.ui-repayment-pay:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-repayment-more { margin: 0; color: var(--ui-muted); font-size: 13px; }
+`
+
+fn repayment_schedule_money(x: dec, currency: str, locale: str?) -> str {
+    let m = money.of(x, currency, "half_up")
+    if is_err(m) { return str(x) }
+    locale != null ? money.format(m, locale) : money.format(m)
+}
+
+// Each installment with what it stands at: { n, due, amount, paid, owed, status
+// ("paid", "overdue", "due" or "upcoming"), days_late, penalty, paid_on, note }.
+fn repayment_schedule_rows(installments: list, today: str, penalty_rate, penalty_fee, grace_days: int) -> list {
+    let rate = dec(penalty_rate)
+    let fee = dec(penalty_fee)
+    let seen_due = false
+    let out = []
+    for [i, x] in enumerate(installments) {
+        let amount = dec(x.amount)
+        let paid = dec(x.paid ?? 0)
+        let owed = amount > paid ? amount - paid : 0m
+        let late = date.days_between(x.due, today)
+        let status = owed <= 0 ? "paid" : (late > 0 ? "overdue" : (seen_due ? "upcoming" : "due"))
+        if status == "due" { seen_due = true }
+        let days_late = status == "overdue" ? late : 0
+        let penalty = status != "overdue" ? 0m
+            : x.penalty != null ? dec(x.penalty)
+            : days_late > grace_days ? round(owed * rate * days_late / 100, 2, "half_up") + fee : 0m
+        out = out | push({ n: x.n ?? i + 1, due: x.due, amount, paid, owed, status, days_late, penalty, paid_on: x.paid_on, note: x.note })
+    }
+    out
+}
+
+view RepaymentSchedule(installments: list, today: str? = null, penalty_rate = 0, penalty_fee = 0, grace_days: int = 0,
+                       pay_action: str? = null, pay_label: str = "Pay", past: int? = null, currency: str = "USD",
+                       locale: str? = null, summary: bool = true, label: str = "Repayment schedule", id: str? = null, class: str? = null) {
+    style global repayment_schedule_css
+    let day = today ?? date.today()
+    let rows = repayment_schedule_rows(installments, day, penalty_rate, penalty_fee, grace_days)
+    let fmt = (x: dec) => repayment_schedule_money(x, currency, locale)
+    let long_date = (d: str) => date.format(d, { locale: locale ?? "en-US", style: "medium" })
+    let next = find(rows, (r) => r.status != "paid")
+    let overdue = filter(rows, (r) => r.status == "overdue")
+    let overdue_owed = dec(sum(for r in overdue => r.owed))
+    let overdue_penalty = dec(sum(for r in overdue => r.penalty))
+    let upcoming = find(rows, (r) => r.status == "due")
+    let paid_rows = filter(rows, (r) => r.status == "paid")
+    let hidden = past != null && len(paid_rows) > past ? len(paid_rows) - past : 0
+    let hidden_ns = for r in take(paid_rows, hidden) => r.n
+    let shown = filter(rows, (r) => !contains(hidden_ns, r.n))
+    <section class={ui_cls(["ui-repayment", class])} id={id} aria-label={label}>
+        {summary && <dl.ui-repayment-sum>
+            <div class={len(overdue) > 0 ? "ui-repayment-alarm" : null}>
+                <dt>Overdue</dt>
+                <dd data-key="overdue">{fmt(overdue_owed + overdue_penalty)}{" "}
+                    <small>{len(overdue) == 0 ? "Nothing overdue" : `${len(overdue)} ${len(overdue) == 1 ? "installment" : "installments"}${overdue_penalty > 0 ? `, ${fmt(overdue_penalty)} in penalties` : ""}`}</small>
+                </dd>
+            </div>
+            <div>
+                <dt>Next due</dt>
+                <dd data-key="next">{upcoming != null ? fmt(upcoming.owed) : "–"}{" "}
+                    {upcoming != null && <small>{long_date(upcoming.due)}</small>}
+                </dd>
+            </div>
+            <div>
+                <dt>Paid</dt>
+                <dd data-key="paid">{len(paid_rows)} of {len(rows)}{" "}
+                    <small>{fmt(dec(sum(for r in rows => r.paid)))} so far</small>
+                </dd>
+            </div>
+        </dl>}
+        {hidden > 0 && <p.ui-repayment-more>{hidden} earlier {hidden == 1 ? "installment" : "installments"} paid, not shown.</p>}
+        <div.ui-repayment-scroll>
+            <table>
+                <caption class="ui-sr">{label}</caption>
+                <thead><tr>
+                    <th scope="col">#</th>
+                    <th scope="col">Due date</th>
+                    <th.ui-repayment-num scope="col">Amount</th>
+                    <th scope="col">Status</th>
+                    <th.ui-repayment-num scope="col">Paid</th>
+                    {pay_action != null && <th scope="col"><span.ui-sr>Pay</span></th>}
+                </tr></thead>
+                <tbody>
+                    {for r in shown {
+                        let is_next = next != null && r.n == next.n
+                        let to_pay = r.owed + r.penalty
+                        let in_days = date.days_between(day, r.due)
+                        <tr class={ui_cls([`ui-repayment-row-${r.status}`, is_next && "ui-repayment-row-next"])} key={r.n} data-n={r.n} data-status={r.status}>
+                            <th scope="row">{r.n}</th>
+                            <td><time datetime={r.due}>{long_date(r.due)}</time></td>
+                            <td.ui-repayment-num>{fmt(r.amount)}</td>
+                            <td>
+                                <span class={`ui-repayment-badge ui-repayment-${r.status == "upcoming" ? "upcoming" : r.status}`}>{match r.status {
+                                    "paid" => "Paid"
+                                    "overdue" => `Overdue ${r.days_late} ${r.days_late == 1 ? "day" : "days"}`
+                                    "due" => in_days == 0 ? "Due today" : `Due in ${in_days} ${in_days == 1 ? "day" : "days"}`
+                                    _ => "Upcoming"
+                                }}</span>{" "}
+                                {r.penalty > 0 && <span.ui-repayment-extra><span.ui-repayment-penalty data-key="penalty">+{fmt(r.penalty)}</span> late penalty</span>}
+                                {r.note != null && <span.ui-repayment-extra>{r.note}</span>}
+                            </td>
+                            <td.ui-repayment-num>
+                                {r.paid > 0 ? fmt(r.paid) : "–"}{" "}
+                                {r.paid_on != null && <span.ui-repayment-extra><time datetime={r.paid_on}>{long_date(r.paid_on)}</time></span>}{" "}
+                                {r.paid > 0 && r.owed > 0 && <span.ui-repayment-extra>{fmt(r.owed)} left</span>}
+                            </td>
+                            {pay_action != null && <td>
+                                {is_next && <form method="post" action={pay_action}>
+                                    <input type="hidden" name="installment" value={r.n}/>
+                                    <input type="hidden" name="amount" value={str(round(to_pay, 2))}/>
+                                    <button.ui-repayment-pay type="submit">{pay_label} {fmt(to_pay)}</button>
+                                </form>}
+                            </td>}
+                        </tr>
+                    }}
+                </tbody>
+            </table>
+        </div>
+    </section>
+}

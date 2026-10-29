@@ -1,0 +1,224 @@
+// TransferForm: money moved between your own accounts or to a saved payee, in two
+// steps. First from, to, amount, date and memo; Continue checks them (an amount
+// above zero, a different account, enough available with the fee, a date not in
+// the past) and shows a review: each party, the amount, the fee, the total, and
+// the balance left after it. Back changes it; Confirm sends it. The fields have
+// names (from, to, amount, date, memo), so with `action` Confirm posts a plain form.
+//
+//   <TransferForm action="/transfers" today="2026-10-29" fee={1.5m}
+//                 accounts={[{ id: "chk", name: "Everyday", number: "0012004821", available: 2310.18m },
+//                            { id: "sav", name: "Rainy day", number: "0012007710", available: 420m }]}
+//                 payees={[{ id: "p-ana", name: "Ana Okafor", bank: "Harbor Bank", number: "88120345" }]}/>
+//   <TransferForm accounts={accounts} payees={payees} on_confirm={(t) => { last = t }}/>
+//
+// accounts: your accounts, a list of { id, name, number?, available, currency? }.
+// payees: who else can be paid, a list of { id, name, bank?, number? }; ids are
+// unique across both lists, and `to` is sent as one of them. from, to: the ids
+// chosen to start with (from: the first account). amount, when (the date, an
+// ISO date; today's by default) and memo: what the fields start with. today: an
+// ISO date, the earliest a transfer can be dated (null: no limit). fee: what a
+// transfer to a payee costs (0); own_fee: one between your own accounts (0).
+// currency ("USD") and locale: how amounts and dates are written. action: where Confirm posts the form
+// (method post); without it, the page's own address. on_confirm(transfer): inside
+// one of your components, called instead of posting with { from, to, amount, fee,
+// total, date, memo } (amounts as decimals), and the form then says it is done.
+// title: the heading ("Transfer money"); id: the element's id.
+
+let transfer_form_css = css`
+.ui-xfer { display: grid; gap: 16px; min-width: 0; max-width: 480px; padding: 20px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.4 var(--ui-font); }
+.ui-xfer-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.ui-xfer-title { margin: 0; font-size: 17px; font-weight: 600; }
+.ui-xfer-step { color: var(--ui-muted); font-size: 12px; font-weight: 500; }
+.ui-xfer-fields { display: grid; gap: 14px; }
+.ui-xfer-field { display: grid; gap: 6px; min-width: 0; }
+.ui-xfer-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.ui-xfer-label { font-size: 13px; font-weight: 500; }
+.ui-xfer-opt { color: var(--ui-muted); font-weight: 400; }
+.ui-xfer-field select, .ui-xfer-field input { width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); outline: none; transition: border-color .15s, box-shadow .15s; }
+.ui-xfer-field select:hover, .ui-xfer-field input:hover { border-color: var(--ui-strong); }
+.ui-xfer-field select:focus, .ui-xfer-field input:focus { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-xfer-money { position: relative; }
+.ui-xfer-money span { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--ui-muted); font-weight: 500; pointer-events: none; }
+.ui-xfer-field .ui-xfer-money input { padding-left: 28px; font-variant-numeric: tabular-nums; }
+.ui-xfer-field [aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-xfer-hint, .ui-xfer-error { margin: 0; color: var(--ui-muted); font-size: 12px; }
+.ui-xfer-error { color: var(--ui-danger); font-weight: 500; }
+.ui-xfer-review { display: grid; grid-template-columns: auto 1fr; gap: 8px 18px; margin: 0; padding: 14px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-xfer-review dt { color: var(--ui-muted); }
+.ui-xfer-review dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-xfer-sub { display: block; color: var(--ui-muted); font-size: 12px; }
+.ui-xfer-total, .ui-xfer-total + dd { padding-top: 8px; border-top: 1px solid var(--ui-border); font-weight: 650; color: var(--ui-fg); }
+.ui-xfer-after + dd { font-weight: 600; }
+.ui-xfer-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.ui-xfer-btn { display: inline-flex; align-items: center; justify-content: center; height: 38px; padding: 0 16px; border: 1px solid transparent;
+  border-radius: var(--ui-radius-sm); font: 500 14px var(--ui-font); cursor: pointer; transition: background .15s, border-color .15s; }
+.ui-xfer-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-xfer-primary { background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-xfer-primary:hover { background: color-mix(in srgb, var(--ui-accent) 88%, #000); }
+.ui-xfer-secondary { border-color: var(--ui-border); background: var(--ui-surface); color: var(--ui-fg); }
+.ui-xfer-secondary:hover { border-color: var(--ui-strong); }
+.ui-xfer-done { display: grid; justify-items: center; gap: 6px; padding: 12px 0; text-align: center; }
+.ui-xfer-done svg { width: 40px; height: 40px; color: var(--ui-success); }
+.ui-xfer-done p { margin: 0; }
+.ui-xfer-done-amount { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+@media (max-width: 480px) { .ui-xfer-row { grid-template-columns: 1fr; } }
+@media (prefers-reduced-motion: reduce) { .ui-xfer-field select, .ui-xfer-field input, .ui-xfer-btn { transition: none; } }
+`
+
+// An amount as text in its currency.
+fn transfer_form_money(amount, currency: str, locale: str?) -> str {
+    let m = money.of(dec(amount), currency, "half_up")
+    if is_err(m) { return str(amount) }
+    locale != null ? money.format(m, locale) : money.format(m)
+}
+
+// An account or payee as one line: "Everyday •••• 4821".
+fn transfer_form_line(p) -> str {
+    let last4 = slice(re.replace(str(p.number ?? ""), "[^0-9A-Za-z]", ""), -4)
+    last4 == "" ? p.name : `${p.name} •••• ${last4}`
+}
+
+// What was typed as an amount: a decimal, or null when it is not one ("1,250.5" is 1250.5m).
+fn transfer_form_amount(text: str) {
+    let clean = re.replace(trim(text), "[,\\s]", "")
+    if clean == "" || !re.test(clean, "^[0-9]*\\.?[0-9]*$") { return null }
+    let d = dec(clean)
+    type_of(d) == "error" ? null : d
+}
+
+component TransferForm(accounts: list = [], payees: list = [], from: str | num | null = null, to: str | num | null = null,
+                       amount: num | str | null = null, when: str? = null, memo: str = "", today: str? = null, fee = 0,
+                       own_fee = 0, currency: str = "USD", locale: str? = null, action: str? = null, on_confirm = null,
+                       title: str = "Transfer money", id: str? = null, class: str? = null) {
+    style global transfer_form_css
+    state step = "edit"
+    state tried = false
+    state from_id = str(from ?? (len(accounts) > 0 ? accounts[0].id : ""))
+    state to_id = to != null ? str(to) : ""
+    state amount_text = amount != null ? str(amount) : ""
+    state day = when ?? today ?? ""
+    state memo_text = memo
+    let code = upper(currency)
+    let base = id ?? "transfer-form"
+    let src = find(accounts, (a) => str(a.id) == from_id)
+    let own_to = find(accounts, (a) => str(a.id) == to_id)
+    let payee_to = find(payees, (p) => str(p.id) == to_id)
+    let dest = own_to ?? payee_to
+    let amt = transfer_form_amount(amount_text)
+    let charge = dec(own_to != null ? own_fee : fee)
+    let places = money.minor_units(code)
+    let total = amt != null ? amt + charge : null
+    let left = src != null && total != null ? dec(src.available ?? 0) - total : null
+    let amount_error = amt == null ? "Enter an amount, such as 125.00."
+        : amt <= 0 ? "Enter an amount above zero."
+        : round(amt, places, "down") != amt ? `Use at most ${places} decimals.`
+        : left != null && left < 0 ? `${src.name} has ${transfer_form_money(src.available ?? 0, code, locale)} available; this needs ${transfer_form_money(total, code, locale)}${charge > 0 ? " with the fee" : ""}.`
+        : null
+    let to_error = to_id == "" ? "Choose who to send it to." : to_id == from_id ? "Choose an account other than the one it comes from." : null
+    let date_error = day == "" || !date.valid(day, "date") ? "Choose a date." : today != null && day < today ? "Choose today or a later date." : null
+    let ok = src != null && amount_error == null && to_error == null && date_error == null
+    let field_error = (key: str, message) => tried && message != null
+        ? <p.ui-xfer-error id={`${base}-${key}-error`}>{message}</p> : null
+    let transfer = () => ({ from: from_id, to: to_id, amount: amt, fee: charge, total, date: day, memo: trim(memo_text) })
+    <form class={ui_cls(["ui-xfer", class])} id={id} method="post" action={action} aria-labelledby={`${base}-title`} novalidate>
+        <div.ui-xfer-head>
+            <h3.ui-xfer-title id={`${base}-title`}>{step == "done" ? "Transfer sent" : title}</h3>
+            {step != "done" && <span.ui-xfer-step>{step == "edit" ? "Step 1 of 2" : "Step 2 of 2: review"}</span>}
+        </div>
+        <p.ui-sr role="status">{step == "review" ? "Review the transfer, then confirm." : step == "done" ? "Transfer sent." : ""}</p>
+        {match step {
+            "edit" => <div.ui-xfer-fields>
+                <div.ui-xfer-field>
+                    <label.ui-xfer-label for={`${base}-from`}>From</label>
+                    <select id={`${base}-from`} name="from" aria-describedby={`${base}-from-hint`} @change={(e) => { from_id = e.value }}>
+                        {for a in accounts => <option key={str(a.id)} value={str(a.id)} selected={str(a.id) == from_id}>{transfer_form_line(a)}</option>}
+                    </select>
+                    <p.ui-xfer-hint id={`${base}-from-hint`}>{src != null ? `Available: ${transfer_form_money(src.available ?? 0, code, locale)}` : ""}</p>
+                </div>
+                <div.ui-xfer-field>
+                    <label.ui-xfer-label for={`${base}-to`}>To</label>
+                    <select id={`${base}-to`} name="to" aria-invalid={tried && to_error != null ? "true" : null}
+                            aria-describedby={tried && to_error != null ? `${base}-to-error` : null} @change={(e) => { to_id = e.value }}>
+                        <option value="" selected={to_id == ""}>Choose an account or payee</option>
+                        {len(accounts) > 1 && <optgroup label="Your accounts">
+                            {for a in accounts => <option key={str(a.id)} value={str(a.id)} selected={str(a.id) == to_id}>{transfer_form_line(a)}</option>}
+                        </optgroup>}
+                        {len(payees) > 0 && <optgroup label="Payees">
+                            {for p in payees => <option key={str(p.id)} value={str(p.id)} selected={str(p.id) == to_id}>{transfer_form_line(p)}{p.bank != null ? `, ${p.bank}` : ""}</option>}
+                        </optgroup>}
+                    </select>
+                    {field_error("to", to_error)}
+                </div>
+                <div.ui-xfer-row>
+                    <div.ui-xfer-field>
+                        <label.ui-xfer-label for={`${base}-amount`}>Amount ({code})</label>
+                        <div.ui-xfer-money>
+                            <input id={`${base}-amount`} name="amount" type="text" inputmode="decimal" autocomplete="off" placeholder="0.00"
+                                   bind:value={amount_text} aria-invalid={tried && amount_error != null ? "true" : null}
+                                   aria-describedby={tried && amount_error != null ? `${base}-amount-error` : null}/>
+                        </div>
+                        {field_error("amount", amount_error)}
+                    </div>
+                    <div.ui-xfer-field>
+                        <label.ui-xfer-label for={`${base}-date`}>Date</label>
+                        <input id={`${base}-date`} name="date" type="date" min={today} bind:value={day}
+                               aria-invalid={tried && date_error != null ? "true" : null}
+                               aria-describedby={tried && date_error != null ? `${base}-date-error` : null}/>
+                        {field_error("date", date_error)}
+                    </div>
+                </div>
+                <div.ui-xfer-field>
+                    <label.ui-xfer-label for={`${base}-memo`}>Memo <span.ui-xfer-opt>(optional)</span></label>
+                    <input id={`${base}-memo`} name="memo" type="text" maxlength="140" autocomplete="off" bind:value={memo_text}
+                           placeholder="What it is for"/>
+                </div>
+                <div.ui-xfer-actions>
+                    <button.ui-xfer-btn.ui-xfer-primary type="button" @click={() => {
+                        tried = true
+                        if ok { step = "review" }
+                    }}>Continue</button>
+                </div>
+            </div>
+            "review" => <div.ui-xfer-fields>
+                <dl.ui-xfer-review>
+                    <dt>From</dt><dd>{transfer_form_line(src)}</dd>
+                    <dt>To</dt><dd>{transfer_form_line(dest)}{payee_to != null && payee_to.bank != null && <span.ui-xfer-sub>{payee_to.bank}</span>}</dd>
+                    <dt>Date</dt><dd><time datetime={day}>{date.format(day, { locale: locale ?? "en-US", style: "long" })}</time>{today != null && day == today && <span.ui-xfer-sub>Today</span>}</dd>
+                    {trim(memo_text) != "" && [<dt>Memo</dt>, <dd>{trim(memo_text)}</dd>]}
+                    <dt>Amount</dt><dd.ui-xfer-amount>{transfer_form_money(amt, code, locale)}</dd>
+                    <dt>Fee</dt><dd.ui-xfer-fee>{charge > 0 ? transfer_form_money(charge, code, locale) : "Free"}</dd>
+                    <dt.ui-xfer-total>Total</dt><dd>{transfer_form_money(total, code, locale)}</dd>
+                    <dt.ui-xfer-after>{src.name} after</dt><dd.ui-xfer-left>{transfer_form_money(left, code, locale)}</dd>
+                    {own_to != null && [<dt>{own_to.name} after</dt>, <dd.ui-xfer-to-left>{transfer_form_money(dec(own_to.available ?? 0) + amt, code, locale)}</dd>]}
+                </dl>
+                <input type="hidden" name="from" value={from_id}/>
+                <input type="hidden" name="to" value={to_id}/>
+                <input type="hidden" name="amount" value={str(amt)}/>
+                <input type="hidden" name="date" value={day}/>
+                <input type="hidden" name="memo" value={trim(memo_text)}/>
+                <div.ui-xfer-actions>
+                    <button.ui-xfer-btn.ui-xfer-secondary type="button" @click={() => { step = "edit" }}>Back</button>
+                    {on_confirm != null
+                        ? <button.ui-xfer-btn.ui-xfer-primary type="button" @click={() => {
+                              on_confirm(transfer())
+                              step = "done"
+                          }}>Confirm transfer</button>
+                        : <button.ui-xfer-btn.ui-xfer-primary type="submit">Confirm transfer</button>}
+                </div>
+            </div>
+            _ => <div.ui-xfer-done>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m7.5 12.5 3 3 6-6.5"/></svg>
+                <p.ui-xfer-done-amount>{transfer_form_money(total ?? 0, code, locale)}</p>
+                <p>to {dest != null ? dest.name : ""}, {today != null && day == today ? "today" : `on ${date.format(day, { locale: locale ?? "en-US", style: "long" })}`}.</p>
+                <button.ui-xfer-btn.ui-xfer-secondary type="button" @click={() => {
+                    amount_text = ""
+                    memo_text = ""
+                    tried = false
+                    step = "edit"
+                }}>Make another transfer</button>
+            </div>
+        }}
+    </form>
+}

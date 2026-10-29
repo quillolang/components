@@ -1,0 +1,139 @@
+// LoanSummary: a loan at a glance, in a card: what is still owed, out of how much
+// was borrowed, how much is paid off as a bar, the rate, and the next payment with
+// its date and how far off it is (or how late), with links to pay and to the loan.
+//
+//   <LoanSummary name="Home loan" lender="Harbor Federal" account="•••• 4821" balance={182450.12} original={250000}
+//                rate={6.25} next_amount={1539.29} next_date="2026-11-15" pay_href="/loans/4821/pay" href="/loans/4821"/>
+//   <LoanSummary name="Car loan" balance={0} original={18000} rate={7.9} currency="EUR" locale="de-DE"/>
+//
+// name: what the loan is ("Home loan"). lender, account: under the name; give the
+// account masked ("•••• 4821"). balance: what is still owed; original: what was
+// borrowed (numbers or decimals); paid off is the part of original no longer owed.
+// rate: the yearly rate in percent; rate_label: after it ("APR"; "" for none).
+// next_amount, next_date (ISO): the next payment; today: the date it is counted
+// from ("2026-10-29"; today's, in UTC). A date past today reads "overdue" in red.
+// ends: the last payment's date (ISO), and payments_left: how many are left, a
+// line each when given. status: a badge by the name: "current", "late",
+// "paid" or other text (made "paid" by a zero balance, "late" by an overdue date).
+// currency: ISO code ("USD"); locale: how amounts and dates are written (the
+// program's; en-US). pay_href: a "Make a payment" link; href: a "Details" link
+// (link_label). id, class.
+
+let loan_summary_css = css`
+.ui-loan-summary { display: grid; gap: 16px; align-content: start; min-width: 0; padding: 18px 20px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-loan-summary-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.ui-loan-summary-name { margin: 0; font-size: 16px; font-weight: 650; line-height: 1.3; }
+.ui-loan-summary-who { margin: 2px 0 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-loan-summary-status { flex: none; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; text-transform: capitalize;
+  background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-loan-summary-current { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-loan-summary-paid { background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-loan-summary-late { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-loan-summary-owed { margin: 0; }
+.ui-loan-summary-owed span { display: block; color: var(--ui-muted); font-size: 13px; font-weight: 500; }
+.ui-loan-summary-owed strong { display: block; font-size: 30px; font-weight: 700; letter-spacing: -.015em; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.ui-loan-summary-owed small { color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-loan-summary-progress { display: grid; gap: 6px; }
+.ui-loan-summary-progress-head { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-loan-summary-progress-head span:last-child { color: var(--ui-muted); }
+.ui-loan-summary-bar { height: 8px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); box-shadow: inset 0 0 0 1px var(--ui-border); }
+.ui-loan-summary-bar > span { display: block; height: 100%; border-radius: inherit; background: var(--ui-accent); }
+.ui-loan-summary-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px 16px; margin: 0; padding-top: 14px;
+  border-top: 1px solid var(--ui-border); }
+.ui-loan-summary-facts dt { color: var(--ui-muted); font-size: 12px; font-weight: 500; }
+.ui-loan-summary-facts dd { margin: 2px 0 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-loan-summary-facts dd small { display: block; color: var(--ui-muted); font-size: 12px; font-weight: 400; }
+.ui-loan-summary-facts .ui-loan-summary-overdue small { color: var(--ui-danger); font-weight: 600; }
+.ui-loan-summary-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.ui-loan-summary-pay { display: inline-flex; align-items: center; height: 34px; padding: 0 14px; border-radius: var(--ui-radius-sm);
+  background: var(--ui-accent); color: var(--ui-accent-fg); font-weight: 600; text-decoration: none; }
+.ui-loan-summary-pay:hover { filter: brightness(1.08); }
+.ui-loan-summary-link { color: var(--ui-accent); font-weight: 500; text-decoration: none; }
+.ui-loan-summary-link:hover { text-decoration: underline; }
+.ui-loan-summary-pay:focus-visible, .ui-loan-summary-link:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: var(--ui-radius-sm); }
+`
+
+fn loan_summary_money(x: dec, currency: str, locale: str?) -> str {
+    let m = money.of(x, currency, "half_up")
+    if is_err(m) { return str(x) }
+    locale != null ? money.format(m, locale) : money.format(m)
+}
+
+// How far off a payment is, in words: "in 17 days", "tomorrow", "today", "3 days overdue".
+fn loan_summary_when(days: int) -> str =
+    days == 0 ? "due today" : days == 1 ? "tomorrow" : days > 1 ? `in ${days} days` : (days == -1 ? "1 day overdue" : `${-days} days overdue`)
+
+view LoanSummary(name: str, balance, original, rate = null, rate_label: str = "APR", lender: str? = null, account: str? = null,
+                 next_amount = null, next_date: str? = null, today: str? = null, ends: str? = null, payments_left: int? = null,
+                 status: str? = null, currency: str = "USD", locale: str? = null, pay_href: str? = null, href: str? = null,
+                 link_label: str = "Details", id: str? = null, class: str? = null) {
+    style global loan_summary_css
+    let owed = dec(balance)
+    let lent = dec(original)
+    let paid = lent > owed ? lent - owed : 0m
+    let pct = lent > 0 ? round(paid * 100 / lent, 1, "down") : 0m
+    let fmt = (x: dec) => loan_summary_money(x, currency, locale)
+    let day = today ?? date.today()
+    let days = owed > 0 && next_date != null ? date.days_between(day, next_date) : null
+    let late = days != null && days < 0
+    let shown = status ?? (owed <= 0 ? "paid" : late ? "late" : "current")
+    let tone = match lower(shown) {
+        "current" | "on time" => "current"
+        "paid" | "paid off" | "closed" => "paid"
+        "late" | "overdue" | "default" | "in arrears" => "late"
+        _ => null
+    }
+    let long_date = (d: str) => date.format(d, { locale: locale ?? "en-US", style: "medium" })
+    let heading = id != null ? `${id}-name` : null
+    <article class={ui_cls(["ui-loan-summary", class])} id={id} aria-labelledby={heading} aria-label={heading == null ? name : null}>
+        <header.ui-loan-summary-head>
+            <div>
+                <h3.ui-loan-summary-name id={heading}>{name}</h3>
+                {(lender != null || account != null) && <p.ui-loan-summary-who>{join(filter([lender, account], (x) => x != null), " · ")}</p>}
+            </div>
+            <span class={ui_cls(["ui-loan-summary-status", tone != null && `ui-loan-summary-${tone}`])}>{tone == "paid" && status == null ? "Paid off" : shown}</span>
+        </header>
+        <p.ui-loan-summary-owed>
+            <span>Outstanding balance</span>
+            <strong data-key="balance">{fmt(owed)}</strong>
+            <small>of {fmt(lent)} borrowed</small>
+        </p>
+        <div.ui-loan-summary-progress>
+            <div.ui-loan-summary-progress-head aria-hidden="true">
+                <span data-key="percent">{pct}% paid off</span>
+                <span>{fmt(paid)} repaid</span>
+            </div>
+            <div.ui-loan-summary-bar role="progressbar" aria-label="Paid off" aria-valuemin="0" aria-valuemax="100" aria-valuenow={pct}
+                 aria-valuetext={`${pct}% paid off, ${fmt(paid)} of ${fmt(lent)}`}>
+                <span style={`width: ${pct}%`}></span>
+            </div>
+        </div>
+        <dl.ui-loan-summary-facts>
+            {rate != null && <div>
+                <dt>Interest rate</dt>
+                <dd data-key="rate">{dec(rate)}%{rate_label != "" ? ` ${rate_label}` : ""}</dd>
+            </div>}
+            {owed > 0 && next_amount != null && <div class={late ? "ui-loan-summary-overdue" : null}>
+                <dt>Next payment</dt>
+                <dd data-key="next">{fmt(dec(next_amount))}{" "}
+                    {next_date != null && <small><span.ui-sr>due </span><time datetime={next_date}>{long_date(next_date)}</time>, {loan_summary_when(days)}</small>}
+                </dd>
+            </div>}
+            {ends != null && <div>
+                <dt>Final payment</dt>
+                <dd data-key="ends"><time datetime={ends}>{long_date(ends)}</time>{" "}
+                    {payments_left != null && <small>{payments_left} {payments_left == 1 ? "payment" : "payments"} left</small>}
+                </dd>
+            </div>}
+            {ends == null && payments_left != null && <div>
+                <dt>Payments left</dt>
+                <dd data-key="left">{payments_left}</dd>
+            </div>}
+        </dl>
+        {(pay_href != null && owed > 0 || href != null) && <div.ui-loan-summary-actions>
+            {pay_href != null && owed > 0 && <a.ui-loan-summary-pay href={pay_href}>Make a payment</a>}
+            {href != null && <a.ui-loan-summary-link href={href}>{link_label} <span aria-hidden="true">→</span></a>}
+        </div>}
+    </article>
+}

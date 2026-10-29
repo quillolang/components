@@ -1,0 +1,144 @@
+// TransactionList: an account's transactions grouped by day, newest first: each
+// one's description, category, the amount in (green, with +) or out, and the
+// balance after it. Pending ones are marked and not yet in the balance. A search
+// box filters them by description, category or amount as it is typed.
+//
+//   <TransactionList balance={2450.18m} today="2026-10-29" items={[
+//       { id: "t9", date: "2026-10-29", description: "Corner Bakery", category: "Food", amount: -6.4m, pending: true },
+//       { id: "t8", date: "2026-10-28", description: "Salary, Northwind Ltd", category: "Income", amount: 3200m },
+//       { id: "t7", date: "2026-10-28", description: "City Power", category: "Bills", amount: -88.15m }]}/>
+//
+// items: a list of { id?, date, description, category?, amount, pending?, detail? },
+// newest first: date an ISO date, amount a number or decimal, below 0 for money
+// out; detail, a second line (a reference, a card's last four). balance: the
+// balance now, after the newest posted transaction; each posted one shows the
+// balance after it, worked back from this (null: no balances). today: an ISO
+// date, so that its day and the one before read "Today" and "Yesterday". currency
+// ("USD") and locale ("en-US"): how amounts and days are written. label: the
+// heading ("Transactions"; null for none). search: the search box (true);
+// placeholder: its hint text. empty: what shows when nothing matches. id: the
+// element's id.
+
+let transaction_list_css = css`
+.ui-txl { display: grid; gap: 12px; min-width: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-txl-top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; }
+.ui-txl-title { margin: 0; font-size: 16px; font-weight: 600; }
+.ui-txl-search { position: relative; flex: 1 1 220px; max-width: 320px; }
+.ui-txl-search svg { position: absolute; left: 10px; top: 50%; width: 14px; height: 14px; transform: translateY(-50%); color: var(--ui-muted); pointer-events: none; }
+.ui-txl-search input { width: 100%; height: 34px; padding: 0 10px 0 30px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); outline: none; transition: border-color .15s, box-shadow .15s; }
+.ui-txl-search input:hover { border-color: var(--ui-strong); }
+.ui-txl-search input:focus { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-txl-days { display: grid; gap: 14px; }
+.ui-txl-day { border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); overflow: hidden; }
+.ui-txl-dayhead { display: flex; justify-content: space-between; gap: 12px; margin: 0; padding: 8px 14px; background: var(--ui-subtle);
+  border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 12px; font-weight: 600; letter-spacing: .03em; }
+.ui-txl-daynet { font-variant-numeric: tabular-nums; }
+.ui-txl-rows { margin: 0; padding: 0; list-style: none; }
+.ui-txl-row { display: flex; align-items: center; gap: 12px; padding: 10px 14px; }
+.ui-txl-row + .ui-txl-row { border-top: 1px solid var(--ui-border); }
+.ui-txl-what { display: grid; flex: 1; gap: 2px; min-width: 0; }
+.ui-txl-desc { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-txl-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; color: var(--ui-muted); font-size: 12px; }
+.ui-txl-cat { padding: 0 7px; border-radius: 999px; background: var(--ui-subtle); color: var(--ui-fg); font-size: 11px; font-weight: 500; line-height: 18px; }
+.ui-txl-pending-tag { padding: 0 7px; border: 1px dashed var(--ui-warning); border-radius: 999px; color: var(--ui-warning); font-size: 11px; font-weight: 600; line-height: 17px; }
+.ui-txl-money { display: grid; flex: none; justify-items: end; gap: 1px; font-variant-numeric: tabular-nums; }
+.ui-txl-amount { font-weight: 600; }
+.ui-txl-in .ui-txl-amount { color: var(--ui-success); }
+.ui-txl-pending .ui-txl-amount { color: var(--ui-muted); font-style: italic; }
+.ui-txl-after { color: var(--ui-muted); font-size: 12px; }
+.ui-txl-empty { margin: 0; padding: 28px 14px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius); color: var(--ui-muted); text-align: center; }
+@media (prefers-reduced-motion: reduce) { .ui-txl-search input { transition: none; } }
+`
+
+// An amount as text in its currency.
+fn transaction_list_money(amount, currency: str, locale: str) -> str {
+    let m = money.of(dec(amount), currency, "half_up")
+    is_err(m) ? str(amount) : money.format(m, locale)
+}
+
+// An amount with its sign: "+$3,200.00" in, "−$6.40" out.
+fn transaction_list_signed(amount, currency: str, locale: str) -> str {
+    let a = dec(amount)
+    `${a < 0 ? "−" : "+"}${transaction_list_money(abs(a), currency, locale)}`
+}
+
+// The items with { amt, pending, after }: after, the balance once each posted one
+// had gone through, worked back from `balance` (null for pending ones, or no balance).
+fn transaction_list_rows(items: list, balance) -> list {
+    let start = { bal: balance != null ? dec(balance) : null, out: [] }
+    let done = reduce(items, start, (acc, t) => {
+        let amt = dec(t.amount)
+        let pending = t.pending ?? false
+        let counts = !pending && acc.bal != null
+        { bal: counts ? acc.bal - amt : acc.bal, out: push(acc.out, merge(t, { amt, pending, after: counts ? acc.bal : null })) }
+    })
+    done.out
+}
+
+// A day's heading: "Today", "Yesterday", else "Monday, October 26, 2026".
+fn transaction_list_day(d: str, today: str?, locale: str) -> str {
+    if today != null && d == today { return "Today" }
+    if today != null && d == date.add_days(today, -1) { return "Yesterday" }
+    date.format(d, { locale, style: "full" })
+}
+
+component TransactionList(items: list = [], balance = null, today: str? = null, currency: str = "USD", locale: str = "en-US",
+                          label: str? = "Transactions", search: bool = true, placeholder: str = "Search transactions",
+                          empty: str = "No transactions match.", id: str? = null, class: str? = null) {
+    style global transaction_list_css
+    state q = ""
+    let code = upper(currency)
+    let rows = transaction_list_rows(items, balance)
+    let needle = lower(trim(q))
+    let shown = needle == "" ? rows : filter(rows, (t) => contains(lower(t.description), needle)
+        || contains(lower(t.category ?? ""), needle) || contains(transaction_list_money(abs(t.amt), code, locale), needle))
+    let days = group_by(shown, (t) => slice(str(t.date), 0, 10))
+    let box = `${id ?? "transaction-list"}-search`
+    <section class={ui_cls(["ui-txl", class])} id={id} aria-label={label ?? "Transactions"}>
+        {(label != null || search) && <div.ui-txl-top>
+            {label != null && <h3.ui-txl-title>{label}</h3>}
+            {search && <div.ui-txl-search role="search">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="5"/><path d="m11 11 3.5 3.5"/></svg>
+                <input type="search" id={box} bind:value={q} placeholder={placeholder} aria-label={placeholder} autocomplete="off"/>
+            </div>}
+        </div>}
+        <p.ui-sr role="status">{needle == "" ? "" : `${len(shown)} ${len(shown) == 1 ? "transaction" : "transactions"} found`}</p>
+        {len(shown) == 0
+            ? <p.ui-txl-empty>{len(items) == 0 ? "No transactions yet." : empty}</p>
+            : <div.ui-txl-days>
+                {for [day, ts] in days {
+                    let net = sum(ts | map((t) => t.amt))
+                    let head = `${id ?? "transaction-list"}-day-${day}`
+                    <section.ui-txl-day key={day} aria-labelledby={head} data-day={day}>
+                        <h4.ui-txl-dayhead id={head}>
+                            <span>{transaction_list_day(day, today, locale)}</span>
+                            <span.ui-txl-daynet><span.ui-sr>Net for the day: </span>{transaction_list_signed(net, code, locale)}</span>
+                        </h4>
+                        <ul.ui-txl-rows>
+                            {for [i, t] in enumerate(ts) {
+                                let money_in = t.amt > 0
+                                <li class={ui_cls(["ui-txl-row", money_in && "ui-txl-in", t.pending && "ui-txl-pending"])} key={str(t.id ?? `${day}-${i}`)}>
+                                    <div.ui-txl-what>
+                                        <span.ui-txl-desc>{t.description}</span>
+                                        {(t.category != null || t.pending || t.detail != null) && <span.ui-txl-meta>
+                                            {t.pending && <span.ui-txl-pending-tag>Pending</span>}
+                                            {t.category != null && <span.ui-txl-cat>{t.category}</span>}
+                                            {t.detail != null && <span>{t.detail}</span>}
+                                        </span>}
+                                    </div>
+                                    <div.ui-txl-money>
+                                        <span.ui-txl-amount>
+                                            <span aria-hidden="true">{transaction_list_signed(t.amt, code, locale)}</span>
+                                            <span.ui-sr>{transaction_list_money(abs(t.amt), code, locale)} {money_in ? "in" : "out"}</span>
+                                        </span>
+                                        {t.after != null && <span.ui-txl-after><span.ui-sr>Balance after: </span>{transaction_list_money(t.after, code, locale)}</span>}
+                                    </div>
+                                </li>
+                            }}
+                        </ul>
+                    </section>
+                }}
+            </div>}
+    </section>
+}

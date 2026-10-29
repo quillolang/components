@@ -1,0 +1,20 @@
+const s = $("#bank-statement-demo");
+const sum = (c) => s.querySelector(`.ui-bstmt-${c} p`).textContent;
+if (sum("open") !== "£1,824.60" || sum("in") !== "£3,224.36" || sum("out") !== "£1,700.33" || sum("close") !== "£3,348.63") return `summary: ${["open", "in", "out", "close"].map(sum)}`;
+if (s.querySelector(".ui-bstmt-in h4").textContent !== "Paid in (3)" || s.querySelector(".ui-bstmt-out h4").textContent !== "Paid out (4)") return "the counts";
+if (s.querySelector(".ui-bstmt-period").textContent !== "1 October 2026 to 31 October 2026") return `period: ${s.querySelector(".ui-bstmt-period").textContent}`;
+const rows = [...s.querySelectorAll("tbody tr")];
+if (rows.length !== 9) return `rows: ${rows.length}`;
+const cells = (r) => [...r.cells].map((c) => c.textContent);
+if (cells(rows[0]).join("|") !== "1 Oct 2026|Opening balance|||£1,824.60") return `opening row: ${cells(rows[0]).join("|")}`;
+if (cells(rows[1]).join("|") !== "1 Oct 2026|Linden Court LettingsStanding order, rent|£1,450.00||£374.60") return `first row: ${cells(rows[1]).join("|")}`;
+const bal = rows.slice(1, 8).map((r) => r.cells[4].textContent);
+if (bal.join(",") !== "£374.60,£312.42,£224.27,£247.26,£147.26,£3,347.26,£3,348.63") return `running balance: ${bal}`;
+if (cells(rows[4])[3] !== "£22.99" || cells(rows[4])[2] !== "") return "money in goes in its column";
+if (cells(rows[8]).join("|") !== "31 Oct 2026|Closing balance|£1,700.33|£3,224.36|£3,348.63") return `closing row: ${cells(rows[8]).join("|")}`;
+if (!s.querySelector(".ui-bstmt-acct").textContent.includes("GB98 FERN 6014 2240 0312 04") || !s.textContent.includes("Dana Whitfield")) return "the account and holder";
+if (s.querySelector("caption")?.textContent !== "Transactions, 1 Oct 2026 to 31 Oct 2026") return "the table's caption";
+if (s.querySelector(".ui-bstmt-meta").textContent !== "No. 10 · Issued 1 Nov 2026") return `meta: ${s.querySelector(".ui-bstmt-meta").textContent}`;
+const printRule = [...document.styleSheets].flatMap((sh) => { try { return [...sh.cssRules]; } catch { return []; } })
+    .some((r) => r.media && r.media.mediaText.includes("print") && r.cssText.includes(".ui-bstmt"));
+if (!printRule) return "no print styles";
