@@ -1,0 +1,172 @@
+// PatronageRefundCalc: what a co-op member gets back for a year, worked out as
+// they type: the dividend on their share capital (the average share capital
+// times the dividend rate) and the patronage refund (the interest they paid on
+// loans, or what they bought from the co-op, times the refund rate), the total
+// and, with a withholding tax, the net. Amounts are decimals, rounded to the
+// currency's cents half up, as a statement would.
+//
+//   <PatronageRefundCalc currency="PHP" share_capital={18000} dividend_rate={6.5} patronage={24500} refund_rate={12}/>
+//   <PatronageRefundCalc currency="USD" basis="purchases" refund_rate={3} tax_rate={10}
+//                        on_change={(f) => { total = f.total }}/>
+//
+// share_capital, dividend_rate, patronage, refund_rate: where the fields start
+// (numbers, decimals or numeric text; empty by default); rates are in percent.
+// basis: what the refund is on, "interest" (interest paid on loans, the default)
+// or "purchases"; the member can switch it. tax_rate: a withholding tax in
+// percent, with its own field (left out, none). currency: ISO code ("USD");
+// locale: how to write amounts (the program's). title: the heading ("Dividend
+// and patronage refund"). id: a prefix for its fields' ids ("patronage-refund-calc"),
+// unique on the page. The fields are named share_capital, dividend_rate,
+// patronage, basis, refund_rate and tax_rate, so a form around it sends them;
+// name: a prefix for those names ("store" names them store_share_capital, ...),
+// which two calculators on one page need to keep their radio buttons apart.
+// on_change(figures): inside one of your components, given { dividend, refund,
+// total, tax, net } as decimals after each change.
+//
+// patronage_refund_calc_figures(share_capital, dividend_rate, patronage, refund_rate,
+// tax_rate, currency) is the arithmetic, for a program's own use: the same map as money.
+
+let patronage_refund_calc_css = css`
+.ui-patronage-calc { display: grid; gap: 18px; min-width: 0; max-width: 560px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-patronage-calc .ui-patronage-calc-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-patronage-calc-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 12px 14px; }
+.ui-patronage-calc-field { display: grid; gap: 5px; min-width: 0; }
+.ui-patronage-calc-field label, .ui-patronage-calc-basis legend { font-size: 13px; font-weight: 500; }
+.ui-patronage-calc-box { box-sizing: border-box; display: flex; align-items: center; gap: 6px; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); transition: border-color .15s, box-shadow .15s; }
+.ui-patronage-calc-box:hover { border-color: var(--ui-strong); }
+.ui-patronage-calc-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-patronage-calc-box input { flex: 1; width: 0; min-width: 0; height: 100%; padding: 0; border: 0; outline: none; background: transparent;
+  color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; text-align: right; }
+.ui-patronage-calc-box input::-webkit-inner-spin-button { display: none; }
+.ui-patronage-calc-box span { flex: none; color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-patronage-calc-bad .ui-patronage-calc-box { border-color: var(--ui-danger); }
+.ui-patronage-calc-basis { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; margin: 0; padding: 0; border: 0; }
+.ui-patronage-calc-basis legend { float: left; margin-right: 6px; padding: 0; }
+.ui-patronage-calc-basis label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ui-patronage-calc-basis input { accent-color: var(--ui-accent); margin: 0; }
+.ui-patronage-calc-out { display: grid; gap: 0; margin: 0; padding: 4px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-patronage-calc-out div { display: grid; grid-template-columns: 1fr auto; gap: 2px 16px; padding: 9px 0; border-bottom: 1px solid var(--ui-border); }
+.ui-patronage-calc-out div:last-child { border-bottom: 0; }
+.ui-patronage-calc-out dt { font-weight: 500; }
+.ui-patronage-calc-out dd { margin: 0; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-patronage-calc-how { display: block; font-weight: 400; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-patronage-calc-total dt, .ui-patronage-calc-total dd { font-size: 16px; font-weight: 700; }
+.ui-patronage-calc-total dd { color: var(--ui-accent); }
+.ui-patronage-calc-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+@media (max-width: 480px) { .ui-patronage-calc-grid { grid-template-columns: 1fr; } }
+@media (prefers-reduced-motion: reduce) { .ui-patronage-calc-box { transition: none; } }
+`
+
+// What was typed as a decimal: 0 when empty, null when it is not a number at or above 0.
+fn patronage_refund_calc_read(text) {
+    let t = re.replace(trim(str(text ?? "")), ",", "")
+    if t == "" { return dec(0) }
+    let d = dec(t)
+    is_err(d) || d < 0 ? null : d
+}
+
+// The year's figures as money: { dividend, refund, total, tax, net }.
+fn patronage_refund_calc_figures(share_capital, dividend_rate, patronage, refund_rate, tax_rate, currency: str) {
+    let part = (base, rate) => money.mul(money.of(dec(base), currency, "half_up"), dec(rate) / 100, "half_up")
+    let dividend = part(share_capital, dividend_rate)
+    let refund = part(patronage, refund_rate)
+    let total = money.add(dividend, refund)
+    let tax = money.mul(total, dec(tax_rate ?? 0) / 100, "half_up")
+    { dividend, refund, total, tax, net: money.sub(total, tax) }
+}
+
+component PatronageRefundCalc(share_capital = null, dividend_rate = null, patronage = null, refund_rate = null, basis: str = "interest",
+                              tax_rate = null, currency: str = "USD", locale: str? = null, title: str = "Dividend and patronage refund",
+                              id: str = "patronage-refund-calc", name: str? = null, on_change = null, class: str? = null) {
+    style global patronage_refund_calc_css
+    state share = share_capital == null ? "" : str(share_capital)
+    state drate = dividend_rate == null ? "" : str(dividend_rate)
+    state pat = patronage == null ? "" : str(patronage)
+    state rrate = refund_rate == null ? "" : str(refund_rate)
+    state tax = tax_rate == null ? "" : str(tax_rate)
+    state on = basis
+    let code = upper(currency)
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let shown = (m) => locale != null ? money.format(m, locale) : money.format(m)
+    let read = [share, drate, pat, rrate, tax] | map(patronage_refund_calc_read)
+    let ok = all(read, (x) => x != null)
+    let f = ok ? patronage_refund_calc_figures(read[0], read[1], read[2], read[3], read[4], code) : null
+    let has_tax = tax_rate != null
+    let pat_label = on == "purchases" ? "Purchases from the co-op" : "Interest paid on loans"
+    let tell = () => {
+        let r = [share, drate, pat, rrate, tax] | map(patronage_refund_calc_read)
+        if on_change != null && all(r, (x) => x != null) {
+            let g = patronage_refund_calc_figures(r[0], r[1], r[2], r[3], r[4], code)
+            on_change({ dividend: g.dividend.amount, refund: g.refund.amount, total: g.total.amount, tax: g.tax.amount, net: g.net.amount })
+        }
+    }
+    let bad = (i: int) => read[i] == null
+    let how = (base, rate) => `${shown(money.of(base, code, "half_up"))} × ${str(rate)}%`
+    <section class={ui_cls(["ui-patronage-calc", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-patronage-calc-title id={`${id}-title`}>{title}</h3>
+        <div.ui-patronage-calc-grid>
+            <div class={ui_cls(["ui-patronage-calc-field", bad(0) && "ui-patronage-calc-bad"])}>
+                <label for={`${id}-share`}>Average share capital</label>
+                <div.ui-patronage-calc-box>
+                    <input type="text" inputmode="decimal" id={`${id}-share`} name={named("share_capital")} value={share} placeholder="0.00"
+                           autocomplete="off" aria-invalid={bad(0) ? "true" : null} @input={(e) => { share = e.value; tell() }}/>
+                    <span aria-hidden="true">{code}</span>
+                </div>
+            </div>
+            <div class={ui_cls(["ui-patronage-calc-field", bad(1) && "ui-patronage-calc-bad"])}>
+                <label for={`${id}-drate`}>Dividend rate</label>
+                <div.ui-patronage-calc-box>
+                    <input type="text" inputmode="decimal" id={`${id}-drate`} name={named("dividend_rate")} value={drate} placeholder="0"
+                           autocomplete="off" aria-invalid={bad(1) ? "true" : null} @input={(e) => { drate = e.value; tell() }}/>
+                    <span aria-hidden="true">%</span>
+                </div>
+            </div>
+            <fieldset.ui-patronage-calc-basis>
+                <legend>Refund on</legend>
+                <label><input type="radio" name={named("basis")} value="interest" checked={on == "interest"} @change={(e) => { on = "interest" }}/> Interest paid</label>
+                <label><input type="radio" name={named("basis")} value="purchases" checked={on == "purchases"} @change={(e) => { on = "purchases" }}/> Purchases</label>
+            </fieldset>
+            <div class={ui_cls(["ui-patronage-calc-field", bad(2) && "ui-patronage-calc-bad"])}>
+                <label for={`${id}-patronage`}>{pat_label}</label>
+                <div.ui-patronage-calc-box>
+                    <input type="text" inputmode="decimal" id={`${id}-patronage`} name={named("patronage")} value={pat} placeholder="0.00"
+                           autocomplete="off" aria-invalid={bad(2) ? "true" : null} @input={(e) => { pat = e.value; tell() }}/>
+                    <span aria-hidden="true">{code}</span>
+                </div>
+            </div>
+            <div class={ui_cls(["ui-patronage-calc-field", bad(3) && "ui-patronage-calc-bad"])}>
+                <label for={`${id}-rrate`}>Refund rate</label>
+                <div.ui-patronage-calc-box>
+                    <input type="text" inputmode="decimal" id={`${id}-rrate`} name={named("refund_rate")} value={rrate} placeholder="0"
+                           autocomplete="off" aria-invalid={bad(3) ? "true" : null} @input={(e) => { rrate = e.value; tell() }}/>
+                    <span aria-hidden="true">%</span>
+                </div>
+            </div>
+            {has_tax && <div class={ui_cls(["ui-patronage-calc-field", bad(4) && "ui-patronage-calc-bad"])}>
+                <label for={`${id}-tax`}>Withholding tax</label>
+                <div.ui-patronage-calc-box>
+                    <input type="text" inputmode="decimal" id={`${id}-tax`} name={named("tax_rate")} value={tax} placeholder="0"
+                           autocomplete="off" aria-invalid={bad(4) ? "true" : null} @input={(e) => { tax = e.value; tell() }}/>
+                    <span aria-hidden="true">%</span>
+                </div>
+            </div>}
+        </div>
+        {!ok && <p.ui-patronage-calc-error role="alert">Amounts and rates are numbers of 0 or more.</p>}
+        {ok && <dl.ui-patronage-calc-out aria-live="polite">
+            <div.ui-patronage-calc-dividend>
+                <dt>Dividend on shares<span.ui-patronage-calc-how>{how(read[0], read[1])}</span></dt><dd>{shown(f.dividend)}</dd>
+            </div>
+            <div.ui-patronage-calc-refund>
+                <dt>Patronage refund<span.ui-patronage-calc-how>{how(read[2], read[3])}</span></dt><dd>{shown(f.refund)}</dd>
+            </div>
+            {has_tax && <div.ui-patronage-calc-tax>
+                <dt>Withholding tax</dt><dd><span aria-hidden="true">−</span><span.ui-sr>minus </span>{shown(f.tax)}</dd>
+            </div>}
+            <div.ui-patronage-calc-total>
+                <dt>{has_tax ? "Net to you" : "Total to you"}</dt><dd>{shown(has_tax ? f.net : f.total)}</dd>
+            </div>
+        </dl>}
+    </section>
+}

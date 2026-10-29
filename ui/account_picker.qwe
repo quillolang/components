@@ -1,0 +1,121 @@
+// AccountPicker: which account to pay from, as radio cards: each account's name,
+// masked number and available balance. Given the amount to pay, an account that
+// cannot cover it says by how much it falls short, and is not offered. Each card
+// is a real radio, so a plain <form> sends the chosen account's `id` as `name`,
+// and the arrow keys move the choice.
+//
+//   <AccountPicker name="from" label="Pay from" amount={250m} value="chk"
+//                  accounts={[{ id: "chk", name: "Everyday", kind: "Checking", number: "0012004821", available: 2310.18m },
+//                             { id: "sav", name: "Rainy day", kind: "Savings", number: "0012007710", available: 120m }]}/>
+//   <AccountPicker name="from" accounts={accounts} amount={amount} on_change={(id) => { from = id }}/>
+//
+// accounts: a list of { id, name, number?, kind?, available, currency?, disabled? }:
+// available is what can be spent (a number or decimal), currency its own when it
+// is not `currency`. amount: what is to be paid (null: nothing is checked); an
+// account in another currency is not checked against it. block_short: an account
+// that cannot cover the amount cannot be chosen (true); false still marks it.
+// value: the id chosen to start with. currency ("USD") and locale: how amounts
+// are written. label (the legend; "Pay from"), hint, error, required, field (the
+// ids' start, "account-picker-" + name by default) as for every field; when the
+// account chosen cannot cover the amount, the error says so. on_change(id):
+// inside one of your components, given the id chosen.
+
+let account_picker_css = css`
+.ui-apick { min-width: 0; margin: 0; padding: 0; border: 0; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-apick-legend { padding: 0; margin-bottom: 8px; font-size: 13px; font-weight: 500; }
+.ui-apick-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-apick-list { display: grid; gap: 8px; }
+.ui-apick-card { position: relative; display: flex; align-items: center; gap: 12px; min-width: 0; padding: 12px 14px; cursor: pointer;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); transition: border-color .15s, background .15s, box-shadow .15s; }
+.ui-apick-card input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+.ui-apick-card:hover { border-color: var(--ui-strong); }
+.ui-apick-card:has(input:checked) { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent-soft) 60%, var(--ui-surface));
+  box-shadow: inset 0 0 0 1px var(--ui-accent); }
+.ui-apick-card:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-apick-card:has(input:disabled) { cursor: not-allowed; background: var(--ui-subtle); }
+.ui-apick-card:has(input:disabled):hover { border-color: var(--ui-border); }
+.ui-apick-card:has(input:disabled) .ui-apick-text { opacity: .6; }
+.ui-apick-dot { flex: none; position: relative; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--ui-strong); background: var(--ui-surface); }
+.ui-apick-dot::after { content: ""; position: absolute; inset: 4px; border-radius: 50%; background: var(--ui-accent); transform: scale(0); transition: transform .12s; }
+.ui-apick-card input:checked ~ .ui-apick-dot { border-color: var(--ui-accent); border-width: 1.5px; }
+.ui-apick-card input:checked ~ .ui-apick-dot::after { transform: scale(1); }
+.ui-apick-text { display: grid; flex: 1; gap: 1px; min-width: 0; }
+.ui-apick-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-apick-meta { color: var(--ui-muted); font-size: 12px; }
+.ui-apick-num { font-family: var(--ui-mono); letter-spacing: .03em; }
+.ui-apick-amount { display: grid; flex: none; justify-items: end; gap: 1px; text-align: right; font-variant-numeric: tabular-nums; }
+.ui-apick-avail { font-weight: 600; }
+.ui-apick-avail-label { color: var(--ui-muted); font-size: 12px; }
+.ui-apick-short .ui-apick-avail { color: var(--ui-danger); }
+.ui-apick-shortby { color: var(--ui-danger); font-size: 12px; font-weight: 500; }
+.ui-apick-invalid .ui-apick-card:has(input:checked) { border-color: var(--ui-danger); box-shadow: inset 0 0 0 1px var(--ui-danger); }
+.ui-apick-hint, .ui-apick-error { margin: 8px 0 0; font-size: 13px; color: var(--ui-muted); }
+.ui-apick-error { color: var(--ui-danger); }
+@media (prefers-reduced-motion: reduce) { .ui-apick-card, .ui-apick-dot::after { transition: none; } }
+`
+
+// An amount as text in its currency.
+fn account_picker_money(amount, currency: str, locale: str?) -> str {
+    if type_of(amount) == "str" { return amount }
+    if amount == null { return "" }
+    let m = money.of(dec(amount), currency, "half_up")
+    if is_err(m) { return str(amount) }
+    locale != null ? money.format(m, locale) : money.format(m)
+}
+
+// How much an account falls short of the amount (a decimal), or null when it covers it,
+// nothing is to be paid, or the account is in another currency.
+fn account_picker_short(a, amount, currency: str) {
+    if amount == null || type_of(amount) == "str" || upper(a.currency ?? currency) != upper(currency) { return null }
+    let need = dec(amount)
+    let have = dec(a.available ?? 0)
+    have < need ? need - have : null
+}
+
+view AccountPicker(name: str = "from", accounts: list = [], value: str | num | null = null, amount = null, label: str? = "Pay from",
+                   currency: str = "USD", locale: str? = null, block_short: bool = true, hint: str? = null, error: str? = null,
+                   required: bool = false, field: str? = null, on_change = null, class: str? = null) {
+    style global account_picker_css
+    let id = field ?? `account-picker-${name}`
+    let chosen = value != null ? str(value) : null
+    let picked = find(accounts, (a) => str(a.id) == chosen)
+    let picked_short = picked != null ? account_picker_short(picked, amount, currency) : null
+    let message = error ?? (picked_short != null
+        ? `${picked.name} has ${account_picker_money(picked.available, upper(picked.currency ?? currency), locale)} available, ${account_picker_money(picked_short, upper(currency), locale)} short of ${account_picker_money(amount, upper(currency), locale)}.`
+        : null)
+    let described = ui_cls([hint != null && `${id}-hint`, message != null && `${id}-error`])
+    <fieldset class={ui_cls(["ui-apick", message != null && "ui-apick-invalid", class])} id={id} role="radiogroup"
+              aria-required={required ? "true" : null} aria-invalid={message != null ? "true" : null}
+              aria-describedby={described != "" ? described : null}>
+        {label != null && <legend.ui-apick-legend>{label}{required && <span.ui-apick-req aria-hidden="true">*</span>}</legend>}
+        <div.ui-apick-list>
+            {for [i, a] in enumerate(accounts) {
+                let oid = `${id}-${i}`
+                let cur = upper(a.currency ?? currency)
+                let short = account_picker_short(a, amount, currency)
+                let last4 = slice(re.replace(str(a.number ?? ""), "[^0-9A-Za-z]", ""), -4)
+                let off = (a.disabled ?? false) || (block_short && short != null)
+                <label class={ui_cls(["ui-apick-card", short != null && "ui-apick-short"])} for={oid} key={str(a.id)}>
+                    <input type="radio" id={oid} name={name} value={str(a.id)} checked={str(a.id) == chosen} required={required}
+                           disabled={off} aria-describedby={`${oid}-amount`} @change={(e) => { on_change && on_change(e.value) }}/>
+                    <span.ui-apick-dot aria-hidden="true"></span>
+                    <span.ui-apick-text>
+                        <span.ui-apick-name>{a.name}</span>
+                        {(a.kind != null || last4 != "") && <span.ui-apick-meta>
+                            {a.kind}{a.kind != null && last4 != "" && " · "}
+                            {last4 != "" && [<span.ui-apick-num aria-hidden="true">•••• {last4}</span>, <span.ui-sr>ending in {last4}</span>]}
+                        </span>}
+                    </span>
+                    <span.ui-apick-amount id={`${oid}-amount`}>
+                        <span.ui-apick-avail>{account_picker_money(a.available ?? 0, cur, locale)}</span>
+                        {short != null
+                            ? <span.ui-apick-shortby>Short by {account_picker_money(short, cur, locale)}</span>
+                            : <span.ui-apick-avail-label>available</span>}
+                    </span>
+                </label>
+            }}
+        </div>
+        {hint != null && <p.ui-apick-hint id={`${id}-hint`}>{hint}</p>}
+        {message != null && <p.ui-apick-error id={`${id}-error`} role="alert">{message}</p>}
+    </fieldset>
+}

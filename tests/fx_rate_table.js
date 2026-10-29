@@ -1,0 +1,24 @@
+const t = $("#fx-rate-table-demo");
+const row = (p) => t.querySelector(`tr[data-pair="${p}"]`);
+const cell = (p, c) => row(p).querySelector(`[data-col="${c}"]`).textContent.replace(/\s+/g, " ").trim();
+if (t.querySelector("caption").textContent.replace(/\s+/g, " ").trim().replace("rates ", "rates") !== "Exchange ratesIndicative, 14:05 UTC") return `caption: ${t.querySelector("caption").textContent}`;
+if (t.querySelectorAll("tbody tr").length !== 6) return "not a row per pair";
+if (cell("EUR/USD", "bid") !== "1.08421" || cell("EUR/USD", "ask") !== "1.08429") return `EUR/USD bid and ask: ${cell("EUR/USD", "bid")} ${cell("EUR/USD", "ask")}`;
+if (cell("EUR/USD", "spread") !== "0.8") return `EUR/USD spread: ${cell("EUR/USD", "spread")}`;
+if (cell("EUR/USD", "pips") !== "up +23.5" || cell("EUR/USD", "pct") !== "+0.22%") return `EUR/USD change: ${cell("EUR/USD", "pips")} ${cell("EUR/USD", "pct")}`;
+if (!row("EUR/USD").classList.contains("ui-fxrates-up")) return "a rise is not marked up";
+if (cell("GBP/USD", "pips") !== "down -27.1" || !row("GBP/USD").classList.contains("ui-fxrates-down")) return `GBP/USD: ${cell("GBP/USD", "pips")}`;
+if (cell("USD/JPY", "bid") !== "156.238" || cell("USD/JPY", "spread") !== "1.3" || cell("USD/JPY", "pips") !== "down -65.8" || cell("USD/JPY", "pct") !== "-0.42%")
+    return `USD/JPY in pips of 0.01: ${cell("USD/JPY", "spread")} ${cell("USD/JPY", "pips")} ${cell("USD/JPY", "pct")}`;
+if (cell("USD/CHF", "pips") !== "unchanged 0.0" || !row("USD/CHF").classList.contains("ui-fxrates-flat")) return `USD/CHF unchanged: ${cell("USD/CHF", "pips")}`;
+if (cell("USD/PHP", "spread") !== "3.5" || cell("USD/PHP", "pips") !== "up +13.3") return `USD/PHP: ${cell("USD/PHP", "spread")} ${cell("USD/PHP", "pips")}`;
+if (cell("AUD/USD", "pips") !== "—" || cell("AUD/USD", "pct") !== "—") return "a pair without an open has a change";
+const flags = row("EUR/USD").querySelector(".ui-fxrates-flags");
+if (!flags || flags.getAttribute("aria-hidden") !== "true" || flags.textContent !== "🇪🇺🇺🇸") return "the flags";
+const pill = getComputedStyle(row("GBP/USD").querySelector(".ui-fxrates-pill")).color;
+const probe = document.createElement("span"); probe.style.color = getComputedStyle(t).getPropertyValue("--ui-danger").trim(); t.appendChild(probe);
+const red = getComputedStyle(probe).color; probe.remove();
+if (pill !== red) return `a fall is not red: ${pill}`;
+const board = $$(".ui-fxrates")[1];
+if (!board.classList.contains("ui-fxrates-compact") || board.querySelector(".ui-fxrates-flags")) return "compact, without flags";
+if (board.querySelector('tr[data-pair="EUR/JPY"] [data-col="pips"]').textContent.replace(/\s+/g, " ").trim() !== "down -32.8") return "EUR/JPY change";

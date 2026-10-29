@@ -1,0 +1,18 @@
+const a = $("#member-card-demo-active");
+if (!a) return "no card";
+if (a.querySelector(".ui-member-card-name").textContent !== "Lourdes Villanueva" || a.querySelector(".ui-member-card-name a")?.getAttribute("href") !== "#member-4217") return "the name and its link";
+if (a.querySelector(".ui-member-card-initials").textContent !== "LV" || a.querySelector(".ui-member-card-initials").getAttribute("aria-hidden") !== "true") return "the initials";
+if (a.querySelector(".ui-member-card-coop").textContent !== "Bayanihan Multi-Purpose Cooperative") return "the co-op's name";
+const facts = (c) => [...c.querySelectorAll(".ui-member-card-facts div")].map((d) => `${d.querySelector("dt").textContent}=${d.querySelector("dd").textContent}`).join("|");
+if (facts(a) !== "Member no.=M-004217|Member since=Mar 4, 2014|Share capital=₱18,500.00") return `the facts: ${facts(a)}`;
+if (a.querySelector("time").getAttribute("datetime") !== "2014-03-04") return "the date is not a <time>";
+if (!a.classList.contains("ui-member-card-active") || a.querySelector(".ui-member-card-status").textContent !== "Status: active") return "the active status";
+const ok = getComputedStyle(a.querySelector(".ui-member-card-status")).color;
+const d = $("#member-card-demo-dormant");
+if (d.querySelector(".ui-member-card-initials").textContent !== "TR") return `initials of a long name: ${d.querySelector(".ui-member-card-initials").textContent}`;
+if (!d.classList.contains("ui-member-card-dormant") || getComputedStyle(d.querySelector(".ui-member-card-status")).color === ok) return "dormant does not look different";
+if (!facts(d).includes("Share capital=₱2,500.50") || d.querySelector(".ui-member-card-note").textContent !== "No transaction since Jan 2025") return `dormant facts: ${facts(d)}`;
+if (d.querySelector(".ui-member-card-name a")) return "a link without href";
+const u = $("#member-card-demo-usd");
+if (!u.classList.contains("ui-member-card-other") || !facts(u).includes("Share capital=$5.00 (1 share)") || !facts(u).includes("Member since=Nov 20, 2008")) return `text capital, other status: ${facts(u)}`;
+if (u.getAttribute("aria-label") !== "Member Harriet Okafor, CU-88213") return "the card's name for screen readers";

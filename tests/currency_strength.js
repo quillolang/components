@@ -1,0 +1,18 @@
+const s = $("#currency-strength-demo");
+const items = [...s.querySelectorAll(".ui-fxstr-item")];
+const order = items.map((li) => li.dataset.code).join(" ");
+if (order !== "AUD EUR CAD CHF JPY GBP USD") return `strongest first: ${order}`;
+const vals = items.map((li) => li.querySelector(".ui-fxstr-value").firstChild.textContent);
+if (vals.join(" ") !== "+0.38% +0.16% +0.12% 0.00% -0.03% -0.11% -0.15%") return `the strengths: ${vals}`;
+if (!s.classList.contains("ui-fxstr-split")) return "negative strengths do not split the bars";
+const bar = (li) => li.querySelector(".ui-fxstr-bar").style;
+if (bar(items[0]).left !== "50%" || bar(items[0]).width !== "50%") return `the strongest bar: ${bar(items[0]).cssText}`;
+const usd = bar(items[6]);
+if (Math.abs(parseFloat(usd.width) - 15 / 38 * 50) > 0.01 || Math.abs(parseFloat(usd.left) + parseFloat(usd.width) - 50) > 0.01) return `the weakest grows left of the middle: ${usd.cssText}`;
+if (!items[0].classList.contains("ui-fxstr-up") || !items[6].classList.contains("ui-fxstr-down") || !items[3].classList.contains("ui-fxstr-level")) return "colours";
+if (!items[0].textContent.includes("the strongest") || !items[6].textContent.includes("the weakest")) return "screen readers are not told the strongest and weakest";
+if (items[0].querySelector(".ui-fxstr-code small").textContent !== "Australian dollar") return "names";
+const sc = $("#currency-strength-demo-score");
+const si = [...sc.querySelectorAll(".ui-fxstr-item")];
+if (si.map((li) => li.dataset.code).join(" ") !== "CHF USD GBP EUR JPY" || sc.classList.contains("ui-fxstr-split")) return "the given scores";
+if (si[0].querySelector(".ui-fxstr-value").firstChild.textContent !== "7.2" || si[4].querySelector(".ui-fxstr-bar").style.width !== "47.22%") return `scores from 0: ${si[4].querySelector(".ui-fxstr-bar").style.cssText}`;

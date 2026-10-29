@@ -1,0 +1,179 @@
+// AmortizationTable: a loan's payment schedule, worked out from its amount, rate
+// and term: each month's payment, how much of it is principal and how much
+// interest, and what is still owed after it, grouped by year, each year a
+// <details> whose summary has the year's totals. A line above gives the monthly
+// payment, the total interest, the total paid and when it is paid off. In
+// decimals: each month's interest is rounded half up to the cent on what is still
+// owed, and the last payment is what is left, so the balance ends at zero.
+//
+//   <AmortizationTable amount={250000} rate={6.5} term={30} start="2026-12-01"/>
+//   <AmortizationTable amount={18000} rate={7.9} term={48} term_unit="months" currency="EUR" locale="de-DE" open={4}/>
+//
+// amount: what is borrowed (a number or a decimal). rate: the yearly interest rate,
+// in percent (6.5). term: how long, in term_unit: "years" (default) or "months".
+// start: the first payment's date (ISO): rows get dates and years are calendar
+// years; without it they are "Year 1", "Year 2", ... counted from the first payment.
+// open: how many years are open to start with (1; 0 for none). currency: ISO code
+// ("USD"); locale: how amounts and dates are written (the program's; en-US).
+// summary: false leaves out the line of totals above. label: what screen readers
+// call it ("Amortization schedule"). id, class.
+//
+// amortization_table_rows(amount, rate, months) gives the schedule as a list of
+// { n, payment, principal, interest, balance } (decimals), for your own use.
+
+let amortization_table_css = css`
+.ui-amortization { display: grid; gap: 14px; min-width: 0; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-amortization-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1px; margin: 0; overflow: hidden;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-border); }
+.ui-amortization-facts div { padding: 12px 14px; background: var(--ui-surface); }
+.ui-amortization-facts dt { color: var(--ui-muted); font-size: 12px; font-weight: 500; }
+.ui-amortization-facts dd { margin: 2px 0 0; font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-amortization-years { display: grid; overflow: hidden; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-amortization-year + .ui-amortization-year { border-top: 1px solid var(--ui-border); }
+.ui-amortization-year > summary { display: grid; grid-template-columns: 18px minmax(90px, 1.2fr) repeat(3, minmax(0, 1fr)); align-items: baseline; gap: 4px 12px;
+  padding: 10px 14px; cursor: pointer; list-style: none; font-variant-numeric: tabular-nums; }
+.ui-amortization-year > summary::-webkit-details-marker { display: none; }
+.ui-amortization-year > summary::before { content: ""; width: 7px; height: 7px; margin-left: 2px; border-right: 2px solid var(--ui-muted); border-bottom: 2px solid var(--ui-muted);
+  transform: translateY(-2px) rotate(-45deg); transition: transform .15s; }
+.ui-amortization-year[open] > summary::before { transform: translateY(-4px) rotate(45deg); }
+.ui-amortization-year > summary:hover { background: var(--ui-subtle); }
+.ui-amortization-year > summary:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-amortization-label b { display: block; font-weight: 650; }
+.ui-amortization-label small, .ui-amortization-sum small { display: block; color: var(--ui-muted); font-size: 12px; }
+.ui-amortization-sum { text-align: right; font-weight: 600; }
+.ui-amortization-scroll { overflow-x: auto; border-top: 1px solid var(--ui-border); }
+.ui-amortization table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-amortization th, .ui-amortization td { padding: 6px 14px; text-align: right; white-space: nowrap; }
+.ui-amortization thead th { color: var(--ui-muted); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; background: var(--ui-subtle); }
+.ui-amortization th:first-child, .ui-amortization td:first-child { text-align: left; }
+.ui-amortization tbody tr:nth-child(even) { background: color-mix(in srgb, var(--ui-subtle) 55%, transparent); }
+.ui-amortization tbody th { font-weight: 500; }
+.ui-amortization tfoot td, .ui-amortization tfoot th { border-top: 1px solid var(--ui-border); font-weight: 650; }
+.ui-amortization-total { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 18px; margin: 0; padding: 0 4px; color: var(--ui-muted); font-size: 13px; }
+.ui-amortization-total b { color: var(--ui-fg); font-variant-numeric: tabular-nums; }
+@media (max-width: 560px) {
+  .ui-amortization-year > summary { grid-template-columns: 18px 1fr 1fr; }
+  .ui-amortization-year > summary .ui-amortization-hide { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-amortization-year > summary::before { transition: none; } }
+`
+
+// x to the power n, for a whole n, exactly (pow takes no decimals).
+fn amortization_table_pow(x: dec, n: int) -> dec {
+    let out = 1m
+    let i = 0
+    while i < n {
+        out = out * x
+        i += 1
+    }
+    out
+}
+
+// The monthly payment, rounded half up to the cent (the annuity formula).
+fn amortization_table_payment(amount: dec, rate: dec, months: int) -> dec {
+    if months <= 0 { return amount }
+    if rate <= 0 { return round(amount / months, 2, "ceiling") }
+    let r = rate / 1200
+    let f = amortization_table_pow(1m + r, months)
+    round(amount * r * f / (f - 1m), 2, "half_up")
+}
+
+// The schedule: a row per month, { n, payment, principal, interest, balance }.
+fn amortization_table_rows(amount: dec, rate: dec, months: int) -> list {
+    let pay = amortization_table_payment(amount, rate, months)
+    let r = rate / 1200
+    let owed = amount
+    let rows = []
+    let i = 1
+    while i <= months && owed > 0 {
+        let interest = round(owed * r, 2, "half_up")
+        let principal = i == months || pay - interest > owed ? owed : pay - interest
+        owed = owed - principal
+        rows = rows | push({ n: i, payment: principal + interest, principal, interest, balance: owed })
+        i += 1
+    }
+    rows
+}
+
+fn amortization_table_money(x: dec, currency: str, locale: str?) -> str {
+    let m = money.of(x, currency, "half_up")
+    if is_err(m) { return str(x) }
+    locale != null ? money.format(m, locale) : money.format(m)
+}
+
+fn amortization_table_date(d: str, locale: str?, short: bool) -> str =
+    short ? date.format(d, { locale: locale ?? "en-US", pattern: "MMM YYYY" }) : date.format(d, { locale: locale ?? "en-US", style: "medium" })
+
+view AmortizationTable(amount, rate, term: int = 30, term_unit: str = "years", start: str? = null, open: int = 1,
+                       currency: str = "USD", locale: str? = null, summary: bool = true, label: str = "Amortization schedule",
+                       id: str? = null, class: str? = null) {
+    style global amortization_table_css
+    let months = term_unit == "months" ? term : term * 12
+    let rows = amortization_table_rows(dec(amount), dec(rate), months)
+    let fmt = (x: dec) => amortization_table_money(x, currency, locale)
+    // Each row's year: the calendar year of its date, or its year of the loan.
+    let dated = for row in rows {
+        let d = start != null ? date.add_months(start, row.n - 1) : null
+        merge(row, { date: d, year: d != null ? slice(d, 0, 4) : `Year ${floor((row.n - 1) / 12) + 1}` })
+    }
+    let years = unique(for row in dated => row.year)
+    let total_interest = dec(sum(for row in rows => row.interest))
+    let total_paid = dec(sum(for row in rows => row.payment))
+    let last = len(dated) > 0 ? dated[len(dated) - 1] : null
+    <section class={ui_cls(["ui-amortization", class])} id={id} aria-label={label}>
+        {summary && <dl.ui-amortization-facts>
+            <div><dt>Monthly payment</dt><dd data-key="payment">{len(rows) > 0 ? fmt(rows[0].payment) : fmt(0m)}</dd></div>
+            <div><dt>Total interest</dt><dd data-key="interest">{fmt(total_interest)}</dd></div>
+            <div><dt>Total paid</dt><dd data-key="total">{fmt(total_paid)}</dd></div>
+            <div><dt>Paid off</dt><dd data-key="payoff">{last == null ? "–" : (last.date != null ? amortization_table_date(last.date, locale, true) : `after ${last.n} payments`)}</dd></div>
+        </dl>}
+        <div.ui-amortization-years>
+            {for [i, y] in enumerate(years) {
+                let these = filter(dated, (row) => row.year == y)
+                let principal = sum(for row in these => row.principal)
+                let interest = sum(for row in these => row.interest)
+                let end = these[len(these) - 1].balance
+                <details.ui-amortization-year key={y} open={i < open} data-year={y}>
+                    <summary>
+                        <span.ui-amortization-label><b>{y}</b><small>{len(these)} {len(these) == 1 ? "payment" : "payments"}</small></span>
+                        <span.ui-amortization-sum data-key="principal"><small>Principal</small>{fmt(principal)}</span>
+                        <span class="ui-amortization-sum ui-amortization-hide" data-key="interest"><small>Interest</small>{fmt(interest)}</span>
+                        <span.ui-amortization-sum data-key="balance"><small>Balance</small>{fmt(end)}</span>
+                    </summary>
+                    <div.ui-amortization-scroll>
+                        <table>
+                            <caption class="ui-sr">{label}, {y}</caption>
+                            <thead><tr>
+                                <th scope="col">{start != null ? "Date" : "Payment"}</th>
+                                <th scope="col">Amount</th>
+                                <th scope="col">Principal</th>
+                                <th scope="col">Interest</th>
+                                <th scope="col">Balance</th>
+                            </tr></thead>
+                            <tbody>
+                                {for row in these => <tr key={row.n} data-n={row.n}>
+                                    <th scope="row">{row.date != null ? <time datetime={row.date}>{amortization_table_date(row.date, locale, false)}</time> : `#${row.n}`}</th>
+                                    <td>{fmt(row.payment)}</td>
+                                    <td>{fmt(row.principal)}</td>
+                                    <td>{fmt(row.interest)}</td>
+                                    <td>{fmt(row.balance)}</td>
+                                </tr>}
+                            </tbody>
+                            <tfoot><tr>
+                                <th scope="row">{y} total</th>
+                                <td>{fmt(principal + interest)}</td>
+                                <td>{fmt(principal)}</td>
+                                <td>{fmt(interest)}</td>
+                                <td>{fmt(end)}</td>
+                            </tr></tfoot>
+                        </table>
+                    </div>
+                </details>
+            }}
+        </div>
+        <p.ui-amortization-total>
+            <span>{len(rows)} payments in all</span>
+            <span>Principal <b>{fmt(dec(amount))}</b> + interest <b>{fmt(total_interest)}</b> = <b>{fmt(total_paid)}</b></span>
+        </p>
+    </section>
+}

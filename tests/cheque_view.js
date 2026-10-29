@@ -1,0 +1,15 @@
+const c = $("#cheque-view-demo");
+const t = (el, s) => el.querySelector(s)?.textContent;
+if (t(c, ".ui-cheque-words") !== "One thousand two hundred thirty-four and 56/100" || t(c, ".ui-cheque-unit") !== "dollars") return `words: ${t(c, ".ui-cheque-words")}`;
+if (t(c, ".ui-cheque-figures") !== "$1,234.56" || t(c, ".ui-cheque-payee") !== "Ana Okafor" || t(c, ".ui-cheque-memo-text") !== "Kitchen tiles") return "figures, payee, memo";
+if (t(c, ".ui-cheque-datebox time") !== "Oct 29, 2026" || c.querySelector(".ui-cheque-datebox time").getAttribute("datetime") !== "2026-10-29") return "the date";
+if (t(c, ".ui-cheque-micr [aria-hidden]") !== "⑆011000015⑆ 40031204⑈ 1042") return `MICR: ${t(c, ".ui-cheque-micr [aria-hidden]")}`;
+if (c.querySelector(".ui-cheque-micr").getAttribute("aria-label") !== "routing number 011000015 account 40031204 cheque 1042") return "the MICR line is not read out";
+if (c.getAttribute("aria-label") !== "Cheque 1042 to Ana Okafor for $1,234.56, dated Oct 29, 2026") return `label: ${c.getAttribute("aria-label")}`;
+if (t(c, ".ui-cheque-signature") !== "Dana Whitfield" || t(c, ".ui-cheque-bank-name") !== "Fernway Credit Union" || c.querySelector(".ui-cheque-void")) return "signature, bank, not void";
+const v = $("#cheque-view-demo-void");
+if (t(v, ".ui-cheque-words") !== "Eighty-five and 00/100" || !v.querySelector(".ui-cheque-void") || !v.getAttribute("aria-label").startsWith("Void cheque 1043")) return `void: ${t(v, ".ui-cheque-words")}`;
+if (t(v, ".ui-cheque-signature") !== "" || t(v, ".ui-cheque-sign .ui-cheque-cap") !== "Authorised signature") return "no signature";
+const y = $("#cheque-view-demo-yen");
+if (t(y, ".ui-cheque-words") !== "One million two hundred fifty thousand" || t(y, ".ui-cheque-unit") !== "yen" || t(y, ".ui-cheque-figures") !== "¥1,250,000") return `yen: ${t(y, ".ui-cheque-words")} ${t(y, ".ui-cheque-figures")}`;
+if (t(y, ".ui-cheque-micr [aria-hidden]") !== "000318") return "a MICR line of only the number";
