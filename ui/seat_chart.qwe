@@ -1,0 +1,124 @@
+// SeatChart: a parliament as election night shows it: every seat a dot in a half
+// circle, coloured by party from left to right in the order given, the seats not yet
+// declared in grey, a mark at the top where the majority falls, and a legend with each
+// party's seats and who has the majority.
+//
+//   <SeatChart title="House of Commons" total={650} parties={[
+//       { name: "Labour", short: "LAB", seats: 411, color: "#d50000" },
+//       { name: "Liberal Democrats", short: "LD", seats: 72, color: "#faa61a" },
+//       { name: "Conservative", short: "CON", seats: 121, color: "#0087dc" },
+//   ]}/>
+//
+// parties: maps of { name, seats, short?, color?, change? }, in the order to seat
+// them (left to right); short: a few letters for the legend's tooltip ("LAB");
+// color: any CSS colour (else the theme's, in turn); change: the seats won or lost
+// since last time (+211, -244), shown in the legend. total: the seats in the house
+// (the parties' seats added up when left out); seats not given to a party are drawn
+// grey as "Undeclared". majority: the seats needed (more than half of total).
+// title: the chart's caption. rows: rows of seats (worked out from the total when
+// left out). legend: show the legend (true; screen readers have it either way).
+// locale: how numbers are written. id: the figure's id.
+
+let seat_chart_css = css`
+.ui-seats { display: grid; gap: 12px; min-width: 0; max-width: 560px; margin: 0; color: var(--ui-fg); font: 14px/1.4 var(--ui-font);
+  font-variant-numeric: tabular-nums; }
+.ui-seats-title { font-size: 16px; font-weight: 700; }
+.ui-seats-plot { position: relative; }
+.ui-seats-plot svg { display: block; width: 100%; height: auto; overflow: visible; }
+.ui-seats-plot circle { fill: var(--c); }
+.ui-seats-plot .ui-seats-none circle { fill: none; stroke: var(--ui-strong); stroke-width: .5; }
+.ui-seats-plot g:hover circle { filter: brightness(1.15); }
+.ui-seats-mid { stroke: var(--ui-fg); stroke-width: .6; stroke-dasharray: 2 1.5; opacity: .7; }
+.ui-seats-center { position: absolute; left: 50%; bottom: 0; transform: translateX(-50%); display: grid; justify-items: center; text-align: center; }
+.ui-seats-center b { font-size: clamp(20px, 6vw, 30px); line-height: 1; font-weight: 800; }
+.ui-seats-center span { color: var(--ui-muted); font-size: 12px; }
+.ui-seats-legend { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 6px 16px; margin: 0; padding: 0; list-style: none; }
+.ui-seats-legend li { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ui-seats-key { flex: none; width: 12px; height: 12px; border-radius: 50%; background: var(--c); }
+.ui-seats-legend .ui-seats-none .ui-seats-key { background: none; border: 1px solid var(--ui-strong); }
+.ui-seats-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ui-seats-n { font-weight: 700; }
+.ui-seats-chg { min-width: 40px; color: var(--ui-muted); font-size: 12px; text-align: right; }
+.ui-seats-gain { color: var(--ui-success); }
+.ui-seats-loss { color: var(--ui-danger); }
+.ui-seats-maj { padding: 0 6px; border-radius: 999px; background: var(--ui-success-soft); color: var(--ui-success); font-size: 11px; font-weight: 700; }
+.ui-seats-p1 { --c: var(--ui-accent); }
+.ui-seats-p2 { --c: var(--ui-danger); }
+.ui-seats-p3 { --c: var(--ui-info); }
+.ui-seats-p4 { --c: var(--ui-warning); }
+.ui-seats-p5 { --c: var(--ui-success); }
+.ui-seats-p6 { --c: color-mix(in srgb, var(--ui-accent) 50%, var(--ui-danger)); }
+.ui-seats-p7 { --c: color-mix(in srgb, var(--ui-info) 50%, var(--ui-success)); }
+.ui-seats-p8 { --c: var(--ui-muted); }
+`
+
+// A coordinate, to two decimals.
+fn seat_chart_at(n: num) -> str {
+    let r = round(n * 100) / 100
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+// Every seat's place in a half circle of `rows` rows, in a 200 by 108 box, left to right:
+// { seats: [{ x, y }], r } with r the dots' radius.
+fn seat_chart_layout(total: int, rows: int) {
+    let outer = 92
+    let inner = rows > 1 ? 38 : 65
+    let radii = rows > 1 ? range(rows) | map((i) => inner + (outer - inner) * i / (rows - 1)) : [inner]
+    let all_r = sum(radii)
+    let counts = radii | map((r) => max([1, round(total * r / all_r)]))
+    let fixed = take(counts, rows - 1) + [max([1, total - sum(take(counts, rows - 1))])]
+    let spots = flatten(for [i, r] in enumerate(radii) => {
+        let n = fixed[i]
+        for j in range(n) => { a: n > 1 ? math.pi * (1 - j / (n - 1)) : math.pi / 2, r }
+    })
+    let ordered = take(sort_by(spots, (s) => -s.a * 1000 + s.r / 1000), total)
+    let gap = rows > 1 ? (outer - inner) / (rows - 1) : 20
+    let arc = min(for [i, r] in enumerate(radii) => math.pi * r / max([1, fixed[i] - 1]))
+    let dot = min([gap * 0.42, arc * 0.42, 7])
+    { seats: ordered | map((s) => { x: 100 + s.r * math.cos(s.a), y: 100 - s.r * math.sin(s.a) }), r: dot }
+}
+
+view SeatChart(parties: list, total: int? = null, majority: int? = null, title: str? = null, rows: int? = null, legend: bool = true,
+               locale: str = "en-US", id: str? = null, class: str? = null) {
+    style global seat_chart_css
+    let given = sum(parties | map((p) => p.seats))
+    let house = total != null && total > given ? total : given
+    let need = majority ?? floor(house / 2) + 1
+    let left = house - given
+    let groups = (for [i, p] in enumerate(parties) => { ...p, cls: `ui-seats-p${i % 8 + 1}` })
+        + (left > 0 ? [{ name: "Undeclared", seats: left, cls: "ui-seats-none", none: true }] : [])
+    let row_count = rows ?? max([1, min([14, round(sqrt(house / 3.3))])])
+    let plan = seat_chart_layout(house, row_count)
+    let starts = reduce(groups, [], (acc, g) => acc + [len(acc) == 0 ? 0 : acc[-1] + groups[len(acc) - 1].seats])
+    let num = (n) => format_number(n, locale, 0)
+    let winner = parties | find((p) => p.seats >= need)
+    let summary = join(parties | map((p) => `${p.name} ${num(p.seats)}`), ", ")
+    <figure class={ui_cls(["ui-seats", class])} id={id}>
+        {title != null && <figcaption.ui-seats-title>{title}</figcaption>}
+        <div.ui-seats-plot>
+            <svg viewBox="0 0 200 108" role="img"
+                 aria-label={`${summary}${left > 0 ? `, ${num(left)} undeclared` : ""}, of ${num(house)} seats; ${num(need)} for a majority${winner != null ? `, which ${winner.name} has` : ""}.`}>
+                {for [i, g] in enumerate(groups) => <g class={g.cls} style={g.color != null ? `--c: ${g.color}` : null} data-seats={g.seats}>
+                    <title>{g.name}: {num(g.seats)}</title>
+                    {for k in range(g.seats) => {
+                        let s = plan.seats[starts[i] + k]
+                        <circle cx={seat_chart_at(s.x)} cy={seat_chart_at(s.y)} r={seat_chart_at(plan.r)}/>
+                    }}
+                </g>}
+                <line.ui-seats-mid x1="100" x2="100" y1="0" y2="64"/>
+            </svg>
+            <div.ui-seats-center aria-hidden="true"><b>{num(house)}</b><span>{num(need)} for majority</span></div>
+        </div>
+        <ul class={ui_cls(["ui-seats-legend", !legend && "ui-sr"])}>
+            {for g in groups => <li class={g.cls} style={g.color != null ? `--c: ${g.color}` : null} title={g.short}>
+                <span.ui-seats-key aria-hidden="true"></span>
+                <span.ui-seats-name>{g.name}</span>
+                {winner != null && g.name == winner.name && <span.ui-seats-maj>Majority</span>}
+                <span.ui-seats-n>{num(g.seats)}</span>
+                {g.change != null && <span class={ui_cls(["ui-seats-chg", g.change > 0 && "ui-seats-gain", g.change < 0 && "ui-seats-loss"])}>
+                    {g.change > 0 ? "+" : ""}{num(g.change)}
+                </span>}
+            </li>}
+        </ul>
+    </figure>
+}

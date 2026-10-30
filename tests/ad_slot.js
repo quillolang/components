@@ -1,0 +1,25 @@
+const top = $("#ad-slot-demo-top");
+if (!top || top.tagName !== "ASIDE" || top.getAttribute("aria-label") !== "Advertisement") return "the slot is not a named aside";
+if (top.dataset.slot !== "home-top" || top.dataset.size !== "728x90") return "data-slot and data-size";
+const box = top.querySelector(".ui-adslot-box");
+const r = box.getBoundingClientRect();
+if (Math.round(r.width) !== 728 || Math.round(r.height) !== 90) return `the leaderboard is ${r.width}×${r.height}`;
+if (!box.classList.contains("ui-adslot-empty") || !box.querySelector(".ui-adslot-wide")?.textContent.includes("728 × 90")) return "the placeholder";
+if (top.querySelector(".ui-adslot-label").textContent !== "Advertisement") return "the label";
+if (!top.classList.contains("ui-adslot-mobile") || top.style.getPropertyValue("--mw") !== "320px" || top.style.getPropertyValue("--mh") !== "50px") return "the phone size";
+if (top.querySelector(".ui-adslot-narrow").checkVisibility()) return "the phone size's placeholder shows on a wide screen";
+const rail = $("#ad-slot-demo-rail");
+if (getComputedStyle(rail).position !== "sticky" || rail.dataset.size !== "300x250") return "the sticky rectangle";
+const img = rail.querySelector(".ui-adslot-box > a > img");
+if (!img || rail.querySelector(".ui-adslot-empty") || rail.querySelector(".ui-adslot-size")) return "an ad given still shows the placeholder";
+const ir = img.getBoundingClientRect();
+if (Math.round(ir.width) !== 300 || Math.round(ir.height) !== 250) return `the ad fills ${ir.width}×${ir.height}`;
+const blank = $("#ad-slot-demo-blank");
+if (blank.querySelector(".ui-adslot-label") || blank.getAttribute("aria-label") !== "Advertisement") return "label \"\" still named for screen readers";
+const bb = blank.querySelector(".ui-adslot-box");
+if (!bb.classList.contains("ui-adslot-blank") || bb.children.length || Math.round(bb.getBoundingClientRect().height) !== 100) return "an empty slot keeps its space";
+if (Math.abs(bb.getBoundingClientRect().left - blank.getBoundingClientRect().left) > 1) return "align start";
+// Narrower than its ad, it shrinks to fit rather than spill out.
+top.style.width = "400px"; await wait(50);
+const w = box.getBoundingClientRect().width; top.style.width = "";
+if (Math.round(w) !== 400) return `in 400px the leaderboard is ${w} wide`;

@@ -1,0 +1,793 @@
+// JsonExportTable: a list of JSON records as a table whose columns have types, to
+// export in many formats. Each column's type is worked out from its values (text,
+// integer, decimal, money, yes/no, date, date-time, email, link, nested JSON, empty
+// or mixed) and shown in its header, where a menu changes it; numbers line up on the
+// right and are grouped, yes/no shows as marks, dates as dates, a null as a muted
+// dash, and a value that does not fit its column's type is marked (and kept as it
+// came). The Columns panel includes or leaves out each column and moves it; a
+// header sorts by its column, in the order its type has (numbers as numbers, dates
+// as dates; empty and unfitting values last), then the other way, then not.
+// Export saves the table as shown (the columns included, in their order, sorted)
+// as CSV, TSV, JSON, JSON Lines, Excel, Markdown, HTML, SQL or XML, Copy puts the
+// text on the clipboard, and a preview shows the file's first rows.
+//
+//   <JsonExportTable id="orders" label="Orders" rows={json.parse(body)} filename="orders"/>
+//   <JsonExportTable id="api" value={json.parse(body)} path={["data", "items"]}
+//                    columns={["sku", { key: "price", label: "Price", type: "money" }]}/>
+//
+// id: a prefix for its ids, unique on the page. rows: the records, a list of maps
+// (an item that is not a map is a record { value: item }). value and path: instead
+// of rows, any JSON and where its list of records is, as keys and indexes from the
+// top (["data", "items"]). columns: which columns, in which order, each a key or
+// { key, label?, type? } (type: one of the type ids below, else worked out); left
+// out, a column for each key the records have, keys first seen first. exclude: keys
+// left out of the table and the files at the start (the Columns panel brings them
+// back). label: the table's name, for screen readers. filename: the files' name
+// without the extension ("data": data.csv, data.xls...). table: the name of the SQL
+// table, the XML root and the Excel sheet (the filename). format: the
+// format picked at the start ("csv"). formats: the formats offered, in order (all
+// nine: "csv", "tsv", "json", "jsonl", "xls", "md", "html", "sql", "xml").
+// order_by: the key it starts sorted by; descending: the other way. locale: how
+// numbers and dates are written in the table ("en-US"; files keep plain values).
+// currency: an ISO code ("USD") to show money columns with its symbol. limit: the
+// most rows the table shows (100; the files have all of them). preview: the rows
+// the preview shows (5; 0 hides it). bom: starts the CSV file with a byte-order
+// mark, so Excel reads it as UTF-8 (true). height: a CSS height past which the
+// table scrolls inside ("420px"). empty: what it says with no rows. class: more
+// classes for its outer element.
+//
+// Types (ids): text, integer, decimal, money (two decimals, exact), boolean (yes/no:
+// true and false, "yes"/"no", "true"/"false", "y"/"n", 1/0), date ("2026-10-27"),
+// datetime ("2026-10-27T14:30:00Z", T or a space, with or without an offset), email,
+// url (http and https), json (an object or array, shown and written as compact JSON),
+// empty (only nulls) and mixed (values kept as they came). Strings like "12.50"
+// (two decimals) are money and like "1.5" decimals, a column of only "yes", "no",
+// "true" and "false" is yes/no, and numbers in a column named like
+// an amount (price, total, amount, cost, balance, fee, tax...) with at most two
+// decimals are money.
+//
+// The files, each with its header or names: CSV (RFC 4180: CRLF lines, a field
+// with a comma, quote or line break quoted, quotes doubled); TSV (a tab, line break
+// or backslash in a field written \t, \n, \r, \\); JSON (an array of objects, one a
+// line, numbers and yes/no as JSON numbers and booleans, money with its two
+// decimals, nested values as JSON, null as null); JSON Lines (one object a line);
+// Excel (SpreadsheetML 2003, an .xls Excel, LibreOffice and Numbers open: typed
+// Number, String, Boolean and DateTime cells, money as #,##0.00, date-times in
+// UTC; Excel says the file's format and extension differ, and opens it); Markdown (a
+// GitHub table, numbers on the right, \ | * _ ` [ ] < > ~ escaped, line breaks as
+// <br>); HTML (a page with the table, & < > " ' escaped); SQL (CREATE TABLE with a
+// type for each column worked out from the values: INTEGER or BIGINT, NUMERIC(p, s),
+// DECIMAL(p, 2), BOOLEAN, DATE, TIMESTAMP [WITH TIME ZONE], VARCHAR(n) or TEXT,
+// JSON, and NOT NULL where no value is missing; then an INSERT a row, names in
+// double quotes and text in single quotes, both doubled inside, as standard SQL
+// writes them; MySQL needs NO_BACKSLASH_ESCAPES for text with backslashes); XML (a
+// <row> a record, an element a field, named from its key, a null left out). The
+// keys name fields in JSON, SQL and XML; the labels head the other files.
+//
+// Everything is a button, a checkbox or a select, so it all works from the keyboard;
+// each header says its column's type to screen readers, the table is a region that
+// scrolls with the arrow keys, and "Saved orders.csv" or "Copied" is announced.
+
+let json_export_table_css = css`
+.ui-jxt { display: grid; gap: 10px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-jxt-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 14px; }
+.ui-jxt-count { color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-jxt-export { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ui-jxt-export label { color: var(--ui-muted); font-size: 13px; }
+.ui-jxt-format { height: 32px; padding: 0 28px 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-jxt-format:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-jxt-btn { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1 var(--ui-font);
+  white-space: nowrap; cursor: pointer; }
+.ui-jxt-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-jxt-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-jxt-btn:disabled { opacity: .5; cursor: not-allowed; }
+.ui-jxt-btn svg { width: 14px; height: 14px; flex: none; }
+.ui-jxt-primary { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-jxt-primary:hover:not(:disabled) { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-jxt-cols { border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-jxt-cols > summary { display: flex; align-items: center; gap: 8px; padding: 8px 12px; font-weight: 600; font-size: 13px;
+  cursor: pointer; list-style: none; border-radius: var(--ui-radius-sm); }
+.ui-jxt-cols > summary::-webkit-details-marker { display: none; }
+.ui-jxt-cols > summary:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-jxt-cols > summary svg { width: 12px; height: 12px; color: var(--ui-muted); transition: transform .15s; }
+.ui-jxt-cols[open] > summary svg { transform: rotate(90deg); }
+.ui-jxt-cols > summary small { color: var(--ui-muted); font-weight: 400; font-size: 12px; }
+.ui-jxt-collist { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 4px 12px; margin: 0;
+  padding: 4px 12px 12px; list-style: none; }
+.ui-jxt-colitem { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 3px 0; }
+.ui-jxt-colitem label { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; cursor: pointer; }
+.ui-jxt-colitem label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-jxt-colitem input { width: 16px; height: 16px; margin: 0; flex: none; accent-color: var(--ui-accent); }
+.ui-jxt-colitem input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-jxt-off label span { color: var(--ui-muted); text-decoration: line-through; }
+.ui-jxt-kind { flex: none; color: var(--ui-muted); font-size: 11px; }
+.ui-jxt-move { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0;
+  border: 1px solid transparent; border-radius: 4px; background: none; color: var(--ui-muted); cursor: pointer; }
+.ui-jxt-move:hover:not(:disabled) { border-color: var(--ui-border); color: var(--ui-fg); }
+.ui-jxt-move:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-jxt-move:disabled { opacity: .3; cursor: default; }
+.ui-jxt-move svg { width: 12px; height: 12px; }
+.ui-jxt-scroll { position: relative; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  overscroll-behavior: contain; }
+.ui-jxt-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-jxt table { width: 100%; border-collapse: separate; border-spacing: 0; font-variant-numeric: tabular-nums; }
+.ui-jxt th, .ui-jxt td { padding: 8px 12px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--ui-border); }
+.ui-jxt tbody tr:last-child td { border-bottom: 0; }
+.ui-jxt thead th { position: sticky; top: 0; z-index: 1; padding: 6px 10px; background: var(--ui-subtle); vertical-align: bottom; }
+.ui-jxt tbody tr:hover td { background: color-mix(in srgb, var(--ui-subtle) 70%, transparent); }
+.ui-jxt .ui-jxt-num { text-align: right; }
+.ui-jxt .ui-jxt-mid { text-align: center; }
+.ui-jxt-head { display: grid; gap: 4px; justify-items: start; }
+.ui-jxt-num .ui-jxt-head { justify-items: end; }
+.ui-jxt-mid .ui-jxt-head { justify-items: center; }
+.ui-jxt-sort { display: inline-flex; align-items: center; gap: 4px; max-width: 220px; margin: 0 -4px; padding: 2px 4px; border: 0;
+  border-radius: 4px; background: none; color: var(--ui-fg); font: 600 13px/1.3 var(--ui-font); cursor: pointer; }
+.ui-jxt-sort > span:first-child { overflow: hidden; text-overflow: ellipsis; }
+.ui-jxt-sort:hover { color: var(--ui-accent); }
+.ui-jxt-sort:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-jxt-arrow { width: 12px; height: 12px; flex: none; opacity: .35; }
+[aria-sort] .ui-jxt-arrow { opacity: 1; color: var(--ui-accent); }
+.ui-jxt-type { position: relative; display: inline-flex; align-items: center; --k: var(--ui-muted); }
+.ui-jxt-glyph { position: absolute; left: 5px; width: 16px; overflow: hidden; text-align: center; color: var(--k);
+  font: 600 10px/1 var(--ui-mono); letter-spacing: -.04em; pointer-events: none; }
+.ui-jxt-type select { appearance: none; -webkit-appearance: none; height: 22px; padding: 0 18px 0 25px; border: 1px solid color-mix(in srgb, var(--k) 35%, transparent);
+  border-radius: 999px; background: color-mix(in srgb, var(--k) 10%, var(--ui-surface)) no-repeat right 6px center / 8px
+  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8' fill='none' stroke='%23888' stroke-width='1.5'%3E%3Cpath d='M1 2.5l3 3 3-3'/%3E%3C/svg%3E");
+  color: var(--ui-fg); font: 500 11px/1 var(--ui-font); cursor: pointer; }
+.ui-jxt-type select:hover { border-color: var(--k); }
+.ui-jxt-type select:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-jxt-k-integer, .ui-jxt-k-decimal, .ui-jxt-k-money { --k: var(--ui-info); }
+.ui-jxt-k-boolean { --k: var(--ui-warning); }
+.ui-jxt-k-date, .ui-jxt-k-datetime { --k: var(--ui-success); }
+.ui-jxt-k-email, .ui-jxt-k-url, .ui-jxt-k-json { --k: var(--ui-accent); }
+.ui-jxt-k-mixed { --k: var(--ui-danger); }
+.ui-jxt-null { color: var(--ui-muted); }
+.ui-jxt-bad { color: var(--ui-danger); text-decoration: underline wavy color-mix(in srgb, var(--ui-danger) 60%, transparent);
+  text-underline-offset: 3px; }
+.ui-jxt-yes, .ui-jxt-no { display: inline-flex; vertical-align: middle; }
+.ui-jxt-yes svg, .ui-jxt-no svg { width: 15px; height: 15px; }
+.ui-jxt-yes { color: var(--ui-success); }
+.ui-jxt-no { color: var(--ui-muted); }
+.ui-jxt td a { color: var(--ui-accent); text-decoration: none; }
+.ui-jxt td a:hover { text-decoration: underline; }
+.ui-jxt td a:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 3px; }
+.ui-jxt-json { display: inline-block; max-width: 260px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom;
+  padding: 1px 6px; border-radius: 4px; background: var(--ui-subtle); font: 12px/1.5 var(--ui-mono); }
+.ui-jxt-empty td { padding: 28px 14px; text-align: center; color: var(--ui-muted); white-space: normal; }
+.ui-jxt-more { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-jxt-preview { display: grid; gap: 4px; margin: 0; min-width: 0; }
+.ui-jxt-preview figcaption { color: var(--ui-muted); font-size: 12px; }
+.ui-jxt-preview pre { max-height: 220px; margin: 0; overflow: auto; padding: 10px 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-subtle); color: var(--ui-fg); font: 12px/1.5 var(--ui-mono); white-space: pre; }
+.ui-jxt-preview pre:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) { .ui-jxt-cols > summary svg { transition: none; } }
+`
+
+// The types a column can have: id, name (in the menu), glyph (in the badge), and
+// what a value that does not fit is not (miss).
+let json_export_table_types = [
+    { id: "text", name: "Text", glyph: "Aa", miss: "text" },
+    { id: "integer", name: "Integer", glyph: "#", miss: "a whole number" },
+    { id: "decimal", name: "Decimal", glyph: ".5", miss: "a number" },
+    { id: "money", name: "Money", glyph: "¤", miss: "an amount" },
+    { id: "boolean", name: "Yes/no", glyph: "✓", miss: "yes or no" },
+    { id: "date", name: "Date", glyph: "31", miss: "a date" },
+    { id: "datetime", name: "Date-time", glyph: "◷", miss: "a date and time" },
+    { id: "email", name: "Email", glyph: "@", miss: "an email address" },
+    { id: "url", name: "Link", glyph: "↗", miss: "a link" },
+    { id: "json", name: "JSON", glyph: "{}", miss: "JSON" },
+    { id: "empty", name: "Empty", glyph: "∅", miss: "empty" },
+    { id: "mixed", name: "Mixed", glyph: "≈", miss: "mixed" },
+]
+
+// The formats: id, name (in the menu), the file's extension and media type.
+let json_export_table_formats = [
+    { id: "csv", name: "CSV", ext: "csv", mime: "text/csv;charset=utf-8" },
+    { id: "tsv", name: "TSV", ext: "tsv", mime: "text/tab-separated-values;charset=utf-8" },
+    { id: "json", name: "JSON", ext: "json", mime: "application/json" },
+    { id: "jsonl", name: "JSON Lines", ext: "jsonl", mime: "application/x-ndjson" },
+    { id: "xls", name: "Excel", ext: "xls", mime: "application/vnd.ms-excel" },
+    { id: "md", name: "Markdown", ext: "md", mime: "text/markdown;charset=utf-8" },
+    { id: "html", name: "HTML", ext: "html", mime: "text/html;charset=utf-8" },
+    { id: "sql", name: "SQL", ext: "sql", mime: "application/sql" },
+    { id: "xml", name: "XML", ext: "xml", mime: "application/xml" },
+]
+
+fn json_export_table_type(id: str) -> map = find(json_export_table_types, (t) => t.id == id) ?? json_export_table_types[0]
+
+fn json_export_table_format(id: str) -> map = find(json_export_table_formats, (f) => f.id == id) ?? json_export_table_formats[0]
+
+// Whether a type is a number's, which lines up on the right.
+fn json_export_table_numeric(kind: str) -> bool = kind == "integer" || kind == "decimal" || kind == "money"
+
+fn json_export_table_is_num(v) -> bool = type_of(v) == "int" || type_of(v) == "float"
+
+// The value at `segs` (keys and indexes) inside v, or null.
+fn json_export_table_at(v, segs: list) {
+    if len(segs) == 0 { return v }
+    let k = segs[0]
+    let next = type_of(v) == "map" ? get(v, str(k))
+        : (type_of(v) == "list" && type_of(k) == "int" && k >= 0 && k < len(v) ? v[k] : null)
+    json_export_table_at(next, slice(segs, 1, len(segs)))
+}
+
+// The records: maps as they are, any other item as { value: item }.
+fn json_export_table_records(rows) -> list =
+    type_of(rows) != "list" ? [] : rows | map((r) => type_of(r) == "map" ? r : { value: r })
+
+// A number as JSON writes it, the same on the server and in the browser (where a
+// whole float such as 2.0 is 2); a decimal with its digits.
+fn json_export_table_num(v) -> str =
+    type_of(v) == "float" && v == floor(v) && abs(v) < 1000000000000000 ? str(floor(v)) : str(v)
+
+// How many decimals a number is written with: 12.5 has 1.
+fn json_export_table_places(v) -> int {
+    let s = json_export_table_num(v)
+    let at = index_of(s, ".")
+    at == null || contains(s, "e") ? 0 : len(s) - at - 1
+}
+
+// Digits before the point: 1234.5 has 4.
+fn json_export_table_int_digits(v) -> int {
+    let s = replace(json_export_table_num(abs(v)), "-", "")
+    let at = index_of(s, ".")
+    at == null ? len(s) : at
+}
+
+// Any value as one line of text: objects and arrays as compact JSON.
+fn json_export_table_plain(v) -> str = match type_of(v) {
+    "null" => ""
+    "str" => v
+    "bool" => v ? "true" : "false"
+    "int" => str(v)
+    "float" => json_export_table_num(v)
+    "dec" => str(v)
+    _ => json.stringify(v)
+}
+
+// A value as JSON text: numbers as numbers, decimals with their digits.
+fn json_export_table_json_raw(v) -> str = match type_of(v) {
+    "int" => str(v)
+    "float" => json_export_table_num(v)
+    "dec" => str(v)
+    _ => json.stringify(v)
+}
+
+let json_export_table_date_re = "^\\d{4}-\\d{2}-\\d{2}$"
+let json_export_table_dt_re = "^(\\d{4}-\\d{2}-\\d{2})[T ](\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d+)?)?(Z|[+-]\\d{2}(?::?\\d{2})?)?$"
+let json_export_table_money_words = "amount|price|total|cost|balance|fee|tax|salary|revenue|payment|paid|due|charge|refund|spend|budget"
+
+// A date-time's parts: { date, time ("14:30:00"), zone ("Z", "+01:00" or ""), iso },
+// or null when the text is not one.
+fn json_export_table_dt(s: str) {
+    let m = re.find(s, json_export_table_dt_re)
+    if m == null || !date.valid(m.groups[0], "date") || int(m.groups[1]) > 23 || int(m.groups[2]) > 59 { return null }
+    let z = m.groups[4] ?? ""
+    let zone = z == "Z" || z == "" ? z : (len(z) == 3 ? `${z}:00` : (contains(z, ":") ? z : `${slice(z, 0, 3)}:${slice(z, 3, 5)}`))
+    let time = `${m.groups[1]}:${m.groups[2]}:${m.groups[3] ?? "00"}`
+    { date: m.groups[0], time, zone, iso: `${m.groups[0]}T${time}${zone}` }
+}
+
+// What one value is, finest first: null, boolean, integer, decimal, money (text
+// with two decimals), date, datetime, email, url, text or json.
+fn json_export_table_kind_of(v) -> str? {
+    let t = type_of(v)
+    if t == "null" { return null }
+    if t == "bool" { return "boolean" }
+    if t == "int" { return "integer" }
+    if t == "float" { return v == floor(v) ? "integer" : "decimal" }
+    if t == "dec" { return v == floor(v) ? "integer" : "decimal" }
+    if t == "map" || t == "list" { return "json" }
+    if t != "str" { return "text" }
+    if re.test(v, json_export_table_date_re) && date.valid(v, "date") { return "date" }
+    if json_export_table_dt(v) != null { return "datetime" }
+    if re.test(v, "^-?\\d+\\.\\d{2}$") { return "money" }
+    if re.test(v, "^-?\\d+\\.\\d+$") { return "decimal" }
+    if re.test(v, "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") { return "email" }
+    if re.test(v, "^https?://[^\\s]+$", "i") { return "url" }
+    "text"
+}
+
+// A column's type from its key and its values.
+fn json_export_table_infer(key: str, values: list) -> str {
+    let kinds = unique(values | map((v) => json_export_table_kind_of(v)) | filter((k) => k != null))
+    let only = (allowed: list) => all(kinds, (k) => contains(allowed, k))
+    let nums = values | filter((v) => json_export_table_is_num(v) || type_of(v) == "dec")
+    let cents = all(nums, (v) => json_export_table_places(v) <= 2)
+    if len(kinds) == 0 { return "empty" }
+    let words = values | filter((v) => v != null) | map((v) => type_of(v) == "str" ? lower(trim(v)) : null)
+    if kinds == ["text"] && all(words, (w) => contains(["yes", "no", "true", "false"], w)) { return "boolean" }
+    if len(kinds) == 1 && kinds[0] != "decimal" { return kinds[0] }
+    if only(["integer", "decimal", "money"]) {
+        let named = re.test(lower(key), json_export_table_money_words)
+        return contains(kinds, "money") || named ? (cents ? "money" : "decimal") : "decimal"
+    }
+    if only(["date", "datetime"]) { return "datetime" }
+    if only(["text", "email", "url", "date", "datetime", "money", "decimal"]) && all(values, (v) => v == null || type_of(v) == "str") { return "text" }
+    "mixed"
+}
+
+// The columns: { key, label, type, given } for each, from `columns` or the keys.
+fn json_export_table_columns(records: list, columns: list?) -> list {
+    let defs = columns != null ? columns | map((c) => type_of(c) == "map" ? c : { key: str(c) })
+        : unique(flatten(records | map((r) => keys(r)))) | map((k) => { key: k })
+    defs | map((d) => {
+        let key = str(d.key)
+        let inferred = json_export_table_infer(key, records | map((r) => get(r, key)))
+        { key, label: d.label ?? key, type: d.type ?? inferred, inferred }
+    })
+}
+
+// One value as a column's type: null for null, else { ok, v } with v the typed
+// value, or the value as it came when it does not fit (ok false).
+fn json_export_table_cast(v, kind: str) {
+    if v == null { return null }
+    let t = type_of(v)
+    let num = t == "int" || t == "float" || t == "dec"
+    let s = t == "str" ? trim(v) : ""
+    let no = { ok: false, v }
+    match kind {
+        "text" => { ok: true, v: json_export_table_plain(v) }
+        "integer" => num ? (v == floor(v) ? { ok: true, v: int(v) } : no)
+            : (re.test(s, "^-?\\d{1,15}$") ? { ok: true, v: int(s) } : no)
+        "decimal" => num ? { ok: true, v: t == "dec" ? float(v) : v }
+            : (re.test(s, "^-?\\d+(\\.\\d+)?$") ? { ok: true, v: float(dec(s)) } : no)
+        "money" => num || re.test(s, "^-?\\d+(\\.\\d+)?$") ? { ok: true, v: round(dec(num ? v : s), 2, "half_up") } : no
+        "boolean" => t == "bool" ? { ok: true, v }
+            : (num && (v == 0 || v == 1) ? { ok: true, v: v == 1 }
+            : (contains(["true", "yes", "y", "1"], lower(s)) ? { ok: true, v: true }
+            : (contains(["false", "no", "n", "0"], lower(s)) ? { ok: true, v: false } : no)))
+        "date" => re.test(s, json_export_table_date_re) && date.valid(s, "date") ? { ok: true, v: s }
+            : (json_export_table_dt(s) != null ? { ok: true, v: slice(s, 0, 10) } : no)
+        "datetime" => {
+            let d = json_export_table_dt(s)
+            d != null ? { ok: true, v: d.iso } : (re.test(s, json_export_table_date_re) && date.valid(s, "date") ? { ok: true, v: `${s}T00:00:00` } : no)
+        }
+        "email" => re.test(s, "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") ? { ok: true, v: s } : no
+        "url" => re.test(s, "^https?://[^\\s]+$", "i") ? { ok: true, v: s } : no
+        _ => { ok: true, v }
+    }
+}
+
+// The cells of the records for the columns: a list of rows of cast values.
+fn json_export_table_grid(cols: list, records: list) -> list =
+    records | map((r) => cols | map((c) => json_export_table_cast(get(r, c.key), c.type)))
+
+// What a value sorts by in its type: numbers, or text.
+fn json_export_table_sort_key(v, kind: str) = match kind {
+    "integer" | "decimal" | "money" => v
+    "boolean" => v ? 1 : 0
+    "datetime" => {
+        let d = json_export_table_dt(v)
+        d == null ? 0 : date.ms(`${d.date}T${d.time}${d.zone == "" ? "Z" : d.zone}`)
+    }
+    "date" => v
+    "text" | "email" | "url" => lower(v)
+    _ => lower(json_export_table_plain(v))
+}
+
+// The records sorted by a column, in its type's order; ties keep their order, and
+// values that do not fit, then empty ones, go last either way.
+fn json_export_table_sorted(records: list, key: str, kind: str, desc: bool) -> list {
+    let tagged = records | map((r) => { r, c: json_export_table_cast(get(r, key), kind) })
+    let good = tagged | filter((x) => x.c != null && x.c.ok)
+    let bad = tagged | filter((x) => x.c != null && !x.c.ok)
+    let none = tagged | filter((x) => x.c == null)
+    let by = (x) => json_export_table_sort_key(x.c.v, kind)
+    let first = desc ? reverse(sort_by(reverse(good), by)) : sort_by(good, by)
+    (first + sort_by(bad, (x) => lower(json_export_table_plain(x.c.v))) + none) | map((x) => x.r)
+}
+
+// The order with `key` moved by one place (-1 up, 1 down).
+fn json_export_table_move(order: list, key: str, by: int) -> list {
+    let i = index_of(order, key)
+    let j = i == null ? -1 : i + by
+    j < 0 || j >= len(order) ? order : set(set(order, i, order[j]), j, key)
+}
+
+// ---- Files ----------------------------------------------------------------
+
+// A cell as plain text, for CSV, TSV, Markdown, HTML and XML.
+fn json_export_table_text(c) -> str {
+    if c == null { return "" }
+    json_export_table_plain(c.v)
+}
+
+// A cell as JSON: typed values as JSON's numbers, booleans and strings.
+fn json_export_table_json_value(c, kind: str) -> str {
+    if c == null { return "null" }
+    if !c.ok { return json_export_table_json_raw(c.v) }
+    match kind {
+        "integer" | "decimal" | "money" | "boolean" | "json" | "mixed" | "empty" => json_export_table_json_raw(c.v)
+        _ => json.stringify(c.v)
+    }
+}
+
+fn json_export_table_json_object(cols: list, row: list) -> str =
+    "{" + join(zip(cols, row) | map((p) => json.stringify(p[0].key) + ":" + json_export_table_json_value(p[1], p[0].type)), ",") + "}"
+
+fn json_export_table_csv_field(s: str) -> str = re.test(s, "[\",\\r\\n]") ? `"${replace(s, "\"", "\"\"")}"` : s
+
+fn json_export_table_tsv_field(s: str) -> str =
+    replace(replace(replace(replace(s, "\\", "\\\\"), "\t", "\\t"), "\n", "\\n"), "\r", "\\r")
+
+fn json_export_table_breaks(s: str, br: str) -> str = replace(replace(replace(s, "\r\n", br), "\n", br), "\r", br)
+
+fn json_export_table_md_field(s: str) -> str =
+    json_export_table_breaks(re.replace(s, "([\\\\`*_\\[\\]<>|~])", "\\$1"), "<br>")
+
+// Text for XML and HTML: & < > " ' as entities, and the characters XML cannot hold left out.
+fn json_export_table_xml_text(s: str) -> str =
+    escape(re.replace(s, "[\u0000-\u0008\u000B\u000C\u000E-\u001F]", ""))
+
+// An XML element's name from a key: what a name cannot hold becomes _.
+fn json_export_table_xml_name(key: str) -> str {
+    let s = re.replace(key, "[^A-Za-z0-9_.-]", "_")
+    s == "" || re.test(s, "^[0-9.-]") || starts_with(lower(s), "xml") ? "_" + s : s
+}
+
+fn json_export_table_sql_name(s: str) -> str = `"${replace(s, "\"", "\"\"")}"`
+
+fn json_export_table_sql_text(s: str) -> str = `'${replace(s, "'", "''")}'`
+
+// A value as an SQL literal.
+fn json_export_table_sql_value(c, kind: str) -> str {
+    if c == null { return "NULL" }
+    let v = c.v
+    let t = type_of(v)
+    if t == "bool" { return v ? "TRUE" : "FALSE" }
+    if t == "int" || t == "float" || t == "dec" { return json_export_table_json_raw(v) }
+    if c.ok && kind == "datetime" {
+        let d = json_export_table_dt(v)
+        return json_export_table_sql_text(`${d.date} ${d.time}${d.zone}`)
+    }
+    json_export_table_sql_text(json_export_table_plain(v))
+}
+
+// Each column's SQL type, from all its cells.
+fn json_export_table_sql_types(cols: list, grid: list) -> list =
+    for [i, c] in enumerate(cols) => {
+        let cells = grid | map((r) => r[i])
+        let vals = cells | filter((x) => x != null && x.ok) | map((x) => x.v)
+        let full = len(grid) > 0 && all(cells, (x) => x != null && x.ok)
+        let base = match c.type {
+            "integer" => any(vals, (v) => abs(v) > 2147483647) ? "BIGINT" : "INTEGER"
+            "decimal" => {
+                let s = min([10, max(vals | map((v) => json_export_table_places(v))) ?? 0])
+                let p = min([38, max([1, (max(vals | map((v) => json_export_table_int_digits(v))) ?? 1) + s])])
+                `NUMERIC(${p}, ${s})`
+            }
+            "money" => `DECIMAL(${max([12, (max(vals | map((v) => json_export_table_int_digits(v))) ?? 1) + 2])}, 2)`
+            "boolean" => "BOOLEAN"
+            "date" => "DATE"
+            "datetime" => any(vals, (v) => json_export_table_dt(v).zone != "") ? "TIMESTAMP WITH TIME ZONE" : "TIMESTAMP"
+            "json" => "JSON"
+            "text" | "email" | "url" => {
+                let n = max(vals | map((v) => len(v))) ?? 0
+                let size = find([16, 32, 64, 128, 255], (k) => n <= k)
+                size != null ? `VARCHAR(${size})` : "TEXT"
+            }
+            _ => "TEXT"
+        }
+        full ? `${base} NOT NULL` : base
+    }
+
+// A date-time for Excel: in UTC when it has an offset, as written when not.
+fn json_export_table_xls_time(v: str, kind: str) -> str {
+    if kind == "date" { return `${v}T00:00:00.000` }
+    let d = json_export_table_dt(v)
+    let at = d.zone == "" ? `${d.date}T${d.time}` : slice(date.to_zone(`${d.date}T${d.time}${d.zone}`, "UTC"), 0, 19)
+    `${at}.000`
+}
+
+// One Excel cell.
+fn json_export_table_xls_cell(c, kind: str) -> str {
+    if c == null { return "<Cell/>" }
+    let v = c.v
+    let t = type_of(v)
+    let data = (type: str, text: str) => `<Data ss:Type="${type}">${text}</Data>`
+    if t == "bool" { return `<Cell>${data("Boolean", v ? "1" : "0")}</Cell>` }
+    if t == "int" || t == "float" || t == "dec" {
+        let style = c.ok && kind == "money" ? " ss:StyleID=\"m\"" : ""
+        return `<Cell${style}>${data("Number", json_export_table_json_raw(v))}</Cell>`
+    }
+    if c.ok && (kind == "date" || kind == "datetime") {
+        return `<Cell ss:StyleID="${kind == "date" ? "d" : "t"}">${data("DateTime", json_export_table_xls_time(v, kind))}</Cell>`
+    }
+    let text = replace(replace(json_export_table_xml_text(json_export_table_plain(v)), "\r", "&#13;"), "\n", "&#10;")
+    `<Cell>${data("String", text)}</Cell>`
+}
+
+// The table as a file's text. cols: [{ key, label, type, sql? }] (sql, each column's
+// SQL type, from json_export_table_sql_types over every row; else from these rows);
+// grid: their cells (json_export_table_grid); name: the SQL table, the XML root and
+// the sheet.
+fn json_export_table_file(fmt: str, cols: list, grid: list, name: str) -> str {
+    let labels = cols | map((c) => c.label)
+    let rows_text = (f) => grid | map((r) => r | map((c) => f(json_export_table_text(c))))
+    match fmt {
+        "tsv" => join([join(labels | map(json_export_table_tsv_field), "\t")]
+            + (rows_text(json_export_table_tsv_field) | map((r) => join(r, "\t"))) + [""], "\n")
+        "json" => len(grid) == 0 ? "[]\n"
+            : "[\n" + join(grid | map((r) => "  " + json_export_table_json_object(cols, r)), ",\n") + "\n]\n"
+        "jsonl" => join(grid | map((r) => json_export_table_json_object(cols, r) + "\n"), "")
+        "md" => {
+            let line = (cells: list) => "| " + join(cells, " | ") + " |"
+            let rule = cols | map((c) => json_export_table_numeric(c.type) ? "---:" : (c.type == "boolean" ? ":---:" : "---"))
+            join([line(labels | map(json_export_table_md_field)), line(rule)] + (rows_text(json_export_table_md_field) | map(line)), "\n") + "\n"
+        }
+        "html" => {
+            let cls = (c) => json_export_table_numeric(c.type) ? " class=\"num\"" : ""
+            let cell = (tag: str, c, x) => `<${tag}${cls(c)}>${json_export_table_breaks(json_export_table_xml_text(json_export_table_text(x)), "<br>")}</${tag}>`
+            join([
+                "<!DOCTYPE html>",
+                "<html>",
+                "<head>",
+                "<meta charset=\"utf-8\">",
+                `<title>${json_export_table_xml_text(name)}</title>`,
+                "<style>table{border-collapse:collapse;font:14px sans-serif}th,td{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top}.num{text-align:right}</style>",
+                "</head>",
+                "<body>",
+                "<table>",
+                "<thead>",
+                "<tr>" + join(cols | map((c) => `<th scope="col"${cls(c)}>${json_export_table_xml_text(c.label)}</th>`), "") + "</tr>",
+                "</thead>",
+                "<tbody>",
+            ] + (grid | map((r) => "<tr>" + join(zip(cols, r) | map((p) => cell("td", p[0], p[1])), "") + "</tr>")) + [
+                "</tbody>",
+                "</table>",
+                "</body>",
+                "</html>",
+                "",
+            ], "\n")
+        }
+        "sql" => {
+            let types = all(cols, (c) => c.sql != null) ? cols | map((c) => c.sql) : json_export_table_sql_types(cols, grid)
+            let table = json_export_table_sql_name(name)
+            let names = join(cols | map((c) => json_export_table_sql_name(c.key)), ", ")
+            join([`CREATE TABLE ${table} (`]
+                + (for [i, c] in enumerate(cols) => `  ${json_export_table_sql_name(c.key)} ${types[i]}${i < len(cols) - 1 ? "," : ""}`)
+                + [");"]
+                + (grid | map((r) => `INSERT INTO ${table} (${names}) VALUES (${join(zip(cols, r) | map((p) => json_export_table_sql_value(p[1], p[0].type)), ", ")});`))
+                + [""], "\n")
+        }
+        "xls" => {
+            let sheet = slice(re.replace(name, "[\\[\\]:*?/\\\\]", "_"), 0, 31)
+            join([
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                "<?mso-application progid=\"Excel.Sheet\"?>",
+                "<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\" xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\">",
+                "<Styles>",
+                "<Style ss:ID=\"h\"><Font ss:Bold=\"1\"/></Style>",
+                "<Style ss:ID=\"m\"><NumberFormat ss:Format=\"#,##0.00\"/></Style>",
+                "<Style ss:ID=\"d\"><NumberFormat ss:Format=\"yyyy\\-mm\\-dd\"/></Style>",
+                "<Style ss:ID=\"t\"><NumberFormat ss:Format=\"yyyy\\-mm\\-dd\\ hh:mm:ss\"/></Style>",
+                "</Styles>",
+                `<Worksheet ss:Name="${json_export_table_xml_text(sheet == "" ? "Sheet1" : sheet)}">`,
+                "<Table>",
+                "<Row>" + join(labels | map((l) => `<Cell ss:StyleID="h"><Data ss:Type="String">${json_export_table_xml_text(l)}</Data></Cell>`), "") + "</Row>",
+            ] + (grid | map((r) => "<Row>" + join(zip(cols, r) | map((p) => json_export_table_xls_cell(p[1], p[0].type)), "") + "</Row>")) + [
+                "</Table>",
+                "</Worksheet>",
+                "</Workbook>",
+                "",
+            ], "\n")
+        }
+        "xml" => {
+            let root = json_export_table_xml_name(name)
+            let field = (c, x) => {
+                let tag = json_export_table_xml_name(c.key)
+                x == null ? "" : `<${tag}>${json_export_table_xml_text(json_export_table_text(x))}</${tag}>`
+            }
+            join(["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", `<${root}>`]
+                + (grid | map((r) => "  <row>" + join(zip(cols, r) | map((p) => field(p[0], p[1])), "") + "</row>"))
+                + [`</${root}>`, ""], "\n")
+        }
+        _ => join([join(labels | map(json_export_table_csv_field), ",")]
+            + (rows_text(json_export_table_csv_field) | map((r) => join(r, ","))), "\r\n") + "\r\n"
+    }
+}
+
+component JsonExportTable(id: str, rows: list? = null, value = null, path: list = [], columns: list? = null,
+                          exclude: list = [], label: str? = null, filename: str = "data", table: str? = null,
+                          format: str = "csv", formats: list = ["csv", "tsv", "json", "jsonl", "xls", "md", "html", "sql", "xml"],
+                          order_by: str? = null, descending: bool = false, locale: str = "en-US", currency: str? = null,
+                          limit: int = 100, preview: int = 5, bom: bool = true, height: str = "420px",
+                          empty: str = "No rows to show", class: str? = null) {
+    style global json_export_table_css
+    let records = json_export_table_records(rows ?? json_export_table_at(value, path))
+    let defs = json_export_table_columns(records, columns)
+    state order = defs | map((d) => d.key)
+    state hidden = exclude
+    state kinds = {}
+    state sort_key = order_by
+    state sort_desc = descending
+    state fmt = format
+    state said = ""
+    let all_cols = order | map((k) => {
+        let d = find(defs, (x) => x.key == k)
+        { key: k, label: d.label, type: get(kinds, k) ?? d.type, inferred: d.inferred }
+    })
+    let cols = all_cols | filter((c) => !contains(hidden, c.key))
+    let sort_type = sort_key != null ? (find(all_cols, (c) => c.key == sort_key).type ?? "text") : "text"
+    let sorted = sort_key == null ? records : json_export_table_sorted(records, sort_key, sort_type, sort_desc)
+    let shown = json_export_table_grid(cols, take(sorted, limit))
+    let f = json_export_table_format(fmt)
+    let file = `${filename}.${f.ext}`
+    let name = table ?? filename
+    // The SQL types come from every row, also for the preview. The preview shows CSV's
+    // CRLF as LF, as HTML would.
+    let typed = (grid: list) => fmt == "sql" ? zip(cols, json_export_table_sql_types(cols, grid)) | map((p) => { ...p[0], sql: p[1] }) : cols
+    let sample = preview > 0 && len(cols) > 0
+        ? json_export_table_file(fmt, fmt == "sql" ? typed(json_export_table_grid(cols, sorted)) : cols,
+                                 json_export_table_grid(cols, take(sorted, preview)), name)
+        : ""
+    let whole = () => {
+        let grid = json_export_table_grid(cols, sorted)
+        json_export_table_file(fmt, typed(grid), grid, name)
+    }
+    let save = () => {
+        let text = whole()
+        let url = js("URL.createObjectURL", js_new("Blob", [fmt == "csv" && bom ? "\u{FEFF}" + text : text], { type: f.mime }))
+        let a = js("document.createElement", "a")
+        a.href = url
+        a.download = file
+        a.click()
+        js("requestAnimationFrame", (t = null) => { js("URL.revokeObjectURL", url) })
+        said = `Saved ${file}`
+    }
+    let copy = () => {
+        if js("isSecureContext") != true {
+            said = "Could not copy"
+        } else {
+            // The promise's callbacks are given undefined, which is no argument: hence `= null`.
+            js("navigator.clipboard.writeText", whole()).then((_ = null) => { said = `Copied ${f.name}` }, (_ = null) => { said = "Could not copy" })
+        }
+    }
+    let sort_by_col = (key: str) => {
+        if sort_key != key {
+            sort_key = key
+            sort_desc = false
+        } else if !sort_desc {
+            sort_desc = true
+        } else {
+            sort_key = null
+            sort_desc = false
+        }
+    }
+    let align = (kind: str) => json_export_table_numeric(kind) ? "ui-jxt-num" : (kind == "boolean" ? "ui-jxt-mid" : null)
+    let mark = (yes: bool) => <span class={yes ? "ui-jxt-yes" : "ui-jxt-no"}>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d={yes ? "M3 8.5l3.2 3L13 4.5" : "M4.5 4.5l7 7M11.5 4.5l-7 7"}/>
+        </svg>
+        <span.ui-sr>{yes ? "yes" : "no"}</span>
+    </span>
+    // Text with CR line ends as the page will have it (HTML reads CR LF as LF).
+    let line = (s: str) => json_export_table_breaks(s, "\n")
+    let show = (c, kind: str) => {
+        if c == null { return <span.ui-jxt-null><span aria-hidden="true">—</span><span.ui-sr>empty</span></span> }
+        let v = c.v
+        if !c.ok {
+            return <span.ui-jxt-bad title={`Not ${json_export_table_type(kind).miss}: kept as it came`}>
+                {line(json_export_table_plain(v))}<span.ui-sr>{` (not ${json_export_table_type(kind).miss})`}</span>
+            </span>
+        }
+        match kind {
+            "integer" => format_number(v, locale, 0)
+            "decimal" => format_number(v, locale, min([10, json_export_table_places(v)]))
+            "money" => currency != null ? money.format(money.of(v, currency, "half_up"), locale) : format_number(v, locale, 2)
+            "boolean" => mark(v)
+            "date" => <time datetime={v}>{date.format(v, { locale, style: "medium" })}</time>
+            "datetime" => {
+                let d = json_export_table_dt(v)
+                <time datetime={v}>
+                    {date.format(d.date, { locale, style: "medium" })}, {slice(d.time, 0, 5)}{d.zone == "Z" ? " UTC" : (d.zone != "" ? ` ${d.zone}` : "")}
+                </time>
+            }
+            "email" => <a href={`mailto:${v}`}>{v}</a>
+            "url" => <a href={v} rel="noopener noreferrer">{re.replace(v, "^https?://", "", "i")}</a>
+            _ => type_of(v) == "map" || type_of(v) == "list"
+                ? <code.ui-jxt-json title={json.stringify(v)}>{json.stringify(v)}</code>
+                : line(json_export_table_plain(v))
+        }
+    }
+    let arrow = (key: str) => <svg.ui-jxt-arrow viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6"
+                                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d={sort_key != key ? "M3.5 4.5L6 2l2.5 2.5M3.5 7.5L6 10l2.5-2.5" : (sort_desc ? "M6 2v8M3 7l3 3 3-3" : "M6 10V2M3 5l3-3 3 3")}/>
+    </svg>
+    let total = len(records)
+    <div class={ui_cls(["ui-jxt", class])} id={id}>
+        <div.ui-jxt-bar>
+            <span.ui-jxt-count>
+                {`${format_number(total, locale, 0)} row${total == 1 ? "" : "s"} · ${len(cols)} of ${len(all_cols)} columns`}
+                {sort_key != null && ` · sorted by ${find(all_cols, (c) => c.key == sort_key).label ?? sort_key}${sort_desc ? ", descending" : ""}`}
+            </span>
+            <div.ui-jxt-export role="group" aria-label={label != null ? `Export ${lower(label)}` : "Export"}>
+                <label for={`${id}-format`}>Format</label>
+                <select.ui-jxt-format id={`${id}-format`} @change={(e) => { fmt = e.value }}>
+                    {for x in formats => {
+                        let fx = json_export_table_format(x)
+                        <option key={fx.id} value={fx.id} selected={fx.id == fmt}>{`${fx.name} (.${fx.ext})`}</option>
+                    }}
+                </select>
+                <button.ui-jxt-btn.ui-jxt-primary type="button" disabled={len(cols) == 0} @click={save}>
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                         aria-hidden="true"><path d="M8 2v8M4.5 6.5L8 10l3.5-3.5M3 13h10"/></svg>
+                    Export <span.ui-sr>{file}</span>
+                </button>
+                {fmt != "xls" && <button.ui-jxt-btn.ui-jxt-copy type="button" disabled={len(cols) == 0} @click={copy}>
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                         aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.5a1 1 0 0 0-1-1H3.5a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h.5"/></svg>
+                    Copy <span.ui-sr>{`as ${f.name}`}</span>
+                </button>}
+                <span.ui-sr role="status">{said}</span>
+            </div>
+        </div>
+        <details.ui-jxt-cols>
+            <summary>
+                <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                     aria-hidden="true"><path d="M3.5 2L7 5 3.5 8"/></svg>
+                Columns <small>{`${len(cols)} of ${len(all_cols)} included`}</small>
+            </summary>
+            <ul.ui-jxt-collist>
+                {for [i, c] in enumerate(all_cols) => <li key={c.key} class={ui_cls(["ui-jxt-colitem", contains(hidden, c.key) && "ui-jxt-off"])}>
+                    <label>
+                        <input type="checkbox" checked={!contains(hidden, c.key)}
+                               @change={(e) => { hidden = e.checked ? remove(hidden, c.key) : push(hidden, c.key) }}/>
+                        <span>{c.label}</span>
+                    </label>
+                    <span.ui-jxt-kind>{json_export_table_type(c.type).name}</span>
+                    <button.ui-jxt-move type="button" aria-label={`Move ${c.label} up`} disabled={i == 0}
+                                        @click={() => { order = json_export_table_move(order, c.key, -1) }}>
+                        <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                             aria-hidden="true"><path d="M6 10V2M3 5l3-3 3 3"/></svg>
+                    </button>
+                    <button.ui-jxt-move type="button" aria-label={`Move ${c.label} down`} disabled={i == len(all_cols) - 1}
+                                        @click={() => { order = json_export_table_move(order, c.key, 1) }}>
+                        <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+                             aria-hidden="true"><path d="M6 2v8M3 7l3 3 3-3"/></svg>
+                    </button>
+                </li>}
+            </ul>
+        </details>
+        <div.ui-jxt-scroll tabindex="0" role="region" aria-label={label != null ? `${label}, table` : "Table"} style={`max-height: ${height}`}>
+            <table aria-label={label}>
+                <thead>
+                    <tr>
+                        {for c in cols => <th key={c.key} scope="col" class={align(c.type)} data-key={c.key} data-type={c.type}
+                                              aria-sort={sort_key == c.key ? (sort_desc ? "descending" : "ascending") : null}>
+                            <div.ui-jxt-head>
+                                <button.ui-jxt-sort type="button" @click={() => sort_by_col(c.key)}>
+                                    <span>{c.label}</span><span.ui-sr>{`, ${lower(json_export_table_type(c.type).name)}`}</span>{arrow(c.key)}
+                                </button>
+                                <span class={`ui-jxt-type ui-jxt-k-${c.type}`}>
+                                    <span.ui-jxt-glyph aria-hidden="true">{json_export_table_type(c.type).glyph}</span>
+                                    <select aria-label={`Type of ${c.label}`} title={c.type != c.inferred ? `Worked out as ${lower(json_export_table_type(c.inferred).name)}` : null}
+                                            @change={(e) => { kinds = set(kinds, c.key, e.value) }}>
+                                        {for t in json_export_table_types => <option key={t.id} value={t.id} selected={t.id == c.type}>{t.name}</option>}
+                                    </select>
+                                </span>
+                            </div>
+                        </th>}
+                    </tr>
+                </thead>
+                <tbody>
+                    {len(shown) == 0 || len(cols) == 0
+                        ? <tr.ui-jxt-empty><td colspan={str(max([1, len(cols)]))}>{len(cols) == 0 ? "No columns included" : empty}</td></tr>
+                        : (for [i, r] in enumerate(shown) => <tr key={i}>
+                              {for p in zip(cols, r) => <td class={align(p[0].type)}>{show(p[1], p[0].type)}</td>}
+                          </tr>)}
+                </tbody>
+            </table>
+        </div>
+        {total > limit && <p.ui-jxt-more>{`Showing ${format_number(limit, locale, 0)} of ${format_number(total, locale, 0)} rows; the files have them all.`}</p>}
+        {sample != "" && <figure.ui-jxt-preview>
+            <figcaption id={`${id}-preview`}>
+                {`Preview of ${file}${total > preview ? `, the first ${preview} of ${format_number(total, locale, 0)} rows` : ""}`}
+            </figcaption>
+            <pre tabindex="0" aria-labelledby={`${id}-preview`}><code>{replace(sample, "\r\n", "\n")}</code></pre>
+        </figure>}
+    </div>
+}

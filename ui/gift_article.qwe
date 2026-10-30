@@ -1,0 +1,135 @@
+// GiftArticle: "Gift this article", as subscribers' papers offer it: a button that
+// opens a panel saying how many gift articles are left this month, makes a link
+// anyone can read the story free with, and offers it to copy or to send by email.
+// Each link made counts one off; when none are left it says when more come. Escape
+// or × closes the panel and gives the focus back to the button.
+//
+//   <GiftArticle id="gift" href="https://ledger.example/2026/10/river" title="The river that ran out of water"
+//                left={8} limit={10} renews="Dec 1"/>
+//   <GiftArticle id="gift" href={story.url} title={story.title} left={me.gifts_left} limit={10}
+//                on_gift={(url) => make_gift_link(url)}/>
+//
+// href: the article's address. title: its headline (in the email). left: the gift
+// articles left this month; limit: how many a month (10). renews: when more come
+// ("Dec 1"), said once none are left. id (required): unique on the page. label: the
+// button's text ("Gift this article"). on_gift(url): inside one of your components,
+// given href when a link is asked for; give back the gift link (made and saved on
+// your server, a `server fn`), or null when it could not be made, and the count is
+// left as it was. Without it the link is href with a random `gift` token added, for
+// a page that only shows how it looks. align: where the panel opens, "start"
+// (default) or "end" (its right edge under the button's).
+
+let gift_article_css = css`
+.ui-gift { position: relative; display: inline-block; max-width: 100%; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-gift-open { display: inline-flex; align-items: center; gap: 8px; height: 36px; padding: 0 14px; border: 1px solid var(--ui-border);
+  border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font: 600 14px var(--ui-font); cursor: pointer; }
+.ui-gift-open svg { width: 16px; height: 16px; color: var(--ui-accent); }
+.ui-gift-open:hover, .ui-gift-open[aria-expanded="true"] { border-color: var(--ui-accent); color: var(--ui-accent); }
+.ui-gift button:focus-visible, .ui-gift a:focus-visible, .ui-gift input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-gift-panel { position: absolute; z-index: 30; top: calc(100% + 8px); left: 0; display: grid; gap: 12px; width: min(380px, 92vw); padding: 16px 18px 18px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); box-shadow: var(--ui-shadow-lg); }
+.ui-gift-end .ui-gift-panel { left: auto; right: 0; }
+.ui-gift-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ui-gift .ui-gift-title { margin: 0; font-size: 16px; font-weight: 750; }
+.ui-gift-x { display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: var(--ui-radius-sm); background: transparent;
+  color: var(--ui-muted); font-size: 20px; line-height: 1; cursor: pointer; }
+.ui-gift-x:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+.ui-gift-text { margin: 0; color: var(--ui-muted); }
+.ui-gift-text b { color: var(--ui-fg); }
+.ui-gift-meter { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 3px; }
+.ui-gift-meter span { height: 6px; border-radius: 3px; background: var(--ui-accent); }
+.ui-gift-meter .ui-gift-used { background: var(--ui-border); }
+.ui-gift-make { justify-self: start; height: 38px; padding: 0 16px; border: 0; border-radius: 999px; background: var(--ui-accent); color: var(--ui-accent-fg);
+  font: 650 14px var(--ui-font); cursor: pointer; }
+.ui-gift-make:hover:not(:disabled) { filter: brightness(1.08); }
+.ui-gift-make:disabled { opacity: .45; cursor: not-allowed; }
+.ui-gift-link { display: flex; gap: 6px; }
+.ui-gift-link input { flex: 1; min-width: 0; height: 36px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-subtle); color: var(--ui-fg); font: 13px var(--ui-mono); }
+.ui-gift-copy, .ui-gift-mail { flex: none; display: inline-flex; align-items: center; height: 36px; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 600 13px var(--ui-font); text-decoration: none; cursor: pointer; }
+.ui-gift-copy:hover, .ui-gift-mail:hover { border-color: var(--ui-accent); color: var(--ui-accent); }
+.ui-gift-ok { color: var(--ui-success); border-color: var(--ui-success); }
+.ui-gift-status { margin: 0; min-height: 1.45em; color: var(--ui-muted); font-size: 13px; }
+.ui-gift-none { margin: 0; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-fg); font-size: 13px; }
+`
+
+component GiftArticle(href: str, id: str, title: str = "", left: int = 10, limit: int = 10, renews: str? = null,
+                      label: str = "Gift this article", on_gift = null, align: str = "start", class: str? = null) {
+    style global gift_article_css
+    state open = false
+    state remaining = left
+    state link = null
+    state copied = ""      // "", "ok" or "bad"
+    state focus = null
+    let panel_id = `${id}-panel`
+    if copied != "" {
+        every(2000, () => { copied = "" })
+    }
+    if focus != null {
+        every(16, () => {
+            let el = js("document.getElementById", focus)
+            focus = null
+            if el != null { el.focus() }
+        })
+    }
+    let close = () => {
+        open = false
+        focus = `${id}-button`
+    }
+    let make = () => {
+        if remaining > 0 {
+            let made = on_gift != null ? on_gift(href) : `${href}${contains(href, "?") ? "&" : "?"}gift=${slice(replace(uuid(), "-", ""), 0, 12)}`
+            if made != null {
+                link = made
+                remaining -= 1
+                copied = ""
+                focus = `${id}-link`
+            }
+        }
+    }
+    let copy = () => {
+        if js("isSecureContext") != true { copied = "bad" } else {
+            js("navigator.clipboard.writeText", link).then((_ = null) => { copied = "ok" }, (_ = null) => { copied = "bad" })
+        }
+    }
+    let mail = link != null
+        ? `mailto:?subject=${url_encode(title != "" ? title : "An article for you")}&body=${url_encode(`I thought you would like this, free to read: ${link}`)}`
+        : null
+    let noun = (n: int) => n == 1 ? "gift article" : "gift articles"
+    <div class={ui_cls(["ui-gift", align == "end" && "ui-gift-end", class])} id={id} @keydown={(e) => {
+        if e.key == "Escape" && open { close() }
+    }}>
+        <button.ui-gift-open type="button" id={`${id}-button`} aria-expanded={open ? "true" : "false"} aria-controls={panel_id}
+                @click={() => { open = !open }}>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2.5 6.5h11v2.5h-11zM3.5 9v5h9V9M8 6.5V14M8 6.5C6.5 6.5 4.5 6 4.5 4.3S7 3 8 6.5zM8 6.5c1.5 0 3.5-.5 3.5-2.2S9 3 8 6.5z"/>
+            </svg>
+            {label}
+        </button>
+        {open && <section.ui-gift-panel id={panel_id} aria-labelledby={`${id}-title`}>
+            <div.ui-gift-top>
+                <h3.ui-gift-title id={`${id}-title`}>{label}</h3>
+                <button.ui-gift-x type="button" aria-label="Close" @click={close}>×</button>
+            </div>
+            <p.ui-gift-text>
+                You have <b data-left={remaining}>{remaining} of {limit}</b> {noun(limit)} left this month. Anyone with the link can read
+                this article free, without a subscription.
+            </p>
+            <div.ui-gift-meter aria-hidden="true">
+                {for i in range(limit) => <span class={i < remaining ? null : "ui-gift-used"}></span>}
+            </div>
+            {link != null && [
+                <div.ui-gift-link>
+                    <input type="text" id={`${id}-link`} value={link} readonly aria-label="Gift link" @focus={(e) => { e.target.select() }}/>
+                    <button type="button" class={ui_cls(["ui-gift-copy", copied == "ok" && "ui-gift-ok"])} @click={copy}>{copied == "ok" ? "Copied" : "Copy"}</button>
+                    <a.ui-gift-mail href={mail}>Email</a>
+                </div>,
+                <p.ui-gift-status role="status">{copied == "ok" ? "Link copied." : (copied == "bad" ? "Could not copy; select the link and copy it." : "")}</p>,
+            ]}
+            {remaining > 0
+                ? <button.ui-gift-make type="button" @click={make}>{link != null ? "Make another link" : "Create gift link"}</button>
+                : <p.ui-gift-none>You have given all {limit} {noun(limit)} this month.{renews != null ? ` More come on ${renews}.` : ""}</p>}
+        </section>}
+    </div>
+}

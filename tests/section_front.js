@@ -1,0 +1,36 @@
+const s = $("#section-front-demo");
+if (!s || s.tagName !== "SECTION" || s.getAttribute("aria-labelledby") !== "section-front-demo-title") return "the front is not a named <section>";
+const t = s.querySelector("h2.ui-secfr-title a");
+if (!t || t.textContent !== "Business" || t.getAttribute("href") !== "#business") return "the section title is not a link";
+const stories = [...s.querySelectorAll("article.ui-secfr-story")];
+if (stories.length !== 4) return `expected 4 stories, found ${stories.length}`;
+const lead = stories[0];
+if (!lead.classList.contains("ui-secfr-lead")) return "the first story is not the lead";
+if (lead.querySelector("h3 a").getAttribute("href") !== "#rates") return "the lead's headline link";
+if (!lead.querySelector(".ui-secfr-dek")?.textContent.includes("4.25%")) return "the lead's dek";
+if (lead.querySelector("img").alt !== "The central bank's building at dusk" || lead.querySelector("img").getAttribute("loading") !== "eager") return "the lead's picture";
+if (lead.querySelector("figcaption")?.textContent !== "Photo: Lena Ortiz for The Ledger") return "the credit";
+const meta = [...lead.querySelector(".ui-secfr-meta").children].map((c) => c.textContent).join("|");
+if (meta !== "1 h ago|By Ada Lovelace") return `the lead's meta: ${meta}`;
+if (getComputedStyle(lead.querySelector(".ui-secfr-meta > span"), "::before").content !== '"·"') return "no dot between time and author";
+if (lead.querySelector("time").getAttribute("datetime") !== "2026-10-30T13:05:00Z") return "datetime";
+if (stories[1].querySelector(".ui-secfr-dek")) return "a story shows its dek without show_deks";
+if (stories[1].querySelector(".ui-secfr-label")?.textContent !== "Analysis" || stories[1].querySelector(".ui-secfr-top").textContent !== "AnalysisTrade") return "label and kicker";
+if (!stories[2].querySelector(".ui-secfr-live") || getComputedStyle(stories[2].querySelector(".ui-secfr-live"), "::before").content === "none") return "Live has no dot";
+if (stories[2].querySelector("img")) return "a story without src has a picture";
+// The whole story is the link: a click in its dek's area goes to the headline's href.
+lead.querySelector(".ui-secfr-dek").scrollIntoView({ block: "center" });
+const r = lead.querySelector(".ui-secfr-dek").getBoundingClientRect();
+const hit = document.elementFromPoint(r.left + 5, r.top + 5);
+if (hit?.closest("a")?.getAttribute("href") !== "#rates") return "the whole lead story is not clickable";
+const more = s.querySelector(".ui-secfr-more");
+if (more.querySelector("h3").textContent !== "More in Business") return "more title";
+if (more.querySelectorAll("li").length !== 4 || more.querySelector("li a").getAttribute("href") !== "#shipping") return "the more list";
+if (more.querySelector(".ui-secfr-all").getAttribute("href") !== "#business-all" || !more.querySelector(".ui-secfr-all").textContent.startsWith("See all")) return "see all";
+// Wide: three columns side by side. Narrow: one column.
+const lr = lead.getBoundingClientRect(), mr = more.getBoundingClientRect();
+if (!(mr.left > lr.right - 1 && Math.abs(mr.top - lr.top) < 40)) return "wide, the more column is not beside the lead";
+s.style.width = "420px"; await wait(100);
+const lr2 = lead.getBoundingClientRect(), mr2 = more.getBoundingClientRect();
+s.style.width = "";
+if (!(mr2.top >= lr2.bottom - 1)) return "narrow, the columns do not stack";
