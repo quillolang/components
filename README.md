@@ -61,7 +61,10 @@ use "ui/modal.qwe"
 route GET / = <html><head><style>{theme_css}</style></head><body class="ui-root">...</body></html>
 ```
 
-They need a Quillo with `style global` (0.5.0 from 2026-10-28 on).
+A component says what it takes from the others with `import` lines at its top: `button.qwe`
+may start with `import ui/theme.qwe use ui_cls`, so the files it names come along too, in a
+`ui/` folder beside your main file. They need a Quillo that has `import`, the release after
+0.6. `quillo-ui.qwe` has no such lines, being one file.
 
 **With git.** Clone it, or add it as a submodule and keep it up to date:
 

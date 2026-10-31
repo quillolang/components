@@ -7,8 +7,8 @@
 #                   Quillo sends only to the pages that show it
 #   demos.qwe       the gallery's examples (demos/_demo.qwe first)
 #
-# and stops if two files declare the same name, since `use` puts every file in
-# one scope and the last would win, or if a demo's gallery entry has no `tags`. With --check, it only says whether the
+# and stops if two files declare the same name, since quillo-ui.qwe puts them in
+# one file, or if a demo's gallery entry has no `tags`. With --check, it only says whether the
 # files are up to date.
 set -eu
 cd "$(dirname "$0")/.."
@@ -38,7 +38,9 @@ ui_files="ui/theme.qwe $(ls ui/*.qwe | grep -v '^ui/theme.qwe$')"
         echo
         echo "// ---- $f ----------------------------------------------------------------"
         echo
-        cat "$f"
+        # A component's `import`s of other components are for when it is used alone:
+        # here they are all this one file.
+        grep -v '^import ui/' "$f"
     done
     echo
     # The page's own sheet: the theme, and the notices' styles, for markup the
@@ -48,6 +50,8 @@ ui_files="ui/theme.qwe $(ls ui/*.qwe | grep -v '^ui/theme.qwe$')"
 demo_files="demos/_demo.qwe $(ls demos/*.qwe | grep -v '^demos/_demo.qwe$')"
 {
     echo "// The gallery's examples, in one file. Made by scripts/build.sh from demos/."
+    echo
+    echo 'use "quillo-ui.qwe"'
     for f in $demo_files; do
         echo
         echo "// ---- $f ----------------------------------------------------------------"
