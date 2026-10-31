@@ -50,8 +50,6 @@ ui_files="ui/theme.qwe $(ls ui/*.qwe | grep -v '^ui/theme.qwe$')"
 demo_files="demos/_demo.qwe $(ls demos/*.qwe | grep -v '^demos/_demo.qwe$')"
 {
     echo "// The gallery's examples, in one file. Made by scripts/build.sh from demos/."
-    echo
-    echo 'use "quillo-ui.qwe"'
     for f in $demo_files; do
         echo
         echo "// ---- $f ----------------------------------------------------------------"
