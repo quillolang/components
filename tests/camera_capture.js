@@ -7,20 +7,23 @@ if (view.getAttribute("role") !== "region" || view.getAttribute("aria-label") !=
 if (!hidden || hidden.value !== "") return "the hidden input is missing or not empty";
 if (msg() !== "The camera is off." || btn()[0].textContent.trim() !== "Turn on the camera") return `it starts with "${msg()}"`;
 if (!view.classList.contains("ui-camera-capture-mirror")) return "the front camera is not mirrored";
-// Headless Chrome has no camera: it says so.
-btn()[0].click();
-for (let i = 0; i < 50 && /Asking|is off/.test(msg()); i++) await wait(100);
-const bad = cam.querySelector(".ui-camera-capture-msg");
-if (!bad || bad.getAttribute("role") !== "alert" || !/No camera|not allowed/.test(msg())) return `without a camera it says "${msg()}"`;
-if (btn()[0].textContent.trim() !== "Try again" || hidden.value !== "") return "without a camera it does not offer to try again";
-// A camera made from a canvas, standing in for a real one.
-const c = document.createElement("canvas"); c.width = 640; c.height = 480;
-const g = c.getContext("2d"); g.fillStyle = "#3f9c8f"; g.fillRect(0, 0, 640, 480); g.fillStyle = "#ffd36b"; g.fillRect(200, 140, 240, 200);
-const fake = c.captureStream(10);
-const keep = setInterval(() => { g.fillRect(200, 140, 240, 200); }, 50);
 const real = navigator.mediaDevices.getUserMedia;
-navigator.mediaDevices.getUserMedia = async () => fake;
+let keep = null;
 try {
+    // A device with no camera: it says so. scripts/test.sh gives Chrome a fake camera, which
+    // the tests of other components use, so the missing one is stood in for here.
+    navigator.mediaDevices.getUserMedia = async () => { throw new DOMException("Requested device not found", "NotFoundError"); };
+    btn()[0].click();
+    for (let i = 0; i < 50 && /Asking|is off/.test(msg()); i++) await wait(100);
+    const bad = cam.querySelector(".ui-camera-capture-msg");
+    if (!bad || bad.getAttribute("role") !== "alert" || !/No camera|not allowed/.test(msg())) return `without a camera it says "${msg()}"`;
+    if (btn()[0].textContent.trim() !== "Try again" || hidden.value !== "") return "without a camera it does not offer to try again";
+    // A camera made from a canvas, standing in for a real one.
+    const c = document.createElement("canvas"); c.width = 640; c.height = 480;
+    const g = c.getContext("2d"); g.fillStyle = "#3f9c8f"; g.fillRect(0, 0, 640, 480); g.fillStyle = "#ffd36b"; g.fillRect(200, 140, 240, 200);
+    const fake = c.captureStream(10);
+    keep = setInterval(() => { g.fillRect(200, 140, 240, 200); }, 50);
+    navigator.mediaDevices.getUserMedia = async () => fake;
     btn()[0].click();
     const v = cam.querySelector("video");
     for (let i = 0; i < 40 && !(v.videoWidth > 0 && !v.hidden); i++) await wait(100);

@@ -1487,14 +1487,14 @@ component ActionSheet(actions = [], title: str? = null, message: str? = null, ca
                 @keydown={(e) => {
                     if e.key == "ArrowDown" || e.key == "ArrowUp" {
                         e.preventDefault()
-                        let buttons = dlg.querySelectorAll(".ui-action-sheet-row")
-                        let active = win.document.activeElement
-                        let here = -1
-                        for i in range(len(rows)) {
-                            if buttons[i].isSameNode(active) { here = i }
-                        }
+                        // From the row the key was pressed on, not from what has the focus: a handler
+                        // can pause partway (at a loop, or a call to one of the component's own
+                        // functions), so a key sent right after another may come before that one
+                        // has moved the focus.
+                        let on = e.target.dataset.row
+                        let here = on != null ? int(on) : -1
                         let next = action_sheet_step(rows, here < 0 && e.key == "ArrowUp" ? 0 : here, e.key == "ArrowDown" ? 1 : -1)
-                        if next >= 0 { buttons[next].focus() }
+                        if next >= 0 { dlg.querySelectorAll(".ui-action-sheet-row")[next].focus() }
                     }
                 }}>
             <div.ui-action-sheet-panel>
@@ -1504,9 +1504,9 @@ component ActionSheet(actions = [], title: str? = null, message: str? = null, ca
                     {message != null && <p>{message}</p>}
                 </div>}
                 <div.ui-action-sheet-list @mount={(el) => { list = el }}>
-                    {for r in rows =>
+                    {for [i, r] in enumerate(rows) =>
                         <button key={r.label} type="button" class={r.destructive ? "ui-action-sheet-row ui-action-sheet-danger" : "ui-action-sheet-row"}
-                                disabled={r.disabled} @click={() => pick(r)}>{r.label}</button>}
+                                data-row={i} disabled={r.disabled} @click={() => pick(r)}>{r.label}</button>}
                 </div>
             </div>
             <button.ui-action-sheet-cancel type="button" @click={shut}>{cancel}</button>
@@ -1880,7 +1880,8 @@ view AdSlot(size: str = "leaderboard", width: int? = null, height: int? = null, 
     let w = width ?? named[0]
     let h = height ?? named[1]
     let m = mobile != null ? ad_slot_size(mobile) : null
-    let empty = str(children) == ""
+    // No children is null on some Quillo versions and empty HTML on others: both are empty.
+    let empty = children == null || str(children) == ""
     <aside class={ui_cls(["ui-adslot", m != null && "ui-adslot-mobile", sticky && "ui-adslot-sticky", align == "start" && "ui-adslot-start", class])}
            id={id} aria-label={label != "" ? label : "Advertisement"} data-slot={slot} data-size={`${w}x${h}`}
            style={`--w: ${w}px; --h: ${h}px${m != null ? `; --mw: ${m[0]}px; --mh: ${m[1]}px` : ""}`}>
@@ -10660,9 +10661,12 @@ component BarcodeInput(id: str, name: str? = null, label: str = "Barcode", value
         on_change && on_change({ code: r.code, kind: r.kind, valid: r.valid })
     }
     let use_code = (e, code: str) => {
+        // The field is found first: the new text can take the button off the page,
+        // and a button no longer on the page has no field around it.
+        let field = e.target.closest(".ui-barcodein").querySelector("input")
         text = code
         tell(code)
-        e.target.closest(".ui-barcodein").querySelector("input").focus()
+        field.focus()
     }
     <div class={ui_cls(["ui-barcodein", class])}>
         <label.ui-barcodein-label for={id}>
@@ -11890,6 +11894,10 @@ fn bill_splitter_code(currency) -> str {
     type_of(money.minor_units(c)) == "error" ? "USD" : c
 }
 
+// An amount in minor units as a decimal, for on_change. A top-level fn, as `map` calls it:
+// a component's own `let` function counts there as one that waits, and `map` refuses it.
+fn bill_splitter_amount(minor: int, code: str) = money.from_minor(minor, code).amount
+
 // What was typed as a decimal: 0 when empty, null when it is not a plain number of 0 or
 // more up to `most`. A comma counts only as a thousands comma, so "12,50" is refused, not 1250.
 fn bill_splitter_read(text, most) {
@@ -12054,9 +12062,9 @@ component BillSplitter(subtotal = null, tax = null, tax_as: str = "percent", tip
     let named = (part: str) => `${name}_${part}`
     let tell = () => {
         if on_change != null && ok {
-            let amount = (minor: int) => money.from_minor(minor, code).amount
+            let amount = (minor: int) => bill_splitter_amount(minor, code)
             on_change({ subtotal: amount(work.subtotal), tax: amount(work.tax), tip: amount(work.tip), total: amount(work.total),
-                        parts: work.parts | map((p) => ({ name: p.name, amount: amount(p.pays) })) })
+                        parts: work.parts | map((p) => ({ name: p.name, amount: bill_splitter_amount(p.pays, code) })) })
         }
     }
     let add_person = () => {
@@ -12690,7 +12698,8 @@ view BoardingPass(airline: str, flight: str, passenger: str, from: map, to: map,
                 {boarding_pass_cell("Terminal", terminal)}
             </dl>
             <div.ui-boarding-pass-bars>
-                {str(children) != "" ? children : <div.ui-boarding-pass-bars-fake aria-hidden="true"></div>}
+                {/* No children is null, whose text is not "": ask for both. */}
+                {children != null && str(children) != "" ? children : <div.ui-boarding-pass-bars-fake aria-hidden="true"></div>}
             </div>
         </div>
         <div.ui-boarding-pass-stub aria-label="Stub">
@@ -16130,6 +16139,15 @@ fn brush_chart_scale(lo: num, hi: num, steps: int = 4) -> map {
     { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
 }
 
+// The index under the pointer in the overview, 0 to last. A function of its own, not the
+// component's: there, reading the page makes a handler wait, and the next pointer event
+// would run before this one's handler is done.
+fn brush_chart_at(e, last: int) -> int {
+    let r = e.target.closest(".ui-brush-mini").getBoundingClientRect()
+    let i = round((e.clientX - r.left) / r.width * last)
+    i < 0 ? 0 : (i > last ? last : i)
+}
+
 component BrushChart(labels: list, values: list? = null, series: list? = null, start: int? = null, end: int? = null,
                      zero: bool = false, height: int = 220, overview: int = 56, prefix: str = "", suffix: str = "",
                      decimals: int? = null, label: str = "Brush chart", show_label: bool = false, on_change = null,
@@ -16176,10 +16194,6 @@ component BrushChart(labels: list, values: list? = null, series: list? = null, s
             a = lo
             b = hi
         }
-    }
-    let at = (e) => {
-        let r = e.target.closest(".ui-brush-mini").getBoundingClientRect()
-        fix(round((e.clientX - r.left) / r.width * last))
     }
     let every_nth = ceil((span + 1) / 8)
     let keys = (e, part: str) => {
@@ -16255,14 +16269,14 @@ component BrushChart(labels: list, values: list? = null, series: list? = null, s
                              e.target.closest(".ui-brush-mini").setPointerCapture(e.pointerId)
                              let part = e.target.dataset.part ?? "new"
                              mode = part
-                             grab = at(e)
+                             grab = brush_chart_at(e, last)
                              from_a = a
                              from_b = b
                          }
                      }}
                      @pointermove={(e) => {
                          if mode != null {
-                             let i = at(e)
+                             let i = brush_chart_at(e, last)
                              if mode == "start" { set_window(i < b ? i : b - 1, b) }
                              else if mode == "end" { set_window(a, i > a ? i : a + 1) }
                              else if mode == "move" {
@@ -16689,6 +16703,27 @@ fn budget_planner_rows(envelopes) -> list {
     })
 }
 
+// A sum in minor units as the currency's decimal: 125050 in USD is 1250.50. Here and not in
+// the component, where a function given to `map` may not be one of its own that reads a field.
+fn budget_planner_amount(minor: int, code: str) = money.from_minor(minor, code).amount
+
+// What on_change is given: the figures as the currency's decimals.
+fn budget_planner_report(work: map, code: str) -> map {
+    let f = work.figures
+    let amount = (minor: int) => budget_planner_amount(minor, code)
+    { income: amount(work.income), assigned: amount(f.assigned), spent: amount(f.spent), left_to_assign: amount(f.left_to_assign),
+      needs: amount(f.kinds[0].assigned), wants: amount(f.kinds[1].assigned), savings: amount(f.kinds[2].assigned),
+      envelopes: work.envelopes | map((e) => ({ name: e.name, kind: e.kind, assigned: amount(e.assigned), spent: amount(e.spent), left: amount(e.assigned - e.spent) })) }
+}
+
+// The rows with each envelope of a move's `assigned` written again from its whole cents.
+fn budget_planner_moved(rows: list, envelopes: list, code: str) -> list {
+    rows | map((r) => {
+        let e = envelopes | find((x) => x.id == r.id)
+        e == null ? r : set(r, "assigned", str(budget_planner_amount(e.assigned, code)))
+    })
+}
+
 // An envelope's name, or "Envelope 2" for a blank one.
 fn budget_planner_label(rows: list, id) -> str {
     let row = rows | enumerate() | find((r) => r[1].id == id)
@@ -16738,16 +16773,9 @@ component BudgetPlanner(income = null, envelopes = null, rule = null, currency: 
     let bad = (field: str) => work.errors | any((e) => e.field == field)
     let field_id = (part: str) => `${id}-${part}`
     let named = (part: str) => `${name}_${part}`
-    let amount_of = (minor: int) => money.from_minor(minor, code).amount
     let of_row = (rid) => work.envelopes | find((e) => e.id == rid)
     let tell = () => {
-        if on_change != null && ok {
-            let f = work.figures
-            let kind = (i: int) => amount_of(f.kinds[i].assigned)
-            on_change({ income: amount_of(work.income), assigned: amount_of(f.assigned), spent: amount_of(f.spent), left_to_assign: amount_of(f.left_to_assign),
-                        needs: kind(0), wants: kind(1), savings: kind(2),
-                        envelopes: work.envelopes | map((e) => ({ name: e.name, kind: e.kind, assigned: amount_of(e.assigned), spent: amount_of(e.spent), left: amount_of(e.assigned - e.spent) })) })
-        }
+        if on_change != null && ok { on_change(budget_planner_report(work, code)) }
     }
     let change = (rid, field: str, value) => {
         rows = rows | map((r) => r.id == rid ? set(r, field, value) : r)
@@ -16764,10 +16792,7 @@ component BudgetPlanner(income = null, envelopes = null, rule = null, currency: 
             refusal = done.error
             message = ""
         } else {
-            rows = rows | map((r) => {
-                let e = done.envelopes | find((x) => x.id == r.id)
-                e == null ? r : set(r, "assigned", str(amount_of(e.assigned)))
-            })
+            rows = budget_planner_moved(rows, done.envelopes, code)
             refusal = ""
             message = `Moved ${shown(amount)} from ${budget_planner_label(rows, from)} to ${budget_planner_label(rows, to)}. Assigned in all stays ${shown(work.figures.assigned)}.`
             move_text = ""
@@ -21322,6 +21347,10 @@ fn cash_count_code(currency) -> str {
     type_of(money.minor_units(c)) == "error" ? "USD" : c
 }
 
+// An amount in minor units as a decimal, for on_change. A top-level fn, as `map` calls it:
+// a component's own `let` function counts there as one that waits, and `map` refuses it.
+fn cash_count_amount(minor: int, code: str) = money.from_minor(minor, code).amount
+
 // The notes and coins of a currency in minor units, largest first; others get a plain series.
 fn cash_count_preset(code: str) -> list {
     if code == "USD" { return [10000, 5000, 2000, 1000, 500, 100, 25, 10, 5, 1] }
@@ -21461,11 +21490,11 @@ component CashCount(currency: str = "USD", denominations = null, counts = null, 
     let named = (part: str) => `${name}_${part}`
     let tell = () => {
         if on_change != null && ok {
-            let amount = (minor: int) => money.from_minor(minor, code).amount
+            let amount = (minor: int) => cash_count_amount(minor, code)
             let c = work.change
             on_change({ total: amount(work.total), expected: work.expected == null ? null : amount(work.expected), variance: work.variance == null ? null : amount(work.variance.variance),
                         status: work.variance == null ? null : work.variance.status,
-                        pieces: c == null || c.pieces == null ? null : c.pieces | map((p) => ({ value: amount(p.value), count: p.count })) })
+                        pieces: c == null || c.pieces == null ? null : c.pieces | map((p) => ({ value: cash_count_amount(p.value, code), count: p.count })) })
         }
     }
     let put = (i: int, text: str) => {
@@ -23650,6 +23679,7 @@ component CheckoutSheetSlide(words: str, ready: bool = true, busy: bool = false,
     state fill = null
     state grab = null        // where the finger went down: { x, y }
     state mark = null        // points not long ago, for the speed at release
+    state last = null        // the last move: { at, t }
     state axis = null
     state keyed = 0          // how far the arrow keys have brought it, in px
     state sliding = false    // state, not a class set by hand: the class below is rewritten whole when `ready` changes
@@ -23670,7 +23700,10 @@ component CheckoutSheetSlide(words: str, ready: bool = true, busy: bool = false,
     let finish = (e) => {
         if grab != null {
             let dx = e.clientX - grab.x
-            let speed = cart_sheet_speed(mark, e.clientX, e.timeStamp)
+            // A finger that comes up where it last moved, and soon (a phone calls it still after
+            // 40 ms), ends a flick: its speed is the moves', not cut by the moment it took to lift.
+            let flicked = last != null && e.clientX == last.at && e.timeStamp - last.t <= 40
+            let speed = flicked ? cart_sheet_speed(mark, last.at, last.t) : cart_sheet_speed(mark, e.clientX, e.timeStamp)
             let was = axis
             grab = null
             axis = null
@@ -23696,6 +23729,7 @@ component CheckoutSheetSlide(words: str, ready: bool = true, busy: bool = false,
                         thumb.setPointerCapture(e.pointerId)
                         grab = { x: e.clientX, y: e.clientY }
                         mark = cart_sheet_mark(e.clientX, e.timeStamp)
+                        last = null
                         axis = null
                     }
                 }}
@@ -23707,9 +23741,10 @@ component CheckoutSheetSlide(words: str, ready: bool = true, busy: bool = false,
                             if axis == "x" { sliding = true }
                         }
                         if axis == "x" {
+                            mark = cart_sheet_marked(mark, e.clientX, e.timeStamp)
+                            last = { at: e.clientX, t: e.timeStamp }
                             // Not ready, it gives a little and no more, so it plainly will not go.
                             put(max([0, min([dx, ready ? room() : 18])]))
-                            mark = cart_sheet_marked(mark, e.clientX, e.timeStamp)
                         }
                     }
                 }}
@@ -30819,7 +30854,8 @@ view ConsentCheckbox(name: str, terms_href: str? = null, privacy_href: str? = nu
     let id = field ?? `consent-checkbox-${name}`
     let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
     let link = (href: str?, text: str) => href != null ? <a href={href} target="_blank" rel="noopener">{text}</a> : text
-    let text = str(children) != "" ? children : (privacy_href != null
+    // No children is null on newer Quillo and empty HTML on older: both mean the built-in sentence.
+    let text = children != null && str(children) != "" ? children : (privacy_href != null
         ? ["I agree to the ", link(terms_href, terms_label), " and the ", link(privacy_href, privacy_label)]
         : ["I agree to the ", link(terms_href, terms_label)])
     <div class={ui_cls(["ui-consent-checkbox", error != null && "ui-consent-checkbox-invalid", disabled && "ui-consent-checkbox-disabled", class])}>
@@ -31131,6 +31167,10 @@ let contact_list_css = css`
 .ui-contlist-clear { flex: none; min-width: 60px; min-height: 44px; padding: 0 6px; border: 0; background: none; color: var(--ui-accent); font: 500 15px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
 .ui-contlist-found { margin: 0; padding: 0 16px 4px; color: var(--ui-muted); font-size: 13px; }
 .ui-contlist-note { position: sticky; top: 60px; z-index: 3; margin: 0 12px 6px; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-info-soft); color: var(--ui-fg); font-size: 14px; }
+/* A letter's section makes no box, so the letters stick to the whole list and stack: the next
+   slides over the last, and one always stands under the search, where a letter held by its own
+   section would be pushed out first and leave a gap at each change of letter. */
+.ui-contlist-section { display: contents; }
 .ui-contlist-letter { position: sticky; top: 60px; z-index: 2; margin: 0; padding: 3px 16px; background: var(--ui-subtle); color: var(--ui-muted); font: 600 13px/1.4 var(--ui-font); }
 .ui-contlist-bare .ui-contlist-letter { top: 0; }
 .ui-contlist-rows { margin: 0; padding: 0; list-style: none; content-visibility: auto; contain-intrinsic-size: auto 600px; }
@@ -31276,7 +31316,7 @@ component ContactList(people = [], by: str = "first", search: bool = true, place
         {query != "" && <p.ui-contlist-found role="status">{len(found) == 1 ? "1 person" : `${len(found)} people`}</p>}
         {len(found) == 0 && <p.ui-contlist-none>{query != "" ? `No one matches “${query}”` : empty}</p>}
         <div aria-label={label} role="group">
-            {for s in sections => <section key={s.letter} data-letter={s.letter}>
+            {for s in sections => <section.ui-contlist-section key={s.letter} data-letter={s.letter}>
                 <h3.ui-contlist-letter>{s.letter}</h3>
                 <ul.ui-contlist-rows>
                     {for e in s.rows => <li.ui-contlist-row key={e.n}>
@@ -31822,6 +31862,23 @@ let context_menu_css = css`
 @media (prefers-reduced-motion: reduce) { .ui-ctx-menu:popover-open { animation: none; } }
 `
 
+// The place among the menu's items of the one an event came from (or from inside), or
+// -1: isSameNode, as `==` on two page elements is not the same test on every Quillo version.
+fn context_menu_at(all, target) -> int {
+    let item = target.closest("[role=menuitem]")
+    item == null ? -1 : (index_of(for i in range(0, all.length) => all[i].isSameNode(item), true) ?? -1)
+}
+
+// The item an arrow key, Home or End goes to from item `at` (-1 for none) of n, round
+// at the ends, or null for another key.
+fn context_menu_next(key: str, at: int, n: int) -> int? = match key {
+    "ArrowDown" => (at + 1 + n) % n
+    "ArrowUp" => (at - 1 + n) % n
+    "Home" => 0
+    "End" => n - 1
+    _ => null
+}
+
 component ContextMenu(id: str, items: list = [], label: str = "Actions",
                       hint: str? = "Right-click, press and hold, or press Shift+F10 for actions.", on_select = null,
                       class: str? = null, children) {
@@ -31848,17 +31905,10 @@ component ContextMenu(id: str, items: list = [], label: str = "Actions",
         let area = menu.parentElement.querySelector(".ui-ctx-area")
         area && area.focus()
     }
-    let move = (e, step: int) => {
-        let all = menu.querySelectorAll("[role=menuitem]")
-        let n = all.length
-        let at = index_of(for i in range(0, n) => all[i] == e.target, true) ?? -1
-        let next = step == 0 ? 0 : (step == 99 ? n - 1 : (at + step + n) % n)
-        all[next].focus()
-    }
     let jump = (e, ch: str) => {
         let all = menu.querySelectorAll("[role=menuitem]")
         let n = all.length
-        let at = index_of(for i in range(0, n) => all[i] == e.target, true) ?? -1
+        let at = context_menu_at(all, e.target)
         let order = for k in range(1, n + 1) => (at + k) % n
         let hit = find(order, (i) => starts_with(lower(trim(all[i].textContent)), ch))
         if hit != null { all[hit].focus() }
@@ -31886,10 +31936,15 @@ component ContextMenu(id: str, items: list = [], label: str = "Actions",
              @mount={(el) => { menu = el }}
              @keydown={(e) => {
                  let k = e.key
-                 if k == "ArrowDown" { e.preventDefault(); move(e, 1) }
-                 if k == "ArrowUp" { e.preventDefault(); move(e, -1) }
-                 if k == "Home" { e.preventDefault(); move(e, 0) }
-                 if k == "End" { e.preventDefault(); move(e, 99) }
+                 // Moved and focused before anything else: on some Quillo versions a `match`,
+                 // or a call to a function of the component's own, lets a second key sent at
+                 // once in first, which would find the focus where it was.
+                 let all = menu.querySelectorAll("[role=menuitem]")
+                 let next = context_menu_next(k, context_menu_at(all, e.target), all.length)
+                 if next != null {
+                     e.preventDefault()
+                     all[next].focus()
+                 }
                  if k == "Escape" || k == "Tab" { e.preventDefault(); back() }
                  if len(k) == 1 && k != " " && !e.ctrlKey && !e.metaKey { jump(e, lower(k)) }
              }}>
@@ -44670,10 +44725,12 @@ component EditableTable(id: str, columns: list = [], rows: list = [], label: str
             el && el.focus()
         })
     }
-    let go = (e, r: int, c: int) => {
+    // root: the table's .ui-et, found by a handler before it changes anything, since
+    // what the event came from can leave the page once the table is drawn again.
+    let go = (root, r: int, c: int) => {
         ar = max([0, min([r, n - 1])])
         ac = max([0, min([c, ncols - 1])])
-        focus_cell(e.target.closest(".ui-et"), ar, ac)
+        focus_cell(root, ar, ac)
     }
     // Sets one value of the row with this id, and tells the callbacks.
     let put = (rid: int, key: str, v) => {
@@ -44730,6 +44787,7 @@ component EditableTable(id: str, columns: list = [], rows: list = [], label: str
         }
     }
     let add = (e) => {
+        let root = e.target.closest(".ui-et")
         if keep() {
             // `n` follows the rows, so the new row's place is taken before adding it.
             let at = n
@@ -44742,7 +44800,7 @@ component EditableTable(id: str, columns: list = [], rows: list = [], label: str
             ac = first
             said = "Row added"
             on_change && on_change(data | map((x) => x.values))
-            focus_cell(e.target.closest(".ui-et"), at, first)
+            focus_cell(root, at, first)
         }
     }
     let sort_on = (c: map) => {
@@ -44776,32 +44834,40 @@ component EditableTable(id: str, columns: list = [], rows: list = [], label: str
                                focus_cell(root, r_at, c_at)
                            } else if k == "Enter" && tag != "SELECT" {
                                e.preventDefault()
-                               if keep() { go(e, r_at + 1, c_at) }
+                               if keep() { go(root, r_at + 1, c_at) }
                            } else if k == "Tab" {
                                e.preventDefault()
                                if keep() {
                                    let flat = r_at * ncols + c_at + (e.shiftKey ? -1 : 1)
                                    let to = max([0, min([flat, n * ncols - 1])])
-                                   go(e, floor(to / ncols), to % ncols)
+                                   go(root, floor(to / ncols), to % ncols)
                                }
                            }
                        } else if tag == "TD" && d != null {
-                           let c = columns[c_at]
+                           // From the cell the key came to, not the one last drawn: a second key
+                           // can come before the table is drawn again.
+                           let place = split(e.target.dataset.cell ?? "", "-") | map((x) => int(x))
+                           let r_on = len(place) == 2 && place[0] < n ? place[0] : r_at
+                           let c_on = len(place) == 2 && place[1] < ncols ? place[1] : c_at
+                           ar = r_on
+                           ac = c_on
+                           d = shown[r_on]
+                           let c = columns[c_on]
                            let ctrl = e.ctrlKey || e.metaKey
                            let to = match k {
-                               "ArrowDown" => [r_at + 1, c_at]
-                               "ArrowUp" => [r_at - 1, c_at]
-                               "ArrowRight" => [r_at, c_at + 1]
-                               "ArrowLeft" => [r_at, c_at - 1]
-                               "Home" => ctrl ? [0, 0] : [r_at, 0]
-                               "End" => ctrl ? [n - 1, ncols - 1] : [r_at, ncols - 1]
-                               "PageDown" => [n - 1, c_at]
-                               "PageUp" => [0, c_at]
+                               "ArrowDown" => [r_on + 1, c_on]
+                               "ArrowUp" => [r_on - 1, c_on]
+                               "ArrowRight" => [r_on, c_on + 1]
+                               "ArrowLeft" => [r_on, c_on - 1]
+                               "Home" => ctrl ? [0, 0] : [r_on, 0]
+                               "End" => ctrl ? [n - 1, ncols - 1] : [r_on, ncols - 1]
+                               "PageDown" => [n - 1, c_on]
+                               "PageUp" => [0, c_on]
                                _ => null
                            }
                            if to != null {
                                e.preventDefault()
-                               go(e, to[0], to[1])
+                               go(root, to[0], to[1])
                            } else if c == null {
                                // The delete column.
                                if k == "Enter" || k == " " || k == "Delete" {
@@ -44868,13 +44934,14 @@ component EditableTable(id: str, columns: list = [], rows: list = [], label: str
                                 }}
                                 @click={(e) => {
                                     if !ed {
+                                        let root = e.target.closest(".ui-et")
                                         if keep() {
                                             ar = ri
                                             ac = ci
                                             if c.type == "checkbox" { flip(d, c) } else { start(c, d, null) }
-                                            if c.type == "checkbox" || !editable(c) { focus_cell(e.target.closest(".ui-et"), ri, ci) }
+                                            if c.type == "checkbox" || !editable(c) { focus_cell(root, ri, ci) }
                                         } else {
-                                            focus_cell(e.target.closest(".ui-et"), r_at, c_at)
+                                            focus_cell(root, r_at, c_at)
                                         }
                                     }
                                 }}>
@@ -44882,8 +44949,9 @@ component EditableTable(id: str, columns: list = [], rows: list = [], label: str
                                     ? (c.type == "select"
                                         ? <select.ui-et-input aria-label={c.label ?? c.key} @mount={(el) => { el.focus() }}
                                                   @change={(e) => {
+                                                      let root = e.target.closest(".ui-et")
                                                       draft = e.value
-                                                      if keep() { focus_cell(e.target.closest(".ui-et"), ri, ci) }
+                                                      if keep() { focus_cell(root, ri, ci) }
                                                   }}
                                                   @blur={() => { if editing { if !keep() { editing = false } } }}>
                                               {c.required != true && <option value="" selected={draft == ""}>—</option>}
@@ -45634,10 +45702,12 @@ component EmailTypoInput(id: str, name: str = "email", label: str? = null, value
             {offer != null && <p.ui-emailtypo-offer>
                 <span>Did you mean</span>
                 <button.ui-emailtypo-fix type="button" @click={(e) => {
+                    // Found first: once the fix is shown, this button is gone from the page.
+                    let box = e.target.closest(".ui-emailtypo").querySelector("input")
                     let fixed = offer
                     text = fixed
                     tell(fixed)
-                    e.target.closest(".ui-emailtypo").querySelector("input").focus()
+                    box.focus()
                 }}>{offer}</button>
                 <span>?</span>
                 {read.status == "suggest" && <button.ui-emailtypo-keep type="button" @click={() => { kept = text }}>Keep what I typed</button>}
@@ -47675,7 +47745,7 @@ view FactCheck(claim: str, rating: str, claimant: str? = null, claimant_role: st
             </ol>
             <span.ui-sr>{at != null ? `${at + 1} of ${n} on a scale from ${scale[0]} to ${scale[n - 1]}.` : `Not on the scale from ${scale[0]} to ${scale[n - 1]}.`}</span>
         </div>
-        {str(children) != "" && <div.ui-fck-found>
+        {children != null && str(children) != "" && <div.ui-fck-found>
             <h3>What we found</h3>
             <div>{children}</div>
         </div>}
@@ -49844,7 +49914,10 @@ component FileUpload(name: str = "files", label: str? = null, hint: str? = null,
                            for f in files => { if f.url != null { js("URL.revokeObjectURL", f.url) } }
                        }
                        let start = multiple ? files : []
-                       let next = reduce(enumerate(picked), start, (acc, p) => acc | push(entry(p[1], acc, seq + p[0])))
+                       // A loop and not `reduce`: `entry` makes a preview with `js`, which a function
+                       // given to a builtin may not do.
+                       let next = start
+                       for p in enumerate(picked) { next = next | push(entry(p[1], next, seq + p[0])) }
                        seq = seq + len(picked)
                        keep(e.target, next)
                    }}/>
@@ -50692,6 +50765,8 @@ component FilterTabs(tabs: list = [], selected: str? = null, name: str? = null, 
     <div class={ui_cls(["ui-filtertabs", variant == "line" && "ui-filtertabs-line", size == "sm" && "ui-filtertabs-sm", class])}
          role="tablist" aria-label={label}
          @keydown={(e) => {
+             // Taken first: pick may wait, as it calls on_change, and after a wait the event has no currentTarget.
+             let bar = e.currentTarget
              let n = len(live)
              let i = index_of(live | map((t) => t.key), at) ?? 0
              let to = match e.key {
@@ -50704,7 +50779,7 @@ component FilterTabs(tabs: list = [], selected: str? = null, name: str? = null, 
              if to != null && n > 0 {
                  e.preventDefault()
                  pick(live[to].key)
-                 e.currentTarget.querySelector(`[data-key="${live[to].key}"]`).focus()
+                 bar.querySelector(`[data-key="${live[to].key}"]`).focus()
              }
          }}>
         {for t in tabs => <button.ui-filtertabs-tab type="button" role="tab" data-key={t.key} key={t.key}
@@ -53247,8 +53322,10 @@ component ForceUpdate(current: str? = null, minimum: str? = null, latest: str? =
                     @cancel={(e) => { if hard { e.preventDefault() } }}
                     @close={(e) => {
                         // A browser lets a second Escape through whatever `cancel` said. Hard means hard.
+                        // In its frame it comes back open, as it was written: show() would also take
+                        // the focus from the page and shut any menu open on it.
                         if hard {
-                            if modal { e.target.showModal() } else { e.target.show() }
+                            if modal { e.target.showModal() } else { e.target.setAttribute("open", "open") }
                         } else {
                             // Escape on the soft one: gone for now, and asked again at the next start.
                             off = true
@@ -54653,6 +54730,22 @@ fn formula_grid_cells(cells) -> map {
     })
 }
 
+// Where a key moves the active cell from column c, row r: [c, r], or null for a key that
+// does not move it. A top-level fn: a `match` in the handler would make what follows it,
+// `preventDefault` and the move, wait a turn, and a second key pressed in that time would
+// start from the old cell.
+fn formula_grid_moved(k: str, ctrl: bool, c: int, r: int, ncols: int, nrows: int) = match k {
+    "ArrowUp" => [c, r - 1]
+    "ArrowDown" => [c, r + 1]
+    "ArrowLeft" => [c - 1, r]
+    "ArrowRight" => [c + 1, r]
+    "Home" => ctrl ? [0, 0] : [0, r]
+    "End" => ctrl ? [ncols - 1, nrows - 1] : [ncols - 1, r]
+    "PageUp" => [c, r - 5]
+    "PageDown" => [c, r + 5]
+    _ => null
+}
+
 component FormulaGrid(id: str, cells = {}, cols: int = 6, rows: int = 10, label: str = "Spreadsheet", name: str? = null,
                       on_change = null, class: str? = null) {
     style global formula_grid_css
@@ -54721,17 +54814,7 @@ component FormulaGrid(id: str, cells = {}, cols: int = 6, rows: int = 10, label:
     let grid_keys = (e) => {
         if !editing {
             let k = e.key
-            let moved = match k {
-                "ArrowUp" => [at_c, at_r - 1]
-                "ArrowDown" => [at_c, at_r + 1]
-                "ArrowLeft" => [at_c - 1, at_r]
-                "ArrowRight" => [at_c + 1, at_r]
-                "Home" => e.ctrlKey ? [0, 0] : [0, at_r]
-                "End" => e.ctrlKey ? [ncols - 1, nrows - 1] : [ncols - 1, at_r]
-                "PageUp" => [at_c, at_r - 5]
-                "PageDown" => [at_c, at_r + 5]
-                _ => null
-            }
+            let moved = formula_grid_moved(k, e.ctrlKey, at_c, at_r, ncols, nrows)
             if moved != null {
                 e.preventDefault()
                 go(moved[0], moved[1])
@@ -62676,8 +62759,10 @@ component IbanInput(id: str, name: str? = null, label: str = "IBAN", value: str 
             {read.status == "ok" ? <p.ui-ibaninput-good>{read.message}</p> : fault ? <p.ui-ibaninput-bad>{read.message}</p> : read.status == "typing" ? <p>{read.message}</p> : null}
             {shown_slip && <p>{iban_input_slip_said(read.slip)}</p>}
             {shown_slip && <button.ui-ibaninput-fix type="button" @click={(e) => {
+                // Found first: once the fix is shown, this button is gone from the page.
+                let box = e.target.closest(".ui-ibaninput").querySelector("input")
                 settle(read.slip.fixed)
-                e.target.closest(".ui-ibaninput").querySelector("input").focus()
+                box.focus()
             }}>Use {iban_input_group(read.slip.fixed)}</button>}
         </div>
     </div>
@@ -63206,6 +63291,8 @@ component IconTabs(id: str, tabs: list = [], selected: int = 0, full: bool = fal
     }
     <div class={ui_cls(["ui-icontabs", full && "ui-icontabs-full", size == "sm" && "ui-icontabs-sm", class])}>
         <div.ui-icontabs-list role="tablist" aria-label={label} @keydown={(e) => {
+            // Taken first: pick may wait, as it calls on_change, and after a wait the event has no currentTarget.
+            let bar = e.currentTarget
             let n = len(live)
             let k = index_of(live, at) ?? 0
             let to = match e.key {
@@ -63218,7 +63305,7 @@ component IconTabs(id: str, tabs: list = [], selected: int = 0, full: bool = fal
             if to != null && n > 0 {
                 e.preventDefault()
                 pick(to)
-                e.currentTarget.querySelector(`[data-i="${to}"]`).focus()
+                bar.querySelector(`[data-i="${to}"]`).focus()
             }
         }}>
             {for [i, t] in enumerate(tabs) => <button.ui-icontabs-tab type="button" role="tab" id={`${id}-tab-${i}`} data-i={i}
@@ -63679,7 +63766,12 @@ component ImageCrop(src: str, alt: str = "", name: str = "crop", ratio: num? = n
              @pointercancel={() => { drag = null }}>
             <img src={src} alt={alt} draggable="false"
                  @mount={(el) => { if el.complete { start(el.naturalWidth, el.naturalHeight) } }}
-                 @load={(e) => { start(e.target.naturalWidth, e.target.naturalHeight) }}/>
+                 @load={(e) => {
+                     // A load Quillo replays for a picture that finished first can come with no
+                     // picture behind it, and so no size: @mount has taken that one already.
+                     let w = e.target.naturalWidth
+                     if w != null { start(w, e.target.naturalHeight) }
+                 }}/>
             <div.ui-image-crop-box role="group" tabindex="0" aria-label={label}
                  aria-description={px != null ? `${px.w} by ${px.h} pixels, at ${px.x}, ${px.y}. Arrow keys move it; Shift and the arrows resize it.` : null}
                  style={`--x: ${round(box.x * 100, 3)}%; --y: ${round(box.y * 100, 3)}%; --w: ${round(box.w * 100, 3)}%; --h: ${round(box.h * 100, 3)}%`}
@@ -64848,9 +64940,10 @@ component InlineEdit(name: str? = null, label: str = "Text", value: str = "", pl
     state said = ""
     let id = field ?? `inline-edit-${name ?? re.replace(lower(label), "[^a-z0-9]+", "-")}`
     let described = ui_cls([hint != null && `${id}-hint`, problem != "" && `${id}-error`])
-    // Runs once the page shows the change: puts the focus on `sel` inside this one.
-    let then_focus = (e, sel: str) => {
-        let root = e.target.closest(".ui-inline-edit")
+    // Runs once the page shows the change: puts the focus on `sel` inside `root`, this one.
+    // Callers find `root` before they change anything, as the element the event came from
+    // can be gone from the page once they have.
+    let then_focus = (root, sel: str) => {
         js("requestAnimationFrame", (t = null) => {
             let el = root.querySelector(sel)
             if el != null {
@@ -64860,13 +64953,15 @@ component InlineEdit(name: str? = null, label: str = "Text", value: str = "", pl
         })
     }
     let start = (e) => {
+        let root = e.target.closest(".ui-inline-edit")
         draft = saved
         problem = ""
         said = ""
         editing = true
-        then_focus(e, "input")
+        then_focus(root, "input")
     }
     let finish = (e, keep: bool) => {
+        let root = e.target.closest(".ui-inline-edit")
         let text = trim(draft)
         if keep && required && text == "" {
             problem = `${label} cannot be empty.`
@@ -64880,7 +64975,7 @@ component InlineEdit(name: str? = null, label: str = "Text", value: str = "", pl
             } else {
                 said = keep ? "" : "Edit cancelled"
             }
-            then_focus(e, ".ui-inline-edit-show")
+            then_focus(root, ".ui-inline-edit-show")
         }
     }
     <div class={ui_cls(["ui-inline-edit", size != "md" && `ui-inline-edit-${size}`, disabled && "ui-inline-edit-disabled", class])}>
@@ -65943,6 +66038,20 @@ fn interactive_line_chart_scale(lo: num, hi: num, steps: int = 4) -> map {
     { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
 }
 
+// Where a key takes the crosshair from `at`, kept to lo..hi; null for a key that does not move it.
+// Out here, not in the handler: there a `match` around one of the component's own functions
+// can wait a turn before the cursor is set, so a second key pressed at once reads the old one.
+fn interactive_line_chart_step(key: str, at: int, lo: int, hi: int) {
+    let to = match key {
+        "ArrowRight" => at + 1
+        "ArrowLeft" => at - 1
+        "Home" => lo
+        "End" => hi
+        _ => null
+    }
+    to == null ? null : (to < lo ? lo : (to > hi ? hi : to))
+}
+
 component InteractiveLineChart(labels: list, series: list, prefix: str = "", suffix: str = "", decimals: int? = null,
                                zero: bool = false, height: int = 260, label: str = "Line chart", show_label: bool = false,
                                on_zoom = null, class: str? = null) {
@@ -66037,13 +66146,7 @@ component InteractiveLineChart(labels: list, series: list, prefix: str = "", suf
                  @pointercancel={() => { drag_from = null }}
                  @keydown={(e) => {
                      let at = cursor ?? (e.key == "ArrowLeft" || e.key == "End" ? hi + 1 : lo - 1)
-                     let next = match e.key {
-                         "ArrowRight" => clamp(at + 1)
-                         "ArrowLeft" => clamp(at - 1)
-                         "Home" => lo
-                         "End" => hi
-                         _ => null
-                     }
+                     let next = interactive_line_chart_step(e.key, at, lo, hi)
                      if next != null {
                          e.preventDefault()
                          cursor = next
@@ -66526,6 +66629,10 @@ fn invoice_builder_work(rows: list, order_text, inclusive: bool, code: str) -> m
     { errors, lines, totals }
 }
 
+// Minor units as the decimal amount that on_change and on_save give. A function of its own, not the
+// component's: `map` refuses one of the component's own that calls another, as one that may wait.
+fn invoice_builder_amount(minor: int, code: str) = money.from_minor(minor, code).amount
+
 // What must be there before saving: [{ field, text }].
 fn invoice_builder_missing(number, bill_to, issued, used: list, work: map, rows: list) -> list {
     let out = []
@@ -66566,7 +66673,6 @@ component InvoiceBuilder(today: str? = null, number: str = "INV-0001", used = nu
     let bad = (field: str) => shown_errors | any((e) => e.field == field)
     let field_id = (part: str) => `${id}-${part}`
     let named = (part: str) => `${name}_${part}`
-    let amount_of = (minor: int) => money.from_minor(minor, code).amount
     let line_amount = (rid) => {
         let at = work.lines | enumerate() | find((row) => row[1].id == rid)
         if at == null || !ok { return "" }
@@ -66575,7 +66681,7 @@ component InvoiceBuilder(today: str? = null, number: str = "INV-0001", used = nu
     let tell = () => {
         if on_change != null && ok {
             let t = work.totals
-            on_change({ subtotal: amount_of(t.subtotal), line_discounts: amount_of(t.line_discounts), order_discount: amount_of(t.order_discount), tax: amount_of(t.tax), total: amount_of(t.total) })
+            on_change({ subtotal: invoice_builder_amount(t.subtotal, code), line_discounts: invoice_builder_amount(t.line_discounts, code), order_discount: invoice_builder_amount(t.order_discount, code), tax: invoice_builder_amount(t.tax, code), total: invoice_builder_amount(t.total, code) })
         }
     }
     let change = (rid, field: str, value) => {
@@ -66603,12 +66709,12 @@ component InvoiceBuilder(today: str? = null, number: str = "INV-0001", used = nu
                             lines: work.lines | enumerate() | map((row) => {
                                 let l = row[1]
                                 let d = l.discount
-                                { description: trim(l.description), quantity: l.quantity, unit_price: amount_of(money.to_minor(money.of(l.unit_price, code, "half_up"))),
-                                  discount: d.percent ? `${d.value}%` : str(d.value), tax_rate: l.tax_rate, amount: amount_of(t.lines[row[0]].net) }
+                                { description: trim(l.description), quantity: l.quantity, unit_price: invoice_builder_amount(money.to_minor(money.of(l.unit_price, code, "half_up")), code),
+                                  discount: d.percent ? `${d.value}%` : str(d.value), tax_rate: l.tax_rate, amount: invoice_builder_amount(t.lines[row[0]].net, code) }
                             }),
-                            subtotal: amount_of(t.subtotal), line_discounts: amount_of(t.line_discounts), order_discount: amount_of(t.order_discount),
-                            tax: amount_of(t.tax), total: amount_of(t.total),
-                            tax_summary: t.summary | map((s) => ({ rate: s.rate, base: amount_of(s.base), tax: amount_of(s.tax) })) }
+                            subtotal: invoice_builder_amount(t.subtotal, code), line_discounts: invoice_builder_amount(t.line_discounts, code), order_discount: invoice_builder_amount(t.order_discount, code),
+                            tax: invoice_builder_amount(t.tax, code), total: invoice_builder_amount(t.total, code),
+                            tax_summary: t.summary | map((s) => ({ rate: s.rate, base: invoice_builder_amount(s.base, code), tax: invoice_builder_amount(s.tax, code) })) }
             taken = taken | push(trim(seq))
             saved = `Saved ${trim(seq)} for ${shown(t.total)}, due ${due}.`
             seq = invoice_builder_next(seq)
@@ -69219,12 +69325,11 @@ component JsonViewer(id: str, value = null, label: str? = null, expanded: int = 
                 let k = e.key
                 if k == "ArrowDown" || k == "ArrowUp" || k == "Home" || k == "End" {
                     e.preventDefault()
-                    let to = match k {
-                        "ArrowDown" => at + 1 < n ? at + 1 : at
-                        "ArrowUp" => at > 0 ? at - 1 : 0
-                        "Home" => 0
-                        _ => n - 1
-                    }
+                    // A ternary, not a `match`: a `match` here is a block the handler waits on,
+                    // and a key sent right after this one would find the old row still active.
+                    let to = k == "ArrowDown" ? (at + 1 < n ? at + 1 : at)
+                        : k == "ArrowUp" ? (at > 0 ? at - 1 : 0)
+                        : k == "Home" ? 0 : n - 1
                     go(e, items[to].path)
                 } else if k == "ArrowRight" {
                     e.preventDefault()
@@ -69772,9 +69877,11 @@ component KanbanBoard(id: str, columns: list = [], label: str? = null, on_change
     state lifted = null       // the id of the card carried by keyboard
     state origin = null       // where it was picked up: the columns then
     state said = ""
+    state board = null        // the board's own element, from its @mount
     let help = `${id}-help`
-    let focus = (e, card) => {
-        let board = e.target.closest(".ui-kb")
+    // Not from the event: a handler that has waited (a call to one of the component's own
+    // functions may) has already redrawn, and the card that had the key is no longer on the page.
+    let focus = (card) => {
         js("queueMicrotask", () => {
             let el = board.querySelector(`[data-card="${card}"]`)
             el && el.focus()
@@ -69794,7 +69901,7 @@ component KanbanBoard(id: str, columns: list = [], label: str? = null, on_change
         said = `${title_of(card)} moved to ${place(next, card)}.`
         on_change && on_change(next)
     }
-    <div class={ui_cls(["ui-kb", class])} role="group" aria-label={label}>
+    <div class={ui_cls(["ui-kb", class])} role="group" aria-label={label} @mount={(el) => { board = el }}>
         <p.ui-sr id={help}>Press Space to pick up a card, the arrow keys to move it, Space to put it down or Escape to put it back.</p>
         <div.ui-kb-cols>
             {for [ci, col] in enumerate(cols) => <section key={col.id}
@@ -69872,7 +69979,7 @@ component KanbanBoard(id: str, columns: list = [], label: str? = null, on_change
                                         e.preventDefault()
                                         cols = kanban_board_move(cols, card.id, to.c, to.at)
                                         said = place(cols, card.id)
-                                        focus(e, card.id)
+                                        focus(card.id)
                                     } else if k == " " || k == "Enter" {
                                         e.preventDefault()
                                         lifted = null
@@ -69882,7 +69989,7 @@ component KanbanBoard(id: str, columns: list = [], label: str? = null, on_change
                                         cols = origin
                                         lifted = null
                                         said = `${card.title} put back in ${place(origin, card.id)}.`
-                                        focus(e, card.id)
+                                        focus(card.id)
                                     } else if k == "Tab" {
                                         e.preventDefault()
                                     }
@@ -69901,7 +70008,7 @@ component KanbanBoard(id: str, columns: list = [], label: str? = null, on_change
                                     }
                                     if to != null {
                                         e.preventDefault()
-                                        focus(e, to.id)
+                                        focus(to.id)
                                     }
                                 }
                             }}
@@ -69925,13 +70032,13 @@ component KanbanBoard(id: str, columns: list = [], label: str? = null, on_change
                                     aria-label={ci > 0 ? `Move ${card.title} to ${cols[ci - 1].title}` : "Move back"}
                                     @click={(e) => {
                                         commit(kanban_board_move(cols, card.id, ci - 1, len(cols[ci - 1].cards)), card.id)
-                                        focus(e, card.id)
+                                        focus(card.id)
                                     }}>‹</button>
                             <button type="button" tabindex="-1" disabled={ci == len(cols) - 1}
                                     aria-label={ci < len(cols) - 1 ? `Move ${card.title} to ${cols[ci + 1].title}` : "Move on"}
                                     @click={(e) => {
                                         commit(kanban_board_move(cols, card.id, ci + 1, len(cols[ci + 1].cards)), card.id)
-                                        focus(e, card.id)
+                                        focus(card.id)
                                     }}>›</button>
                         </div>
                     </li>}
@@ -77038,6 +77145,22 @@ fn long_press_menu_buzz(ms: int) -> str {
     js("navigator.vibrate", ms) == true ? "vibrate" : "none"
 }
 
+// Which of `all`, the items not disabled, a key takes the focus to from `target`: the arrows
+// go round, Home and End to the ends, and any other key is -1. Out here, not in the handler,
+// where the `??` would wait a turn before the focus moves.
+fn long_press_menu_step(all, target, key: str) -> int {
+    let n = all.length
+    if n == 0 { return -1 }
+    let at = index_of(for i in range(0, n) => all[i].isSameNode(target), true) ?? -1
+    match key {
+        "ArrowDown" => (at + 1) % n
+        "ArrowUp" => (at - 1 + n) % n
+        "Home" => 0
+        "End" => n - 1
+        _ => -1
+    }
+}
+
 component LongPressMenu(items = [], on_select = null, on_open = null, delay: int = 500, label: str = "Item", class: str? = null, children) {
     style global long_press_menu_css
     let list = long_press_menu_clean(items)
@@ -77166,16 +77289,8 @@ component LongPressMenu(items = [], on_select = null, on_open = null, delay: int
                 }}
                 @keydown={(e) => {
                     let all = dlg.querySelectorAll(".ui-long-press-item:not([disabled])")
-                    let n = all.length
-                    let at = index_of(for i in range(0, n) => all[i].isSameNode(e.target), true) ?? -1
-                    let to = match e.key {
-                        "ArrowDown" => (at + 1) % n
-                        "ArrowUp" => (at - 1 + n) % n
-                        "Home" => 0
-                        "End" => n - 1
-                        _ => -1
-                    }
-                    if to >= 0 && n > 0 {
+                    let to = long_press_menu_step(all, e.target, e.key)
+                    if to >= 0 {
                         e.preventDefault()
                         all[to].focus()
                     }
@@ -83697,8 +83812,7 @@ component MonthCalendar(month: str, days: list = [], labels: map = {}, selected:
         own_month = to
         on_month && on_month(to)
     }
-    let focus_day = (e, z: int) => {
-        let root = e.target.closest(".ui-month-calendar")
+    let focus_day = (root, z: int) => {
         js("requestAnimationFrame", (t) => {
             let cell = root.querySelector(`[data-day="${month_calendar_iso(z)}"]`)
             cell && cell.focus()
@@ -83728,9 +83842,12 @@ component MonthCalendar(month: str, days: list = [], labels: map = {}, selected:
                  }
                  if to != null {
                      e.preventDefault()
+                     // Found before turning: a new month takes the old day, and with it
+                     // e.target, off the page.
+                     let root = e.target.closest(".ui-month-calendar")
                      if to < first { turn(-1) }
                      if to >= first + n { turn(1) }
-                     focus_day(e, to)
+                     focus_day(root, to)
                  }
                  if e.key == "PageUp" || e.key == "PageDown" {
                      e.preventDefault()
@@ -106701,6 +106818,11 @@ fn pull_to_refresh_speed(s, pos: num, now: num, moved: num) -> num {
     abs(since) > abs(s.v) ? since : s.v
 }
 
+// What the callback gave, Promise or not, in a map. Called from the component, a Promise
+// of nothing would be waited for there and come back as null, which reads as "no answer,
+// done will be called"; called here, and boxed, it is still the Promise when it comes back.
+fn pull_to_refresh_ask(on_refresh, done) = { answer: on_refresh(done) }
+
 component PullToRefresh(on_refresh = null, height: str = "420px", threshold: int = 70, limit: int = 180, timeout: int = 30,
                         label: str = "Refreshable list", pull_text: str = "Pull to refresh", ready_text: str = "Release to refresh",
                         busy_text: str = "Refreshing", done_text: str = "Up to date", failed_text: str = "Could not refresh",
@@ -106732,7 +106854,7 @@ component PullToRefresh(on_refresh = null, height: str = "420px", threshold: int
         if on_refresh == null {
             finish(r, true)
         } else {
-            let v = on_refresh((ok = true) => { finish(r, ok) })
+            let v = pull_to_refresh_ask(on_refresh, (ok = true) => { finish(r, ok) }).answer
             // A callback may wait, and then what it gives is a Promise.
             if type_of(v) == "promise" {
                 v.then((x = true) => { finish(r, x) }, (_e = null) => { finish(r, false) })
@@ -113158,7 +113280,9 @@ component RealtimeChart(values: list = [], labels: list? = null, window: int = 6
     let x = (i) => (keep - m + i) * 100 / (keep - 1)
     let pt = (i) => `${realtime_chart_pct(x(i))},${realtime_chart_pct(top(vals[i]))}`
     let idx = range(m) | filter((i) => vals[i] != null)
-    let line = len(idx) == 0 ? "" : "M" + join(idx | map(pt), " L")
+    // `pt` is called here, not handed to `map`: a component's own function given by name
+    // counts as one that waits, and `map` refuses it.
+    let line = len(idx) == 0 ? "" : "M" + join(for i in idx => pt(i), " L")
     let last = m > 0 ? vals[m - 1] : null
     let before = m > 1 ? vals[m - 2] : null
     let change = last != null && before != null ? last - before : null
@@ -114123,7 +114247,8 @@ view RecordCard(title: str, subtitle: str? = null, avatar = false, status: str? 
                 </div>
             }}
         </dl>}
-        {str(children) != "" && <footer.ui-recordcard-foot>{children}</footer>}
+        // No children is null on newer Quillo and empty HTML on older: either means no footer.
+        {children != null && str(children) != "" && <footer.ui-recordcard-foot>{children}</footer>}
     </article>
 }
 
@@ -118317,6 +118442,18 @@ let rich_text_editor_tools = ["bold", "italic", "underline", "strike", "heading"
 let rich_text_editor_tags = { bold: "b", italic: "i", underline: "u", strike: "s" }
 let rich_text_editor_same = { bold: "b,strong", italic: "i,em", underline: "u", strike: "s,strike,del", list: "ul", numbered: "ol" }
 
+// The element around a range's start that matches `selector`, inside `el`, or null. Out
+// here, not in the component: `filter` may not be given one of a component's own functions
+// that reads what a call gave.
+fn rich_text_editor_around(el, r, selector: str) {
+    let node = r.startContainer
+    let found = (node.nodeType == 1 ? node : node.parentElement).closest(selector)
+    found != null && found != el && el.contains(found) ? found : null
+}
+
+// The styles on where the range starts, inside `el`: the toolbar's pressed buttons.
+fn rich_text_editor_styles(el, r) -> list = ["bold", "italic", "underline", "strike", "list", "numbered"] | filter((t) => rich_text_editor_around(el, r, rich_text_editor_same[t]) != null)
+
 component RichTextEditor(name: str? = null, label: str? = null, value: str = "", tools: list? = null, min_height: int = 120,
                          placeholder: str = "Write something…", hint: str? = null, error: str? = null, required: bool = false,
                          disabled: bool = false, field: str? = null, on_change = null, class: str? = null) {
@@ -118327,18 +118464,12 @@ component RichTextEditor(name: str? = null, label: str? = null, value: str = "",
     let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
     let offered = (tools ?? rich_text_editor_tools) | filter((t) => contains(rich_text_editor_tools, t))
     let area = (e) => e.target.closest(".ui-rich-text-editor").querySelector(".ui-rich-text-editor-area")
-    let element_of = (node) => node.nodeType == 1 ? node : node.parentElement
     // The selection, when it is inside `el`.
     let range_in = (el) => {
         let sel = js("getSelection")
         if sel == null || sel.rangeCount == 0 { return null }
         let r = sel.getRangeAt(0)
         el.contains(r.commonAncestorContainer) ? r : null
-    }
-    // The element around the selection's start that matches `selector`, inside `el`.
-    let around = (el, r, selector: str) => {
-        let found = element_of(r.startContainer).closest(selector)
-        found != null && found != el && el.contains(found) ? found : null
     }
     let select_in = (node) => {
         let sel = js("getSelection")
@@ -118381,8 +118512,7 @@ component RichTextEditor(name: str? = null, label: str? = null, value: str = "",
     }
     let look = (el) => {
         let r = range_in(el)
-        on = r == null ? [] : ["bold", "italic", "underline", "strike", "list", "numbered"]
-            | filter((t) => around(el, r, rich_text_editor_same[t]) != null)
+        on = r == null ? [] : rich_text_editor_styles(el, r)
     }
     let changed = (el) => {
         let next = el.innerHTML
@@ -118400,7 +118530,7 @@ component RichTextEditor(name: str? = null, label: str? = null, value: str = "",
         }
         let style = rich_text_editor_tags[tool]
         if style != null || tool == "link" {
-            let on_already = around(el, r, tool == "link" ? "a" : rich_text_editor_same[tool])
+            let on_already = rich_text_editor_around(el, r, tool == "link" ? "a" : rich_text_editor_same[tool])
             if on_already != null {
                 unwrap(on_already)
             } else if !r.collapsed {
@@ -118415,7 +118545,7 @@ component RichTextEditor(name: str? = null, label: str? = null, value: str = "",
             }
         } else if tool == "list" || tool == "numbered" {
             let tag = tool == "list" ? "ul" : "ol"
-            let list = around(el, r, "ul,ol")
+            let list = rich_text_editor_around(el, r, "ul,ol")
             if list != null && lower(list.nodeName) == tag {
                 for li in js("Array.from", list.children) => {
                     let p = retag(li, "p")
@@ -118669,6 +118799,12 @@ fn risk_matrix_tally(rows: list, bands: list) -> list =
           after: len(rows | filter((r) => band_of(risk_matrix_after(r) ?? r.l * r.i) == name)) }
     }
 
+// The matrix an event came from, and a cell in it. Top-level functions, not a component's
+// `let`s: a `let` that touches the page is waited for, which would move the focus only once
+// the handler is over, too late for a key pressed straight after.
+fn risk_matrix_root(e) = e.target.closest(".ui-risk-matrix")
+fn risk_matrix_cell(root, l: int, i: int) = root.querySelector(`[data-l="${l}"][data-i="${i}"]`)
+
 component RiskMatrix(risks: list = [], bands: list = risk_matrix_bands, likelihood_labels: list = risk_matrix_likelihoods, impact_labels: list = risk_matrix_impacts,
                      title: str = "Risk matrix", id: str = "risk-matrix", name: str? = null, on_change = null, class: str? = null) {
     style global risk_matrix_css
@@ -118683,8 +118819,6 @@ component RiskMatrix(risks: list = [], bands: list = risk_matrix_bands, likeliho
     let sorted = risk_matrix_register(rows)
     let shown = only == null ? sorted : sorted | filter((r) => (r.l == only.l && r.i == only.i) || (r.ml == only.l && r.mi == only.i))
     let tally = risk_matrix_tally(rows, bands)
-    let root_of = (e) => e.target.closest(".ui-risk-matrix")
-    let cell_at = (root, l: int, i: int) => root.querySelector(`[data-l="${l}"][data-i="${i}"]`)
     let move_held = (l: int, i: int) => {
         rows = rows | map((r) => r.id != held.id ? r : (held.which == "after" ? { ...r, ml: l, mi: i } : { ...r, l, i }))
     }
@@ -118692,7 +118826,7 @@ component RiskMatrix(risks: list = [], bands: list = risk_matrix_bands, likeliho
         at_l = l
         at_i = i
         if held != null { move_held(l, i) }
-        cell_at(root_of(e), l, i).focus()
+        risk_matrix_cell(risk_matrix_root(e), l, i).focus()
     }
     let pick_up = (e, r: map, which: str) => {
         let l = which == "after" ? (r.ml ?? r.l) : r.l
@@ -118703,12 +118837,12 @@ component RiskMatrix(risks: list = [], bands: list = risk_matrix_bands, likeliho
         at_i = i
         move_held(l, i)
         said = `Moving ${r.title}. Arrow keys to move, Enter to place, Escape to cancel.`
-        cell_at(root_of(e), l, i).focus()
+        risk_matrix_cell(risk_matrix_root(e), l, i).focus()
     }
     let let_go = (e) => {
         let key_of = `${held.id}-${held.which}`
         held = null
-        root_of(e).querySelector(`[data-move="${key_of}"]`).focus()
+        risk_matrix_root(e).querySelector(`[data-move="${key_of}"]`).focus()
     }
     let put_down = (e, l: int, i: int) => {
         move_held(l, i)
@@ -124021,20 +124155,24 @@ component Scrollspy(items: list = [], horizontal: bool = false, sticky: bool = f
         spy()
     }
     let jump = (e, to: str) => {
-        let h = js("document.getElementById", to)
+        // Found through the element, not js(): Quillo may wait on a js() call, and by
+        // then the browser has followed the link, too late for preventDefault.
+        let h = e.target.ownerDocument.getElementById(to)
         if h != null {
             e.preventDefault()
             let still = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
             let top = box != null ? box.getBoundingClientRect().top : 0
             let by = h.getBoundingClientRect().top - top - offset
             let at = box != null ? box.scrollTop : js("scrollY")
-            mark(to)
-            going = by > 1 || by < -1
-            (box ?? js("window")).scrollTo({ top: at + by, behavior: still ? "instant" : "smooth" })
+            // The focus and the address bar before the scroll: where scrollTo gives a
+            // Promise, the handler waits for the scroll to end.
             if !h.hasAttribute("tabindex") && h.tabIndex < 0 { h.tabIndex = -1 }
             h.focus({ preventScroll: true })
             js("history.replaceState", js("history.state"), "", `#${to}`)
+            mark(to)
+            going = by > 1 || by < -1
             e.target.closest("a").scrollIntoView({ block: "nearest", inline: "nearest" })
+            (box ?? js("window")).scrollTo({ top: at + by, behavior: still ? "instant" : "smooth" })
         }
     }
     <nav class={ui_cls(["ui-scrollspy", horizontal && "ui-scrollspy-horizontal", sticky && "ui-scrollspy-sticky", class])} id={id}
@@ -128771,6 +128909,10 @@ fn settle_up_name(who: list, id) -> str {
     filled(trim(str(row[1].name))) ?? `Person ${row[0] + 1}`
 }
 
+// Minor units as the decimal amount that on_change gives. A function of its own, not the
+// component's: `map` refuses one of the component's own that calls another, as one that may wait.
+fn settle_up_amount(minor: int, code: str) = money.from_minor(minor, code).amount
+
 // Everything from the rows as typed: { errors: [{ field, text }], balances, transfers,
 // fewest }, in minor units; balances is null with errors.
 fn settle_up_work(who: list, rows: list, code: str) -> map {
@@ -128810,9 +128952,8 @@ component SettleUp(people = null, expenses = null, currency: str = "USD", locale
     let named = (part: str) => `${name}_${part}`
     let tell = () => {
         if on_change != null && ok {
-            let amount = (minor: int) => money.from_minor(minor, code).amount
-            on_change({ balances: work.balances | map((b) => ({ name: b.name, paid: amount(b.paid), share: amount(b.share), balance: amount(b.balance) })),
-                        transfers: work.transfers | map((t) => ({ from: t.from, to: t.to, amount: amount(t.amount) })), fewest: work.fewest })
+            on_change({ balances: work.balances | map((b) => ({ name: b.name, paid: settle_up_amount(b.paid, code), share: settle_up_amount(b.share, code), balance: settle_up_amount(b.balance, code) })),
+                        transfers: work.transfers | map((t) => ({ from: t.from, to: t.to, amount: settle_up_amount(t.amount, code) })), fewest: work.fewest })
         }
     }
     let change = (eid, field: str, value) => {
@@ -132005,6 +132146,14 @@ let signature_pad_css = css`
 @media (prefers-reduced-motion: reduce) { .ui-signature-pad-box { transition: none; } }
 `
 
+// Where a pointer event is on the drawing, in its own pixels. A top-level fn and not the
+// component's own `let` function: one of those calling a method of the canvas gives a
+// Promise, and the handler would go on after the moves and the lift already sent.
+fn signature_pad_point(pad, e, width: num, height: num) {
+    let r = pad.getBoundingClientRect()
+    { x: (e.clientX - r.left) * width / r.width, y: (e.clientY - r.top) * height / r.height }
+}
+
 component SignaturePad(name: str = "signature", label: str? = null, width: int = 400, height: int = 160, line_width: num = 2,
                        typed: bool = true, clear_label: str = "Clear", hint: str? = null, error: str? = null,
                        required: bool = false, disabled: bool = false, field: str? = null, on_change = null,
@@ -132019,10 +132168,6 @@ component SignaturePad(name: str = "signature", label: str? = null, width: int =
     state text = ""
     let id = field ?? `signature-pad-${name}`
     let described = ui_cls([hint != null && `${id}-hint`, error != null && `${id}-error`])
-    let point = (e) => {
-        let r = pad.getBoundingClientRect()
-        { x: (e.clientX - r.left) * width / r.width, y: (e.clientY - r.top) * height / r.height }
-    }
     let save = () => {
         value = pad.toDataURL("image/png")
         on_change && on_change(value)
@@ -132075,7 +132220,7 @@ component SignaturePad(name: str = "signature", label: str? = null, width: int =
                         if disabled || mode != "draw" { return null }
                         e.preventDefault()
                         e.target.setPointerCapture(e.pointerId)
-                        let p = point(e)
+                        let p = signature_pad_point(pad, e, width, height)
                         ctx.beginPath()
                         ctx.moveTo(p.x, p.y)
                         ctx.lineTo(p.x + 0.1, p.y + 0.1)
@@ -132084,7 +132229,7 @@ component SignaturePad(name: str = "signature", label: str? = null, width: int =
                     }}
                     @pointermove={(e) => {
                         if drawing {
-                            let p = point(e)
+                            let p = signature_pad_point(pad, e, width, height)
                             ctx.lineTo(p.x, p.y)
                             ctx.stroke()
                         }
@@ -132579,6 +132724,13 @@ fn size_class_view_of(width) -> str {
 // Whether a slot's `when` names a size: whole words, so "compact" never matches "not-compact".
 fn size_class_view_in(when, size: str) -> bool = contains(split(str(when ?? ""), " "), size)
 
+// Whether element e is in a slot shown at size s. A top-level function, as a component's
+// own may not be given to `filter` on every Quillo version.
+fn size_class_view_inside(e, s: str) -> bool {
+    let slot = e.closest(".ui-size-class-slot")
+    slot != null && size_class_view_in(slot.dataset.when, s)
+}
+
 // Every element with a data-keep of that name, in whichever slots.
 fn size_class_view_twins(root, name: str) {
     let found = root.querySelectorAll("[data-keep]")
@@ -132598,16 +132750,12 @@ component SizeClassView(on_change = null, fill: bool = false, class: str? = null
     // What came into view takes over from what left. Each pair is looked at once, by
     // name, so three slots sharing a name still give the text of the one that left.
     let carry = (root, left: str, came: str) => {
-        let inside = (e, s: str) => {
-            let slot = e.closest(".ui-size-class-slot")
-            slot != null && size_class_view_in(slot.dataset.when, s)
-        }
         let all = root.querySelectorAll("[data-keep]")
         let names = range(all.length) | map((i) => all[i].dataset.keep) | unique()
         for name in names {
             let twins = size_class_view_twins(root, name)
-            let from = twins | filter((e) => inside(e, left) && !inside(e, came))
-            let to = twins | filter((e) => inside(e, came) && !inside(e, left))
+            let from = twins | filter((e) => size_class_view_inside(e, left) && !size_class_view_inside(e, came))
+            let to = twins | filter((e) => size_class_view_inside(e, came) && !size_class_view_inside(e, left))
             if len(from) > 0 && len(to) > 0 {
                 let a = from[0]
                 let b = to[0]
@@ -138116,18 +138264,24 @@ component SpotlightTour(id: str, steps: list = [], trigger: str? = "Take the tou
     let n = len(steps)
     let step = n > 0 ? steps[min([at, n - 1])] : { title: "", text: "" }
     // Lights the element of step i and puts the card beside it: under it, or above when there is no room.
+    // Measuring waits on the page, so two quick steps measure side by side: only the step
+    // still shown when its measure ends is drawn, or an earlier hole could land last.
     let measure = (i: int) => {
         let el = js("document.getElementById", get(steps[i], "target") ?? "")
         if el == null {
-            hole = null
-            card = ""
+            if at == i {
+                hole = null
+                card = ""
+            }
         } else {
             let r = el.getBoundingClientRect()
             let vw = js("innerWidth")
             let vh = js("innerHeight")
-            hole = { x: r.left - 6, y: r.top - 6, w: r.width + 12, h: r.height + 12 }
             let left = max([12, min([r.left, vw - 332])])
-            card = r.bottom + 220 < vh ? `left: ${left}px; top: ${r.bottom + 16}px` : `left: ${left}px; bottom: ${vh - r.top + 16}px`
+            if at == i {
+                hole = { x: r.left - 6, y: r.top - 6, w: r.width + 12, h: r.height + 12 }
+                card = r.bottom + 220 < vh ? `left: ${left}px; top: ${r.bottom + 16}px` : `left: ${left}px; bottom: ${vh - r.top + 16}px`
+            }
         }
     }
     let go = (i: int) => {
@@ -140837,8 +140991,11 @@ component StockChart(candles: list = [], kind: str = "candles", period: str = "3
                  aria-label={`${label}, ${nb > 0 ? `${when(bars[0])} to ${when(bars[nb - 1])}` : "no data"}`}
                  aria-roledescription="chart"
                  @pointermove={(e) => {
+                     // Read before the call below, which can pause the handler: a pointerup that
+                     // comes meanwhile must not cut this move short.
+                     let held = drag
                      let p = locate(e)
-                     if drag != null && p.width > 0 { move_to(drag.from + round((drag.x - e.clientX) * c / p.width)) }
+                     if held != null && p.width > 0 { move_to(held.from + round((held.x - e.clientX) * c / p.width)) }
                      let j = floor(p.fx * nb)
                      hover = nb == 0 ? null : (j < 0 ? 0 : (j >= nb ? nb - 1 : j))
                      at_y = p.py >= 0 && p.py <= 1 ? p.py : null
@@ -140852,8 +141009,10 @@ component StockChart(candles: list = [], kind: str = "candles", period: str = "3
                  }}
                  @pointerdown={(e) => {
                      if e.button == 0 {
-                         e.target.closest(".ui-stk-panes").setPointerCapture(e.pointerId)
+                         // Set first: the handler can pause here, and a move that comes meanwhile
+                         // must find the drag begun.
                          drag = { x: e.clientX, from: s }
+                         e.target.closest(".ui-stk-panes").setPointerCapture(e.pointerId)
                      }
                  }}
                  @pointerup={() => { drag = null }}
@@ -144021,6 +144180,30 @@ fn swipe_deck_sample(s, pos: num, now: num) {
     dt < 32 ? s : { pos, at: now, v: (pos - s.pos) / dt }
 }
 
+// The top card's element. This and the two below are top-level fns, not the component's
+// own `let` functions: one of those that calls a method of the page, or a prop, gives a
+// Promise, and a handler calling it would go on late, after the next click had come.
+fn swipe_deck_top(stack) = stack.querySelector(".ui-swipe-deck-top")
+
+// A held card drawn x, y from home, tilted, its stamp showing as far as it has gone.
+fn swipe_deck_hold(stack, card, x: num, y: num) {
+    if card != null {
+        let w = stack.offsetWidth
+        card.style.transform = x != 0 || y != 0 ? `translate(${x}px, ${y}px) rotate(${swipe_deck_tilt(x, w)}deg)` : ""
+        let p = w > 0 ? min([1, abs(x) / (w * 0.38)]) : 0
+        card.style.setProperty("--right", x > 0 ? `${p}` : "0")
+        card.style.setProperty("--left", x < 0 ? `${p}` : "0")
+    }
+}
+
+// on_swipe and on_empty, for a card that has landed: { id, way, rest }, or null for none.
+fn swipe_deck_tell(landed, on_swipe, on_empty) {
+    if landed != null {
+        on_swipe && on_swipe(landed.id, landed.way)
+        if landed.rest == 0 { on_empty && on_empty() }
+    }
+}
+
 // The speed at release, signed: none if the finger stopped before it lifted.
 fn swipe_deck_speed(s, pos: num, now: num, moved: num) -> num {
     if now - moved > 80 { return 0 }
@@ -144043,16 +144226,8 @@ component SwipeDeck(cards = [], left_label: str = "Skip", right_label: str = "Ke
     let done = history | map((h) => h.id)
     let waiting = deck | filter((c) => !contains(done, c.id))
     let shown = take(waiting, 3)
-    let top = () => stack.querySelector(".ui-swipe-deck-top")
-    let hold = (card, x: num, y: num) => {
-        if card != null {
-            let w = stack.offsetWidth
-            card.style.transform = x != 0 || y != 0 ? `translate(${x}px, ${y}px) rotate(${swipe_deck_tilt(x, w)}deg)` : ""
-            let p = w > 0 ? min([1, abs(x) / (w * 0.38)]) : 0
-            card.style.setProperty("--right", x > 0 ? `${p}` : "0")
-            card.style.setProperty("--left", x < 0 ? `${p}` : "0")
-        }
-    }
+    // The card in flight lands. It calls nothing but builtins, so it is done at once and what
+    // follows it sees the deck as it now is; swipe_deck_tell gives the props the news.
     let finish = () => {
         if flying != null && len(waiting) > 0 {
             let c = waiting[0]
@@ -144061,24 +144236,24 @@ component SwipeDeck(cards = [], left_label: str = "Skip", right_label: str = "Ke
             flying = null
             history = history + [{ id: c.id, way, title: c.title }]
             said = `${way == "right" ? right_label : left_label}: ${c.title}. ${rest} left.`
-            on_swipe && on_swipe(c.id, way)
-            if rest == 0 { on_empty && on_empty() }
+            return { id: c.id, way, rest }
         }
+        null
     }
     let fling = (way: str) => {
-        finish()
+        swipe_deck_tell(finish(), on_swipe, on_empty)
         if len(waiting) > 0 {
             moving = false
             flying = way
             let w = stack.offsetWidth * 1.5
-            let card = top()
+            let card = swipe_deck_top(stack)
             if card != null {
                 card.style.transform = `translate(${way == "right" ? w : -w}px, 30px) rotate(${way == "right" ? 18 : -18}deg)`
             }
         }
     }
     let undo = () => {
-        finish()
+        swipe_deck_tell(finish(), on_swipe, on_empty)
         if len(history) > 0 {
             let h = history[len(history) - 1]
             back = { id: h.id, way: h.way }
@@ -144087,7 +144262,7 @@ component SwipeDeck(cards = [], left_label: str = "Skip", right_label: str = "Ke
             on_undo && on_undo(h.id)
         }
     }
-    if flying != null { every(210, finish) }
+    if flying != null { every(210, () => { swipe_deck_tell(finish(), on_swipe, on_empty) }) }
     <div class={ui_cls(["ui-swipe-deck", class])}>
         <div.ui-swipe-deck-inner>
             <div class={ui_cls(["ui-swipe-deck-stack", moving && "ui-swipe-deck-moving", flying != null && "ui-swipe-deck-flying"])}
@@ -144116,11 +144291,11 @@ component SwipeDeck(cards = [], left_label: str = "Skip", right_label: str = "Ke
                                  back = null
                                  moving = true
                                  // This card, whatever comes to stand on top of it while it is held.
-                                 g = { ...g, on: true, card: top() }
+                                 g = { ...g, on: true, card: swipe_deck_top(stack) }
                              }
                          }
                          if g != null && g.on {
-                             hold(g.card, dx, dy * 0.4)
+                             swipe_deck_hold(stack, g.card, dx, dy * 0.4)
                              g = { ...g, dx, moved: e.timeStamp, s: swipe_deck_sample(g.s, e.clientX, e.timeStamp) }
                          }
                      }
@@ -144132,8 +144307,8 @@ component SwipeDeck(cards = [], left_label: str = "Skip", right_label: str = "Ke
                          if was.on {
                              let way = swipe_deck_decide(was.dx, swipe_deck_speed(was.s, e.clientX, e.timeStamp, was.moved), stack.offsetWidth)
                              moving = false
-                             let still_top = was.card != null && top() != null && was.card.isSameNode(top())
-                             if way != "" && still_top { fling(way) } else { hold(was.card, 0, 0) }
+                             let still_top = was.card != null && swipe_deck_top(stack) != null && was.card.isSameNode(swipe_deck_top(stack))
+                             if way != "" && still_top { fling(way) } else { swipe_deck_hold(stack, was.card, 0, 0) }
                          }
                      }
                  }}
@@ -144142,7 +144317,7 @@ component SwipeDeck(cards = [], left_label: str = "Skip", right_label: str = "Ke
                          let was = g
                          g = null
                          moving = false
-                         if was.on { hold(was.card, 0, 0) }
+                         if was.on { swipe_deck_hold(stack, was.card, 0, 0) }
                      }
                  }}>
                 {len(waiting) == 0 && <div.ui-swipe-deck-none>{empty_text}</div>}
@@ -146108,8 +146283,10 @@ component SwipeViewer(photos = [], open: bool = false, start = 0, label: str = "
         }
     }
     let turn = (by) => {
-        finish_turn()
-        let to = at + by
+        // Where to go is counted from where the turn under way lands, and with none under
+        // way nothing here waits on the page before `turning` is set: two quick keys both count.
+        let to = at + turning + by
+        if turning != 0 { finish_turn() }
         if to >= 0 && to < count {
             if still {
                 land(to)
@@ -147349,7 +147526,9 @@ component TableOfContents(items: list = [], label: str = "On this page", offset:
         spy()
     }
     let jump = (e, to: str) => {
-        let h = js("document.getElementById", to)
+        // From the link's own document, not `js(...)`: code after a `js(...)` can run once
+        // the browser has followed the link, too late to stop it.
+        let h = e.target.ownerDocument.getElementById(to)
         if h != null {
             e.preventDefault()
             let still = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
@@ -148714,6 +148893,11 @@ fn task_row_due(due, today: str) {
     { text: date.format(due, "D MMM YYYY"), tone: "later" }
 }
 
+// The day the row counts from: the one given, or today. In a fn of its own, as a state that
+// starts from a call like `date.valid(...)` in the component is waited for, and a row made
+// in the page (one brought back by Undo) would begin with no day at all.
+fn task_row_day(given) -> str = date.valid(given, "date") ? given : date.today()
+
 // The Monday after today's week.
 fn task_row_next_week(today: str) -> str = date.add_days(today, 8 - date.weekday(today))
 
@@ -148770,7 +148954,7 @@ fn task_row_list_clean(tasks) {
 
 component TaskRow(task = null, today: str = "", on_toggle = null, on_due = null, on_delete = null, on_subtask = null, class: str? = null) {
     style global task_row_css
-    state day = date.valid(today, "date") ? today : date.today()
+    state day = task_row_day(today)
     state cur = task_row_clean(task)
     state rest = ""          // "", "due" or "del": what a swipe left showing
     state more = false
@@ -150913,14 +151097,16 @@ component TextLint(value: str = "", name: str = "text", label: str = "Text to ch
         on_change && on_change({ text: next, issues: text_lint_issues(next, on, long_sentence, limit) })
     }
     // A fixed row goes, and the focus with it: the list keeps it, and Tab goes on from there.
-    let hold_focus = (e) => { e.target.closest(".ui-text-lint").querySelector(".ui-text-lint-issues").focus() }
+    // The list is found before the change, as the button pressed may be gone after it.
     let fix = (e, i) => {
+        let list = e.target.closest(".ui-text-lint").querySelector(".ui-text-lint-issues")
         change(text_lint_apply(text, [i.edit]), `Fixed "${i.text}".`)
-        hold_focus(e)
+        list.focus()
     }
     let fix_all = (e) => {
+        let list = e.target.closest(".ui-text-lint").querySelector(".ui-text-lint-issues")
         change(text_lint_apply(text, fixable | map((i) => i.edit)), `Fixed ${len(fixable)} ${len(fixable) == 1 ? "issue" : "issues"}.`)
-        hold_focus(e)
+        list.focus()
     }
     let select = (e, i) => {
         let box = e.target.closest(".ui-text-lint").querySelector("textarea")
@@ -156562,6 +156748,24 @@ fn transfer_list_options(options: list) -> list =
         ? { label: o.label ?? str(o.value), value: o.value ?? o.label, i }
         : { label: str(o), value: o, i }
 
+// The option an arrow key, Home or End goes to from option `at` (-1 for none) of n,
+// stopping at the ends, or null for another key or an empty list.
+fn transfer_list_key(key: str, at: int, n: int) -> int? = n == 0 ? null : match key {
+    "ArrowDown" => at + 1 < n ? at + 1 : n - 1
+    "ArrowUp" => at > 0 ? at - 1 : 0
+    "Home" => 0
+    "End" => n - 1
+    _ => null
+}
+
+// The options selected after a Shift+click or Shift+arrow: those already selected, and
+// every one shown from `from` (where the keys were) to `to`, by i.
+fn transfer_list_span(chosen: list, ids: list, from: int?, to: int) -> list {
+    let a = index_of(ids, from ?? to) ?? 0
+    let b = index_of(ids, to) ?? 0
+    unique(sort(chosen + slice(ids, min([a, b]), max([a, b]) + 1)))
+}
+
 // The SVG path of the move buttons' arrows, by what each does.
 fn transfer_list_arrow(kind: str) -> str = match kind {
     "add" => "M6 3l5 5-5 5"
@@ -156617,12 +156821,7 @@ component TransferList(id: str, options: list = [], value: list = [], name: str?
         sel = set_side(sel, s, index_of(sel[s], i) != null ? sel[s] | filter((x) => x != i) : sort(sel[s] + [i]))
     }
     let run = (s: str, from: int?, to: int) => {
-        let ids = shown(s) | map((o) => o.i)
-        let a = index_of(ids, from ?? to) ?? 0
-        let b = index_of(ids, to) ?? 0
-        let lo = min([a, b])
-        let hi = max([a, b])
-        sel = set_side(sel, s, unique(sort(sel[s] + slice(ids, lo, hi + 1))))
+        sel = set_side(sel, s, transfer_list_span(sel[s], shown(s) | map((o) => o.i), from, to))
     }
     let reveal = (e, i: int) => {
         let el = e.target.closest(".ui-tl").querySelector(`#${id}-opt-${i}`)
@@ -156657,17 +156856,15 @@ component TransferList(id: str, options: list = [], value: list = [], name: str?
                         let ids = shown(s) | map((o) => o.i)
                         let n = len(ids)
                         let at = index_of(ids, active[s]) ?? -1
-                        let to = match e.key {
-                            "ArrowDown" => n == 0 ? null : (at + 1 < n ? at + 1 : n - 1)
-                            "ArrowUp" => n == 0 ? null : (at > 0 ? at - 1 : 0)
-                            "Home" => n == 0 ? null : 0
-                            "End" => n == 0 ? null : n - 1
-                            _ => null
-                        }
+                        // Where the keys go is set before anything that can let a second key, sent
+                        // at once, in first (on some Quillo versions a `match`, a block or a call
+                        // to a function of the component's own), so it starts from this one's.
+                        let to = transfer_list_key(e.key, at, n)
                         if to != null {
                             e.preventDefault()
-                            if e.shiftKey { run(s, active[s], ids[to]) }
+                            let from = active[s]
                             active = set_side(active, s, ids[to])
+                            if e.shiftKey { sel = set_side(sel, s, transfer_list_span(sel[s], ids, from, ids[to])) }
                             reveal(e, ids[to])
                         } else if e.key == " " && at >= 0 {
                             e.preventDefault()
@@ -161601,10 +161798,13 @@ component UsernameInput(id: str, name: str = "username", label: str = "Username"
             <li.ui-userinput-offers-label aria-hidden="true">Free:</li>
             {for o in offers => <li key={o}>
                 <button.ui-userinput-offer type="button" @click={(e) => {
+                    // The field is found first: once the name is free this button's list
+                    // is gone, and the page may already be updated by the next line.
+                    let field = e.target.closest(".ui-userinput").querySelector("input")
                     let picked = o
                     text = picked
                     tell(picked)
-                    e.target.closest(".ui-userinput").querySelector("input").focus()
+                    field.focus()
                 }}>{o}</button>
             </li>}
         </ul>}
@@ -162302,6 +162502,21 @@ let vertical_tabs_css = css`
 @media (prefers-reduced-motion: reduce) { .ui-vtabs-tab { transition: none; } }
 `
 
+// The tab a key goes to, of the live ones (indexes), from the one at `at`; null for
+// another key. A function of its own, not a `match` in the handler: in a handler that
+// can wait, Quillo may wait after a `match`, and preventDefault would come too late.
+fn vertical_tabs_to(key: str, live: list, at: int) {
+    let n = len(live)
+    let k = index_of(live, at) ?? 0
+    n == 0 ? null : match key {
+        "ArrowDown" => live[(k + 1) % n]
+        "ArrowUp" => live[(k + n - 1) % n]
+        "Home" => live[0]
+        "End" => live[n - 1]
+        _ => null
+    }
+}
+
 component VerticalTabs(id: str, tabs: list = [], selected: int = 0, width: int = 220, label: str? = null, on_change = null,
                        class: str? = null, children) {
     style global vertical_tabs_css
@@ -162314,19 +162529,14 @@ component VerticalTabs(id: str, tabs: list = [], selected: int = 0, width: int =
     }
     <div class={ui_cls(["ui-vtabs", class])} style={`--ui-vtabs-w: ${width}px`}>
         <div.ui-vtabs-list role="tablist" aria-label={label} aria-orientation="vertical" @keydown={(e) => {
-            let n = len(live)
-            let k = index_of(live, at) ?? 0
-            let to = match e.key {
-                "ArrowDown" => live[(k + 1) % n]
-                "ArrowUp" => live[(k + n - 1) % n]
-                "Home" => live[0]
-                "End" => live[n - 1]
-                _ => null
-            }
-            if to != null && n > 0 {
+            let to = vertical_tabs_to(e.key, live, at)
+            if to != null {
                 e.preventDefault()
+                // Kept before on_change runs: once the handler has waited on it, the
+                // event is over and its currentTarget is null.
+                let list = e.currentTarget
                 pick(to)
-                e.currentTarget.querySelector(`[data-i="${to}"]`).focus()
+                list.querySelector(`[data-i="${to}"]`).focus()
             }
         }}>
             {for [i, t] in enumerate(items) => <button.ui-vtabs-tab type="button" role="tab" id={`${id}-tab-${i}`} data-i={i}
@@ -163167,6 +163377,20 @@ fn virtual_list_item(it) -> map =
         ? { title: str(it.title ?? ""), subtitle: it.subtitle, meta: it.meta, value: it.value ?? it.title }
         : { title: str(it), subtitle: null, meta: null, value: it }
 
+// The item a key moves to from `active`, or null for a key that moves nothing. Out of the
+// handler on purpose: there a `match` is waited for, so two keys sent at once would both
+// start from the same item and move by one.
+fn virtual_list_target(key, active: int, n: int, page: int) =
+    match key {
+        "ArrowDown" => min([n - 1, active + 1])
+        "ArrowUp" => max([0, active - 1])
+        "PageDown" => min([n - 1, active + page])
+        "PageUp" => max([0, active - page])
+        "Home" => 0
+        "End" => n - 1
+        _ => null
+    }
+
 component VirtualList(id: str, items: list = [], item_height: int = 56, height: int = 360, overscan: int = 4,
                       label: str? = null, selected = null, name: str? = null, empty: str = "Nothing to show",
                       on_select = null, class: str? = null) {
@@ -163211,15 +163435,7 @@ component VirtualList(id: str, items: list = [], item_height: int = 56, height: 
              @scroll={(e) => { top = e.scrollTop }}
              @keydown={(e) => {
                  let page = max([1, floor(height / item_height) - 1])
-                 let to = match e.key {
-                     "ArrowDown" => min([n - 1, active + 1])
-                     "ArrowUp" => max([0, active - 1])
-                     "PageDown" => min([n - 1, active + page])
-                     "PageUp" => max([0, active - page])
-                     "Home" => 0
-                     "End" => n - 1
-                     _ => null
-                 }
+                 let to = virtual_list_target(e.key, active, n, page)
                  if to != null && n > 0 {
                      e.preventDefault()
                      go(e, to)
@@ -163335,6 +163551,20 @@ fn virtual_table_text(v, format: str?) -> str =
 
 fn virtual_table_right(c: map) -> bool = c.align == "right" || (c.align == null && c.format == "number")
 
+// The row a key moves to from row `at` of `total`, or null for a key that does not move.
+// A top-level fn: a `match` in the handler would make what follows it, `preventDefault`
+// and the move, wait a turn, and a second key pressed in that time would start from the
+// old row.
+fn virtual_table_key_to(key: str, at, total, page) = match key {
+    "ArrowDown" => min([total - 1, at + 1])
+    "ArrowUp" => max([0, at - 1])
+    "PageDown" => min([total - 1, at + page])
+    "PageUp" => max([0, at - page])
+    "Home" => 0
+    "End" => total - 1
+    _ => null
+}
+
 component VirtualTable(id: str, columns: list = [], rows: list = [], order_by: str? = null, descending: bool = false,
                        search: bool = false, row_height: int = 36, height: int = 420, overscan: int = 6,
                        min_width: str = "720px", label: str? = null, empty: str = "Nothing to show", on_select = null,
@@ -163405,15 +163635,7 @@ component VirtualTable(id: str, columns: list = [], rows: list = [], order_by: s
                    aria-activedescendant={total > 0 ? `${id}-row-${at}` : null}
                    @keydown={(e) => {
                        let page = max([1, floor(height / row_height) - 2])
-                       let to = match e.key {
-                           "ArrowDown" => min([total - 1, at + 1])
-                           "ArrowUp" => max([0, at - 1])
-                           "PageDown" => min([total - 1, at + page])
-                           "PageUp" => max([0, at - page])
-                           "Home" => 0
-                           "End" => total - 1
-                           _ => null
-                       }
+                       let to = virtual_table_key_to(e.key, at, total, page)
                        if e.target.tagName != "TABLE" || total == 0 {
                            null
                        } else if to != null {
@@ -164372,7 +164594,9 @@ component VoiceRecorder(name: str = "voice", label: str = "Record a voice note",
             if fill != null { fill.style.transform = "scaleX(0)" }
         }
     }
-    let resume = () => {
+    // Not `resume`: `ctx.resume()` below would be taken as a call of it, which waits, and
+    // the Promise around it would no longer catch a throwing AudioContext.
+    let resume_recording = () => {
         if recorder != null && recorder.state == "paused" {
             recorder.resume()
             since = now()
@@ -164520,7 +164744,7 @@ component VoiceRecorder(name: str = "voice", label: str = "Record a voice note",
             <div.ui-voice-recorder-bar>
                 {(status == "idle" || status == "starting") && <Button size="lg" disabled={status == "starting"} on_click={start}>{status == "starting" ? "Asking for the microphone…" : label}</Button>}
                 {status == "recording" && <Button size="lg" variant="outline" tone="neutral" on_click={pause}>Pause</Button>}
-                {status == "paused" && <Button size="lg" variant="outline" tone="neutral" on_click={resume}>Resume</Button>}
+                {status == "paused" && <Button size="lg" variant="outline" tone="neutral" on_click={resume_recording}>Resume</Button>}
                 {(status == "recording" || status == "paused") && <Button size="lg" tone="danger" on_click={stop_recording}>Finish</Button>}
                 {status == "done" && <Button size="lg" variant="outline" tone="danger" on_click={wipe}>Delete</Button>}
                 {status == "done" && <Button size="lg" variant="outline" tone="neutral" on_click={() => { wipe(); start() }}>Record again</Button>}
@@ -167400,6 +167624,17 @@ fn weight_trend_at(rows, holes, day: num) {
     { hole: null, i: weight_trend_nearest(rows, day) }
 }
 
+// The weigh-in a key goes to from weigh-in `from` (-1 for none) of n, or null for another key.
+// A function of its own: a `match` in a handler lets a second key, sent at once, in
+// before this one has chosen, on some Quillo versions.
+fn weight_trend_key(key: str, from: int, n: int) -> int? = match key {
+    "ArrowRight" => from + 1
+    "ArrowLeft" => from < 0 ? 0 : from - 1
+    "Home" => 0
+    "End" => n - 1
+    _ => null
+}
+
 fn weight_trend_read(row, unit: str) -> str = `${weight_trend_label(row.date)}: ${weight_trend_show(row.kg, unit)}, trend ${weight_trend_show(row.trend, unit)}`
 
 fn weight_trend_hole_read(h) -> str = `No weigh-in for ${h.days} days, ${weight_trend_label(h.from_date)} to ${weight_trend_label(h.to_date)}`
@@ -167531,13 +167766,7 @@ component WeightTrend(entries = [], unit: str = "kg", show: str? = null, goal: n
                      @keydown={(e) => {
                          if e.key == "Escape" && pick != null { choose(null) }
                          let from = pick != null && pick.i != null ? pick.i : (pick != null ? weight_trend_nearest(rows, pick.hole.from) : -1)
-                         let to = match e.key {
-                             "ArrowRight" => from + 1
-                             "ArrowLeft" => from < 0 ? 0 : from - 1
-                             "Home" => 0
-                             "End" => n - 1
-                             _ => null
-                         }
+                         let to = weight_trend_key(e.key, from, n)
                          if to != null {
                              e.preventDefault()
                              choose({ i: to < 0 ? 0 : (to >= n ? n - 1 : to), hole: null })

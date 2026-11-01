@@ -17,6 +17,9 @@ if (!$(".ui-swipeback-back")) return "no back button";
 // Tracks the finger, the previous screen peeking behind, and a slow release short of
 // half way springs back.
 await pull(left + 8, top, 120, 0, 500);
+// Chrome hands a finger's moves to the page at the next frame, so the last one can come after
+// pull's 16 ms: read once it has.
+await wait(40);
 if (getComputedStyle(behind).visibility !== "visible") return "the screen behind does not show during a drag";
 if (Math.abs(shift() - 120) > 1) return "the screen does not follow the finger: " + shift();
 const peek = new DOMMatrix(getComputedStyle(behind).transform).m41;

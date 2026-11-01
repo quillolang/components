@@ -55,6 +55,8 @@ await cdp("Emulation.setGeolocationOverride", { latitude: 38.72, longitude: -9.1
 await wait(300);
 if (state("location") !== "allowed") return "granted reads as allowed: " + state("location");
 await cdp("Browser.resetPermissions", {});
+// A reset can leave what Chrome's fake camera and microphone let through earlier: say "ask" for each again.
+await set("geolocation", "prompt"); await set("notifications", "prompt"); await set("camera", "prompt"); await set("microphone", "prompt");
 await cdp("Emulation.clearGeolocationOverride", {});
 
 // In the app: the stand-in refuses, Settings is the way, coming back looks again.

@@ -73,6 +73,8 @@ const open_tab = async () => {
     await new Promise((r) => (ws.onopen = r));
     ws.onmessage = onmessage;
     if (old) await fetch(`http://127.0.0.1:${port}/json/close/${old.id}`);
+    // Permissions belong to the origin, not the tab: what one test granted would carry into the next.
+    await send("Browser.resetPermissions");
     await send("Runtime.enable");
     await send("Log.enable");
     await send("Page.enable");

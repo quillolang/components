@@ -84,13 +84,15 @@ if (!inkAt(950, 100)) return "undo did not paint it back";
 await tap(btn("Pen"));
 // The pen's own eraser end, with Pen chosen.
 // DevTools cannot press it, so this one event is made up. Chrome's capture refuses a made-up pointer.
-const real = stage.setPointerCapture;
+// As a browser sends them: down and up each in a task of its own, a handler being free to finish
+// its work after the event returns, and the stand-in capture kept until both are handled.
 stage.setPointerCapture = () => {};
 const e = at(900, 100), o = { bubbles: true, cancelable: true, pointerId: 99, pointerType: "pen", clientX: e.x, clientY: e.y };
 stage.dispatchEvent(new PointerEvent("pointerdown", { ...o, button: 5, buttons: 32, pressure: 0.5 }));
+await wait(30);
 stage.dispatchEvent(new PointerEvent("pointerup", { ...o, button: 5, buttons: 0 }));
-delete stage.setPointerCapture;
 await wait(80);
+delete stage.setPointerCapture;
 if (data().length !== 2) return "the pen's eraser did not erase: " + data().length;
 await tap(btn("Undo"));
 
