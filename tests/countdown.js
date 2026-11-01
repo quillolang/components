@@ -4,7 +4,7 @@ const [year, sale, seat, early] = timers;
 const nums = (t) => [...t.querySelectorAll(".ui-cd-num")].map((n) => n.textContent);
 const names = [...year.querySelectorAll(".ui-cd-name")].map((n) => n.textContent);
 if (names.join() !== "Days,Hours,Minutes,Seconds") return `units: ${names}`;
-const left = (Date.UTC(2027, 0, 1) - Date.now()) / 1000;
+const left = (Date.UTC(new Date().getUTCFullYear() + 1, 0, 1) - Date.now()) / 1000;
 const shown = nums(year).map(Number);
 const secs = shown[0] * 86400 + shown[1] * 3600 + shown[2] * 60 + shown[3];
 if (Math.abs(secs - left) > 3) return `it shows ${secs} s left, there are ${Math.round(left)}`;
