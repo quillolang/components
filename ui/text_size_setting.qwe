@@ -1,0 +1,222 @@
+// TextSizeSetting: a slider for how large the text is, with a preview, and the whole page
+// following as it moves. It changes text only, not the layout around it, and it reaches
+// the kit's own sizes in px, through `text-size-adjust`, as a phone's browser and web view
+// do; a desktop browser ignores that, so there it zooms the page instead. It respects
+// the system: 100% means "as the system says", and at 100% it sets nothing at all, so
+// the system's own setting stays in charge. Above or below that, this multiplies it. iOS
+// says its text size to the page, so this adds to it and says what it is; Android's web
+// view applies its own under this one, and the page cannot read that.
+//
+// The choice is kept in a cookie, which outlasts a phone app's launches where
+// localStorage does not, and a server can read. With TextSizeSettingStyle in <head> the
+// page has its size before the first paint, with no script:
+//
+//   let size = get(request.cookies, "ui-text-size")
+//   <head> ... <TextSizeSettingStyle saved={size}/> </head>
+//   <TextSizeSetting saved={size}/>
+//   <TextSizeSetting value={110} remember={null} on_change={(p) => { save_size(p) }}/>
+//
+// value: the percent to start from with nothing saved (100). saved: what was kept, from the
+// cookie or your database; left out, the cookie is read in the browser, a moment after the
+// first paint. least, most: the slider's ends (85, 200). step: its steps (5). remember: the
+// cookie's name ("ui-text-size"), null for none. apply: make the page follow (true);
+// false leaves the page alone, and only the preview follows. label: the slider's name
+// ("Text size"). sample: the preview's words. id, class: for the outer element.
+// on_change(percent): inside one of your components, on letting go, not at each step.
+//
+// While a size is set --ui-text-scale is set on <html>, for a size of your own.
+// TextSizeSettingStyle takes saved, least, most and step, the same as here.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let text_size_setting_css = css`
+.ui-text-size-setting { container-type: inline-size; box-sizing: border-box; width: 100%; min-width: 0; color: var(--ui-fg); font: 15px/1.45 var(--ui-font); }
+.ui-text-size-setting-grid { display: grid; gap: 14px; }
+.ui-text-size-setting-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.ui-text-size-setting-head label { font-weight: 600; }
+.ui-text-size-setting-head output { color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-text-size-setting-row { display: flex; align-items: center; gap: 6px; }
+.ui-text-size-setting-key {
+  display: grid; place-items: center; flex: none; width: 44px; height: 44px; padding: 0; border: 1px solid var(--ui-border); border-radius: 50%;
+  background: var(--ui-surface); color: var(--ui-fg); font-family: var(--ui-font); font-weight: 600; cursor: pointer;
+}
+.ui-text-size-setting-key:disabled { color: var(--ui-strong); cursor: default; }
+.ui-text-size-setting-key:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-text-size-setting-less { font-size: 13px; }
+.ui-text-size-setting-more { font-size: 20px; }
+.ui-text-size-setting-track { position: relative; flex: 1; min-width: 0; height: 44px; }
+.ui-text-size-setting-mark { position: absolute; top: 50%; left: var(--ui-text-size-setting-at); width: 2px; height: 16px; margin: -8px 0 0 -1px; background: var(--ui-strong); pointer-events: none; }
+.ui-text-size-setting-track input {
+  position: relative; display: block; box-sizing: border-box; width: 100%; height: 44px; margin: 0; background: transparent; accent-color: var(--ui-accent); cursor: pointer;
+  /* Up and down stays the page's, so a slider in a long settings screen can be scrolled past. */
+  touch-action: pan-y;
+}
+.ui-text-size-setting-track input:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: var(--ui-radius-sm); }
+.ui-text-size-setting-preview { box-sizing: border-box; min-width: 0; padding: 14px 16px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-text-size-setting-preview h3 { margin: 0 0 4px; font-size: 17px; font-weight: 600; }
+.ui-text-size-setting-preview p { margin: 0; font-size: 15px; }
+.ui-text-size-setting-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+/* Asks the browser two things and is never seen. Held to its own size, as the page's scale would otherwise count twice. */
+.ui-text-size-setting-probe { position: absolute; visibility: hidden; pointer-events: none; }
+.ui-text-size-setting-probe-system { font: -apple-system-body; -webkit-text-size-adjust: none; text-size-adjust: none; }
+.ui-text-size-setting-probe-adjust { font-size: 20px; -webkit-text-size-adjust: 200%; text-size-adjust: 200%; }
+@container (min-width: 640px) {
+  .ui-text-size-setting-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 14px 24px; }
+  .ui-text-size-setting-preview { grid-column: 2; grid-row: 1 / span 4; }
+}
+`
+
+// A number from a prop or a cookie, which may be text; anything else is null.
+fn text_size_setting_number(x) {
+    let kind = type_of(x)
+    if kind == "int" || kind == "float" { return x }
+    if kind != "str" || len(x) > 6 { return null }
+    let n = int(trim(x))
+    is_err(n) ? null : n
+}
+
+fn text_size_setting_ends(least, most) {
+    let low = text_size_setting_number(least) ?? 85
+    let high = text_size_setting_number(most) ?? 200
+    low > 0 && high > low ? { low, high } : { low: 85, high: 200 }
+}
+
+fn text_size_setting_step(step) {
+    let n = text_size_setting_number(step) ?? 5
+    n > 0 ? n : 5
+}
+
+// A value on the slider: within the ends, on a step counted from the low end.
+fn text_size_setting_snap(v, least, most, step) {
+    let ends = text_size_setting_ends(least, most)
+    let by = text_size_setting_step(step)
+    let n = text_size_setting_number(v) ?? 100
+    let inside = min([max([n, ends.low]), ends.high])
+    min([ends.low + round((inside - ends.low) / by) * by, ends.high])
+}
+
+// What the cookie holds of this name, in a `document.cookie` line.
+fn text_size_setting_cookie(line, name: str) {
+    if type_of(line) != "str" { return null }
+    let found = split(line, ";") | map((p) => trim(p)) | find((p) => starts_with(p, `${name}=`))
+    found != null ? slice(found, len(name) + 1, len(found)) : null
+}
+
+// The system's text size as a percent, from the size iOS gives `-apple-system-body`, 17 px
+// as it comes. Null when the text is not a size.
+fn text_size_setting_system(px) {
+    if type_of(px) != "str" || !ends_with(px, "px") { return null }
+    let n = float(replace(px, "px", ""))
+    is_err(n) || n <= 0 ? null : round(n / 17 * 100)
+}
+
+// What to ask the browser for: the choice on top of the system, at most `most`.
+fn text_size_setting_effective(chosen, system, most) {
+    let on = system != null ? round(chosen * system / 100) : chosen
+    let high = text_size_setting_number(most) ?? 200
+    system != null ? min([on, max([high, system])]) : on
+}
+
+// The sheet for a percent. At 100 it is empty, so nothing overrides the system's own.
+fn text_size_setting_css_for(percent, zoomed: bool) -> str {
+    if percent == 100 { return "" }
+    let scale = round(percent / 100, 4)
+    zoomed
+        ? `html { zoom: ${scale}; --ui-text-scale: ${scale}; }`
+        : `html { -webkit-text-size-adjust: ${percent}%; text-size-adjust: ${percent}%; --ui-text-scale: ${scale}; }`
+}
+
+// Goes in <head>, so that the page starts at the kept size with no script. It writes only
+// numbers it worked out itself, as a cookie can say anything.
+view TextSizeSettingStyle(saved = null, least = 85, most = 200, step = 5) {
+    let on = text_size_setting_number(saved) != null ? text_size_setting_snap(saved, least, most, step) : 100
+    <style id="ui-text-size-setting-style">{text_size_setting_css_for(on, false)}</style>
+}
+
+fn text_size_setting_tag(doc) {
+    let found = doc.getElementById("ui-text-size-setting-style")
+    if found != null { return found }
+    let tag = doc.createElement("style")
+    tag.id = "ui-text-size-setting-style"
+    doc.head.append(tag)
+    tag
+}
+
+component TextSizeSetting(value = 100, saved = null, least = 85, most = 200, step = 5, remember: str? = "ui-text-size", apply: bool = true,
+                          label: str = "Text size", sample: str = "This is how your reading will look. Move the slider until it is comfortable.",
+                          id: str? = null, class: str? = null, on_change = null) {
+    style global text_size_setting_css
+    state size = text_size_setting_snap(saved ?? value, least, most, step)
+    state doc = null
+    state system = null
+    state zoomed = false
+    let ends = text_size_setting_ends(least, most)
+    let by = text_size_setting_step(step)
+    let at = round((100 - ends.low) / (ends.high - ends.low) * 100, 2)
+    let field = id != null ? `${id}-range` : "ui-text-size-setting-range"
+    let write = () => {
+        if doc != null && apply {
+            text_size_setting_tag(doc).textContent = text_size_setting_css_for(text_size_setting_effective(size, system, ends.high), zoomed)
+        }
+    }
+    let keep = () => {
+        if doc != null && remember != null {
+            doc.cookie = `${remember}=${size}; Path=/; Max-Age=31536000; SameSite=Lax`
+        }
+        on_change && on_change(size)
+    }
+    let nudge = (dir) => {
+        size = text_size_setting_snap(size + dir * by, least, most, step)
+        write()
+        keep()
+    }
+    <div class={ui_cls(["ui-text-size-setting", class])} id={id}
+         @mount={(el) => {
+             let win = js("window")
+             let d = win.document
+             let got = text_size_setting_cookie(d.cookie, remember ?? "")
+             let probe = el.querySelector(".ui-text-size-setting-probe-adjust")
+             zoomed = win.getComputedStyle(probe).fontSize != "40px"
+             if win.CSS.supports("font", "-apple-system-body") {
+                 system = text_size_setting_system(win.getComputedStyle(el.querySelector(".ui-text-size-setting-probe-system")).fontSize)
+             }
+             doc = d
+             if saved == null && remember != null && text_size_setting_number(got) != null { size = text_size_setting_snap(got, least, most, step) }
+             write()
+         }}>
+        <i.ui-text-size-setting-probe.ui-text-size-setting-probe-adjust aria-hidden="true"></i>
+        <i.ui-text-size-setting-probe.ui-text-size-setting-probe-system aria-hidden="true"></i>
+        <div.ui-text-size-setting-grid>
+            <div.ui-text-size-setting-head>
+                <label for={field}>{label}</label>
+                <output for={field}>{size}%</output>
+            </div>
+            <div.ui-text-size-setting-row>
+                <button.ui-text-size-setting-key.ui-text-size-setting-less type="button" aria-label="Smaller text" disabled={size <= ends.low} @click={() => { nudge(-1) }}>A</button>
+                <div.ui-text-size-setting-track style={`--ui-text-size-setting-at: ${at}%`}>
+                    <i.ui-text-size-setting-mark aria-hidden="true"></i>
+                    <input id={field} type="range" min={ends.low} max={ends.high} step={by} value={size} aria-valuetext={`${size} percent`}
+                           @input={(e) => {
+                               size = text_size_setting_snap(e.value, least, most, step)
+                               write()
+                           }}
+                           @change={() => { keep() }}/>
+                </div>
+                <button.ui-text-size-setting-key.ui-text-size-setting-more type="button" aria-label="Larger text" disabled={size >= ends.high} @click={() => { nudge(1) }}>A</button>
+            </div>
+            <Button size="lg" variant="outline" disabled={size == 100} on_click={() => {
+                size = text_size_setting_snap(100, least, most, step)
+                write()
+                keep()
+            }}>Same as the system</Button>
+            <p.ui-text-size-setting-note role="status">{system != null
+                ? `The system's text size is ${system}%, and this goes on top of it.`
+                : "Whatever the system sets stays underneath this."}</p>
+            <div.ui-text-size-setting-preview style={apply ? null : `zoom: ${round(size / 100, 4)}`}>
+                <h3>Preview</h3>
+                <p>{sample}</p>
+            </div>
+        </div>
+    </div>
+}

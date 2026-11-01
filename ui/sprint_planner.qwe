@@ -1,0 +1,344 @@
+// SprintPlanner: what fits in a sprint. Capacity comes from the team's working days, so
+// a day off lowers it at once. Auto-fit takes the backlog by priority and brings each
+// item's dependencies with it, so nothing is planned ahead of what it needs; what does
+// not fit is marked with the reason. Items can then be moved by hand, by button or by
+// dragging, and the capacity and any broken dependency show as they move.
+//
+//   <SprintPlanner days={10} rate={0.8} team={[{ name: "Ana", days_off: 2 }, { name: "Ben" }]}
+//       items={[{ id: "A", title: "Login", points: 5, priority: 1 },
+//               { id: "B", title: "Reset password", points: 3, priority: 2, deps: ["A"] }]}/>
+//
+// team: a list of { name, days_off? }, days_off being how many of the sprint's days they
+// are away. days: working days in the sprint (10). rate: points one person does in a day,
+// a decimal (1). items: the backlog, a list of { id, title?, points, priority?, deps? }.
+// priority: 1 first; "high", "medium" and "low" also work (left out, last). deps: ids of
+// items it needs. planned: the ids in the sprint to start with; left out, it starts
+// auto-fitted. title: the heading. id: a prefix for its ids, unique on the page. name:
+// a prefix for the fields: the days off are <name>_off_0 and so on, and the sprint's
+// ids are <name>_planned, comma-separated ("sprint"). on_change(plan): inside one of your
+// components, after each change, with { planned, used, capacity, left }, decimals.
+//
+// The logic stands alone: sprint_planner_capacity(team, days, rate), sprint_planner_read(items)
+// gives { items, problems, stuck }, sprint_planner_fit(read, capacity) gives { planned,
+// why, used }, and sprint_planner_check(read, planned, capacity) gives { used, left,
+// warnings }. Points may be fractions and add up exactly. It reads at most 1,000 items.
+
+import ui/theme.qwe use ui_cls
+
+let sprint_planner_css = css`
+.ui-sprint-planner { display: grid; gap: 14px; min-width: 0; padding: 18px 20px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-sprint-planner .ui-sprint-planner-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-sprint-planner-team { display: flex; flex-wrap: wrap; gap: 10px 14px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-sprint-planner-team legend { padding: 0 0 4px; font-size: 13px; font-weight: 600; }
+.ui-sprint-planner-off { display: grid; gap: 3px; font-size: 13px; }
+.ui-sprint-planner-off input { box-sizing: border-box; width: 88px; padding: 5px 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); }
+.ui-sprint-planner-off input:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-sprint-planner-off input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-sprint-planner-meter { display: grid; gap: 4px; }
+.ui-sprint-planner-figures { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-sprint-planner-used, .ui-sprint-planner-left { white-space: nowrap; }
+.ui-sprint-planner-bar { display: block; height: 8px; overflow: hidden; border-radius: 4px; background: var(--ui-subtle); }
+.ui-sprint-planner-bar i { display: block; height: 100%; background: var(--ui-accent); }
+.ui-sprint-planner-full .ui-sprint-planner-figures { color: var(--ui-danger); }
+.ui-sprint-planner-full .ui-sprint-planner-bar i { background: var(--ui-danger); }
+.ui-sprint-planner-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-sprint-planner-warnings { display: grid; gap: 2px; margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; list-style: none; }
+.ui-sprint-planner-lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.ui-sprint-planner-list { display: grid; align-content: start; gap: 6px; min-width: 0; min-height: 80px; padding: 10px; border: 1px dashed var(--ui-strong); border-radius: var(--ui-radius-sm); }
+.ui-sprint-planner-list h4 { margin: 0; font-size: 13px; font-weight: 650; }
+.ui-sprint-planner-list ul { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-sprint-planner-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; padding: 7px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); font-size: 13px; cursor: grab; }
+.ui-sprint-planner-name { min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
+.ui-sprint-planner-meta { color: var(--ui-muted); font-size: 12px; }
+.ui-sprint-planner-why { grid-column: 1 / -1; color: var(--ui-warning); font-size: 12px; overflow-wrap: anywhere; }
+.ui-sprint-planner-btn { padding: 4px 9px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 12px/1.2 var(--ui-font); cursor: pointer; }
+.ui-sprint-planner-btn:hover { border-color: var(--ui-accent); }
+.ui-sprint-planner-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-sprint-planner-fit { justify-self: start; border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); font-size: 13px; padding: 7px 12px; }
+.ui-sprint-planner-said { min-height: 1.4em; margin: 0; color: var(--ui-muted); font-size: 13px; }
+`
+
+let sprint_planner_most = 1000
+
+// A number as a decimal of 0 or more, or null.
+fn sprint_planner_num(v) {
+    let kind = type_of(v)
+    if kind != "int" && kind != "float" && kind != "dec" && kind != "str" { return null }
+    let d = dec(v)
+    is_err(d) || d < 0 ? null : d
+}
+
+// Numbers as they read: 22.40m is "22.4", 8.00m is "8".
+fn sprint_planner_show(d) -> str {
+    let s = str(d)
+    contains(s, ".") ? re.replace(re.replace(s, "0+$", ""), "\\.$", "") : s
+}
+
+// A person's days off as an int from 0 to `days`, or null.
+fn sprint_planner_off(v, days: int) {
+    if v == null || v == "" { return 0 }
+    let t = trim(str(v))
+    if !re.test(t, "^\\d{1,6}$") { return null }
+    let n = int(t)
+    n <= days ? n : null
+}
+
+// Points the team can do: each person's days at work, times the rate. A day-off value
+// that cannot be read counts as none, and the field says so.
+fn sprint_planner_capacity(team, days: int, rate) {
+    let per_day = sprint_planner_num(rate) ?? 0m
+    let worked = (type_of(team) == "list" ? team : []) | map((t) => days - (sprint_planner_off(type_of(t) == "map" ? t.days_off : null, days) ?? 0)) | sum()
+    per_day * worked
+}
+
+// Priority as a number: 1 goes first.
+fn sprint_planner_rank(p) -> int {
+    if type_of(p) == "int" { return p }
+    let t = lower(trim(str(p ?? "")))
+    match t {
+        "highest" | "critical" => 0
+        "high" => 1
+        "medium" => 2
+        "low" => 3
+        _ => re.test(t, "^\\d{1,6}$") ? int(t) : 1000000
+    }
+}
+
+// The first cycle through `id`, if following deps from it leads back: ids in order.
+fn sprint_planner_loop(id: str, trail: list, deps: map, seen: map) -> map {
+    let at = index_of(trail, id)
+    if at != null && at >= 0 { return { found: slice(trail, at, len(trail)) | push(id), seen } }
+    if has(seen, id) { return { found: null, seen } }
+    let mark = set(seen, id, true)
+    let path = trail | push(id)
+    let out = { found: null, seen: mark }
+    for d in get(deps, id) ?? [] {
+        if out.found == null { out = sprint_planner_loop(d, path, deps, out.seen) }
+    }
+    out
+}
+
+// The backlog made safe: { items, by_id, problems, stuck }. `stuck` maps each item that can
+// never be planned to the reason, which is whatever is wrong with it or what it needs.
+fn sprint_planner_read(items) -> map {
+    let given = type_of(items) == "list" ? items : []
+    let good = []
+    let by_id = {}
+    let problems = []
+    if len(given) > sprint_planner_most { problems = problems | push(`Only the first ${sprint_planner_most} items are read.`) }
+    for [i, it] in enumerate(take(given, sprint_planner_most)) {
+        let at = `Item ${i + 1}`
+        let m = type_of(it) == "map" ? it : {}
+        let id = trim(str(m.id ?? ""))
+        let points = sprint_planner_num(m.points)
+        if type_of(it) != "map" {
+            problems = problems | push(`${at}: this is not an item.`)
+        } else if id == "" {
+            problems = problems | push(`${at}: it has no id.`)
+        } else if has(by_id, id) {
+            problems = problems | push(`${at}: the id ${id} is used twice.`)
+        } else if points == null {
+            problems = problems | push(`${at} (${id}): "${slice(str(m.points ?? ""), 0, 20)}" is not a number of points.`)
+        } else {
+            let deps = (type_of(m.deps) == "list" ? m.deps : []) | map((d) => trim(str(d))) | filter((d) => d != "") | unique
+            let item = { id, title: filled(trim(str(m.title ?? ""))) ?? id, points, rank: sprint_planner_rank(m.priority), order: i, deps }
+            good = good | push(item)
+            by_id = set(by_id, id, item)
+        }
+    }
+    let deps = {}
+    for it in good { deps = set(deps, it.id, it.deps) }
+    let stuck = {}
+    for it in good {
+        for d in it.deps {
+            if !has(by_id, d) { stuck = set(stuck, it.id, `Depends on ${slice(d, 0, 30)}, which is not in the backlog.`) }
+        }
+    }
+    // Marks are shared, so each item is walked once however the backlog is shaped.
+    let walked = {}
+    for it in good {
+        let r = sprint_planner_loop(it.id, [], deps, walked)
+        walked = r.seen
+        if r.found != null {
+            for id in r.found {
+                if !has(stuck, id) { stuck = set(stuck, id, `In a cycle: ${join(r.found, " → ")}.`) }
+            }
+        }
+    }
+    // What needs something stuck is stuck in turn; each pass reaches one step further.
+    let changed = true
+    while changed {
+        changed = false
+        for it in good {
+            if !has(stuck, it.id) {
+                let bad = it.deps | find((d) => has(stuck, d))
+                if bad != null {
+                    stuck = set(stuck, it.id, `Depends on ${bad}, which cannot be planned.`)
+                    changed = true
+                }
+            }
+        }
+    }
+    { items: good, by_id, problems, stuck }
+}
+
+// The items by priority, the list's order within one.
+fn sprint_planner_order(items: list) -> list = sort_by(sort_by(items, (i) => i.order), (i) => i.rank)
+
+// What must come in for `id`, dependencies first, leaving out what is already `in`.
+fn sprint_planner_needs(id: str, by_id: map, planned: map, out: list) -> list {
+    if has(planned, id) || contains(out, id) { return out }
+    let mine = out
+    for d in get(by_id, id).deps { mine = sprint_planner_needs(d, by_id, planned, mine) }
+    mine | push(id)
+}
+
+// See the top of the file. An item that does not fit is passed over, so a smaller one
+// after it can still go in; capacity is never overrun.
+fn sprint_planner_fit(read: map, capacity) -> map {
+    let planned = {}
+    let order = []
+    let why = {}
+    let used = 0m
+    for it in sprint_planner_order(read.items) {
+        if !has(planned, it.id) {
+            if has(read.stuck, it.id) {
+                why = set(why, it.id, get(read.stuck, it.id))
+            } else {
+                let bring = sprint_planner_needs(it.id, read.by_id, planned, [])
+                let cost = bring | map((i) => get(read.by_id, i).points) | sum()
+                if used + cost <= capacity {
+                    for i in bring { planned = set(planned, i, true) }
+                    order = order + bring
+                    used += cost
+                }
+            }
+        }
+    }
+    // Reasons are written last, against what finally went in: nothing can fit now that
+    // did not at its turn, as whatever came in after it took at least what it saved.
+    for it in read.items {
+        if !has(planned, it.id) && !has(read.stuck, it.id) {
+            let bring = sprint_planner_needs(it.id, read.by_id, planned, [])
+            let cost = bring | map((i) => get(read.by_id, i).points) | sum()
+            let extra = bring | filter((i) => i != it.id)
+            let left = sprint_planner_show(capacity - used)
+            why = set(why, it.id, len(extra) > 0
+                ? `Needs ${sprint_planner_show(cost)} points with ${join(extra, ", ")}; ${left} left.`
+                : `Needs ${sprint_planner_show(cost)} points; ${left} left.`)
+        }
+    }
+    { planned: order, why, used }
+}
+
+// See the top of the file. Warnings are for what a hand move broke.
+fn sprint_planner_check(read: map, planned: list, capacity) -> map {
+    let used = planned | map((i) => get(read.by_id, i).points) | sum()
+    let inside = {}
+    for i in planned { inside = set(inside, i, true) }
+    let warnings = []
+    for i in planned {
+        let it = get(read.by_id, i)
+        for d in it.deps {
+            if !has(inside, d) { warnings = warnings | push(`${i} needs ${slice(d, 0, 30)}, which is not in the sprint.`) }
+        }
+    }
+    let total = dec(used)
+    if total > capacity { warnings = warnings | push(`The sprint is ${sprint_planner_show(total - capacity)} points over capacity.`) }
+    { used: total, left: capacity - total, warnings }
+}
+
+component SprintPlanner(team: list = [], days: int = 10, rate = 1, items: list = [], planned: list? = null, title: str = "Sprint plan", id: str = "sprint-planner",
+                        name: str = "sprint", on_change = null, class: str? = null) {
+    style global sprint_planner_css
+    let span = days >= 0 ? min([days, 1000]) : 0
+    let read = sprint_planner_read(items)
+    let people = (type_of(team) == "list" ? team : []) | map((t) => type_of(t) == "map" ? t : { name: str(t) })
+    state offs = people | map((t) => t.days_off == null ? "" : str(t.days_off))
+    let capacity = sprint_planner_capacity(zip(people, offs) | map((p) => ({ days_off: p[1] })), span, rate)
+    let starts = planned != null ? planned | map(str) | filter((i) => has(read.by_id, i)) | unique : sprint_planner_fit(read, capacity).planned
+    state sprint = starts
+    state reasons = planned != null ? {} : sprint_planner_fit(read, capacity).why
+    state held = null
+    state said = ""
+    let check = sprint_planner_check(read, sprint, capacity)
+    let inside = read.items | filter((i) => contains(sprint, i.id))
+    let outside = sprint_planner_order(read.items | filter((i) => !contains(sprint, i.id)))
+    let tell = () => {
+        if on_change != null {
+            let c = sprint_planner_check(read, sprint, sprint_planner_capacity(zip(people, offs) | map((p) => ({ days_off: p[1] })), span, rate))
+            // Trailing zeros off, so 0.8 x 20 is told as 16, not 16.0.
+            let plain = (d) => dec(sprint_planner_show(d))
+            on_change({ planned: sprint, used: plain(c.used), capacity: plain(c.used + c.left), left: plain(c.left) })
+        }
+    }
+    let bring_in = (i: str) => {
+        if !contains(sprint, i) {
+            sprint = sprint | push(i)
+            reasons = remove(reasons, i)
+            said = `${i} moved into the sprint.`
+            tell()
+        }
+    }
+    let send_out = (i: str) => {
+        if contains(sprint, i) {
+            sprint = remove(sprint, i)
+            reasons = set(reasons, i, "Moved out by hand.")
+            said = `${i} moved out of the sprint.`
+            tell()
+        }
+    }
+    let auto = () => {
+        let f = sprint_planner_fit(read, capacity)
+        sprint = f.planned
+        reasons = f.why
+        said = `${len(f.planned)} of ${len(read.items)} items fit, ${sprint_planner_show(f.used)} of ${sprint_planner_show(capacity)} points.`
+        tell()
+    }
+    let width = capacity > 0 ? int(min([check.used * 100 / capacity, 100m])) : (check.used > 0 ? 100 : 0)
+    let label = (it) => `P${it.rank >= 1000000 ? "–" : it.rank}, ${sprint_planner_show(it.points)} pts${len(it.deps) > 0 ? `, needs ${join(it.deps, " ")}` : ""}`
+    <section class={ui_cls(["ui-sprint-planner", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-sprint-planner-title id={`${id}-title`}>{title}</h3>
+        <input type="hidden" name={`${name}_planned`} value={join(sprint, ",")}/>
+        {len(people) > 0 && <fieldset.ui-sprint-planner-team>
+            <legend>Days off, of {span}</legend>
+            {for [i, p] in enumerate(people) => <label.ui-sprint-planner-off key={i}>{p.name}
+                <input type="text" inputmode="numeric" id={`${id}-off-${i}`} name={`${name}_off_${i}`} value={offs[i]} placeholder="0" autocomplete="off"
+                       aria-invalid={sprint_planner_off(offs[i], span) == null ? "true" : null}
+                       @input={(e) => { offs = set(offs, i, e.value); tell() }}/>
+            </label>}
+        </fieldset>}
+        {any(offs, (o) => sprint_planner_off(o, span) == null) && <p.ui-sprint-planner-problems role="alert">Days off must be a whole number from 0 to {span}; those that are not count as 0.</p>}
+        {len(read.problems) > 0 && <ul.ui-sprint-planner-problems role="alert">{for p in take(read.problems, 6) => <li key={p}>{p}</li>}</ul>}
+        <div class={ui_cls(["ui-sprint-planner-meter", check.left < 0 && "ui-sprint-planner-full"])} aria-live="polite">
+            <p.ui-sprint-planner-figures>
+                <span.ui-sprint-planner-used>{sprint_planner_show(check.used)} of {sprint_planner_show(capacity)} points</span>
+                <span.ui-sprint-planner-left>{check.left >= 0 ? `${sprint_planner_show(check.left)} left` : `${sprint_planner_show(0m - check.left)} over`}</span>
+            </p>
+            <span.ui-sprint-planner-bar aria-hidden="true"><i style={`width: ${width}%`}></i></span>
+        </div>
+        {len(check.warnings) > 0 && <ul.ui-sprint-planner-warnings>{for w in take(check.warnings, 8) => <li key={w}>{w}</li>}</ul>}
+        <button class="ui-sprint-planner-btn ui-sprint-planner-fit" type="button" @click={auto}>Auto-fit by priority</button>
+        <div.ui-sprint-planner-lists>
+            <div.ui-sprint-planner-list data-list="in" @dragover={(e) => { e.preventDefault() }} @drop={(e) => { e.preventDefault(); held && bring_in(held); held = null }}>
+                <h4>In the sprint ({len(inside)})</h4>
+                <ul>{for it in inside => <li.ui-sprint-planner-item key={it.id} data-item={it.id} draggable="true" @dragstart={(e) => { held = it.id }}>
+                    <span.ui-sprint-planner-name>{it.id}: {it.title}</span>
+                    <button.ui-sprint-planner-btn type="button" aria-label={`Move ${it.id} out of the sprint`} @click={() => { send_out(it.id) }}>Out</button>
+                    <span.ui-sprint-planner-meta>{label(it)}</span>
+                </li>}</ul>
+            </div>
+            <div.ui-sprint-planner-list data-list="out" @dragover={(e) => { e.preventDefault() }} @drop={(e) => { e.preventDefault(); held && send_out(held); held = null }}>
+                <h4>Did not fit ({len(outside)})</h4>
+                <ul>{for it in outside => <li.ui-sprint-planner-item key={it.id} data-item={it.id} draggable="true" @dragstart={(e) => { held = it.id }}>
+                    <span.ui-sprint-planner-name>{it.id}: {it.title}</span>
+                    <button.ui-sprint-planner-btn type="button" aria-label={`Move ${it.id} into the sprint`} @click={() => { bring_in(it.id) }}>In</button>
+                    <span.ui-sprint-planner-meta>{label(it)}</span>
+                    {(get(read.stuck, it.id) ?? get(reasons, it.id)) != null && <span.ui-sprint-planner-why>{get(read.stuck, it.id) ?? get(reasons, it.id)}</span>}
+                </li>}</ul>
+            </div>
+        </div>
+        <p.ui-sprint-planner-said aria-live="polite">{said}</p>
+    </section>
+}

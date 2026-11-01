@@ -1,0 +1,139 @@
+// ExpandingRow: a row that opens in place, its content pushing what is below it
+// down smoothly, as in a phone's Clock or Reminders. Rows that share a `group` keep
+// only one open. Once open, the row scrolls itself into view, inside whatever scrolls
+// it, so the part just opened is not left below the fold; a row taller than the
+// screen comes to its top. It is a real button with aria-expanded, so a keyboard
+// and a screen reader work it as a finger does, and what is in a closed row cannot
+// be reached by Tab.
+//
+//   <ExpandingRow title="Morning alarm" subtitle="7:00, weekdays" meta="On" group="alarms">
+//       <p>Ring, snooze and repeat go here.</p>
+//   </ExpandingRow>
+//
+// title: the words. subtitle: a second line. meta: on the right, muted. open: starts
+// open; when this prop changes, the row follows it. group: rows with the same word,
+// anywhere on the page, keep one open between them; left out, each row is on its own.
+// id: for its parts' ids and aria-controls (made from the title when left out, so
+// give it when titles repeat). margin: pixels kept clear above the row when it
+// scrolls into view, the height of a sticky header (0). on_toggle(open): inside one
+// of your components, true or false, when a person opens or closes it, and false when
+// another of its group takes over. class: on the outer element. children: what opens.
+//
+// The animation is a grid row growing from 0fr to 1fr, which needs no measuring, so
+// content that changes size while open stays right. Reduced motion opens at once.
+
+import ui/theme.qwe use ui_cls
+
+let expanding_row_css = css`
+.ui-exprow { container-type: inline-size; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); color: var(--ui-fg); font: 16px/1.35 var(--ui-font); }
+.ui-exprow-h { margin: 0; font: inherit; }
+.ui-exprow-head { display: flex; align-items: center; gap: 10px; box-sizing: border-box; width: 100%; min-height: 56px; padding: 8px 16px; border: 0; background: transparent; color: inherit; font: inherit;
+  text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+.ui-exprow-head:active { background: color-mix(in srgb, var(--ui-fg) 8%, transparent); }
+@media (hover: hover) { .ui-exprow-head:hover { background: color-mix(in srgb, var(--ui-fg) 4%, transparent); } }
+.ui-exprow-head:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-exprow-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ui-exprow-sub { display: block; color: var(--ui-muted); font-size: 13px; }
+.ui-exprow-meta { flex: none; max-width: 40%; color: var(--ui-muted); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-exprow-mark { flex: none; width: 14px; height: 8px; color: var(--ui-muted); transition: transform .24s cubic-bezier(.2, .8, .2, 1); }
+.ui-exprow-on .ui-exprow-mark { transform: rotate(180deg); }
+.ui-exprow-panel { display: grid; grid-template-rows: 0fr; visibility: hidden; transition: grid-template-rows .24s cubic-bezier(.2, .8, .2, 1), visibility 0s linear .24s; }
+.ui-exprow-on .ui-exprow-panel { grid-template-rows: 1fr; visibility: visible; transition: grid-template-rows .24s cubic-bezier(.2, .8, .2, 1), visibility 0s; }
+.ui-exprow-clip { min-height: 0; overflow: hidden; }
+.ui-exprow-body { padding: 2px 16px 16px; }
+.ui-exprow-body > :first-child { margin-top: 0; }
+.ui-exprow-body > :last-child { margin-bottom: 0; }
+@container (min-width: 640px) { .ui-exprow-body { padding: 4px 56px 18px 16px; } }
+@media (prefers-reduced-motion: reduce) { .ui-exprow-panel, .ui-exprow-on .ui-exprow-panel, .ui-exprow-mark { transition: none; } }
+`
+
+// The block position for scrollIntoView: a row that fits is moved as little as
+// possible; one taller than its view comes to its top, or its start would be lost.
+fn expanding_row_block(row_height: num, view_height: num) -> str = row_height > view_height ? "start" : "nearest"
+
+// How tall the view around a row is: the box that scrolls it, else the visible part
+// of the screen, which leaves out the on-screen keyboard.
+fn expanding_row_view(el) {
+    let box = el.parentElement
+    while box != null {
+        let flow = js("getComputedStyle", box).overflowY
+        if (flow == "auto" || flow == "scroll") && box.scrollHeight > box.clientHeight { return box.clientHeight }
+        box = box.parentElement
+    }
+    let seen = js("window.visualViewport.height")
+    is_err(seen) ? js("window.innerHeight") : seen
+}
+
+// An id for the row's parts from its title, for when none is given.
+fn expanding_row_id(id: str?, title: str) -> str {
+    if id != null && id != "" { return id }
+    let made = re.replace(lower(title), "[^a-z0-9]+", "-")
+    `ui-exprow-${made == "" ? "row" : made}`
+}
+
+component ExpandingRow(title: str = "", subtitle: str? = null, meta: str? = null, open: bool = false, group: str? = null, id: str? = null,
+                       margin: int = 0, on_toggle = null, class: str? = null, children) {
+    style global expanding_row_css
+    state shut = !open
+    state given = open
+    state root = null
+    let the_id = expanding_row_id(id, title)
+    // Scrolls once the row has its full height. Reduced motion has no transition to wait for.
+    let show = () => {
+        if root != null && !shut {
+            let tall = root.getBoundingClientRect().height
+            let quiet = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+            root.scrollIntoView({ block: expanding_row_block(tall, expanding_row_view(root) - margin), behavior: quiet ? "instant" : "smooth" })
+        }
+    }
+    let opened = () => {
+        if group != null && root != null { root.dispatchEvent(js_new("CustomEvent", "ui-exprow-open", { bubbles: true, detail: { group } })) }
+        // Asked each time, as a person can change it with the app open.
+        if js("matchMedia", "(prefers-reduced-motion: reduce)").matches { js("requestAnimationFrame", (_t = null) => { show() }) }
+    }
+    let flip = () => {
+        shut = !shut
+        if !shut { opened() }
+        on_toggle && on_toggle(!shut)
+    }
+    if open != given {
+        given = open
+        if shut == open {
+            shut = !open
+            if open { opened() }
+        }
+    }
+    <div class={ui_cls(["ui-exprow", !shut && "ui-exprow-on", class])} data-group={group}
+         style={margin != 0 ? `scroll-margin-top: ${margin}px` : null}
+         @mount={(el) => {
+             root = el
+             // Rows of a group tell each other through an event of their own on the
+             // document, as they may stand in different components.
+             let d = js("document")
+             let other = (e) => {
+                 if group != null && e.detail.group == group && !el.contains(e.target) && !shut {
+                     shut = true
+                     on_toggle && on_toggle(false)
+                 }
+             }
+             d.addEventListener("ui-exprow-open", other)
+             () => d.removeEventListener("ui-exprow-open", other)
+         }}>
+        <h3.ui-exprow-h>
+            <button.ui-exprow-head type="button" id={`${the_id}-head`} aria-expanded={shut ? "false" : "true"} aria-controls={`${the_id}-panel`}
+                    @click={flip}>
+                <span.ui-exprow-text>{title}{subtitle != null && <span.ui-exprow-sub>{subtitle}</span>}</span>
+                {meta != null && <span.ui-exprow-meta>{meta}</span>}
+                <svg.ui-exprow-mark viewBox="0 0 14 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m1 1 6 6 6-6"/></svg>
+            </button>
+        </h3>
+        <div.ui-exprow-panel id={`${the_id}-panel`} role="region" aria-labelledby={`${the_id}-head`}
+             @transitionend={(e) => {
+                 // Only the panel's own growth, not a transition inside what was passed in.
+                 // (isSameNode: `==` says any two elements are equal.)
+                 if e.target.isSameNode(e.currentTarget) && e.propertyName == "grid-template-rows" { show() }
+             }}>
+            <div.ui-exprow-clip><div.ui-exprow-body>{children}</div></div>
+        </div>
+    </div>
+}

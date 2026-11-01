@@ -1,0 +1,297 @@
+// TextCompare: two texts compared word by word: what was taken out and what was put in,
+// marked with <del> and <ins>, how similar they are, and the counts, in one column or
+// side by side. Case and spacing can be ignored. It finds the longest common subsequence
+// itself, by Myers's method, so a small change in a long text is quick. Past what can be
+// worked out between two keystrokes it stops and marks the rest as replaced, and says so.
+//
+//   <TextCompare before={old_draft} after={new_draft}/>
+//   <TextCompare before={a} after={b} mode="side" ignore_case={true} on_change={(r) => { similar = r.similarity }}/>
+//
+// before, after: the two texts to start with. before_label ("Before") and after_label
+// ("After") name the boxes, and before_name ("before") and after_name ("after") are the
+// fields' names, so a plain <form> sends them. mode: "inline" (one column, the default)
+// or "side" (side by side). ignore_case, ignore_space: start with those options on. id:
+// a prefix for its ids ("text-compare"), unique on the page. rows: the boxes' height
+// in lines (6). limit: the most words and marks read of each text (20000). most: the
+// most changes it follows (2000). on_change(result): inside one of your components, given
+// the map below as it changes. class: more classes for its outer element.
+//
+// text_compare_of(before, after, ignore_case, ignore_space, limit, most) is the
+// comparison, for a program's own use: { hunks, similarity, added, removed, unchanged,
+// spacing, same, partial, capped }. hunks lists { kind, left, right } in order, kind
+// being "same", "del", "ins" or "space" (only the spaces between two words differ), left the
+// text in `before`, right the text in `after`. added, removed and unchanged count words;
+// spacing counts the places only spaces differ. similarity is a percentage to one
+// decimal, twice the tokens kept over all the tokens of both, and is 100 only for
+// texts with no change. same says whether nothing differs; partial that it stopped at
+// `most`; capped that it stopped at `limit`. text_compare_path(a, b, most) is the
+// comparison of any two lists of text: runs of { kind, a0, a1, b0, b1 }.
+
+import ui/theme.qwe use ui_cls
+import ui/readability_meter.qwe use readability_meter_one, readability_meter_word_re
+
+let text_compare_css = css`
+.ui-text-compare { display: grid; gap: 14px; min-width: 0; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-text-compare-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px 14px; min-width: 0; }
+.ui-text-compare-field { display: grid; gap: 4px; min-width: 0; }
+.ui-text-compare-field label { font-size: 13px; font-weight: 500; }
+.ui-text-compare-field textarea { box-sizing: border-box; display: block; width: 100%; min-width: 0; padding: 8px 10px; resize: vertical; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.5 var(--ui-font); }
+.ui-text-compare-field textarea:hover { border-color: var(--ui-strong); }
+.ui-text-compare-field textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-text-compare-options { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-text-compare-options label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.ui-text-compare-options input { margin: 0; accent-color: var(--ui-accent); }
+.ui-text-compare-options input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-text-compare-said { margin: 0; font-weight: 600; }
+.ui-text-compare-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-text-compare-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 10px; margin: 0; }
+.ui-text-compare-stats dt { color: var(--ui-muted); font-size: 12px; }
+.ui-text-compare-stats dd { margin: 0; font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-text-compare-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px 14px; min-width: 0; }
+.ui-text-compare-panel { max-height: 360px; overflow: auto; margin: 0; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-text-compare-panel:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-text-compare-panel del { background: var(--ui-danger-soft); color: var(--ui-danger); text-decoration: line-through; }
+.ui-text-compare-panel ins { background: var(--ui-success-soft); color: var(--ui-success); text-decoration: none; }
+.ui-text-compare-space { outline: 1px dotted currentColor; }
+`
+
+// A text as tokens, a word or a mark each, with the spaces after it: { keys, plain, spaces, words, capped },
+// words being how many word tokens come before each place. The empty token at the start
+// holds the spaces before the first word, and is there in both texts.
+fn text_compare_tokens(text: str, ignore_case: bool, limit: int) {
+    let all_found = re.find_all(text, `(?:(${readability_meter_word_re})|(\\S))(\\s*)`)
+    let capped = len(all_found) > limit
+    let found = capped ? take(all_found, limit) : all_found
+    let lead = len(found) > 0 ? slice(text, 0, found[0].start) : ""
+    let keys = ["", ...(found | map((m) => {
+        let t = m.groups[0] ?? m.groups[1]
+        ignore_case ? lower(t) : t
+    }))]
+    let plain = ["", ...(found | map((m) => m.groups[0] ?? m.groups[1]))]
+    let spaces = [len(found) == 0 ? text : lead, ...(found | map((m) => m.groups[2] ?? ""))]
+    let at = 0
+    let words = [0, ...(found | map((m) => {
+        at += m.groups[0] != null ? 1 : 0
+        at
+    }))]
+    { keys, plain, spaces, words, capped }
+}
+
+// The furthest each diagonal gets in `d` edits, from the last round's: Myers's greedy
+// step. A round is a new list, not writes to one, as `set` copies a list in the browser.
+// { reached, done }: done is true when one of them is the end of both.
+fn text_compare_round(a: list, b: list, prev: list, d: int) {
+    let n = len(a)
+    let m = len(b)
+    let done = false
+    let reached = for i in range(0, d + 1) {
+        let k = 2 * i - d
+        let x = d == 0 ? 0 : (i == 0 || (i != d && prev[i - 1] < prev[i])) ? prev[i] : prev[i - 1] + 1
+        let y = x - k
+        while x < n && y < m && a[x] == b[y] {
+            x += 1
+            y += 1
+        }
+        if x == n && y == m { done = true }
+        x
+    }
+    { reached, done }
+}
+
+// Runs of { kind, a0, a1, b0, b1 } turning list `a` into list `b`, with `most` edits
+// at most: past that, the rest is one removal and one insertion. { runs, partial }.
+fn text_compare_path(a: list, b: list, most: int = 2000) {
+    let n = len(a)
+    let m = len(b)
+    // The same at both ends costs nothing, and most edits leave most of a text alone.
+    let top = 0
+    while top < n && top < m && a[top] == b[top] { top += 1 }
+    let tail = 0
+    while tail < n - top && tail < m - top && a[n - 1 - tail] == b[m - 1 - tail] { tail += 1 }
+    let mid_a = slice(a, top, n - tail)
+    let mid_b = slice(b, top, m - tail)
+    let trace = []
+    let d = 0
+    let found = false
+    while !found && d <= most {
+        let step = text_compare_round(mid_a, mid_b, d == 0 ? [] : trace[d - 1], d)
+        trace = push(trace, step.reached)
+        found = step.done
+        d += 1
+    }
+    let rounds = len(trace)
+    let last_round = trace[rounds - 1]
+    let na = len(mid_a)
+    let nb = len(mid_b)
+    // Where it ended: the end of both, or as far as it got within both.
+    let ends = range(0, rounds) | map((i) => {
+        let x = last_round[i]
+        { x, y: x - (2 * i - (rounds - 1)) }
+    }) | filter((p) => p.x <= na && p.y <= nb && p.y >= 0)
+    let best = found ? { x: na, y: nb } : reduce(ends, { x: 0, y: 0 }, (b0, p) => p.x + p.y > b0.x + b0.y ? p : b0)
+    // Back through the rounds, keeping each edit and where the matches after it end.
+    let x = best.x
+    let y = best.y
+    let edits = []
+    let r = rounds - 1
+    while r > 0 {
+        let k = x - y
+        let i = floor((k + r) / 2)
+        let prev = trace[r - 1]
+        let down = i == 0 || (i != r && prev[i - 1] < prev[i])
+        let px = down ? prev[i] : prev[i - 1]
+        let py = px - (down ? k + 1 : k - 1)
+        edits = push(edits, { kind: down ? "ins" : "del", px, py, x, y })
+        x = px
+        y = py
+        r -= 1
+    }
+    // Forward: the matches, then each edit and the matches after it.
+    let runs = []
+    let same = (a0: int, a1: int, b0: int, b1: int) => { kind: "same", a0: a0 + top, a1: a1 + top, b0: b0 + top, b1: b1 + top }
+    if x > 0 { runs = push(runs, same(0, x, 0, y)) }
+    for e in reverse(edits) {
+        let sx = e.kind == "del" ? e.px + 1 : e.px
+        let sy = e.kind == "ins" ? e.py + 1 : e.py
+        runs = push(runs, { kind: e.kind, a0: e.px + top, a1: sx + top, b0: e.py + top, b1: sy + top })
+        if e.x > sx { runs = push(runs, same(sx, e.x, sy, e.y)) }
+    }
+    if best.x < na { runs = push(runs, { kind: "del", a0: best.x + top, a1: na + top, b0: best.y + top, b1: best.y + top }) }
+    if best.y < nb { runs = push(runs, { kind: "ins", a0: na + top, a1: na + top, b0: best.y + top, b1: nb + top }) }
+    let head = top > 0 ? [{ kind: "same", a0: 0, a1: top, b0: 0, b1: top }] : []
+    let foot = tail > 0 ? [{ kind: "same", a0: n - tail, a1: n, b0: m - tail, b1: m }] : []
+    { runs: head + runs + foot, partial: !found }
+}
+
+// The text of tokens from i to j, with the spaces after each.
+fn text_compare_text(t, i: int, j: int) -> str {
+    let plain = slice(t.plain, i, j)
+    let spaces = slice(t.spaces, i, j)
+    join(flatten(zip(plain, spaces)), "")
+}
+
+// The hunks of a run of matches: broken where the spaces differ, unless they do not
+// count. After the last word of a run they differ by nature when a change follows: the
+// spaces there go with what follows, and the column of changes keeps one.
+fn text_compare_same(ta, tb, r, ignore_space: bool, ends_both: bool) -> list {
+    let off = r.b0 - r.a0
+    let top = ends_both ? r.a1 : r.a1 - 1
+    let differ = ignore_space ? [] : range(r.a0, top) | filter((i) => ta.spaces[i] != tb.spaces[i + off])
+    let at = r.a0
+    let parts = for i in differ {
+        let left = text_compare_text(ta, at, i) + ta.plain[i]
+        let right = text_compare_text(tb, at + off, i + off) + tb.plain[i + off]
+        at = i + 1
+        [{ kind: "same", left, right }, { kind: "space", left: ta.spaces[i], right: tb.spaces[i + off] }]
+    }
+    let last_gap = !ends_both && tb.spaces[r.b1 - 1] == "" ? ta.spaces[r.a1 - 1] : ""
+    let rest = at < r.a1 ? [{ kind: "same", left: text_compare_text(ta, at, r.a1), right: text_compare_text(tb, at + off, r.b1) + last_gap }] : []
+    flatten(parts) + rest
+}
+
+// Runs of one kind as one mark, and every change between two matches as one removal
+// then one insertion, as Myers's path may weave the two a word at a time.
+fn text_compare_merge(hunks: list) -> list {
+    let n = len(hunks)
+    let changed = (h) => h.kind == "del" || h.kind == "ins"
+    let starts = range(0, n) | filter((i) => i == 0 || changed(hunks[i]) != changed(hunks[i - 1]) || (!changed(hunks[i]) && hunks[i].kind != hunks[i - 1].kind))
+    let bounds = zip(starts, [...drop(starts, 1), n])
+    flatten(bounds | map((b) => {
+        let run = slice(hunks, b[0], b[1])
+        let left = join(run | map((h) => h.left), "")
+        let right = join(run | map((h) => h.right), "")
+        changed(run[0])
+            ? [...(left != "" ? [{ kind: "del", left, right: "" }] : []), ...(right != "" ? [{ kind: "ins", left: "", right }] : [])]
+            : [{ kind: run[0].kind, left, right }]
+    }))
+}
+
+// A share with one decimal, 100 kept for what is the same.
+fn text_compare_percent(kept: int, all_tokens: int, same: bool) {
+    if same || all_tokens == 0 { return 100 }
+    let tenths = floor(kept * 2 * 1000 / all_tokens)
+    min([tenths, 999]) / 10
+}
+
+// The comparison (see the top of the file).
+fn text_compare_of(before: str, after: str, ignore_case: bool = false, ignore_space: bool = false, limit: int = 20000, most: int = 2000) {
+    let ta = text_compare_tokens(before, ignore_case, limit)
+    let tb = text_compare_tokens(after, ignore_case, limit)
+    let p = text_compare_path(ta.keys, tb.keys, most)
+    let kept = p.runs | filter((r) => r.kind == "same")
+    let raw = flatten(p.runs | map((r) => match r.kind {
+        "same" => text_compare_same(ta, tb, r, ignore_space, r.a1 == len(ta.keys) && r.b1 == len(tb.keys))
+        "del" => [{ kind: "del", left: text_compare_text(ta, r.a0, r.a1), right: "" }]
+        _ => [{ kind: "ins", left: "", right: text_compare_text(tb, r.b0, r.b1) }]
+    }))
+    let hunks = text_compare_merge(raw | filter((h) => h.left != "" || h.right != ""))
+    let words = (t, i: int, j: int) => j <= i ? 0 : t.words[j - 1] - (i == 0 ? 0 : t.words[i - 1])
+    let unchanged = kept | map((r) => words(ta, r.a0, r.a1)) | sum()
+    let removed = p.runs | filter((r) => r.kind == "del") | map((r) => words(ta, r.a0, r.a1)) | sum()
+    let added = p.runs | filter((r) => r.kind == "ins") | map((r) => words(tb, r.b0, r.b1)) | sum()
+    let spacing = count(hunks, (h) => h.kind == "space")
+    let same = all(hunks, (h) => h.kind == "same")
+    let tokens_kept = kept | map((r) => r.a1 - r.a0) | sum()
+    // The empty token at the start of each is not a word of either.
+    let similarity = text_compare_percent(tokens_kept - 1, len(ta.keys) + len(tb.keys) - 2, same)
+    { hunks, similarity, added, removed, unchanged, spacing, same, partial: p.partial, capped: ta.capped || tb.capped }
+}
+
+component TextCompare(before: str = "", after: str = "", before_label: str = "Before", after_label: str = "After", before_name: str = "before", after_name: str = "after", mode: str = "inline",
+                      ignore_case: bool = false, ignore_space: bool = false, id: str = "text-compare", rows: int = 6, limit: int = 20000, most: int = 2000, on_change = null, class: str? = null) {
+    style global text_compare_css
+    state a = before
+    state b = after
+    state nocase = ignore_case
+    state nospace = ignore_space
+    state view_as = mode
+    let r = text_compare_of(a, b, nocase, nospace, limit, most)
+    let blank = trim(a) == "" && trim(b) == ""
+    let words_said = (n: int) => n == 1 ? "1 word" : `${n} words`
+    let said = blank ? "Type or paste two texts to compare them."
+        : r.same ? "The texts are the same."
+        : `${readability_meter_one(r.similarity)}% similar: ${words_said(r.added)} added, ${words_said(r.removed)} removed.`
+    let tell = (at_a: str, at_b: str, at_case: bool, at_space: bool) => { on_change && on_change(text_compare_of(at_a, at_b, at_case, at_space, limit, most)) }
+    <section class={ui_cls(["ui-text-compare", class])} aria-labelledby={`${id}-said`}>
+        <div.ui-text-compare-fields>
+            <div.ui-text-compare-field>
+                <label for={`${id}-before`}>{before_label}</label>
+                <textarea id={`${id}-before`} name={before_name} rows={rows} value={a} @input={(e) => { a = e.value; tell(e.value, b, nocase, nospace) }}></textarea>
+            </div>
+            <div.ui-text-compare-field>
+                <label for={`${id}-after`}>{after_label}</label>
+                <textarea id={`${id}-after`} name={after_name} rows={rows} value={b} @input={(e) => { b = e.value; tell(a, e.value, nocase, nospace) }}></textarea>
+            </div>
+        </div>
+        <div.ui-text-compare-options>
+            <label><input type="checkbox" id={`${id}-case`} checked={nocase} @change={(e) => { nocase = e.checked; tell(a, b, e.checked, nospace) }}/> Ignore case</label>
+            <label><input type="checkbox" id={`${id}-space`} checked={nospace} @change={(e) => { nospace = e.checked; tell(a, b, nocase, e.checked) }}/> Ignore spacing</label>
+            <label><input type="radio" name={`${id}-view`} value="inline" checked={view_as != "side"} @change={(e) => { view_as = "inline" }}/> One column</label>
+            <label><input type="radio" name={`${id}-view`} value="side" checked={view_as == "side"} @change={(e) => { view_as = "side" }}/> Side by side</label>
+        </div>
+        <p.ui-text-compare-said id={`${id}-said`} aria-live="polite">{said}</p>
+        {r.capped && <p.ui-text-compare-note>Only the first {format_number(limit, "en-US", 0)} words of each text were compared.</p>}
+        {r.partial && <p.ui-text-compare-note>These texts differ too much to follow past {format_number(most, "en-US", 0)} changes, so the rest is marked as replaced.</p>}
+        {!blank && <dl.ui-text-compare-stats>
+            <div><dt>Similarity</dt><dd>{readability_meter_one(r.similarity)}%</dd></div>
+            <div><dt>Added</dt><dd>{r.added}</dd></div>
+            <div><dt>Removed</dt><dd>{r.removed}</dd></div>
+            <div><dt>Unchanged</dt><dd>{r.unchanged}</dd></div>
+            {r.spacing > 0 && <div><dt>Spacing</dt><dd>{r.spacing}</dd></div>}
+        </dl>}
+        {!blank && <div.ui-text-compare-out>
+            {view_as == "side"
+                ? <div.ui-text-compare-panel id={`${id}-left`} tabindex="0" role="group" aria-label={before_label}>
+                      {for [i, h] in enumerate(r.hunks) => h.kind == "same" ? h.left : h.left == "" ? null : <del key={i} class={h.kind == "space" ? "ui-text-compare-space" : null}>{h.left}</del>}
+                  </div>
+                : <div.ui-text-compare-panel id={`${id}-inline`} tabindex="0" role="group" aria-label="Changes">
+                      {for [i, h] in enumerate(r.hunks) => h.kind == "same" ? h.right : <span key={i}>{h.left != "" && <del class={h.kind == "space" ? "ui-text-compare-space" : null}>{h.left}</del>}{h.right != "" && <ins class={h.kind == "space" ? "ui-text-compare-space" : null}>{h.right}</ins>}</span>}
+                  </div>}
+            {view_as == "side" && <div.ui-text-compare-panel id={`${id}-right`} tabindex="0" role="group" aria-label={after_label}>
+                {for [i, h] in enumerate(r.hunks) => h.kind == "same" ? h.right : h.right == "" ? null : <ins key={i} class={h.kind == "space" ? "ui-text-compare-space" : null}>{h.right}</ins>}
+            </div>}
+        </div>}
+    </section>
+}

@@ -1,0 +1,305 @@
+// PayCode: a code to pay with at a till: a QR code or its digits, new every so many
+// seconds. It stays locked behind a hold, shown when the finger lifts after it (or a
+// confirmation, for those who cannot hold) until the person says it is them, and locks again when the app leaves the screen, so a
+// phone left on a table shows nothing. While shown, the screen goes to full brightness
+// for the reader, and back after. When the till confirms, the code goes.
+//
+//   import ui/pay_code.qwe use PayCode
+//
+//   <PayCode amount="12.50" payee="Cafe Luz" seed={wallet_seed} period={30} confirmed={paid}/>
+//   <PayCode amount="12.50" payee="Cafe Luz" on_refresh={(step) => next_code(step)} confirmed={paid}/>
+//
+// amount: a decimal or text. currency ("USD"), locale. payee: who it is for. period: seconds
+// a code lasts (30). seed: what codes are worked out from, here, with no server; such a
+// code only stands for one given by your payment service, so a real one comes from
+// on_refresh(step): it gives the code for that period, and may wait for a server fn; an
+// error value or null says so and tries again next second. scheme: what starts the QR's
+// text ("pay"). confirmed: true when the payment has gone through: from your own state,
+// which your till or server sets. hold_ms: how long to hold (800). lock_after: seconds
+// until it locks by itself (120). on_show(), on_lock(): as it opens and locks.
+//
+// Brightness needs the phone apps' quilloNative.brightness: the page says how it went, and a
+// plain browser, which cannot change it, asks the person, and keeps the screen awake by
+// Wake Lock where there is one. A refusal is said the same way.
+//
+// pay_code_value(seed, step) and pay_code_step(ms, period) are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/price.qwe use price_text
+import ui/qr_code.qwe use QrCode, qr_code_bytes
+
+let pay_code_css = css`
+.ui-paycode { display: grid; gap: 12px; justify-items: center; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 14px/1.4 var(--ui-font); text-align: center; }
+.ui-paycode-sum { margin: 0; color: var(--ui-muted); }
+.ui-paycode-sum strong { display: block; color: var(--ui-fg); font-size: 28px; font-variant-numeric: tabular-nums; }
+.ui-paycode-cols { display: grid; gap: 12px; justify-items: center; width: 100%; min-width: 0; }
+/* A hold is the finger's: no scroll, selection or callout may take it. */
+.ui-paycode-hold {
+  position: relative; display: grid; place-items: center; width: 150px; height: 150px; padding: 0; overflow: hidden; border: 2px solid var(--ui-accent); border-radius: 50%;
+  background: var(--ui-accent-soft); color: var(--ui-fg); font: 600 15px/1.3 var(--ui-font); cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ui-paycode-hold::before { content: ""; position: absolute; inset: 0; background: var(--ui-accent); opacity: .35; transform: scaleY(0); transform-origin: 50% 100%; }
+.ui-paycode-holding::before { transform: scaleY(1); transition: transform var(--ui-paycode-hold, .8s) linear; }
+.ui-paycode-armed::before { transform: scaleY(1); }
+.ui-paycode-hold span { position: relative; }
+.ui-paycode-hold:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-paycode-ask { display: grid; gap: 8px; justify-items: center; margin: 0; }
+.ui-paycode-ask p { margin: 0; }
+.ui-paycode-acts { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.ui-paycode-qr { box-sizing: border-box; width: min(100%, 300px); padding: 8px; border-radius: var(--ui-radius); background: #fff; color: #000; }
+.ui-paycode-qr figure { margin: 0; }
+.ui-paycode-qr svg { display: block; width: 100%; height: auto; }
+.ui-paycode-digits { margin: 0; font: 600 24px/1.3 var(--ui-mono); letter-spacing: .04em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-paycode-clock { width: min(100%, 300px); }
+.ui-paycode-clock p { margin: 0 0 4px; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-paycode-left { height: 6px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-paycode-left span { display: block; height: 100%; background: var(--ui-accent); transition: width .9s linear; }
+.ui-paycode-note { margin: 0; color: var(--ui-muted); font-size: 13px; max-width: 34em; }
+.ui-paycode-bad { color: var(--ui-danger); }
+.ui-paycode-paid { margin: 0; color: var(--ui-success); font-size: 22px; font-weight: 700; }
+@container (min-width: 560px) {
+  .ui-paycode-showing { grid-template-columns: minmax(0, 300px) minmax(0, 1fr); align-items: center; gap: 28px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-paycode-holding::before, .ui-paycode-left span { transition: none; } .ui-paycode-holding::before { opacity: .6; } }
+`
+
+// Which period a moment falls in.
+fn pay_code_step(ms, period: int) -> int = int(floor(ms / 1000 / max([1, period])))
+
+// Seconds left in that period.
+fn pay_code_left(ms, period: int) -> int {
+    let p = max([1, period])
+    p - int(floor(ms / 1000)) % p
+}
+
+// A 31-bit mix of bytes: the same on server and browser, as every step stays under 2^53.
+fn pay_code_mix(bytes: list, start: int) -> int = bytes | reduce(start, (h, b) => (h * 131 + b + 7) % 2147483647)
+
+// The Luhn digit that makes the digits before it check.
+fn pay_code_luhn(digits: str) -> str {
+    let sum_all = reverse(split(digits, "")) | enumerate() | reduce(0, (a, p) => {
+        let d = int(p[1])
+        let x = p[0] % 2 == 0 ? d * 2 : d
+        a + (x > 9 ? x - 9 : x)
+    })
+    str((10 - sum_all % 10) % 10)
+}
+
+// A code of twelve digits for a seed and a period, its last digit a check. It stands for
+// one from a payment service: anyone holding the seed can make the same.
+fn pay_code_value(seed, step: int) -> str {
+    let bytes = qr_code_bytes(`${str(seed ?? "")}:${step}`)
+    let a = pay_code_mix(bytes, 7)
+    let b = pay_code_mix(reverse(bytes), a % 65521 + 1)
+    let c = `${a % 1000000}`
+    let d = `${b % 100000}`
+    let body = repeat("0", 6 - len(c)) + c + repeat("0", 5 - len(d)) + d
+    body + pay_code_luhn(body)
+}
+
+// The amount in its currency: a decimal or a number is written out, other text as it is.
+fn pay_code_amount(amount, currency: str, locale: str?) -> str {
+    if amount == null { return "" }
+    let d = dec(amount)
+    price_text(is_err(d) ? str(amount) : d, currency, locale)
+}
+
+// Digits in fours, to read aloud.
+fn pay_code_groups(code: str) -> str {
+    let n = len(code)
+    range(0, ceil(n / 4)) | map((i) => slice(code, i * 4, min([(i + 1) * 4, n]))) | join(" ")
+}
+
+component PayCode(amount = null, currency: str = "USD", locale: str? = null, payee: str = "", period: int = 30, seed: str = "", scheme: str = "pay",
+                  confirmed: bool = false, hold_ms: int = 800, lock_after: int = 120, on_refresh = null, on_show = null, on_lock = null) {
+    style global pay_code_css
+    state phase = confirmed ? "paid" : "locked"     // locked, shown or paid
+    state holding = false
+    state armed = false      // held long enough: it opens when the finger lifts, as what opens now under a held finger would take its release
+    state grab = null        // where a hold began
+    state asked = false      // the way without holding is open
+    state code = ""
+    state step = -1
+    state left = period
+    state until = 0          // when it locks by itself, in ms
+    state as_digits = false
+    state failed = false
+    state bright = ""        // "app", "refused" or "web": what could be done about brightness
+    state saved = null       // the brightness to go back to
+    state wake = null        // the browser's Wake Lock
+    state waiting = false    // on_refresh has not answered yet
+    let sum_text = pay_code_amount(amount, currency, locale)
+    let got = (r, s) => {
+        waiting = false
+        if r == null || is_err(r) {
+            failed = true
+        } else {
+            failed = false
+            code = str(r)
+            step = s
+        }
+    }
+    let renew = (s) => {
+        if on_refresh == null {
+            got(pay_code_value(seed, s), s)
+        } else if !waiting {
+            waiting = true
+            let r = on_refresh(s)
+            if type_of(r) == "promise" { r.then((v = null) => { got(v, s) }, (_e = null) => { got(null, s) }) } else { got(r, s) }
+        }
+    }
+    let brighten = () => {
+        let w = js("window")
+        if w.quilloNative != null {
+            let was = js("quilloNative.brightness")
+            let set_it = is_err(was) ? was : js("quilloNative.brightness", 1)
+            if is_err(was) || is_err(set_it) {
+                bright = "refused"
+            } else {
+                saved = was
+                bright = "app"
+            }
+            js("quilloNative.keepAwake", true)
+        } else {
+            bright = "web"
+            let locks = js("navigator").wakeLock
+            if locks != null {
+                locks.request("screen").then((s) => { wake = s }, (_e = null) => { wake = null })
+            }
+        }
+    }
+    let dim = () => {
+        let w = js("window")
+        if w.quilloNative != null {
+            if saved != null { js("quilloNative.brightness", saved) }
+            js("quilloNative.keepAwake", false)
+        }
+        saved = null
+        bright = ""
+        if wake != null {
+            wake.release()
+            wake = null
+        }
+    }
+    let show = () => {
+        if phase == "locked" {
+            asked = false
+            phase = "shown"
+            let t = now()
+            until = t + lock_after * 1000
+            left = pay_code_left(t, period)
+            renew(pay_code_step(t, period))
+            brighten()
+            on_show && on_show()
+        }
+    }
+    let lock = () => {
+        if phase == "shown" {
+            phase = "locked"
+            code = ""
+            step = -1
+            failed = false
+            dim()
+            on_lock && on_lock()
+        }
+    }
+    if holding {
+        every(hold_ms, () => {
+            holding = false
+            armed = true
+        })
+    }
+    // The clock is read each second, not counted: `every` stands still while the phone sleeps.
+    if phase == "shown" {
+        every(1000, () => {
+            let t = now()
+            if t >= until {
+                lock()
+            } else {
+                left = pay_code_left(t, period)
+                let s = pay_code_step(t, period)
+                if s != step || failed { renew(s) }
+            }
+        })
+    }
+    if confirmed && phase != "paid" {
+        if phase == "shown" { dim() }
+        phase = "paid"
+        code = ""
+        holding = false
+        armed = false
+    }
+    let let_go = (_e = null) => {
+        holding = false
+        armed = false
+        grab = null
+    }
+    <div.ui-paycode
+         @mount={(_el) => {
+             let d = js("document")
+             let away = (_e = null) => { if d.visibilityState == "hidden" { lock() } }
+             d.addEventListener("visibilitychange", away)
+             js("window").addEventListener("pagehide", away)
+             () => {
+                 d.removeEventListener("visibilitychange", away)
+                 js("window").removeEventListener("pagehide", away)
+                 lock()
+             }
+         }}>
+        <p.ui-paycode-sum>{payee != "" ? `Pay ${payee}` : "Pay"}<strong>{sum_text}</strong></p>
+        {phase == "locked" && <div.ui-paycode-cols>
+            <button type="button" class={ui_cls(["ui-paycode-hold", holding && "ui-paycode-holding", armed && "ui-paycode-armed"])} style={`--ui-paycode-hold: ${hold_ms}ms`}
+                    aria-label={`Show the code to pay ${sum_text}`}
+                    @pointerdown={(e) => {
+                        if e.button == 0 {
+                            e.target.closest(".ui-paycode-hold").setPointerCapture(e.pointerId)
+                            grab = { x: e.clientX, y: e.clientY }
+                            holding = true
+                        }
+                    }}
+                    @pointermove={(e) => {
+                        if grab != null && (abs(e.clientX - grab.x) > 16 || abs(e.clientY - grab.y) > 16) { let_go() }
+                    }}
+                    @pointerup={(_e) => {
+                        let opens = armed
+                        let_go()
+                        if opens { show() }
+                    }}
+                    @pointercancel={let_go}
+                    @contextmenu={(e) => { e.preventDefault() }}
+                    @click={(e) => { if e.detail == 0 { show() } }}>
+                <span>{armed ? "Let go to show" : holding ? "Keep holding" : "Hold to show the code"}</span>
+            </button>
+            {asked
+                ? <div.ui-paycode-ask>
+                    <p>Show the code to pay {sum_text}?</p>
+                    <div.ui-paycode-acts>
+                        <Button size="lg" on_click={show}>Yes, show it</Button>
+                        <Button variant="ghost" size="lg" on_click={() => { asked = false }}>Not now</Button>
+                    </div>
+                </div>
+                : <Button variant="ghost" size="lg" on_click={() => { asked = true }}>Show without holding</Button>}
+        </div>}
+        {phase == "shown" && <div class="ui-paycode-cols ui-paycode-showing">
+            {as_digits
+                ? <p.ui-paycode-digits aria-label={`Code: ${split(code, "") | join(" ")}`}>{pay_code_groups(code)}</p>
+                : <div.ui-paycode-qr>{code != "" && <QrCode text={`${scheme}:${code}`} size={280} label={`QR code to pay ${sum_text}`}/>}</div>}
+            <div.ui-paycode-cols>
+                <div.ui-paycode-clock>
+                    <p role="timer">New code in {left} s</p>
+                    <div.ui-paycode-left aria-hidden="true"><span style={`width: ${round(left * 100 / max([1, period]))}%`}></span></div>
+                </div>
+                {failed && <p class="ui-paycode-note ui-paycode-bad" role="alert">A new code could not be fetched. Trying again.</p>}
+                {bright == "app" && <p.ui-paycode-note>Screen brightness is up until you finish.</p>}
+                {bright == "refused" && <p.ui-paycode-note>Brightness could not be changed: turn it up yourself so the reader can see the code.</p>}
+                {bright == "web" && <p.ui-paycode-note>This browser cannot change brightness: turn it up yourself so the reader can see the code.</p>}
+                <div.ui-paycode-acts>
+                    <Button variant="outline" size="lg" on_click={() => { as_digits = !as_digits }}>{as_digits ? "Show QR code" : "Show digits"}</Button>
+                    <Button variant="ghost" size="lg" on_click={lock}>Lock</Button>
+                </div>
+            </div>
+        </div>}
+        {phase == "paid" && <p.ui-paycode-paid role="status">Paid</p>}
+    </div>
+}

@@ -1,0 +1,334 @@
+// DuplicateFinder: finds rows that are probably the same thing, over the fields
+// chosen. Text is compared after normalising (case, accents, punctuation, spacing
+// and word order go, so "Lovelace, Ada" meets "ada  lovelace"), then by edit
+// distance, so a typo still matches. Two rows' score is the mean of their fields'
+// likeness, and rows joined by any pair at or above the threshold form a group. Each
+// group shows its rows with the fields that differ marked; the person picks the one
+// to keep, or says they are not duplicates, and Resolve reports what stays and goes.
+//
+//   <DuplicateFinder id="people" rows={people} fields={["name", "email", "city"]} threshold={80}
+//                    on_resolve={(kept, dropped) => { people = kept; removed = dropped }}/>
+//
+// id: a prefix for its ids, unique on the page. rows: a list of maps; anything else
+// is counted and left out. fields: what to compare, keys or { key, label } (left out,
+// every key of the rows). on: the keys ticked at the start (all of fields).
+// threshold: how alike two rows must be, in percent, from 50 to 100 (80); the person
+// can slide it, and the rows are compared again where it stops, not on each step. limit: the most rows compared (200), as every row meets every other;
+// past it, it says so. title: the heading ("Find duplicates"). name: starts the radio
+// buttons' names, so a form sends which row each group keeps (`<name>_keep_<group>`,
+// the row's place), with `<name>_dropped` the places dropped as JSON (id by default).
+// on_resolve(kept, dropped): inside one of your components, given the rows that stay
+// (rows in no group too) and those that go, in their order. class: more classes for
+// its outer element.
+//
+// A field empty in either row says nothing and is not counted. Each value is compared
+// by its first 64 normalised characters, so a long text cannot hold up the page.
+//
+// duplicate_finder_groups(rows, keys, threshold) is the search, for a program: a list
+// of { id, members (places in rows), score, differ (keys that differ) }.
+
+import ui/theme.qwe use ui_cls
+
+let duplicate_finder_css = css`
+.ui-dupfind { display: grid; gap: 12px; min-width: 0; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-dupfind .ui-dupfind-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-dupfind-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; }
+.ui-dupfind-fields { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-dupfind-fields legend { float: left; margin-right: 8px; padding: 0; font-size: 13px; font-weight: 500; }
+.ui-dupfind-fields label, .ui-dupfind-skip { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.ui-dupfind input[type="checkbox"], .ui-dupfind input[type="radio"] { margin: 0; accent-color: var(--ui-accent); }
+.ui-dupfind input[type="checkbox"]:focus-visible, .ui-dupfind input[type="radio"]:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-dupfind-level { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 13px; }
+.ui-dupfind-level label { font-weight: 500; }
+.ui-dupfind-level input { width: 160px; max-width: 100%; accent-color: var(--ui-accent); }
+.ui-dupfind-level input:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 4px; }
+.ui-dupfind-level output { min-width: 3em; font-variant-numeric: tabular-nums; font-weight: 600; }
+.ui-dupfind-sum { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-dupfind-note { margin: 0; color: var(--ui-warning); font-size: 13px; }
+.ui-dupfind-group { min-width: 0; margin: 0; padding: 8px 12px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-dupfind-group legend { padding: 0 6px; font-size: 13px; font-weight: 600; }
+.ui-dupfind-off { opacity: .7; }
+.ui-dupfind-scroll { overflow: auto; }
+.ui-dupfind-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-dupfind table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-dupfind th, .ui-dupfind td { padding: 5px 8px; text-align: left; border-bottom: 1px solid var(--ui-border); overflow-wrap: anywhere; }
+.ui-dupfind thead th { color: var(--ui-muted); font-weight: 600; white-space: nowrap; }
+.ui-dupfind tbody tr:last-child th, .ui-dupfind tbody tr:last-child td { border-bottom: 0; }
+.ui-dupfind-kept { background: var(--ui-success-soft); }
+.ui-dupfind-gone td { color: var(--ui-muted); text-decoration: line-through; }
+.ui-dupfind mark { padding: 0 3px; border-radius: 3px; background: var(--ui-warning-soft); color: var(--ui-warning); }
+.ui-dupfind-skip { margin-top: 8px; }
+.ui-dupfind-done { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.ui-dupfind-go { height: 36px; padding: 0 16px; border: 1px solid var(--ui-accent); border-radius: var(--ui-radius-sm); background: var(--ui-accent);
+  color: var(--ui-accent-fg); font: 600 14px var(--ui-font); cursor: pointer; }
+.ui-dupfind-go:hover:not(:disabled) { background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-dupfind-go:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-dupfind-go:disabled { opacity: .5; cursor: not-allowed; }
+.ui-dupfind-said { color: var(--ui-muted); font-size: 13px; }
+`
+
+let duplicate_finder_folds = [
+    ["[àáâãäåāăą]", "a"], ["[çćĉċč]", "c"], ["[ďđ]", "d"], ["[èéêëēĕėęě]", "e"], ["[ĝğġģ]", "g"], ["[ìíîïĩīĭįı]", "i"], ["[ñńņňŋ]", "n"],
+    ["[òóôõöøōŏő]", "o"], ["[ŕŗř]", "r"], ["[śŝşš]", "s"], ["[ţťŧ]", "t"], ["[ùúûüũūŭůűų]", "u"], ["[ýÿŷ]", "y"], ["[źżž]", "z"],
+    ["ß", "ss"], ["æ", "ae"], ["œ", "oe"],
+]
+
+// Any value as text.
+fn duplicate_finder_text(v) -> str = match type_of(v) {
+    "null" => ""
+    "str" => v
+    "int" | "float" | "dec" | "bool" => str(v)
+    _ => json.stringify(v)
+}
+
+// Text as it is compared: lower case, without accents, with ASCII punctuation gone
+// and its words in order, so word order and spacing do not count. Letters of other
+// scripts stay as they are.
+fn duplicate_finder_norm(v) -> str {
+    let s = lower(duplicate_finder_text(v))
+    let plain = re.test(s, "[^ -~]") ? reduce(duplicate_finder_folds, s, (t, f) => re.replace(t, f[0], f[1])) : s
+    let words = re.split(trim(re.replace(plain, "[\\s!-/:-@\\[-`{-~]+", " ")), " ") | filter((w) => w != "")
+    slice(join(sort(words), " "), 0, 64)
+}
+
+// Levenshtein distance. It gives up once the distance must pass `most` (giving
+// most + 1), which is what keeps hundreds of rows quick. Each row is made by `for`, not
+// `push`, which copies the list each time in the browser and takes 2.5 times as long.
+fn duplicate_finder_edits(a: list, b: list, most: int) -> int {
+    let la = len(a)
+    let lb = len(b)
+    let prev = for j in 0..(lb + 1) => j
+    let i = 0
+    while i < la {
+        let c = a[i]
+        let left = i + 1
+        let low = left
+        let tail = for j in 0..lb => {
+            let d = c == b[j] ? prev[j] : prev[j] + 1
+            let e = prev[j + 1] + 1
+            let f = left + 1
+            let m = d < e ? d : e
+            left = m < f ? m : f
+            if left < low { low = left }
+            left
+        }
+        if low > most { return most + 1 }
+        prev = [i + 1, ...tail]
+        i += 1
+    }
+    prev[lb]
+}
+
+// A row's fields ready to compare: each { text, chars, bag }, the bag the number of
+// each character in it, for a quick bound on the distance.
+fn duplicate_finder_cells(rows: list, names: list) -> list =
+    rows | map((r) => names | map((k) => {
+        let text = duplicate_finder_norm(get(r, k))
+        let chars = split(text, "")
+        let bag = reduce(chars, {}, (m, c) => set(m, c, (get(m, c) ?? 0) + 1))
+        { text, chars, bag, letters: keys(bag) }
+    }))
+
+// The fewest edits two texts can be apart: what one has and the other lacks.
+fn duplicate_finder_bound(a: map, b: map) -> int {
+    let short = 0
+    for c in a.letters {
+        let n = get(a.bag, c) - (get(b.bag, c) ?? 0)
+        if n > 0 { short += n }
+    }
+    let over = 0
+    for c in b.letters {
+        let n = get(b.bag, c) - (get(a.bag, c) ?? 0)
+        if n > 0 { over += n }
+    }
+    short > over ? short : over
+}
+
+fn duplicate_finder_pct(size: int, edits: int) -> int = floor((size - edits) * 100 / size)
+
+// Two rows' score, or null when they fall short of `need`. Each field's most it could
+// score comes first, so only rows that could still pass are worked out, and each
+// field in turn is given only the edits the score can still afford.
+fn duplicate_finder_score(a: list, b: list, need: int) {
+    let n = len(a)
+    let tops = []
+    let i = 0
+    let counted = 0
+    let reach = 0
+    let by_size = 0
+    for k in 0..n {
+        let x = a[k]
+        let y = b[k]
+        if x.text != "" && y.text != "" {
+            counted += 1
+            by_size += duplicate_finder_pct(max([len(x.chars), len(y.chars)]), abs(len(x.chars) - len(y.chars)))
+        }
+    }
+    if counted == 0 || by_size < need * counted { return null }
+    while i < n {
+        let x = a[i]
+        let y = b[i]
+        let usable = x.text != "" && y.text != ""
+        let size = max([len(x.chars), len(y.chars)])
+        let top = !usable ? 0 : (x.text == y.text ? 100 : duplicate_finder_pct(size, duplicate_finder_bound(x, y)))
+        tops = push(tops, top)
+        reach += top
+        i += 1
+    }
+    if reach < need * counted { return null }
+    let goal = need * counted
+    let total = 0
+    let j = 0
+    while j < n {
+        let x = a[j]
+        let y = b[j]
+        if x.text != "" && y.text != "" {
+            reach -= tops[j]
+            let size = max([len(x.chars), len(y.chars)])
+            if x.text == y.text {
+                total += 100
+            } else {
+                // This field must score at least `least`, whatever the rest do.
+                let least = max([0, goal - total - reach])
+                let most = size - ceil(least * size / 100)
+                let edits = duplicate_finder_edits(x.chars, y.chars, most)
+                if edits > most { return null }
+                total += duplicate_finder_pct(size, edits)
+            }
+        }
+        j += 1
+    }
+    let score = floor(total / counted)
+    score >= need ? score : null
+}
+
+// Every pair at or above `need`: { a, b, score }.
+fn duplicate_finder_pairs(cells: list, need: int) -> list {
+    let out = []
+    let n = len(cells)
+    let a = 0
+    while a < n {
+        let b = a + 1
+        while b < n {
+            let s = duplicate_finder_score(cells[a], cells[b], need)
+            if s != null { out = push(out, { a, b, score: s }) }
+            b += 1
+        }
+        a += 1
+    }
+    out
+}
+
+// The groups rows fall into: pairs join them, so a row like a row of the group is in it.
+fn duplicate_finder_groups(rows: list, names: list, threshold: int) -> list {
+    if len(names) == 0 { return [] }
+    let pairs = duplicate_finder_pairs(duplicate_finder_cells(rows, names), threshold)
+    let label = for i in 0..len(rows) => i
+    for p in pairs {
+        let from = label[p.b]
+        let to = label[p.a]
+        if from != to { label = label | map((l) => l == from ? to : l) }
+    }
+    // A label held by two rows is a group.
+    let sets = values(group_by(enumerate(label), (x) => x[1])) | filter((xs) => len(xs) > 1)
+    let groups = sets | map((xs) => {
+        let places = sort(xs | map((x) => x[0]))
+        let inside = pairs | filter((p) => contains(places, p.a) && contains(places, p.b)) | map((p) => p.score)
+        let differ = names | filter((k) => len(unique(places | map((i) => duplicate_finder_text(get(rows[i], k))))) > 1)
+        { id: str(places[0]), members: places, score: min(inside) ?? 100, differ }
+    })
+    sort_by(groups, (g) => g.members[0])
+}
+
+// The row to keep unless told otherwise: the one with most fields filled, first of equals.
+fn duplicate_finder_fullest(rows: list, members: list, names: list) -> int {
+    let filled = (i: int) => len(names | filter((k) => trim(duplicate_finder_text(get(rows[i], k))) != ""))
+    reduce(members, members[0], (best, i) => filled(i) > filled(best) ? i : best)
+}
+
+component DuplicateFinder(id: str, rows = [], fields: list? = null, on: list? = null, threshold: int = 80, limit: int = 200,
+                          title: str = "Find duplicates", name: str? = null, on_resolve = null, class: str? = null) {
+    style global duplicate_finder_css
+    let given = type_of(rows) == "list" ? rows : []
+    let maps = given | filter((r) => type_of(r) == "map")
+    let records = take(maps, limit)
+    let all_keys = unique(flatten(records | map((r) => keys(r))))
+    let cols = (fields ?? all_keys) | map((f) => type_of(f) == "map" ? { key: str(f.key), label: f.label ?? str(f.key) } : { key: str(f), label: str(f) })
+    let stem = name ?? id
+    state ticked = on ?? (cols | map((c) => c.key))
+    state bar = threshold < 50 ? 50 : (threshold > 100 ? 100 : threshold)
+    state level = bar
+    state keeps = {}
+    state skips = []
+    state said = ""
+    let names = cols | filter((c) => contains(ticked, c.key)) | map((c) => c.key)
+    let groups = duplicate_finder_groups(records, names, level)
+    let kept_of = (g) => get(keeps, g.id) ?? duplicate_finder_fullest(records, g.members, names)
+    let live = groups | filter((g) => !contains(skips, g.id))
+    let gone = sort(flatten(live | map((g) => g.members | filter((i) => i != kept_of(g)))))
+    let n_groups = len(groups)
+    let resolve = () => {
+        let dropped = gone | map((i) => records[i])
+        let kept = enumerate(records) | filter((p) => !contains(gone, p[0])) | map((p) => p[1])
+        said = `Kept ${len(kept)} row${len(kept) == 1 ? "" : "s"}, dropped ${len(dropped)}.`
+        on_resolve && on_resolve(kept, dropped)
+    }
+    <section class={ui_cls(["ui-dupfind", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-dupfind-title id={`${id}-title`}>{title}</h3>
+        <div.ui-dupfind-bar>
+            <fieldset.ui-dupfind-fields>
+                <legend>Compare</legend>
+                {for c in cols => <label key={c.key}>
+                    <input type="checkbox" checked={contains(ticked, c.key)} data-field={c.key}
+                           @change={(e) => { ticked = e.checked ? push(remove(ticked, c.key), c.key) : remove(ticked, c.key) }}/> {c.label}
+                </label>}
+            </fieldset>
+            <div.ui-dupfind-level>
+                <label for={`${id}-level`}>Alike at least</label>
+                <input type="range" id={`${id}-level`} name={`${stem}_threshold`} min="50" max="100" step="1" value={str(bar)}
+                       @input={(e) => { bar = int(e.value) ?? bar }} @change={(e) => { level = int(e.value) ?? level }}/>
+                <output for={`${id}-level`}>{`${bar}%`}</output>
+            </div>
+        </div>
+        {type_of(rows) != "list" && <p.ui-dupfind-note role="alert">These rows are not a list, so there is nothing to compare.</p>}
+        {len(given) > len(maps) && <p.ui-dupfind-note>{`${len(given) - len(maps)} item${len(given) - len(maps) == 1 ? " is" : "s are"} not a record, and left out.`}</p>}
+        {len(maps) > limit && <p.ui-dupfind-note>{`Only the first ${limit} of ${len(maps)} rows are compared.`}</p>}
+        {len(names) == 0 && <p.ui-dupfind-note role="alert">Pick at least one field to compare.</p>}
+        <p.ui-dupfind-sum aria-live="polite">
+            {len(names) == 0 ? "" : (n_groups == 0 ? `No duplicates among ${len(records)} rows at ${level}%.`
+                : `${n_groups} group${n_groups == 1 ? "" : "s"} of likely duplicates among ${len(records)} rows, ${len(gone)} to drop.`)}
+        </p>
+        {for [n, g] in enumerate(groups) => {
+            let off = contains(skips, g.id)
+            let keep = kept_of(g)
+            <fieldset key={g.id} data-group={g.id} class={ui_cls(["ui-dupfind-group", off && "ui-dupfind-off"])}>
+                <legend>{`Group ${n + 1}: ${len(g.members)} rows, ${g.score}% alike`}</legend>
+                <div.ui-dupfind-scroll tabindex="0" role="region" aria-label={`Group ${n + 1}`}>
+                    <table>
+                        <thead><tr><th scope="col">Keep</th>{for c in cols => <th key={c.key} scope="col">{c.label}</th>}</tr></thead>
+                        <tbody>
+                            {for i in g.members => <tr key={i} data-row={i} class={!off && (i == keep ? "ui-dupfind-kept" : "ui-dupfind-gone")}>
+                                <th scope="row">
+                                    <input type="radio" name={`${stem}_keep_${g.id}`} value={str(i)} checked={i == keep} disabled={off}
+                                           aria-label={`Keep row ${i + 1}`} @change={() => { keeps = set(keeps, g.id, i) }}/>
+                                </th>
+                                {for c in cols => {
+                                    let v = duplicate_finder_text(get(records[i], c.key))
+                                    <td key={c.key}>{contains(g.differ, c.key) ? <mark>{filled(v) ?? "(empty)"}</mark> : v}</td>
+                                }}
+                            </tr>}
+                        </tbody>
+                    </table>
+                </div>
+                <label.ui-dupfind-skip>
+                    <input type="checkbox" checked={off} @change={(e) => { skips = e.checked ? push(skips, g.id) : remove(skips, g.id) }}/> Not duplicates
+                </label>
+            </fieldset>
+        }}
+        <div.ui-dupfind-done>
+            <button.ui-dupfind-go type="button" disabled={n_groups == 0} @click={resolve}>{`Resolve, dropping ${len(gone)}`}</button>
+            <span.ui-dupfind-said role="status">{said}</span>
+        </div>
+        <input type="hidden" name={`${stem}_dropped`} value={json.stringify(gone)}/>
+    </section>
+}

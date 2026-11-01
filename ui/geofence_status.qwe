@@ -1,0 +1,320 @@
+// GeofenceStatus: whether a person is inside or outside each of a list of areas, by real
+// distance from the centre of each. A position wanders by metres, so someone standing at an
+// edge would cross it again and again: here it takes going clearly in to be inside and
+// clearly out to be outside, and in between it stays as it was. A fix too poor to tell is
+// held, and says so. Each crossing calls back once and goes in a short log.
+//
+//   import ui/geofence_status.qwe use GeofenceStatus
+//
+//   <GeofenceStatus position={here} areas={[{ id: "yard", name: "The yard", lat: 14.5995, lng: 120.9842, radius: 150 }]}
+//                   on_enter={(a) => { arrived = a.name }} on_exit={(a) => { arrived = null }}/>
+//
+// areas: a list of { id, name, lat, lng (or lon), radius (metres) }; one that cannot be used
+// is shown as such. position: [lat, lng], or { lat, lng, accuracy }, the page's own place
+// (null); "Follow me" takes it from the phone instead: the app's location services, or the
+// web's. margin: metres either side of the edge in which nothing changes (0: a tenth of
+// the radius, 15 at least), and never more than half the radius. A fix's own accuracy widens
+// it. worst: a fix less accurate than this many metres changes nothing (100). units: "km"
+// (default) or "mi". start: follows from the first moment (false), as a browser may ask with
+// nothing yet tapped. gap: seconds between asks in the app, whose call gives one place at
+// a time (5). label: its heading ("Areas"). on_enter(area), on_exit(area): a crossing, inside
+// one of your components, not called for the first reading, which crosses nothing.
+// on_change(list): each area's { id, state, metres } after any crossing.
+//
+// A page watches only while it is on the screen: neither browsers nor the apps follow
+// a place for it in the background. It says so while following.
+//
+// geofence_status_metres, geofence_status_band and geofence_status_step are the working.
+
+import ui/theme.qwe use ui_cls
+
+let geofence_status_css = css`
+.ui-geofence { position: relative; container-type: inline-size; font: 15px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-geofence-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.ui-geofence-bar h3 { margin: 0; font-size: 18px; font-weight: 700; }
+.ui-geofence-btn {
+  box-sizing: border-box; min-width: 44px; min-height: 44px; padding: 0 16px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-geofence-btn[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-geofence-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-geofence-say { margin: 0 0 10px; color: var(--ui-muted); font-size: 14px; }
+.ui-geofence-say:empty { display: none; }
+.ui-geofence-body { display: grid; gap: 12px; }
+.ui-geofence-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-geofence-area {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 2px 12px; padding: 10px 14px; border: 1px solid var(--ui-border); border-left: 5px solid var(--t);
+  border-radius: var(--ui-radius); background: var(--ui-surface); --t: var(--ui-strong);
+}
+.ui-geofence-area[data-state="inside"] { --t: var(--ui-success); }
+.ui-geofence-area[data-state="outside"] { --t: var(--ui-muted); }
+.ui-geofence-name { font-weight: 600; overflow-wrap: anywhere; }
+.ui-geofence-state { font-weight: 700; color: var(--t); }
+.ui-geofence-far { grid-column: 1 / -1; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-geofence-log { margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-geofence-log li { padding: 4px 0; border-top: 1px solid var(--ui-border); }
+.ui-geofence-log li:first-child { border-top: 0; }
+/* With the room, the areas beside what has happened. */
+@container (min-width: 620px) {
+  .ui-geofence-body { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); align-items: start; }
+}
+`
+
+fn geofence_status_num(x) = (type_of(x) == "int" || type_of(x) == "float" || type_of(x) == "dec") && math.isfinite(float(x))
+
+fn geofence_status_clock() = now()
+
+// { lat, lng, accuracy } from a pair or a map, or null if it is not a place on Earth.
+fn geofence_status_point(p) {
+    if p == null { return null }
+    let lat = type_of(p) == "list" ? (len(p) > 1 ? p[0] : null) : p.lat
+    let lng = type_of(p) == "list" ? (len(p) > 1 ? p[1] : null) : (p.lng ?? p.lon)
+    if !geofence_status_num(lat) || !geofence_status_num(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180 { return null }
+    let acc = type_of(p) == "list" ? null : p.accuracy
+    { lat: float(lat), lng: float(lng), accuracy: geofence_status_num(acc) && acc >= 0 ? float(acc) : null }
+}
+
+// An area that can be used: a place and a radius above nothing. Else null.
+fn geofence_status_area(a) {
+    if type_of(a) != "map" || !geofence_status_num(a.radius) || a.radius <= 0 { return null }
+    let at = geofence_status_point(a)
+    at == null ? null : { id: a.id ?? a.name, name: a.name ?? "An area", lat: at.lat, lng: at.lng, radius: float(a.radius), given: a }
+}
+
+// Metres along the ground: the haversine, on a sphere of the Earth's mean radius.
+fn geofence_status_metres(a, b) {
+    let la = math.radians(a.lat)
+    let lb = math.radians(b.lat)
+    let dlat = lb - la
+    let dlng = math.radians(b.lng - a.lng)
+    let h = pow(math.sin(dlat / 2), 2) + math.cos(la) * math.cos(lb) * pow(math.sin(dlng / 2), 2)
+    2 * 6371008.8 * math.atan2(sqrt(h), sqrt(max([1 - h, 0])))
+}
+
+// How far either side of the edge nothing changes. A fix known only to 40 m cannot say
+// on which side of a 15 m band a person stands, so its accuracy widens the band. Half the
+// radius at most, or a small area could never be entered.
+fn geofence_status_band(radius: num, margin: num, accuracy) {
+    let set_by = margin > 0 ? margin : max([15, radius * 0.1])
+    let wide = geofence_status_num(accuracy) ? max([set_by, accuracy]) : set_by
+    min([wide, radius / 2])
+}
+
+// The state after a fix `metres` from the centre, given the state before. With no state
+// before, the edge itself decides: there is nothing to keep.
+fn geofence_status_step(was, metres: num, radius: num, band: num) {
+    if was == "inside" { return metres > radius + band ? "outside" : "inside" }
+    if was == "outside" { return metres < radius - band ? "inside" : "outside" }
+    metres <= radius ? "inside" : "outside"
+}
+
+// The areas after a fix: [{ id, state, metres, held }], as a map to read by id, and which
+// crossed. A fix past `worst` tells nothing: each area keeps what it had.
+fn geofence_status_next(areas, was, p, margin: num, worst: num) {
+    let held = p.accuracy != null && p.accuracy > worst
+    let rows = areas | map((a) => {
+        let before = get(was, str(a.id), null)
+        let metres = geofence_status_metres(p, a)
+        let state = held ? (before == null ? null : before.state) : geofence_status_step(before == null ? null : before.state, metres, a.radius, geofence_status_band(a.radius, margin, p.accuracy))
+        { id: a.id, state: state, metres: metres, held: held, crossed: before != null && before.state != null && state != before.state, area: a }
+    })
+    { rows: rows, map: reduce(rows, {}, (m, r) => set(m, str(r.id), { state: r.state, metres: r.metres, held: r.held })) }
+}
+
+fn geofence_status_distance(m, units: str = "km") {
+    if units == "mi" {
+        let miles = m / 1609.344
+        if miles < 0.1 { return `${format_number(round(m / 0.3048), "en-US", 0)} ft` }
+        return `${format_number(miles, "en-US", 1)} mi`
+    }
+    m < 1000 ? `${format_number(round(m), "en-US", 0)} m` : `${format_number(m / 1000, "en-US", 1)} km`
+}
+
+// What an area's line says.
+fn geofence_status_line(row, radius, units) {
+    if row == null { return "No position yet" }
+    if row.held { return "Weak signal, holding" }
+    let gap = abs(row.metres - radius)
+    if row.state == "inside" {
+        return row.metres <= radius ? `${geofence_status_distance(gap, units)} inside the edge` : `${geofence_status_distance(gap, units)} past the edge, not left yet`
+    }
+    row.metres > radius ? `${geofence_status_distance(gap, units)} from the edge` : `${geofence_status_distance(gap, units)} inside the edge, not in yet`
+}
+
+fn geofence_status_time(ms, off) {
+    let t = date.from_ms(ms, off)
+    date.format(t, "HH:mm:ss")
+}
+
+// A key for a position, so that one given again counts once.
+fn geofence_status_key(p) = p == null ? "" : `${p.lat},${p.lng},${p.accuracy ?? ""}`
+
+fn geofence_status_message(status, in_app) = match status {
+    "asking" => "Finding where you are."
+    "live" => "Following while this screen is open. Neither a page nor the app can watch in the background."
+    "refused" => in_app ? "Location is turned off for this app. You can allow it in Settings." :
+        "Location is blocked for this page. Allow it in your browser's site settings."
+    "off" => "No location came. Check that location services are on."
+    "none" => "This browser cannot give a location."
+    "insecure" => "Browsers give a location only to pages on https."
+    _ => ""
+}
+
+fn geofence_status_app_state(text) {
+    let t = lower(str(text))
+    contains(t, "for this app") || contains(t, "denied") || contains(t, "not allowed") ? "refused" : "off"
+}
+
+fn geofence_status_offset() {
+    let off = 0 - js_new("Date").getTimezoneOffset()
+    let hh = floor(abs(off) / 60)
+    `${off < 0 ? "-" : "+"}${hh < 10 ? "0" : ""}${hh}:${abs(off) % 60 < 10 ? "0" : ""}${abs(off) % 60}`
+}
+
+// The state before anything has happened, from the first position given, if any.
+fn geofence_status_first(areas, p, margin: num, worst: num) = p == null ? {} : geofence_status_next(areas, {}, p, margin, worst).map
+
+component GeofenceStatus(areas: list = [], position = null, margin: num = 0, worst: num = 100, units: str = "km", start: bool = false,
+                         gap: num = 5, label: str = "Areas", on_enter = null, on_exit = null, on_change = null, class: str? = null) {
+    style global geofence_status_css
+    let good = areas | map(geofence_status_area) | filter((a) => a != null)
+    state zones = geofence_status_first(areas | map(geofence_status_area) | filter((a) => a != null), geofence_status_point(position), margin, worst)
+    state seen = geofence_status_key(geofence_status_point(position))
+    state log = []
+    state status = "idle"
+    state in_app = false
+    state watch_id = null
+    state polling = false
+    state busy = false
+    state to_settings = false
+
+    let feed = (p) => {
+        let next = geofence_status_next(good, zones, p, margin, worst)
+        zones = next.map
+        let crossed = next.rows | filter((r) => r.crossed)
+        if len(crossed) > 0 {
+            let at = geofence_status_time(geofence_status_clock(), geofence_status_offset())
+            log = slice(crossed | map((r) => `${at} ${r.state == "inside" ? "Entered" : "Left"} ${r.area.name}`), 0, 5) + slice(log, 0, 5 - min([len(crossed), 5]))
+            for r in crossed {
+                if r.state == "inside" { on_enter && on_enter(r.area.given) } else { on_exit && on_exit(r.area.given) }
+            }
+            on_change && on_change(next.rows | map((r) => { id: r.id, state: r.state, metres: r.metres }))
+        }
+    }
+    // A position from the page, once for each one given. The key keeps this from running
+    // again on the state it has just set.
+    let given = geofence_status_point(position)
+    if geofence_status_key(given) != seen {
+        seen = geofence_status_key(given)
+        if given != null { feed(given) }
+    }
+
+    let stop = () => {
+        if watch_id != null {
+            js("navigator.geolocation.clearWatch", watch_id)
+            watch_id = null
+        }
+        polling = false
+    }
+    let got = (lat, lng, accuracy) => {
+        let p = geofence_status_point({ lat: lat, lng: lng, accuracy: accuracy })
+        if p == null {
+            status = "off"
+        } else {
+            status = "live"
+            feed(p)
+        }
+    }
+    let ask_app = () => {
+        if !busy && js("document.visibilityState") == "visible" {
+            busy = true
+            let r = js("quilloNative.location")
+            busy = false
+            if is_err(r) {
+                status = geofence_status_app_state(r.error)
+                stop()
+            } else {
+                got(r.lat, r.lon, r.accuracy)
+            }
+        }
+    }
+    let follow = () => {
+        let win = js("window")
+        status = "asking"
+        if win.quilloNative != null {
+            in_app = true
+            polling = true
+            ask_app()
+        } else if win.navigator.geolocation == null {
+            status = "none"
+        } else if win.isSecureContext != true {
+            status = "insecure"
+        } else {
+            watch_id = js("navigator.geolocation.watchPosition",
+                (pos) => { got(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy) },
+                (e) => {
+                    if e.code == 1 {
+                        status = "refused"
+                        stop()
+                    } else if status == "asking" {
+                        status = "off"
+                    }
+                },
+                { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 })
+        }
+    }
+    if polling { every(round(max([gap, 1]) * 1000), ask_app) }
+
+    let following = watch_id != null || polling
+    let bad = len(areas) - len(good)
+    <section class={ui_cls(["ui-geofence", class])} aria-label={label} @mount={(_el) => {
+        let d = js("document")
+        let back = (_e = null) => {
+            if to_settings && js("document.visibilityState") == "visible" {
+                to_settings = false
+                follow()
+            }
+        }
+        d.addEventListener("visibilitychange", back)
+        if start { follow() }
+        () => {
+            d.removeEventListener("visibilitychange", back)
+            stop()
+        }
+    }}>
+        <div.ui-geofence-bar>
+            <h3>{label}</h3>
+            <button.ui-geofence-btn.ui-geofence-follow type="button" aria-pressed={following ? "true" : "false"}
+                    @click={() => {
+                        if following {
+                            stop()
+                            status = "idle"
+                        } else {
+                            follow()
+                        }
+                    }}>Follow me</button>
+        </div>
+        <p.ui-geofence-say role="status">{geofence_status_message(status, in_app)}</p>
+        {status == "refused" && in_app && <button.ui-geofence-btn.ui-geofence-settings type="button" @click={() => {
+            to_settings = true
+            js("quilloNative.openSettings")
+        }}>Open Settings</button>}
+        <div.ui-geofence-body>
+            <ul.ui-geofence-list>
+                {for a in good => {
+                    let row = get(zones, str(a.id), null)
+                    let st = row == null ? null : row.state
+                    <li.ui-geofence-area key={a.id} data-id={str(a.id)} data-state={st ?? "unknown"}>
+                        <span.ui-geofence-name>{a.name}</span>
+                        <span.ui-geofence-state>{st == "inside" ? "Inside" : st == "outside" ? "Outside" : "Not known"}</span>
+                        <span.ui-geofence-far>{geofence_status_line(row, a.radius, units)}</span>
+                    </li>
+                }}
+                {bad > 0 && <li.ui-geofence-far>{bad == 1 ? "One area has no usable place or radius." : `${bad} areas have no usable place or radius.`}</li>}
+            </ul>
+            <ol.ui-geofence-log aria-label="Crossings" aria-live="polite">
+                {for line in log => <li>{line}</li>}
+            </ol>
+        </div>
+    </section>
+}

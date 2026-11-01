@@ -1,0 +1,240 @@
+// LongPressMenu: a menu that opens where a finger rests, with a tap felt on the phones
+// that can give one. The finger can slide straight to an item and lift, or lift first
+// and tap one. The press selects no text, and neither the browser's menu nor iOS's callout
+// comes up. A More button opens the same menu for keyboards and screen readers; the Menu
+// key and Shift+F10 work on the focused area, and a right click opens it at the pointer.
+// On a tablet it opens beside the finger, where the hand does not cover it; on a phone,
+// above it, and below when there is no room.
+//
+//   component Photo(p) {
+//       <LongPressMenu label={p.title} items={[{ id: "share", label: "Share" }, { id: "del", label: "Delete", tone: "danger" }]}
+//                      on_select={(id) => { act(p, id) }}>
+//           <img src={p.url} alt={p.title}/>
+//       </LongPressMenu>
+//   }
+//
+// items: each { id, label, tone?, disabled? }: tone "danger" marks it, and one without a
+// label is left out. on_select(id): inside one of your components, which was chosen.
+// on_open(felt): the menu opened; felt says what the hand got: "native" (the app's
+// haptics), "vibrate" (the web's), or "none", as in iOS's browser, which has neither.
+// delay: the press's length in milliseconds (500). label: what the area is called,
+// for its More button. class. children: what is pressed.
+
+import ui/theme.qwe use ui_cls
+
+let long_press_menu_css = css`
+.ui-long-press { display: flex; align-items: center; gap: 4px; color: var(--ui-fg); font: 15px/1.45 var(--ui-font); }
+/* The callout and the browser's drag are off for good here; selection only during a press. */
+.ui-long-press-area { flex: 1; min-width: 0; border-radius: var(--ui-radius-sm); outline: none; touch-action: pan-y; -webkit-touch-callout: none;
+  transition: transform .18s, opacity .18s; }
+.ui-long-press-area img { -webkit-user-drag: none; }
+.ui-long-press-area:focus-visible { box-shadow: var(--ui-focus); }
+.ui-long-press-pressing { transform: scale(.98); opacity: .85; user-select: none; -webkit-user-select: none; }
+.ui-long-press-more { display: grid; flex: none; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); cursor: pointer; }
+.ui-long-press-more svg { width: 20px; height: 20px; }
+.ui-long-press-more:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+/* In the top layer, so a frame's transform or overflow does not hold it. */
+.ui-long-press-menu { position: fixed; inset: auto; box-sizing: border-box; width: 240px; max-width: calc(100vw - 24px); max-height: calc(100dvh - 24px); margin: 0; padding: 6px; overflow: auto;
+  border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 2px); background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); }
+.ui-long-press-menu[open] { animation: ui-long-press-pop .16s cubic-bezier(.2, .9, .3, 1.2); }
+@keyframes ui-long-press-pop { from { opacity: 0; transform: scale(.9); } }
+.ui-long-press-menu::backdrop { background: var(--ui-overlay); }
+.ui-long-press-item { display: flex; align-items: center; width: 100%; min-height: 48px; padding: 0 12px; border: 0; border-radius: var(--ui-radius-sm); background: transparent;
+  color: inherit; font: inherit; text-align: start; cursor: pointer; }
+.ui-long-press-item:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-long-press-hot { background: var(--ui-subtle); }
+.ui-long-press-danger { color: var(--ui-danger); }
+.ui-long-press-item[disabled] { color: var(--ui-muted); opacity: .6; cursor: default; }
+@media (hover: hover) {
+  .ui-long-press-more:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+  .ui-long-press-item:not([disabled]):hover { background: var(--ui-subtle); }
+}
+@media (min-width: 700px) { .ui-long-press-menu::backdrop { background: transparent; } }
+@media (prefers-reduced-motion: reduce) { .ui-long-press-area { transition: none; } .ui-long-press-menu[open] { animation: none; } }
+`
+
+// Items with a label, each with an id, the label standing in.
+fn long_press_menu_clean(items) {
+    if type_of(items) != "list" { return [] }
+    items | filter((i) => type_of(i) == "map" && get(i, "label") != null) | map((i) => { ...i, id: get(i, "id") ?? i.label })
+}
+
+fn long_press_menu_clamp(v: num, size: num, room: num, edge: num) -> num {
+    max([edge, min([v, room - size - edge])])
+}
+
+// Where the menu goes, as [left, top], for a finger at x, y, a menu of w by h and a screen of
+// vw by vh. A wide screen puts it beside the finger, on the right unless it does not fit; a
+// narrow one above the finger, or below it with no room above. 12 px from every edge.
+fn long_press_menu_place(x: num, y: num, w: num, h: num, vw: num, vh: num, wide: bool) -> list {
+    let edge = 12
+    let gap = 16
+    if wide {
+        let right = x + gap
+        let left = right + w > vw - edge ? x - gap - w : right
+        return [long_press_menu_clamp(left, w, vw, edge), long_press_menu_clamp(y - h / 2, h, vh, edge)]
+    }
+    let above = y - gap - h
+    let top = above < edge ? y + gap : above
+    [long_press_menu_clamp(x - w / 2, w, vw, edge), long_press_menu_clamp(top, h, vh, edge)]
+}
+
+// A tap felt, and which kind. The web's vibrate is refused, with a warning, until the page
+// has been tapped once, which a first long press is not.
+fn long_press_menu_buzz(ms: int) -> str {
+    if !is_err(js("quilloNative.haptic", "medium")) { return "native" }
+    if js("navigator.userActivation.hasBeenActive") != true { return "none" }
+    js("navigator.vibrate", ms) == true ? "vibrate" : "none"
+}
+
+component LongPressMenu(items = [], on_select = null, on_open = null, delay: int = 500, label: str = "Item", class: str? = null, children) {
+    style global long_press_menu_css
+    let list = long_press_menu_clean(items)
+    state dlg = null
+    state press = null       // { id, x, y }: a finger down, its time not yet up
+    state slide = null       // { id, x, y }: the finger that opened the menu, still down
+    state hot = null         // the item under that finger
+    state lifted = -1000     // when that finger lifted
+    let open_at = (x: num, y: num, felt: str) => {
+        if !dlg.open {
+            dlg.showModal()
+            let vw = js("document.documentElement.clientWidth")
+            // What the on-screen keyboard leaves, on iOS, where it does not shrink the page.
+            let seen = js("visualViewport.height")
+            let vh = is_err(seen) || seen == null ? js("window.innerHeight") : seen
+            let to = long_press_menu_place(x, y, dlg.offsetWidth, dlg.offsetHeight, vw, vh, vw >= 700)
+            dlg.style.left = `${to[0]}px`
+            dlg.style.top = `${to[1]}px`
+            on_open && on_open(felt)
+        }
+    }
+    let fire = () => {
+        if press != null {
+            let p = press
+            press = null
+            slide = p
+            open_at(p.x, p.y, long_press_menu_buzz(14))
+        }
+    }
+    let shut = () => {
+        slide = null
+        hot = null
+        if dlg.open { dlg.close() }
+    }
+    let pick = (it) => {
+        if get(it, "disabled") != true {
+            shut()
+            on_select && on_select(it.id)
+        }
+    }
+    // The item at a point: the menu is in the top layer, so the finger's own element is no help.
+    let item_at = (x: num, y: num) => {
+        let at = js("document.elementFromPoint", x, y)
+        let el = at != null ? at.closest(".ui-long-press-item") : null
+        el != null ? list[int(el.dataset.at)] : null
+    }
+    if press != null { every(delay, fire) }
+    <div class={ui_cls(["ui-long-press", class])}>
+        <div class={ui_cls(["ui-long-press-area", (press != null || slide != null) && "ui-long-press-pressing"])} tabindex="0" role="group" aria-label={label}
+             @mount={(me) => {
+                 // Once the menu is open the finger is ours for sliding to an item, which pan-y alone
+                 // would give to the page on the first move.
+                 let guard = (e) => { if slide != null && e.cancelable { e.preventDefault() } }
+                 // Chrome can follow a long press with a click, aimed at whatever is at that spot by
+                 // then: the backdrop, an item, or the page once the menu has gone. It is not a choice.
+                 let ghost = (e) => {
+                     if e.timeStamp - lifted < 80 {
+                         e.preventDefault()
+                         e.stopPropagation()
+                     }
+                 }
+                 let d = js("document")
+                 me.addEventListener("touchmove", guard, { passive: false })
+                 d.addEventListener("click", ghost, true)
+                 () => {
+                     me.removeEventListener("touchmove", guard)
+                     d.removeEventListener("click", ghost, true)
+                 }
+             }}
+             @contextmenu={(e) => {
+                 // Android's long press, and a right click. With a finger the timer may have got there first.
+                 e.preventDefault()
+                 if e.pointerType == "touch" || press != null { fire() } else { open_at(e.clientX, e.clientY, "none") }
+             }}
+             @selectstart={(e) => { if press != null || slide != null { e.preventDefault() } }}
+             @keydown={(e) => {
+                 if e.key == "ContextMenu" || (e.key == "F10" && e.shiftKey) {
+                     e.preventDefault()
+                     let r = e.target.getBoundingClientRect()
+                     open_at(r.left + r.width / 2, r.top + r.height / 2, "none")
+                 }
+             }}
+             @pointerdown={(e) => {
+                 if e.pointerType != "mouse" && e.isPrimary { press = { id: e.pointerId, x: e.clientX, y: e.clientY } }
+             }}
+             @pointermove={(e) => {
+                 if press != null && e.pointerId == press.id && abs(e.clientX - press.x) + abs(e.clientY - press.y) > 10 { press = null }
+                 if slide != null && e.pointerId == slide.id {
+                     let it = item_at(e.clientX, e.clientY)
+                     hot = it != null && get(it, "disabled") != true ? it.id : null
+                 }
+             }}
+             @pointerup={(e) => {
+                 press = null
+                 if slide != null && e.pointerId == slide.id {
+                     let chose = hot != null ? find(list, (i) => i.id == hot) : null
+                     lifted = e.timeStamp
+                     slide = null
+                     hot = null
+                     if chose != null { pick(chose) }
+                 }
+             }}
+             @pointercancel={() => {
+                 press = null
+                 slide = null
+                 hot = null
+             }}>{children}</div>
+        <button.ui-long-press-more type="button" aria-label={`More for ${label}`} aria-haspopup="menu"
+                @click={(e) => {
+                    let r = e.target.closest("button").getBoundingClientRect()
+                    open_at(r.left + r.width / 2, r.top, "none")
+                }}>
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+        </button>
+        <dialog.ui-long-press-menu aria-label={label}
+                @mount={(me) => { dlg = me }}
+                @close={() => {
+                    slide = null
+                    hot = null
+                }}
+                @click={(e) => {
+                    // The backdrop is the dialog too, as is its own edge: only the point tells them apart.
+                    let r = dlg.getBoundingClientRect()
+                    let inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom
+                    if e.target.isSameNode(dlg) && !inside { shut() }
+                }}
+                @keydown={(e) => {
+                    let all = dlg.querySelectorAll(".ui-long-press-item:not([disabled])")
+                    let n = all.length
+                    let at = index_of(for i in range(0, n) => all[i].isSameNode(e.target), true) ?? -1
+                    let to = match e.key {
+                        "ArrowDown" => (at + 1) % n
+                        "ArrowUp" => (at - 1 + n) % n
+                        "Home" => 0
+                        "End" => n - 1
+                        _ => -1
+                    }
+                    if to >= 0 && n > 0 {
+                        e.preventDefault()
+                        all[to].focus()
+                    }
+                }}>
+            <div role="menu" aria-label={label}>
+                {for [i, it] in enumerate(list) => <button key={it.id} type="button" role="menuitem" data-at={i} disabled={get(it, "disabled") == true}
+                    class={ui_cls(["ui-long-press-item", get(it, "tone") == "danger" && "ui-long-press-danger", hot == it.id && "ui-long-press-hot"])}
+                    @click={() => pick(it)}>{it.label}</button>}
+            </div>
+        </dialog>
+    </div>
+}

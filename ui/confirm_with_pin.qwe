@@ -1,0 +1,302 @@
+// ConfirmWithPin: the step before something that cannot be taken back: what is about to happen,
+// a PIN pad, tries counted down, and a clock, so a phone put down half way stops by itself. It
+// fills a phone's screen and stands in the middle of a tablet's. What was typed is cleared when
+// the app leaves the screen, and the tries stay used when it is closed and opened again, so
+// shutting it is no way to get more.
+//
+//   import ui/confirm_with_pin.qwe use ConfirmWithPin
+//
+//   component Pay() {
+//       state asking = false
+//       <Button on_click={() => { asking = true }}>Send $4,000.00</Button>
+//       <ConfirmWithPin open={asking} title="Confirm this transfer" request="tx-42"
+//                       summary={[{ label: "To", value: "Harbour Lettings" }, { label: "Amount", value: "$4,000.00" }]}
+//                       on_check={(pin) => check_pin(pin)} on_confirm={() => { send() }}
+//                       on_close={() => { asking = false }}/>
+//   }
+//
+// open: whether it is showing, from your own state. title. summary: each { label, value }, what
+// is being agreed to. warning: a line under it ("This cannot be undone"). request: names this
+// action: a new one gives a new clock and new tries. digits: the PIN's length (6, from 4 to
+// 8), as the pad checks by itself on the last digit. tries: how many (3). seconds: how long it
+// stays open (60; 0 for no limit). on_check(pin): true when right; it may wait for a server
+// fn, and may give { ok: false, left: 1 } with the tries your server counts. An error value
+// says it could not be checked, which uses no try. on_confirm(): it was right. on_close(): the
+// person shut it, by Cancel, Close or Escape, whatever came before: set `open` to false here,
+// as it stays open until you do. on_timeout(): time ran out. on_locked(): the last try went wrong.
+//
+// Check the PIN on your server, and count tries there too. This counts what a person sees; it
+// cannot stop anyone who has opened the browser's tools. Nothing here keeps the PIN after a
+// check, and it is never on the page.
+//
+// confirm_with_pin_press(pin, k, digits), confirm_with_pin_clock(seconds) and
+// confirm_with_pin_outcome(answer, left) are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let confirm_with_pin_css = css`
+.ui-pinstep-host { display: contents; }
+.ui-pinstep {
+  box-sizing: border-box; inset: 0; width: 100%; max-width: 100%; height: 100dvh; max-height: 100dvh; margin: 0; padding: max(10px, env(safe-area-inset-top)) 16px max(10px, env(safe-area-inset-bottom)); border: 0;
+  overflow: hidden; background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.4 var(--ui-font); overscroll-behavior: contain;
+}
+.ui-pinstep[open] { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 8px; }
+.ui-pinstep::backdrop { background: var(--ui-overlay); }
+html:has(.ui-pinstep[open]) { overflow: hidden; }
+.ui-pinstep-top { display: grid; align-content: start; gap: 6px; min-height: 0; }
+.ui-pinstep-top h2 { margin: 0; font-size: 19px; line-height: 1.25; text-align: center; outline: none; }
+.ui-pinstep-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 12px; margin: 0; padding: 8px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-pinstep-facts dt { color: var(--ui-muted); }
+.ui-pinstep-facts dd { margin: 0; font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-pinstep-warn { margin: 0; color: var(--ui-warning); font-size: 13px; text-align: center; }
+.ui-pinstep-mid { display: grid; align-content: center; justify-items: center; gap: 8px; min-height: 0; }
+.ui-pinstep-dots { display: flex; gap: 12px; padding: 6px; }
+.ui-pinstep-dots i { width: 14px; height: 14px; border: 2px solid var(--ui-strong); border-radius: 50%; }
+.ui-pinstep-dots i.ui-pinstep-dot-on { border-color: var(--ui-accent); background: var(--ui-accent); }
+.ui-pinstep-wrong .ui-pinstep-dots { animation: ui-pinstep-shake .3s; }
+@keyframes ui-pinstep-shake { 25% { transform: translateX(-7px); } 75% { transform: translateX(7px); } }
+.ui-pinstep-said { min-height: 20px; margin: 0; color: var(--ui-muted); font-size: 14px; text-align: center; }
+.ui-pinstep-bad { color: var(--ui-danger); font-weight: 600; }
+.ui-pinstep-clock { margin: 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; text-align: center; }
+.ui-pinstep-low { color: var(--ui-warning); font-weight: 600; }
+.ui-pinstep-end { display: grid; justify-items: center; gap: 10px; text-align: center; }
+.ui-pinstep-end h3 { margin: 0; font-size: 19px; }
+.ui-pinstep-end p { margin: 0; color: var(--ui-muted); }
+.ui-pinstep-pad { display: grid; grid-template-columns: repeat(3, minmax(0, 96px)); justify-content: center; gap: 8px 14px; margin: 0 auto; width: 100%; }
+.ui-pinstep-pad[hidden] { display: none; }
+.ui-pinstep-key {
+  height: clamp(44px, 9.5dvh, 68px); padding: 0; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font: 600 24px/1 var(--ui-font); font-variant-numeric: tabular-nums;
+  cursor: pointer; touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ui-pinstep-key:active { background: var(--ui-accent-soft); }
+.ui-pinstep-key:disabled { opacity: .4; cursor: default; }
+.ui-pinstep-key:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-pinstep-del { border-color: transparent; background: transparent; }
+.ui-pinstep-foot { display: flex; justify-content: center; }
+/* Sideways on a phone there is no height for a pad under the rest: they stand side by side. */
+@media (orientation: landscape) and (max-height: 520px) {
+  .ui-pinstep[open] { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; column-gap: 16px; }
+  .ui-pinstep-top { overflow-y: auto; }
+  .ui-pinstep-mid { grid-column: 1; grid-row: 2; }
+  .ui-pinstep-pad { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
+  .ui-pinstep-key { height: clamp(44px, 20dvh, 56px); }
+  .ui-pinstep-foot { grid-column: 1; }
+}
+/* A tablet's screen is not filled: it is a dialog in the middle. */
+@media (min-width: 600px) and (min-height: 600px) {
+  .ui-pinstep { inset: 0; width: min(440px, 92vw); height: auto; max-height: min(92dvh, 760px); margin: auto; padding: 22px 26px; border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 6px); box-shadow: var(--ui-shadow-lg); }
+  .ui-pinstep[open] { grid-template-rows: auto auto auto; gap: 14px; }
+}
+@media (hover: hover) { .ui-pinstep-key:hover:not(:disabled) { background: var(--ui-subtle); } }
+@media (prefers-reduced-motion: reduce) { .ui-pinstep-wrong .ui-pinstep-dots { animation: none; } }
+`
+
+// The digits after a key: a digit up to the length, or "back". Nothing else changes them.
+fn confirm_with_pin_press(pin: str, k: str, digits: int) -> str {
+    if k == "back" { return slice(pin, 0, max([0, len(pin) - 1])) }
+    if !re.test(k, "^[0-9]$") || len(pin) >= digits { return pin }
+    pin + k
+}
+
+// Seconds as m:ss.
+fn confirm_with_pin_clock(seconds: int) -> str {
+    let s = max([0, seconds])
+    let rest = s % 60
+    `${int(floor(s / 60))}:${rest < 10 ? "0" : ""}${rest}`
+}
+
+// What a check's answer means: { kind, left }. kind: right, wrong, locked or unknown. An error
+// value is not a wrong PIN: the check did not happen, and a try is not used for it.
+fn confirm_with_pin_outcome(answer, left: int) -> map {
+    if is_err(answer) || answer == null { return { kind: "unknown", left: left } }
+    if answer == true { return { kind: "right", left: left } }
+    if type_of(answer) == "map" && get(answer, "ok", false) == true { return { kind: "right", left: left } }
+    let told = type_of(answer) == "map" ? get(answer, "left", null) : null
+    let rest = type_of(told) == "int" ? max([0, told]) : max([0, left - 1])
+    { kind: rest == 0 ? "locked" : "wrong", left: rest }
+}
+
+// A length the pad can use, whatever was passed.
+fn confirm_with_pin_length(digits: int) -> int = max([4, min([digits, 8])])
+
+// What the tries left come to, in words.
+fn confirm_with_pin_tries(left: int) -> str = left == 1 ? "1 try left" : `${left} tries left`
+
+component ConfirmWithPin(open: bool = false, title: str = "Confirm it is you", summary: list = [], warning: str = "", request: str = "", digits: int = 6, tries: int = 3, seconds: int = 60,
+                         on_check = null, on_confirm = null, on_close = null, on_timeout = null, on_locked = null) {
+    style global confirm_with_pin_css
+    state dlg = null
+    state pin = ""
+    state left = tries       // tries left, kept when closed and opened again
+    state phase = "entry"    // entry, checking, right, timed, locked
+    state said = ""
+    state wrong = false      // the dots shake
+    state ends = 0           // when it runs out, in ms; 0 while not running
+    state secs = seconds
+    state asked = request    // the request these tries and this clock belong to
+    state win = null
+    let length = confirm_with_pin_length(digits)
+    let busy = phase != "entry"
+    let buzz = (kind: str) => {
+        if win != null {
+            if win.quilloNative != null {
+                win.quilloNative.haptic(kind).then((_v = null) => { wrong = wrong }, (_e = null) => { wrong = wrong })
+            } else if win.navigator.vibrate != null {
+                win.navigator.vibrate(kind == "error" ? 120 : 40)
+            }
+        }
+    }
+    let start = () => {
+        secs = seconds
+        ends = seconds > 0 ? now() + seconds * 1000 : 0
+    }
+    let time_out = () => {
+        phase = "timed"
+        pin = ""
+        ends = 0
+        said = ""
+        on_timeout && on_timeout()
+    }
+    let tick = () => {
+        if ends > 0 && (phase == "entry" || phase == "checking") {
+            let rest = int(ceil((ends - now()) / 1000))
+            secs = max([0, rest])
+            if rest <= 0 { time_out() }
+        }
+    }
+    let check = () => {
+        let typed = pin
+        pin = ""
+        phase = "checking"
+        said = "Checking…"
+        wrong = false
+        let answer = on_check == null ? false : js("Promise.resolve", on_check(typed))
+        // The clock may have run out, or the sheet been closed, while the answer was on its way.
+        if phase == "checking" {
+            let out = confirm_with_pin_outcome(answer, left)
+            left = out.left
+            if out.kind == "right" {
+                phase = "right"
+                said = ""
+                ends = 0
+                buzz("success")
+                on_confirm && on_confirm()
+            } else if out.kind == "unknown" {
+                phase = "entry"
+                said = "It could not be checked, so no try was used. Try again."
+            } else if out.kind == "locked" {
+                phase = "locked"
+                said = ""
+                ends = 0
+                buzz("error")
+                on_locked && on_locked()
+            } else {
+                phase = "entry"
+                said = `That is not it. ${confirm_with_pin_tries(left)}.`
+                wrong = true
+                buzz("error")
+            }
+        }
+    }
+    let press = (k: str) => {
+        if phase == "entry" {
+            wrong = false
+            pin = confirm_with_pin_press(pin, k, length)
+            if k != "back" { said = said == "Checking…" ? "" : said }
+            if len(pin) == length { check() }
+        }
+    }
+    let cancel = () => {
+        pin = ""
+        ends = 0
+        if phase == "entry" || phase == "checking" { phase = "entry" }
+        on_close && on_close()
+    }
+    if request != asked {
+        asked = request
+        left = tries
+        phase = "entry"
+        said = ""
+        pin = ""
+        ends = 0
+    }
+    if open && dlg != null && !dlg.open {
+        dlg.showModal()
+        // Tries are kept; a clock that ran out is the same one, which `phase` says.
+        if phase == "entry" { start() }
+    }
+    if !open && dlg != null && dlg.open {
+        dlg.close()
+        ends = 0
+        pin = ""
+    }
+    if ends > 0 { every(500, tick) }
+    <div.ui-pinstep-host
+         @mount={(_el) => {
+             let doc = js("document")
+             let w = js("window")
+             let away = (_e = null) => {
+                 if doc.visibilityState == "hidden" {
+                     pin = ""
+                 } else {
+                     tick()
+                 }
+             }
+             doc.addEventListener("visibilitychange", away)
+             win = w
+             () => { doc.removeEventListener("visibilitychange", away) }
+         }}>
+        <dialog.ui-pinstep aria-label={title}
+                @mount={(el) => { dlg = el }}
+                @cancel={(e) => {
+                    e.preventDefault()
+                    cancel()
+                }}
+                @keydown={(e) => {
+                    let k = e.key == "Backspace" ? "back" : e.key
+                    if k == "back" || re.test(k, "^[0-9]$") {
+                        e.preventDefault()
+                        press(k)
+                    }
+                }}>
+            <div.ui-pinstep-top>
+                <h2 tabindex="-1">{title}</h2>
+                {len(summary) > 0 && <dl.ui-pinstep-facts>
+                    {for s in summary => <div style="display: contents" key={s.label}><dt>{s.label}</dt><dd>{s.value}</dd></div>}
+                </dl>}
+                {warning != "" && <p.ui-pinstep-warn>{warning}</p>}
+            </div>
+            <div class={ui_cls(["ui-pinstep-mid", wrong && "ui-pinstep-wrong"])}>
+                {(phase == "entry" || phase == "checking") && <div.ui-pinstep-dots role="img" aria-label={`${len(pin)} of ${length} digits entered`}>
+                    {for i in range(0, length) => <i key={i} class={i < len(pin) || phase == "checking" ? "ui-pinstep-dot-on" : null}></i>}
+                </div>}
+                {(phase == "entry" || phase == "checking") && <p class={ui_cls(["ui-pinstep-said", wrong && "ui-pinstep-bad"])} role="status">{said != "" ? said : `Enter your ${length}-digit PIN`}</p>}
+                {(phase == "entry" || phase == "checking") && ends > 0 && <p class={ui_cls(["ui-pinstep-clock", secs <= 10 && "ui-pinstep-low"])} role="timer">Closes in {confirm_with_pin_clock(secs)}</p>}
+                {phase == "right" && <div.ui-pinstep-end role="status"><h3>Confirmed</h3></div>}
+                {phase == "timed" && <div.ui-pinstep-end role="alert">
+                    <h3>Time ran out</h3>
+                    <p>Nothing was done.</p>
+                    <Button size="lg" variant="outline" on_click={() => {
+                        phase = "entry"
+                        said = ""
+                        start()
+                    }}>Start again</Button>
+                </div>}
+                {phase == "locked" && <div.ui-pinstep-end role="alert">
+                    <h3>Too many tries</h3>
+                    <p>Nothing was done. This PIN cannot be used here for now.</p>
+                </div>}
+            </div>
+            <div.ui-pinstep-pad role="group" aria-label="PIN pad" hidden={phase == "timed" || phase == "locked" || phase == "right"}>
+                {for k in ["1", "2", "3", "4", "5", "6", "7", "8", "9"] => <button.ui-pinstep-key key={k} type="button" disabled={busy} @click={() => { press(k) }}>{k}</button>}
+                <span></span>
+                <button.ui-pinstep-key type="button" disabled={busy} @click={() => { press("0") }}>0</button>
+                <button class="ui-pinstep-key ui-pinstep-del" type="button" aria-label="Delete" disabled={busy || pin == ""} @click={() => { press("back") }}>⌫</button>
+            </div>
+            <div.ui-pinstep-foot>
+                <Button size="lg" variant="ghost" on_click={cancel}>{phase == "entry" || phase == "checking" ? "Cancel" : "Close"}</Button>
+            </div>
+        </dialog>
+    </div>
+}

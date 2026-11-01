@@ -1,0 +1,356 @@
+// SchemaInferrer: reads JSON samples and works out their shape: every field, its
+// types, whether it is optional or nullable, likely enums, and formats (date,
+// date-time, email, url, uuid), merging across the samples and down into nested
+// objects and arrays. It shows a table of the fields and the JSON Schema.
+//
+//   <SchemaInferrer id="events" text={sample_json} name="sample"
+//                   on_change={(schema) => { saved = schema }}/>
+//
+// id: a prefix for its ids, unique on the page. text: the JSON it starts with: an array
+// of samples, one object, or JSON Lines (a value a line). title: the heading ("Infer a
+// schema"). enum_limit: the most values an enum may have (6); a text field is called an
+// enum when its values repeat, at least twice each on average, and fit no format.
+// max_chars: the most text read (200,000); max_samples: the most samples (1,000); past
+// them it says so. name: the box's field name, so a plain <form> sends the text;
+// `<name>_schema` goes with it, the JSON Schema. on_change(schema): inside one of your
+// components, as the text changes, given the schema as a map, or null when the JSON
+// is bad. class: more classes for its outer element.
+//
+// A field is required when every object at its place has it, and nullable when one
+// has it as null. Whole numbers are integer, others number, and one of each number
+// (2.0 is whole, as JSON Schema has it). Bad JSON says the line, the column and
+// what was expected there. Nesting past 32 levels is left as any value, and it says so.
+//
+// schema_inferrer_samples(text) reads the text, schema_inferrer_tree(samples) merges
+// them, and schema_inferrer_schema(tree) and schema_inferrer_rows(tree) give the
+// results, for a program.
+
+import ui/theme.qwe use ui_cls
+
+let schema_inferrer_css = css`
+.ui-schemainf { display: grid; gap: 12px; min-width: 0; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-schemainf .ui-schemainf-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-schemainf-field { display: grid; gap: 4px; min-width: 0; }
+.ui-schemainf-field label { font-size: 13px; font-weight: 500; }
+.ui-schemainf-text { box-sizing: border-box; width: 100%; min-height: 150px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 12.5px/1.5 var(--ui-mono); resize: vertical; }
+.ui-schemainf-text:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-schemainf-text[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-schemainf-error { margin: 0; color: var(--ui-danger); font-size: 13px; overflow-wrap: anywhere; }
+.ui-schemainf-sum { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-schemainf-note { margin: 0; color: var(--ui-warning); font-size: 13px; }
+.ui-schemainf-scroll { overflow: auto; max-height: 360px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-schemainf-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-schemainf table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-schemainf th, .ui-schemainf td { padding: 6px 10px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--ui-border); overflow-wrap: anywhere; }
+.ui-schemainf thead th { position: sticky; top: 0; background: var(--ui-subtle); font-weight: 600; white-space: nowrap; }
+.ui-schemainf tbody tr:last-child th, .ui-schemainf tbody tr:last-child td { border-bottom: 0; }
+.ui-schemainf tbody th { font: 500 12.5px var(--ui-mono); }
+.ui-schemainf-opt { color: var(--ui-muted); }
+.ui-schemainf-tag { display: inline-block; margin: 0 4px 2px 0; padding: 0 6px; border-radius: 999px; background: var(--ui-accent-soft); color: var(--ui-accent); font-size: 12px; }
+.ui-schemainf-out { display: grid; gap: 4px; min-width: 0; margin: 0; }
+.ui-schemainf-out figcaption { color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-schemainf-out pre { max-height: 320px; margin: 0; padding: 10px 12px; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-subtle); font: 12px/1.5 var(--ui-mono); }
+.ui-schemainf-out pre:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+`
+
+let schema_inferrer_formats = [
+    { id: "date-time", test: "^\\d{4}-\\d{2}-\\d{2}[Tt]\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?([Zz]|[+-]\\d{2}:\\d{2})$" },
+    { id: "date", test: "^\\d{4}-\\d{2}-\\d{2}$" },
+    { id: "uuid", test: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" },
+    { id: "email", test: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$" },
+    { id: "url", test: "^[a-zA-Z][a-zA-Z0-9+.-]*://[^\\s/]+\\S*$" },
+]
+
+// ---- Saying where bad JSON goes wrong ------------------------------------------
+// The parser's own message differs between the server and each browser, and some give no
+// place, so this walks the text as far as it is good. Gives null, or { line, col, why }.
+
+fn schema_inferrer_at(chars: list, i: int, why: str) -> map {
+    let before = take(chars, i)
+    let lines = len(before | filter((c) => c == "\n"))
+    let last = reduce(enumerate(before), -1, (b, p) => p[1] == "\n" ? p[0] : b)
+    { line: lines + 1, col: i - last, why }
+}
+
+fn schema_inferrer_found(c) -> str = c == null ? "the end of the text" : (c == "\n" ? "a line break" : `"${c}"`)
+
+// Past the string that starts at i: the index after its closing quote, or { i, why }.
+fn schema_inferrer_string(chars: list, start: int) {
+    let n = len(chars)
+    let i = start + 1
+    while i < n {
+        let c = chars[i]
+        if c == "\"" { return i + 1 }
+        if c == "\n" { return { i, why: "a line break inside a string" } }
+        if c == "\\" {
+            let e = chars[i + 1]
+            if e == null || !contains("\"\\/bfnrtu", e) { return { i, why: "a bad escape in a string" } }
+            i += 1
+        }
+        i += 1
+    }
+    { i: start, why: "a string that never ends" }
+}
+
+// The first thing wrong with a JSON text, or null. It keeps a stack rather than
+// recursing, so text nested a thousand deep cannot use up the stack.
+fn schema_inferrer_scan(text: str) {
+    let chars = split(text, "")
+    let n = len(chars)
+    let stack = []
+    let want = "value"
+    let i = 0
+    while i < n {
+        let c = chars[i]
+        if c == " " || c == "\n" || c == "\t" || c == "\r" {
+            i += 1
+        } else if want == "value" || want == "value_or_end" {
+            if want == "value_or_end" && c == "]" {
+                stack = take(stack, len(stack) - 1)
+                want = "next"
+                i += 1
+            } else if c == "{" {
+                stack = push(stack, c)
+                want = "key_or_end"
+                i += 1
+            } else if c == "[" {
+                stack = push(stack, c)
+                want = "value_or_end"
+                i += 1
+            } else if c == "\"" {
+                let after = schema_inferrer_string(chars, i)
+                if type_of(after) == "map" { return schema_inferrer_at(chars, after.i, `Found ${after.why}.`) }
+                i = after
+                want = "next"
+            } else {
+                let word = join(slice(chars, i, i + 40), "")
+                let m = re.find(word, "^(true|false|null|-?(0|[1-9]\\d*)(\\.\\d+)?([eE][-+]?\\d+)?)")
+                if m == null { return schema_inferrer_at(chars, i, `Expected a value, found ${schema_inferrer_found(c)}.`) }
+                i += len(m.text)
+                want = "next"
+            }
+        } else if want == "key" || want == "key_or_end" {
+            if want == "key_or_end" && c == "}" {
+                stack = take(stack, len(stack) - 1)
+                want = "next"
+                i += 1
+            } else if c == "\"" {
+                let after = schema_inferrer_string(chars, i)
+                if type_of(after) == "map" { return schema_inferrer_at(chars, after.i, `Found ${after.why}.`) }
+                i = after
+                want = "colon"
+            } else {
+                return schema_inferrer_at(chars, i, `Expected a key in double quotes, found ${schema_inferrer_found(c)}.`)
+            }
+        } else if want == "colon" {
+            if c != ":" { return schema_inferrer_at(chars, i, `Expected ":" after the key, found ${schema_inferrer_found(c)}.`) }
+            want = "value"
+            i += 1
+        } else {
+            let top = len(stack) > 0 ? stack[-1] : null
+            if top == null { return schema_inferrer_at(chars, i, `Expected the end of the text, found ${schema_inferrer_found(c)}.`) }
+            if c == "," {
+                want = top == "{" ? "key" : "value"
+                i += 1
+            } else if (top == "{" && c == "}") || (top == "[" && c == "]") {
+                stack = take(stack, len(stack) - 1)
+                i += 1
+            } else {
+                return schema_inferrer_at(chars, i, `Expected "," or "${top == "{" ? "}" : "]"}", found ${schema_inferrer_found(c)}.`)
+            }
+        }
+    }
+    if want == "next" && len(stack) == 0 { return null }
+    let open = len(stack) > 0 ? (stack[-1] == "{" ? "}" : "]") : null
+    schema_inferrer_at(chars, n, open != null ? `The text ends before the closing "${open}".` : "The text ends where a value was expected.")
+}
+
+// The samples in a text: { samples, bad } with bad { line, col, why } or null. An array
+// is its items; JSON Lines, a value a line, is tried when the whole does not parse.
+fn schema_inferrer_samples(text: str, cap: int = 1000) -> map {
+    if trim(text) == "" { return { samples: [], bad: null, more: 0 } }
+    let whole = json.parse(text)
+    if !is_err(whole) {
+        let items = type_of(whole) == "list" ? whole : [whole]
+        return { samples: take(items, cap), bad: null, more: max([0, len(items) - cap]) }
+    }
+    let lines = enumerate(split(text, "\n")) | filter((p) => trim(p[1]) != "")
+    if len(lines) > 1 && !is_err(json.parse(lines[0][1])) {
+        let wrong = find(lines, (p) => is_err(json.parse(p[1])))
+        if wrong != null {
+            let at = schema_inferrer_scan(wrong[1])
+            return { samples: [], bad: at != null ? { ...at, line: wrong[0] + 1 } : { line: wrong[0] + 1, col: 1, why: "This line is not JSON." }, more: 0 }
+        }
+        let items = lines | map((p) => json.parse(p[1]))
+        return { samples: take(items, cap), bad: null, more: max([0, len(items) - cap]) }
+    }
+    { samples: [], bad: schema_inferrer_scan(text) ?? { line: 1, col: 1, why: "This is not JSON the browser can read." }, more: 0 }
+}
+
+// ---- Merging samples -----------------------------------------------------------
+// A node says what was seen at one place: count, nulls, how many of each kind, and for
+// objects its fields, for arrays a node for all their items, for text its formats and
+// values (up to enum_limit + 1 different ones, which is enough to rule an enum out).
+
+fn schema_inferrer_node() -> map = { count: 0, nulls: 0, kinds: {}, fields: {}, items: null, formats: {}, words: [], many: false, deep: false }
+
+fn schema_inferrer_kind(v) -> str = match type_of(v) {
+    "map" => "object"
+    "list" => "array"
+    "str" => "string"
+    "bool" => "boolean"
+    "int" => "integer"
+    "dec" | "float" => v == floor(v) ? "integer" : "number"
+    _ => "null"
+}
+
+fn schema_inferrer_format(s: str) -> str? {
+    let f = find(schema_inferrer_formats, (x) => re.test(s, x.test))
+    if f == null { return null }
+    if f.id == "date" && !date.valid(s, "date") { return null }
+    if f.id == "date-time" && !date.valid(s, "date-time") { return null }
+    f.id
+}
+
+// A node with one more value in it. The nesting stops at 32, so a hostile sample cannot
+// run the stack out.
+fn schema_inferrer_add(node: map, v, deep: int, limit: int) -> map {
+    let kind = schema_inferrer_kind(v)
+    let seen = { ...node, count: node.count + 1 }
+    if kind == "null" { return { ...seen, nulls: node.nulls + 1 } }
+    let tallied = { ...seen, kinds: set(node.kinds, kind, (get(node.kinds, kind) ?? 0) + 1) }
+    if kind == "string" {
+        let f = schema_inferrer_format(v)
+        let known = len(v) <= 40 && contains(node.words, v)
+        let room = len(node.words) <= limit && len(v) <= 40
+        return { ...tallied, formats: f != null ? set(node.formats, f, (get(node.formats, f) ?? 0) + 1) : node.formats,
+                 words: !known && room ? push(node.words, v) : node.words, many: node.many || (!known && !room) }
+    }
+    if (kind == "object" || kind == "array") && deep >= 32 { return { ...tallied, deep: true } }
+    if kind == "object" {
+        let fields = reduce(keys(v), node.fields, (m, k) => set(m, k, schema_inferrer_add(get(m, k) ?? schema_inferrer_node(), get(v, k), deep + 1, limit)))
+        return { ...tallied, fields }
+    }
+    if kind == "array" {
+        let items = reduce(v, node.items ?? schema_inferrer_node(), (m, x) => schema_inferrer_add(m, x, deep + 1, limit))
+        return { ...tallied, items }
+    }
+    tallied
+}
+
+fn schema_inferrer_tree(samples: list, limit: int = 6) -> map =
+    reduce(samples, schema_inferrer_node(), (m, s) => schema_inferrer_add(m, s, 0, limit))
+
+// A node's JSON types, in a fixed order; integer goes into number when both are seen.
+fn schema_inferrer_types(n: map) -> list {
+    let found = ["object", "array", "string", "number", "integer", "boolean"] | filter((k) => has(n.kinds, k))
+    let types = contains(found, "number") ? remove(found, "integer") : found
+    n.nulls > 0 ? push(types, "null") : types
+}
+
+// The format every string at a node has, or null.
+fn schema_inferrer_format_of(n: map) -> str? {
+    let total = get(n.kinds, "string") ?? 0
+    find(keys(n.formats), (f) => get(n.formats, f) == total)
+}
+
+// The values of a likely enum, or null: few, repeating, and no format.
+fn schema_inferrer_enum(n: map, limit: int) {
+    let total = get(n.kinds, "string") ?? 0
+    let k = len(n.words)
+    if total < 2 || n.many || k == 0 || k > limit || total < k * 2 || schema_inferrer_format_of(n) != null { return null }
+    sort(n.words)
+}
+
+// A node as JSON Schema.
+fn schema_inferrer_part(n: map, limit: int) -> map {
+    let types = schema_inferrer_types(n)
+    let base = len(types) == 0 ? {} : { type: len(types) == 1 ? types[0] : types }
+    let with_format = schema_inferrer_format_of(n) != null ? set(base, "format", schema_inferrer_format_of(n)) : base
+    let with_enum = schema_inferrer_enum(n, limit) != null ? set(with_format, "enum", schema_inferrer_enum(n, limit)) : with_format
+    let object = get(n.kinds, "object") ?? 0
+    let with_object = !has(n.kinds, "object") || n.deep ? with_enum : {
+        ...with_enum,
+        properties: reduce(keys(n.fields), {}, (m, k) => set(m, k, schema_inferrer_part(get(n.fields, k), limit))),
+        required: keys(n.fields) | filter((k) => get(n.fields, k).count == object),
+    }
+    n.items != null ? set(with_object, "items", schema_inferrer_part(n.items, limit)) : with_object
+}
+
+// The whole schema: the samples are instances of the root.
+fn schema_inferrer_schema(tree: map, limit: int = 6) -> map =
+    { "$schema": "https://json-schema.org/draft/2020-12/schema", ...schema_inferrer_part(tree, limit) }
+
+// The fields as table rows, depth first: { path, types, required, nullable, format, values }.
+fn schema_inferrer_rows(n: map, limit: int = 6, path: str = "", holder: int? = null) -> list {
+    let object = get(n.kinds, "object") ?? 0
+    let own = path == "" ? [] : [{ path, types: remove(schema_inferrer_types(n), "null"), required: holder == null || n.count == holder,
+                                    nullable: n.nulls > 0, format: schema_inferrer_format_of(n), values: schema_inferrer_enum(n, limit), deep: n.deep }]
+    let kids = flatten(keys(n.fields) | map((k) => schema_inferrer_rows(get(n.fields, k), limit, path == "" ? k : `${path}.${k}`, object)))
+    let inner = n.items != null ? schema_inferrer_rows(n.items, limit, `${path}[]`, null) : []
+    own + kids + inner
+}
+
+component SchemaInferrer(id: str, text: str = "", title: str = "Infer a schema", enum_limit: int = 6, max_chars: int = 200000, max_samples: int = 1000,
+                         name: str? = null, on_change = null, class: str? = null) {
+    style global schema_inferrer_css
+    state source = text
+    let clipped = len(source) > max_chars
+    let read = schema_inferrer_samples(clipped ? slice(source, 0, max_chars) : source, max_samples)
+    let tree = schema_inferrer_tree(read.samples, enum_limit)
+    let schema = schema_inferrer_schema(tree, enum_limit)
+    let rows = schema_inferrer_rows(tree, enum_limit)
+    let n_samples = len(read.samples)
+    let shown = take(rows, 500)
+    let is_deep = any(rows, (r) => r.deep)
+    let good = read.bad == null && n_samples > 0
+    let out = json.stringify(schema, true)
+    let changed = (s: str) => {
+        source = s
+        if on_change != null {
+            let cut = len(s) > max_chars ? slice(s, 0, max_chars) : s
+            let r = schema_inferrer_samples(cut, max_samples)
+            on_change(r.bad == null && len(r.samples) > 0 ? schema_inferrer_schema(schema_inferrer_tree(r.samples, enum_limit), enum_limit) : null)
+        }
+    }
+    <section class={ui_cls(["ui-schemainf", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-schemainf-title id={`${id}-title`}>{title}</h3>
+        <div.ui-schemainf-field>
+            <label for={`${id}-text`}>JSON samples</label>
+            <textarea.ui-schemainf-text id={`${id}-text`} name={name} rows="8" spellcheck="false" autocomplete="off" placeholder="An array of objects, one object, or a value a line"
+                      aria-invalid={read.bad != null ? "true" : null} aria-describedby={read.bad != null ? `${id}-bad` : null}
+                      @input={(e) => { changed(e.value) }}>{source}</textarea>
+        </div>
+        {read.bad != null && <p.ui-schemainf-error id={`${id}-bad`} role="alert">{`Line ${read.bad.line}, column ${read.bad.col}: ${read.bad.why}`}</p>}
+        {clipped && <p.ui-schemainf-note>{`Only the first ${format_number(max_chars, "en-US", 0)} characters are read.`}</p>}
+        {read.more > 0 && <p.ui-schemainf-note>{`Only the first ${format_number(max_samples, "en-US", 0)} samples are read; ${format_number(read.more, "en-US", 0)} more left out.`}</p>}
+        {is_deep && <p.ui-schemainf-note>Nesting past 32 levels is left as any value.</p>}
+        <p.ui-schemainf-sum aria-live="polite">
+            {good ? `${n_samples} sample${n_samples == 1 ? "" : "s"}, ${len(rows)} field${len(rows) == 1 ? "" : "s"}` : (read.bad != null ? "" : "Paste JSON to see its shape.")}
+        </p>
+        {good && len(shown) > 0 && <div.ui-schemainf-scroll tabindex="0" role="region" aria-label="Fields">
+            <table>
+                <thead><tr><th scope="col">Field</th><th scope="col">Type</th><th scope="col">Presence</th><th scope="col">Format or values</th></tr></thead>
+                <tbody>
+                    {for r in shown => <tr key={r.path} data-path={r.path}>
+                        <th scope="row">{r.path}</th>
+                        <td>{filled(join(r.types, " or ")) ?? "null"}{r.nullable && len(r.types) > 0 ? ", nullable" : ""}</td>
+                        <td class={!r.required && "ui-schemainf-opt"}>{r.required ? "required" : "optional"}</td>
+                        <td>
+                            {r.format != null && <span.ui-schemainf-tag>{r.format}</span>}
+                            {r.values != null && (for w in r.values => <span.ui-schemainf-tag key={w}>{w}</span>)}
+                        </td>
+                    </tr>}
+                </tbody>
+            </table>
+        </div>}
+        {len(rows) > len(shown) && <p.ui-schemainf-note>{`The table shows the first ${len(shown)} of ${len(rows)} fields; the schema has them all.`}</p>}
+        {good && <figure.ui-schemainf-out>
+            <figcaption>JSON Schema</figcaption>
+            <pre tabindex="0" id={`${id}-schema`}>{out}</pre>
+        </figure>}
+        {name != null && <input type="hidden" name={`${name}_schema`} value={good ? json.stringify(schema) : ""}/>}
+    </section>
+}

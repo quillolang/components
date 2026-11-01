@@ -1,0 +1,269 @@
+// EmailTypoInput: an email field that catches the slip before it costs a lost message.
+// It checks the address's shape and says what is wrong and where, and it offers "did you
+// mean jane@gmail.com?" with one click to fix, by edit distance against common mail
+// domains. It warns of a throwaway domain from a list it is given, and stays quiet on a
+// valid domain it has never heard of: precision first, as a false alarm teaches people
+// to ignore it. No lookup is made: nothing leaves the page.
+//
+//   <EmailTypoInput id="email" name="email" label="Email" required={true}/>
+//   <EmailTypoInput id="invite" label="Invite" disposable={["mailinator.com"]} domains={["ourcompany.com"]}
+//                   on_change={(r) => { ok = r.status == "ok" }}/>
+//
+// id: the field's id, unique on the page. name: its name ("email"); it is a real
+// <input type="email">, so a form sends what it shows. label, hint, placeholder,
+// required, disabled as for every field. value: the address to start with. domains:
+// more domains to take as right and to compare with, besides the common ones (a
+// company's own, say). disposable: domains to warn about, which count with their
+// subdomains ("x@a.mailinator.com"). class: more classes. on_change(result): inside one
+// of your components, { email, status } after each change or fix; status as below,
+// email the address when its shape is right, else "".
+//
+// What is only unfinished ("jane", "jane@") is not called wrong until the field is left.
+// "Keep what I typed" sets a suggestion aside until the address changes. The comparison:
+// a domain from the list is right as it is. Otherwise, with the same name and an ending one
+// edit off ("gmail.con"), or with the same ending and a name one edit off ("gmial.com"), or
+// two edits for a name of eight letters or more, it is offered. Names under five letters
+// are not compared, and a name's first letter must match, or be swapped with the second, as
+// that is what tells "gmial" from "wahoo" and "cloud". Any domain ending in an ending that
+// does not exist and is a known slip (.con, .cmo, .ogr) is offered the real one.
+//
+// email_typo_input_check(text, domains, disposable) is the same for a program's own
+// use: { status, email, message, at, fix }. status is "empty", "typing", "bad", "ok",
+// "suggest" (fix holds the address it offers) or "disposable"; at is where the message
+// points, from 0. email_typo_input_distance(a, b) is the edit distance, a swap of two
+// neighbours counting as one.
+
+import ui/theme.qwe use ui_cls
+
+let email_typo_input_css = css`
+.ui-emailtypo { display: grid; gap: 6px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-emailtypo-label { font-size: 13px; font-weight: 500; }
+.ui-emailtypo-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-emailtypo-control { box-sizing: border-box; width: 100%; height: 38px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1 var(--ui-font);
+  transition: border-color .15s, box-shadow .15s; }
+.ui-emailtypo-control::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-emailtypo-control:hover { border-color: var(--ui-strong); }
+.ui-emailtypo-control:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-emailtypo-control[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-emailtypo-control:disabled { opacity: .55; cursor: not-allowed; }
+.ui-emailtypo-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-emailtypo-out { display: grid; gap: 4px; min-height: 20px; font-size: 13px; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-emailtypo-out p { margin: 0; }
+.ui-emailtypo-bad { color: var(--ui-danger); }
+.ui-emailtypo-warn { color: var(--ui-warning); }
+.ui-emailtypo-good { color: var(--ui-success); }
+.ui-emailtypo-offer { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin: 0; color: var(--ui-fg); }
+.ui-emailtypo-fix, .ui-emailtypo-keep { padding: 0; border: 0; border-radius: 3px; background: none; font: inherit; cursor: pointer; text-align: left; overflow-wrap: anywhere; }
+.ui-emailtypo-fix { color: var(--ui-accent); font-weight: 600; text-decoration: underline; }
+.ui-emailtypo-keep { color: var(--ui-muted); font-size: 12px; }
+.ui-emailtypo-fix:focus-visible, .ui-emailtypo-keep:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) { .ui-emailtypo-control { transition: none; } }
+`
+
+// Most-used first: of two equally near, the commoner is offered.
+let email_typo_input_common = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com", "aol.com", "live.com", "msn.com", "me.com", "mac.com",
+    "googlemail.com", "ymail.com", "rocketmail.com", "protonmail.com", "proton.me", "pm.me", "fastmail.com", "zoho.com", "mail.com", "email.com", "hey.com",
+    "tutanota.com", "tuta.com", "gmx.com", "gmx.net", "gmx.de", "web.de", "mail.ru", "yandex.com", "yandex.ru", "qq.com", "163.com", "comcast.net", "verizon.net",
+    "att.net", "sbcglobal.net", "cox.net", "yahoo.co.uk", "hotmail.co.uk", "yahoo.co.jp", "btinternet.com", "orange.fr", "free.fr", "wanadoo.fr", "libero.it"]
+// Endings of two parts, so "yahoo.co.uk" is named "yahoo".
+let email_typo_input_pairs = ["co.uk", "co.jp", "co.nz", "co.za", "co.in", "com.au", "com.br", "com.mx", "com.ph", "com.sg"]
+// Endings no registry has, each a slip for a real one. ".co", ".cm" and ".om" do exist.
+let email_typo_input_endings = { con: "com", cmo: "com", ocm: "com", vom: "com", xom: "com", cpm: "com", cim: "com", clm: "com", coom: "com", comm: "com",
+    nte: "net", nett: "net", ogr: "org", rog: "org", orgg: "org" }
+let email_typo_input_limit = 254
+
+// Edit distance, a swap of neighbours counting one (optimal string alignment).
+// Past `cap` the exact figure does not matter, so far-apart lengths stop at once.
+fn email_typo_input_distance(a: str, b: str, cap: int = 3) {
+    let n = len(a)
+    let m = len(b)
+    if abs(n - m) > cap { return cap + 1 }
+    let x = split(a, "")
+    let y = split(b, "")
+    let before = []
+    let row = range(m + 1)
+    for i in 1..(n + 1) {
+        let cur = [i]
+        for j in 1..(m + 1) {
+            let cost = x[i - 1] == y[j - 1] ? 0 : 1
+            let best = min([row[j] + 1, cur[j - 1] + 1, row[j - 1] + cost])
+            if i > 1 && j > 1 && x[i - 1] == y[j - 2] && x[i - 2] == y[j - 1] { best = min([best, before[j - 2] + 1]) }
+            cur = push(cur, best)
+        }
+        before = row
+        row = cur
+    }
+    row[m]
+}
+
+// A domain as { name, ending }: "yahoo.co.uk" is "yahoo" and "co.uk".
+fn email_typo_input_split(domain: str) {
+    let parts = split(domain, ".")
+    let two = len(parts) >= 3 ? join(slice(parts, -2, len(parts)), ".") : ""
+    let cut = contains(email_typo_input_pairs, two) ? 2 : 1
+    { name: join(slice(parts, 0, len(parts) - cut), "."), ending: join(slice(parts, len(parts) - cut, len(parts)), ".") }
+}
+
+fn email_typo_input_near_name(name: str, known: str) {
+    if len(known) < 5 || len(name) < 4 { return null }
+    let same_start = slice(name, 0, 1) == slice(known, 0, 1)
+    let swapped = slice(name, 0, 2) == reverse(slice(known, 0, 2))
+    if !same_start && !swapped { return null }
+    let reach = len(known) >= 8 ? 2 : 1
+    let d = email_typo_input_distance(name, known, reach)
+    d <= reach ? d : null
+}
+
+// The domain it would offer for this one, or null.
+fn email_typo_input_suggestion(domain: str, known: list) {
+    if contains(known, domain) { return null }
+    let here = email_typo_input_split(domain)
+    let real_end = email_typo_input_endings[here.ending]
+    let best = null
+    let best_d = 99
+    for c in known {
+        let there = email_typo_input_split(c)
+        let d = here.name == there.name ? (email_typo_input_distance(here.ending, there.ending, 1) <= 1 ? 1 : null)
+            : here.ending == there.ending || real_end == there.ending ? email_typo_input_near_name(here.name, there.name)
+            : null
+        if d != null && d < best_d {
+            best = c
+            best_d = d
+        }
+    }
+    if best != null { return best }
+    real_end != null ? `${here.name}.${real_end}` : null
+}
+
+// A domain that lost its dot or its ending: "gmail", "gmailcom", "gmial".
+fn email_typo_input_bare(domain: str, known: list) {
+    for c in known {
+        if replace(c, ".", "") == domain || email_typo_input_split(c).name == domain { return c }
+    }
+    for c in known {
+        if email_typo_input_near_name(domain, email_typo_input_split(c).name) != null { return c }
+    }
+    null
+}
+
+fn email_typo_input_listed(domain: str, list_of: list) =
+    any(list_of, (d) => domain == lower(str(d)) || ends_with(domain, `.${lower(str(d))}`))
+
+// What is wrong with the shape of the part before the @, as { message, at }, or null.
+fn email_typo_input_local(local: str) {
+    if local == "" { return { message: "Something goes before the @.", at: 0 } }
+    if len(local) > 64 { return { message: "The part before the @ is too long: 64 characters at most.", at: 64 } }
+    if starts_with(local, ".") { return { message: "The address cannot start with a dot.", at: 0 } }
+    if ends_with(local, ".") { return { message: "The part before the @ cannot end with a dot.", at: len(local) - 1 } }
+    let double = index_of(local, "..")
+    if double != null { return { message: "Two dots in a row.", at: double } }
+    let wrong = re.find(local, "[\\s(),:;<>\\[\\]\\\\\"]")
+    if wrong != null { return { message: wrong.text == " " ? "A space cannot be in an address." : `"${wrong.text}" cannot be in an address.`, at: wrong.start } }
+    null
+}
+
+fn email_typo_input_domain(domain: str, from: int) {
+    let wrong = re.find(domain, "[\\s!#$%&'*+/=?^`{|}~(),:;<>\\[\\]\\\\\"_]")
+    if wrong != null { return { message: wrong.text == " " ? "A space cannot be in an address." : `"${wrong.text}" cannot be in a domain.`, at: from + wrong.start } }
+    if starts_with(domain, ".") { return { message: "The domain cannot start with a dot.", at: from } }
+    if ends_with(domain, ".") { return { message: "The domain cannot end with a dot.", at: from + len(domain) - 1 } }
+    let double = index_of(domain, "..")
+    if double != null { return { message: "Two dots in a row.", at: from + double } }
+    if len(domain) > 253 { return { message: "The domain is too long.", at: from + 253 } }
+    let place = from
+    for part in split(domain, ".") {
+        if len(part) > 63 { return { message: "A part of the domain is too long: 63 characters at most.", at: place + 63 } }
+        if starts_with(part, "-") { return { message: "A part of the domain cannot start with a hyphen.", at: place } }
+        if ends_with(part, "-") { return { message: "A part of the domain cannot end with a hyphen.", at: place + len(part) - 1 } }
+        place += len(part) + 1
+    }
+    null
+}
+
+// The whole check: see the opening comment.
+fn email_typo_input_check(text, domains: list = [], disposable: list = []) {
+    let known = [...(domains | map((d) => lower(str(d)))), ...email_typo_input_common]
+    let answer = (status: str, email: str, message, at, fix) => { status, email, message, at, fix }
+    let raw = trim(str(text ?? ""))
+    if raw == "" { return answer("empty", "", null, null, null) }
+    if len(raw) > email_typo_input_limit { return answer("bad", "", `Too long for an address: ${email_typo_input_limit} characters at most.`, email_typo_input_limit, null) }
+    let plain = re.replace(raw, "^mailto:", "", "i")
+    let named = re.find(plain, "<([^<>@\\s]+@[^<>@\\s]+)>$")
+    if named != null || plain != raw { return answer("bad", "", "Only the address goes here.", 0, named != null ? named.groups[0] : plain) }
+    let cut = split(raw, "@")
+    if len(cut) > 2 { return answer("bad", "", "An address has one @.", len(cut[0]) + 1 + len(cut[1]), null) }
+    if len(cut) == 1 {
+        let spoken = re.find(raw, "^(\\S+) at (\\S+\\.\\S+)$", "i")
+        if spoken != null { return answer("bad", "", "An address has an @ in place of the word.", len(spoken.groups[0]) + 1, `${spoken.groups[0]}@${spoken.groups[1]}`) }
+        return answer("typing", "", "An address needs an @.", len(raw), null)
+    }
+    let local = cut[0]
+    let domain = lower(cut[1])
+    let hurt = email_typo_input_local(local)
+    if hurt != null { return answer("bad", "", hurt.message, hurt.at, null) }
+    if domain == "" { return answer("typing", "", "Something goes after the @.", len(raw), null) }
+    let from = len(local) + 1
+    if contains(domain, ",") {
+        let dotted = replace(domain, ",", ".")
+        if email_typo_input_domain(dotted, from) == null { return answer("bad", "", "A comma cannot be in a domain.", from + index_of(domain, ","), `${local}@${dotted}`) }
+    }
+    if ends_with(domain, ".") && email_typo_input_domain(slice(domain, 0, -1), from) == null {
+        return answer("bad", "", "The domain cannot end with a dot.", from + len(domain) - 1, `${local}@${email_typo_input_suggestion(slice(domain, 0, -1), known) ?? slice(domain, 0, -1)}`)
+    }
+    let broken = email_typo_input_domain(domain, from)
+    if broken != null { return answer("bad", "", broken.message, broken.at, null) }
+    if !contains(domain, ".") {
+        let bare = email_typo_input_bare(domain, known)
+        return answer("typing", "", "The domain needs an ending, such as .com.", len(raw), bare != null ? `${local}@${bare}` : null)
+    }
+    let ending = split(domain, ".") | last
+    if !re.test(ending, "^(?:xn--)?[^\\d]{2,}") || re.test(ending, "^\\d+$") { return answer("bad", "", "The domain's ending should be letters, such as .com.", len(raw) - len(ending), null) }
+    let good = `${local}@${domain}`
+    if email_typo_input_listed(domain, disposable) { return answer("disposable", good, "This is a throwaway address, so a reply may never reach it.", null, null) }
+    let near = email_typo_input_suggestion(domain, known)
+    if near != null { return answer("suggest", good, null, null, `${local}@${near}`) }
+    answer("ok", good, null, null, null)
+}
+
+component EmailTypoInput(id: str, name: str = "email", label: str? = null, value: str = "", placeholder: str = "you@example.com", hint: str? = null,
+                         required: bool = false, disabled: bool = false, domains: list = [], disposable: list = [], on_change = null, class: str? = null) {
+    style global email_typo_input_css
+    state text = value
+    state left = false
+    state kept = null
+    let read = email_typo_input_check(text, domains, disposable)
+    let fault = read.status == "bad" || (read.status == "typing" && left) ? read.message : null
+    let offer = read.fix != null && text != kept ? read.fix : null
+    let described = ui_cls([hint != null && `${id}-hint`, `${id}-out`])
+    let tell = (typed: str) => {
+        let r = email_typo_input_check(typed, domains, disposable)
+        on_change && on_change({ email: r.email, status: r.status })
+    }
+    <div class={ui_cls(["ui-emailtypo", class])}>
+        {label != null && <label.ui-emailtypo-label for={id}>
+            {label}{required && <span.ui-emailtypo-req aria-hidden="true">*</span>}
+        </label>}
+        <input.ui-emailtypo-control type="email" id={id} name={name} value={text} placeholder={placeholder} required={required} disabled={disabled}
+               autocomplete="email" spellcheck="false" autocapitalize="none" aria-invalid={fault != null ? "true" : null} aria-describedby={described}
+               @input={(e) => { text = e.value; tell(e.value) }}
+               @blur={() => { left = true }}/>
+        {hint != null && <p.ui-emailtypo-hint id={`${id}-hint`}>{hint}</p>}
+        <div.ui-emailtypo-out id={`${id}-out`} aria-live="polite">
+            {fault != null && <p.ui-emailtypo-bad>{fault}{read.at != null ? ` (character ${read.at + 1})` : ""}</p>}
+            {read.status == "disposable" && <p.ui-emailtypo-warn>{read.message}</p>}
+            {read.status == "ok" && <p.ui-emailtypo-good>Looks right.</p>}
+            {offer != null && <p.ui-emailtypo-offer>
+                <span>Did you mean</span>
+                <button.ui-emailtypo-fix type="button" @click={(e) => {
+                    let fixed = offer
+                    text = fixed
+                    tell(fixed)
+                    e.target.closest(".ui-emailtypo").querySelector("input").focus()
+                }}>{offer}</button>
+                <span>?</span>
+                {read.status == "suggest" && <button.ui-emailtypo-keep type="button" @click={() => { kept = text }}>Keep what I typed</button>}
+            </p>}
+        </div>
+    </div>
+}

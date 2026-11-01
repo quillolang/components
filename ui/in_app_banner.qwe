@@ -1,0 +1,260 @@
+// InAppBanner: a notification that slides down from the top of the screen while someone is
+// using the app, as a phone's own do. A tap opens it, a swipe up sends it away, and it goes
+// by itself after a few seconds. Several wait their turn, and it says how many. A finger on
+// it, or focus in it, holds its timer. It takes nothing from the page: what is around it
+// stays in use, and it is announced to screen readers without moving focus.
+//
+//   import ui/in_app_banner.qwe use InAppBanner
+//
+//   component Chat() {
+//       state notes = []
+//       <InAppBanner notes={notes} on_open={(n) => { navigate(`/chat/${n.id}`) }}/>
+//   }
+//
+// notes: a list of maps, which may grow at any time: id (each its own, or the title
+// serves), title, body, app (who it is from, whose first letter stands as its icon), time
+// (text such as "now"), seconds (how long this one stays). One without a title or a body
+// is left out, and so is an id seen before: give a new one an id of its own. seconds: how
+// long each stays (5; 0 keeps it until someone acts). label: what screen readers call the
+// place they appear ("Notifications"). on_open(note): called when it is tapped.
+// on_dismiss(note): called when it leaves without being opened.
+//
+// The equal of the swipe is the Dismiss button, and Escape with focus in it. The fixed
+// position is held by a frame with a transform: see the demo.
+
+import ui/bottom_sheet.qwe use bottom_sheet_track, bottom_sheet_track_move, bottom_sheet_speed, bottom_sheet_rubber, bottom_sheet_dismissed
+
+let in_app_banner_css = css`
+.ui-in-app-banner-host {
+  position: fixed; inset: 0 0 auto 0; z-index: 70; display: flex; justify-content: center; box-sizing: border-box;
+  padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) 0 max(8px, env(safe-area-inset-left)); pointer-events: none;
+}
+.ui-in-app-banner {
+  position: relative; display: flex; align-items: stretch; box-sizing: border-box; width: 100%; max-width: 480px; pointer-events: auto;
+  border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 8px); background: var(--ui-surface); color: var(--ui-fg);
+  box-shadow: var(--ui-shadow-lg); font: 14px/1.35 var(--ui-font);
+  /* Sideways is left to the page. */
+  touch-action: pan-x; -webkit-touch-callout: none; user-select: none;
+  animation: ui-in-app-banner-in .34s cubic-bezier(.22, 1, .36, 1); transition: transform .26s cubic-bezier(.22, 1, .36, 1), opacity .2s;
+}
+@keyframes ui-in-app-banner-in { from { transform: translateY(calc(-100% - 16px)); } }
+.ui-in-app-banner-out { transform: translateY(calc(-100% - 24px)); opacity: 0; }
+.ui-in-app-banner-main {
+  display: flex; flex: 1; align-items: center; gap: 12px; min-width: 0; min-height: 68px; padding: 10px 4px 10px 12px; border: 0; background: transparent;
+  color: inherit; font: inherit; text-align: left; cursor: pointer; border-radius: inherit; touch-action: inherit;
+}
+.ui-in-app-banner-main:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: -2px; }
+.ui-in-app-banner-icon {
+  display: grid; place-items: center; flex: none; width: 40px; height: 40px; border-radius: var(--ui-radius);
+  background: var(--ui-accent-soft); color: var(--ui-accent); font-size: 17px; font-weight: 700;
+}
+.ui-in-app-banner-text { display: block; flex: 1; min-width: 0; }
+.ui-in-app-banner-top { display: flex; justify-content: space-between; gap: 8px; color: var(--ui-muted); font-size: 12px; }
+.ui-in-app-banner-title { display: block; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-in-app-banner-body { display: -webkit-box; overflow: hidden; color: var(--ui-muted); -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.ui-in-app-banner-close {
+  display: grid; place-items: center; flex: none; align-self: center; width: 44px; height: 44px; margin-right: 4px; padding: 0; border: 0;
+  border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: pointer; touch-action: inherit;
+}
+@media (hover: hover) { .ui-in-app-banner-close:hover { background: var(--ui-subtle); color: var(--ui-fg); } }
+.ui-in-app-banner-close:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-in-app-banner-close svg { width: 16px; height: 16px; }
+.ui-in-app-banner-more {
+  position: absolute; left: 50%; bottom: -9px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-subtle);
+  color: var(--ui-muted); font-size: 11px; line-height: 16px; transform: translateX(-50%); white-space: nowrap;
+}
+@media (prefers-reduced-motion: reduce) { .ui-in-app-banner { animation: none; transition: none; } }
+`
+
+// What can be shown, in order, each once: no title or body, or something that is no note,
+// and it is left out, and so is an id already done with or already in the line.
+fn in_app_banner_queue(notes, gone) {
+    let done = gone
+    let list_of = type_of(notes) == "list" ? notes : []
+    let given = list_of | filter((n) => type_of(n) == "map" && (n.title != null || n.body != null))
+    let rows = given | map((n) => {
+        { id: str(n.id ?? n.title ?? n.body), title: n.title == null ? "" : str(n.title), body: n.body == null ? "" : str(n.body),
+          app: n.app == null ? "" : str(n.app), time: n.time == null ? "" : str(n.time), seconds: n.seconds }
+    })
+    let seen = {}
+    let line = []
+    for r in rows {
+        if !contains(done, r.id) && get(seen, r.id, false) == false {
+            seen = set(seen, r.id, true)
+            line = line + [r]
+        }
+    }
+    line
+}
+
+// How long a note stays, in milliseconds; 0 for one that waits. Its own seconds come first,
+// and what is not a number of seconds is taken as not given.
+fn in_app_banner_ms(note, seconds) {
+    let own = note.seconds
+    let s = type_of(own) == "int" || type_of(own) == "float" ? own : seconds
+    let good = type_of(s) == "int" || type_of(s) == "float" ? s : 5
+    good <= 0 ? 0 : round(min([good, 3600]) * 1000)
+}
+
+// The app's first letter, for the icon.
+fn in_app_banner_letter(note) {
+    let from = note.app != "" ? note.app : note.title != "" ? note.title : note.body
+    let chars = split(from, "")
+    len(chars) > 0 ? upper(chars[0]) : "?"
+}
+
+component InAppBanner(notes = [], seconds: num = 5, label: str = "Notifications", on_open = null, on_dismiss = null) {
+    style global in_app_banner_css
+    state gone = []             // ids done with
+    state left = 0              // milliseconds left on the one showing
+    state shown_id = null
+    state held = false          // a finger is on it
+    state inside = false        // focus is in it
+    state leaving = null        // "open" or "away" while it goes
+    state slide = 220           // how long that takes; next to nothing where motion is unwelcome
+    state card = null
+    state track = null
+    state dragging = false
+    state moved = false
+    let line = in_app_banner_queue(notes, gone)
+    let head = len(line) > 0 ? line[0] : null
+    let waiting = len(line) - 1
+    if head != null && head.id != shown_id {
+        shown_id = head.id
+        left = in_app_banner_ms(head, seconds)
+    }
+    let go = (how: str) => {
+        if leaving == null {
+            if card != null {
+                card.style.removeProperty("transform")
+                card.style.removeProperty("transition")
+            }
+            leaving = how
+        }
+    }
+    if leaving != null {
+        every(slide, () => {
+            let was = head
+            let how = leaving
+            leaving = null
+            track = null
+            dragging = false
+            held = false
+            inside = false
+            card = null
+            gone = gone + [was.id]
+            if how == "open" {
+                on_open && on_open(was)
+            } else {
+                on_dismiss && on_dismiss(was)
+            }
+        })
+    }
+    let timed = head != null && in_app_banner_ms(head, seconds) > 0
+    if timed && !held && !inside && leaving == null {
+        every(100, () => {
+            left = left - 100
+            if left <= 0 { go("away") }
+        })
+    }
+    let moving = (e) => {
+        if track != null {
+            track = bottom_sheet_track_move(track, e.clientX, e.clientY, e.timeStamp)
+            if track.lock == "x" && !dragging { track = null }
+            if track != null && track.lock == "y" {
+                if !dragging {
+                    dragging = true
+                    moved = true
+                    card.setPointerCapture(e.pointerId)
+                    card.style.transition = "none"
+                }
+                let dy = track.y - track.y0
+                let y = dy <= 0 ? dy : bottom_sheet_rubber(dy, 40)
+                card.style.transform = `translateY(${round(y, 2)}px)`
+            }
+        }
+    }
+    let ended = (e) => {
+        held = false
+        if track != null && dragging {
+            let leave = bottom_sheet_dismissed(track.y0 - track.y, card.offsetHeight, 0 - bottom_sheet_speed(track, "y", e.timeStamp), 0.4)
+            if leave {
+                go("away")
+            } else {
+                card.style.removeProperty("transform")
+                card.style.removeProperty("transition")
+            }
+        }
+        track = null
+        dragging = false
+    }
+    let cancelled = () => {
+        held = false
+        if dragging {
+            card.style.removeProperty("transform")
+            card.style.removeProperty("transition")
+        }
+        track = null
+        dragging = false
+    }
+    // role="status" is on the host, which is there before anything is, or nothing is read out.
+    <div.ui-in-app-banner-host role="status" aria-live="polite" aria-label={label}
+         @mount={(_el) => {
+             if js("window.matchMedia", "(prefers-reduced-motion: reduce)").matches { slide = 16 }
+         }}>
+        {for n in take(line, 1) =>
+            <div key={n.id} class={leaving != null ? "ui-in-app-banner ui-in-app-banner-out" : "ui-in-app-banner"}
+                 @pointerdown={(e) => {
+                     moved = false
+                     if e.button == 0 {
+                         held = true
+                         card = e.target.closest(".ui-in-app-banner")
+                         track = bottom_sheet_track(e.clientX, e.clientY, e.timeStamp)
+                     }
+                 }}
+                 @pointermove={moving}
+                 @pointerup={ended}
+                 @pointercancel={cancelled}
+                 @pointerleave={() => {
+                     if !dragging {
+                         held = false
+                         track = null
+                     }
+                 }}
+                 @touchmove={(e) => {
+                     if dragging && e.cancelable { e.preventDefault() }
+                 }}
+                 @focusin={() => { inside = true }}
+                 @focusout={() => { inside = false }}
+                 @keydown={(e) => {
+                     if e.key == "Escape" {
+                         card = e.target.closest(".ui-in-app-banner")
+                         go("away")
+                     }
+                 }}>
+                <button.ui-in-app-banner-main type="button"
+                        @click={(e) => {
+                            if !moved {
+                                card = e.target.closest(".ui-in-app-banner")
+                                go("open")
+                            }
+                            moved = false
+                        }}>
+                    <span.ui-in-app-banner-icon aria-hidden="true">{in_app_banner_letter(n)}</span>
+                    <span.ui-in-app-banner-text>
+                        {(n.app != "" || n.time != "") && <span.ui-in-app-banner-top><span>{n.app}</span><span>{n.time}</span></span>}
+                        {n.title != "" && <span.ui-in-app-banner-title>{n.title}</span>}
+                        {n.body != "" && <span.ui-in-app-banner-body>{n.body}</span>}
+                    </span>
+                </button>
+                <button.ui-in-app-banner-close type="button" aria-label="Dismiss"
+                        @click={(e) => {
+                            card = e.target.closest(".ui-in-app-banner")
+                            go("away")
+                        }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+                {waiting > 0 && <span.ui-in-app-banner-more>{waiting} more</span>}
+            </div>}
+    </div>
+}

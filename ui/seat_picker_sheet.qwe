@@ -1,0 +1,638 @@
+// SeatPickerSheet: picks seats in a sheet that rises over the page, on a cabin to be pinched,
+// dragged and tapped. A wide cabin does not fit a phone at a size a finger can press, so
+// the first tap on a small seat zooms in on it and the next one takes it. It shows each seat's
+// fare, the total, what is beside the seat just taken, and whether a party sits together, and it
+// finds a run of seats together with one press. Someone who needs an accessible seat
+// says so, and those seats stand out while exit rows, which need a person able to help in
+// an emergency, are closed. On a tablet the sheet stands in the middle, the cabin beside the fares.
+//
+//   import ui/seat_picker_sheet.qwe use SeatPickerSheet
+//
+//   <SeatPickerSheet trigger="Choose seats" count={2} rows={30} layout="ABC DEF" skip_rows={[13]} taken={["1A", "12C"]}
+//                    exit_rows={[14, 15]} access_seats={["3A", "3B"]} base={18.00m}
+//                    fares={[{ name: "Front", first: 1, last: 5, price: 42.00m }, { name: "Exit", first: 14, last: 15, price: 55.00m }]}
+//                    on_confirm={(seats, total) => { chosen = seats }}/>
+//
+// trigger: the words of a button that opens it. Inside one of your components, open it from
+// your own state instead: open={...} and on_close(). title: its heading ("Choose your seats").
+// count: how many seats to take (1); a press past that gives up the oldest taken. layout: the seat
+// letters across, a space for each aisle ("ABC DEF"). rows: how many; first_row (1); skip_rows:
+// numbers not used. taken: seats no one can have. exit_rows. access_seats: seats with a
+// movable armrest or the room for a person with a disability. base: the fare of any seat in no
+// band (0 is "Included"). fares: bands of rows, { name, first, last, price }, the first that holds
+// a row counting; prices are decimals. currency ("USD"), locale ("en-US"). value: the seats it
+// starts with. name: a hidden field for a plain <form>, the seats with commas between.
+// on_change(seats, total): after each change. on_confirm(seats, total): the button at its foot.
+// Both inside one of your components; total is a decimal. on_close(): it has closed.
+//
+// The equal of the gestures: + and - zoom, arrow keys walk the seats, Enter or Space takes one.
+// Escape, Close and pulling the handle down close it; "Find seats together" does the search.
+//
+// seat_picker_sheet_cabin, seat_picker_sheet_toggle, seat_picker_sheet_neighbours,
+// seat_picker_sheet_together, seat_picker_sheet_suggest and seat_picker_sheet_total are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let seat_picker_sheet_css = css`
+html:has(.ui-seatps-dlg[open]) { overflow: hidden; }
+.ui-seatps-dlg {
+  box-sizing: border-box; position: fixed; inset: auto 0 0 0; width: 100%; max-width: 100vw; height: calc(100dvh - max(12px, env(safe-area-inset-top))); max-height: none; margin: 0; padding: 0; overflow: hidden;
+  border: 1px solid var(--ui-border); border-bottom: 0; border-radius: calc(var(--ui-radius) + 8px) calc(var(--ui-radius) + 8px) 0 0; background: var(--ui-surface); color: var(--ui-fg); font: 15px/1.4 var(--ui-font);
+  overscroll-behavior: contain; transition: transform .28s cubic-bezier(.22, 1, .36, 1);
+}
+.ui-seatps-dlg[open] { display: flex; flex-direction: column; animation: ui-seatps-up .28s cubic-bezier(.22, 1, .36, 1); }
+@keyframes ui-seatps-up { from { transform: translateY(100%); } }
+.ui-seatps-dlg::backdrop { background: var(--ui-overlay); }
+.ui-seatps-grip { flex: none; display: grid; place-items: center; width: 100%; height: 44px; padding: 0; border: 0; background: transparent; cursor: grab; touch-action: none; -webkit-touch-callout: none; user-select: none; }
+.ui-seatps-grip span { width: 40px; height: 5px; border-radius: 999px; background: var(--ui-strong); }
+.ui-seatps-grip:focus-visible { outline: none; }
+.ui-seatps-grip:focus-visible span { background: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-seatps-head { flex: none; display: flex; align-items: center; gap: 8px; margin-top: -8px; padding: 0 8px 6px 16px; touch-action: none; user-select: none; }
+.ui-seatps-head h2 { flex: 1; min-width: 0; margin: 0; font-size: 17px; font-weight: 600; }
+.ui-seatps-icon { box-sizing: border-box; display: grid; place-items: center; flex: none; width: 44px; height: 44px; padding: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 600 20px/1 var(--ui-font); cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.ui-seatps-icon:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-seatps-icon svg { width: 18px; height: 18px; }
+.ui-seatps-close { border-color: transparent; background: transparent; color: var(--ui-muted); }
+.ui-seatps-in { flex: 1; min-height: 0; display: flex; flex-direction: column; container-type: inline-size; }
+.ui-seatps-main { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* Clip, not hidden: a hidden box scrolls when a seat in it takes focus, and the pan is ours. */
+.ui-seatps-view { position: relative; flex: 1; min-height: 0; overflow: clip; touch-action: none; -webkit-touch-callout: none; user-select: none; background: var(--ui-subtle); }
+.ui-seatps-plane { position: absolute; left: 0; top: 0; display: grid; gap: 4px; width: max-content; padding: 10px 8px 24px; transform-origin: 0 0; will-change: transform; }
+.ui-seatps-plane[data-glide] { transition: transform .3s cubic-bezier(.22, 1, .36, 1); }
+.ui-seatps-row { display: flex; gap: 4px; align-items: center; }
+.ui-seatps-num { width: 28px; color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: center; }
+.ui-seatps-gap { width: 24px; }
+.ui-seatps-exit { display: flex; justify-content: space-between; padding: 0 36px; color: var(--ui-danger); font-size: 11px; font-weight: 700; letter-spacing: .08em; }
+.ui-seatps-seat {
+  box-sizing: border-box; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid var(--ui-border); border-radius: 10px 10px 6px 6px; background: var(--f, var(--ui-surface)); color: var(--ui-fg);
+  font: 600 13px/1 var(--ui-font); cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-seatps-seat[data-band="1"] { --f: color-mix(in srgb, var(--ui-accent) 16%, var(--ui-surface)); }
+.ui-seatps-seat[data-band="2"] { --f: color-mix(in srgb, var(--ui-warning) 22%, var(--ui-surface)); }
+.ui-seatps-seat[data-band="3"] { --f: color-mix(in srgb, var(--ui-info) 20%, var(--ui-surface)); }
+.ui-seatps-seat[aria-disabled="true"] { background: var(--ui-strong); color: var(--ui-muted); opacity: .5; cursor: default; }
+.ui-seatps-seat[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); opacity: 1; }
+.ui-seatps-seat[data-access] { box-shadow: inset 0 0 0 2px var(--ui-success); }
+.ui-seatps-seat:focus-visible { outline: 3px solid var(--ui-accent); outline-offset: 1px; }
+.ui-seatps-foot { flex: none; display: grid; gap: 8px; padding: 8px 12px max(10px, env(safe-area-inset-bottom)); border-top: 1px solid var(--ui-border); }
+.ui-seatps-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 13px; }
+.ui-seatps-legend li { display: flex; align-items: center; gap: 5px; }
+.ui-seatps-swatch { width: 12px; height: 12px; border: 1px solid var(--ui-border); border-radius: 3px; background: var(--f, var(--ui-surface)); }
+.ui-seatps-swatch[data-band="1"] { --f: color-mix(in srgb, var(--ui-accent) 16%, var(--ui-surface)); }
+.ui-seatps-swatch[data-band="2"] { --f: color-mix(in srgb, var(--ui-warning) 22%, var(--ui-surface)); }
+.ui-seatps-swatch[data-band="3"] { --f: color-mix(in srgb, var(--ui-info) 20%, var(--ui-surface)); }
+.ui-seatps-say { min-height: 40px; margin: 0; font-size: 14px; }
+.ui-seatps-note { color: var(--ui-muted); display: block; }
+.ui-seatps-tools { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-seatps-chip {
+  box-sizing: border-box; min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.ui-seatps-chip[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-seatps-chip:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+/* With the room, a card in the middle with the cabin beside what it costs. */
+@media (min-width: 700px) {
+  .ui-seatps-dlg { inset: 0; width: min(92vw, 860px); height: min(88dvh, 760px); margin: auto; border-bottom: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 8px); }
+  .ui-seatps-dlg[open] { animation: none; }
+  .ui-seatps-grip { display: none; }
+  .ui-seatps-head { margin-top: 0; padding-top: 10px; touch-action: auto; }
+}
+.ui-seatps-in-row { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+@container (min-width: 620px) {
+  .ui-seatps-in-row { flex-direction: row; }
+  .ui-seatps-foot { flex: 0 0 300px; align-content: start; border-top: 0; border-left: 1px solid var(--ui-border); }
+}
+@media (hover: hover) { .ui-seatps-seat:not([aria-disabled="true"]):hover { border-color: var(--ui-accent); } }
+@media (prefers-reduced-motion: reduce) { .ui-seatps-dlg, .ui-seatps-plane[data-glide] { transition: none; } .ui-seatps-dlg[open] { animation: none; } }
+`
+
+// A cabin's seat in the plane's own pixels; the plane is scaled, so this is its size at zoom 1.
+let seat_picker_sheet_size = 44
+
+fn seat_picker_sheet_blocks(layout) = (type_of(layout) == "str" ? split(trim(layout), " ") : []) | filter((b) => b != "") | map((b) => split(b, ""))
+
+// Where a seat is in its block: "window", "aisle" or "middle".
+fn seat_picker_sheet_side(i: int, count: int, at: int, n: int) {
+    if (i == 0 && at == 0) || (i == count - 1 && at == n - 1) { return "window" }
+    if (at == 0 && i > 0) || (at == n - 1 && i < count - 1) { return "aisle" }
+    "middle"
+}
+
+// A fare from data as a decimal. What cannot be read counts as nothing, and does not stop the page.
+fn seat_picker_sheet_dec(x) {
+    let t = type_of(x)
+    if t == "dec" || t == "int" || (t == "float" && math.isfinite(x)) { return dec(x) }
+    t == "str" && re.test(x, "^-?[0-9]{1,12}(\\.[0-9]{1,6})?$") ? dec(x) : dec(0)
+}
+
+// The band of fares that holds a row: { band (1 up, 0 for none), name, price }.
+fn seat_picker_sheet_fare(row: int, fares, base) {
+    let list = type_of(fares) == "list" ? fares : []
+    let found = find(enumerate(list), (p) => type_of(p[1]) == "map" && row >= (p[1].first ?? 0) && row <= (p[1].last ?? 0))
+    found == null ? { band: 0, name: "Standard", price: seat_picker_sheet_dec(base) } : { band: found[0] + 1, name: str(found[1].name ?? "Seat"), price: seat_picker_sheet_dec(found[1].price) }
+}
+
+// Every row: { row, exit, cells }, each cell { aisle } or a seat { id, letter, side, block, at,
+// taken, exit, access, band, price, fare }. All that does not depend on the person, worked once.
+// A cabin is capped at 120 rows, as a page of ten thousand seats is no use to anyone.
+fn seat_picker_sheet_cabin(layout, rows, first_row, skip_rows, taken, exit_rows, access_seats, fares, base) {
+    let blocks = seat_picker_sheet_blocks(layout)
+    let count = len(blocks)
+    let how_many = max([0, min([type_of(rows) == "int" ? rows : 0, 120])])
+    let skip = type_of(skip_rows) == "list" ? skip_rows : []
+    let gone = type_of(taken) == "list" ? taken : []
+    let exits = type_of(exit_rows) == "list" ? exit_rows : []
+    let access = type_of(access_seats) == "list" ? access_seats : []
+    let numbers = range(first_row, first_row + how_many + len(skip)) | filter((n) => !contains(skip, n))
+    take(numbers, how_many) | map((n) => {
+        let fare = seat_picker_sheet_fare(n, fares, base)
+        let is_exit = contains(exits, n)
+        let cells = flatten(for pair in enumerate(blocks) => {
+            let b = pair[0]
+            let letters = pair[1]
+            let seats = for s in enumerate(letters) => {
+                let id = `${n}${s[1]}`
+                { id: id, letter: s[1], side: seat_picker_sheet_side(b, count, s[0], len(letters)), block: b, at: s[0], taken: contains(gone, id), exit: is_exit, access: contains(access, id),
+                  band: fare.band, price: fare.price, fare: fare.name, row: n }
+            }
+            b == 0 ? seats : [{ aisle: true, id: `${n}-${b}` }] + seats
+        })
+        { row: n, exit: is_exit, cells: cells }
+    })
+}
+
+fn seat_picker_sheet_seats(cabin) = flatten(cabin | map((r) => r.cells | filter((c) => c.aisle != true)))
+
+fn seat_picker_sheet_find(cabin, id) = find(seat_picker_sheet_seats(cabin), (s) => s.id == id)
+
+// A seat a person can have, given what they asked for.
+fn seat_picker_sheet_open(s, need: bool) = s != null && !s.taken && !(need && s.exit)
+
+// The seats after a press: a seat held is given up; one more than `count` gives up the oldest.
+fn seat_picker_sheet_toggle(chosen, id: str, count: int) {
+    if contains(chosen, id) { return chosen | filter((s) => s != id) }
+    let more = chosen + [id]
+    len(more) > max([count, 1]) ? slice(more, len(more) - max([count, 1]), len(more)) : more
+}
+
+// The sum of the seats' fares. Decimals, so it comes to the cent.
+fn seat_picker_sheet_total(cabin, chosen) {
+    let seats = seat_picker_sheet_seats(cabin)
+    reduce(chosen, dec(0), (sum_so_far, id) => {
+        let s = find(seats, (x) => x.id == id)
+        s == null ? sum_so_far : sum_so_far + s.price
+    })
+}
+
+// The seats either side of one in its block, across no aisle: { left, right }, each "free",
+// "taken", "yours", or null at the wall or the aisle.
+fn seat_picker_sheet_neighbours(cabin, id, chosen) {
+    let row = find(cabin, (r) => len(r.cells | filter((c) => c.id == id)) > 0)
+    if row == null { return { left: null, right: null } }
+    let cells = row.cells
+    let i = index_of(cells | map((c) => c.id), id)
+    let say = (c) => c == null || c.aisle == true ? null : (contains(chosen, c.id) ? "yours" : (c.taken ? "taken" : "free"))
+    { left: i > 0 ? say(cells[i - 1]) : null, right: i + 1 < len(cells) ? say(cells[i + 1]) : null }
+}
+
+// How a party sits: "alone" (one seat or none), "together" (a run in a block), "aisle" (a run but
+// for the aisle), or "apart".
+fn seat_picker_sheet_together(cabin, chosen) {
+    if len(chosen) < 2 { return "alone" }
+    let seats = seat_picker_sheet_seats(cabin)
+    let held = chosen | map((id) => find(seats, (s) => s.id == id)) | filter((s) => s != null)
+    if len(held) < 2 || len(unique(held | map((s) => s.row))) > 1 { return "apart" }
+    let row = find(cabin, (r) => r.row == held[0].row)
+    let order = row.cells | filter((c) => c.aisle != true) | map((c) => c.id)
+    let spots = held | map((s) => index_of(order, s.id)) | sort()
+    if spots[len(spots) - 1] - spots[0] != len(spots) - 1 { return "apart" }
+    len(unique(held | map((s) => s.block))) == 1 ? "together" : "aisle"
+}
+
+// The cheapest run of `count` free seats in one block, nearest the front: a list of ids, or [].
+fn seat_picker_sheet_suggest(cabin, count: int, need: bool) {
+    let runs = flatten(cabin | map((r) => {
+        let seats = r.cells | filter((c) => c.aisle != true)
+        let blocks = unique(seats | map((s) => s.block))
+        flatten(blocks | map((b) => {
+            let inside = seats | filter((s) => s.block == b)
+            let tries = range(0, max([0, len(inside) - count + 1]))
+            tries | map((i) => slice(inside, i, i + count)) | filter((run) => all(run, (s) => seat_picker_sheet_open(s, need)))
+        }))
+    }))
+    if len(runs) == 0 { return [] }
+    let cheapest = runs | sort_by((run) => float(run[0].price) * 1000 + run[0].row)
+    cheapest[0] | map((s) => s.id)
+}
+
+// The seat a key goes to from `id`, past gaps in the rows; null at the edge.
+fn seat_picker_sheet_step(cabin, id, k: str) {
+    let here = seat_picker_sheet_find(cabin, id)
+    if here == null { return null }
+    let row_i = index_of(cabin | map((r) => r.row), here.row)
+    let order = cabin[row_i].cells | filter((c) => c.aisle != true) | map((c) => c.id)
+    let at = index_of(order, id)
+    if k == "ArrowLeft" { return at > 0 ? order[at - 1] : null }
+    if k == "ArrowRight" { return at + 1 < len(order) ? order[at + 1] : null }
+    let to = k == "ArrowUp" ? row_i - 1 : row_i + 1
+    if to < 0 || to >= len(cabin) { return null }
+    `${cabin[to].row}${here.letter}`
+}
+
+fn seat_picker_sheet_money(x, currency: str, locale: str) {
+    if x == 0 { return "Included" }
+    let m = money.of(x, currency, "half_up")
+    type_of(m) == "error" ? `${format_number(round(x, 2, "half_up"), locale, 2)} ${currency}` : money.format(m, locale)
+}
+
+// What a seat's button says to a screen reader.
+fn seat_picker_sheet_label(s, currency: str, locale: str, need: bool) {
+    let state = s.taken ? ", taken" : (need && s.exit ? ", closed: exit row" : "")
+    `Row ${s.row}, seat ${s.letter}, ${s.side}${s.exit ? ", exit row" : ""}${s.access ? ", accessible" : ""}, ${seat_picker_sheet_money(s.price, currency, locale)}${state}`
+}
+
+// What is said about the last seat taken.
+fn seat_picker_sheet_beside(cabin, id, chosen) {
+    let n = seat_picker_sheet_neighbours(cabin, id, chosen)
+    let word = (v) => v == "free" ? "an empty seat" : (v == "taken" ? "someone" : "your party")
+    let sides = [n.left, n.right] | filter((v) => v != null)
+    if len(sides) == 0 { return "No one beside you." }
+    if len(sides) == 1 { return `Beside you: ${word(sides[0])}.` }
+    sides[0] == sides[1] ? `Beside you: ${word(sides[0])} on each side.` : `Beside you: ${word(sides[0])} and ${word(sides[1])}.`
+}
+
+fn seat_picker_sheet_party(way: str) = match way {
+    "together" => "Your party sits together."
+    "aisle" => "Your party sits together, across the aisle."
+    "apart" => "Your party is not together."
+    _ => ""
+}
+
+// Pan and zoom held to what can be seen: a plane narrower than the view stands in its middle.
+fn seat_picker_sheet_clamp(x: num, y: num, z: num, plane_w: num, plane_h: num, view_w: num, view_h: num) {
+    let w = plane_w * z
+    let h = plane_h * z
+    { x: w <= view_w ? (view_w - w) / 2 : max([view_w - w, min([0, x])]), y: h <= view_h ? 0 : max([view_h - h, min([0, y])]), z: z }
+}
+
+// The zoom that fits the width, never above life size.
+fn seat_picker_sheet_fit(plane_w: num, view_w: num) = plane_w <= 0 ? 1 : min([1, view_w / plane_w])
+
+// What a pinch from (z0, x0, y0) with fingers around (fx0, fy0) gives now that they are `ratio`
+// as far apart, around (fx, fy): the point under the fingers stays under them.
+fn seat_picker_sheet_pinch(z0: num, x0: num, y0: num, fx0: num, fy0: num, ratio: num, fx: num, fy: num, least: num, most: num) {
+    let z = max([least, min([most, z0 * ratio])])
+    let k = z / z0
+    { z: z, x: fx - (fx0 - x0) * k, y: fy - (fy0 - y0) * k }
+}
+
+// A finger as it goes: its last few places, to tell how fast it was going.
+fn seat_picker_sheet_samples(s, at: num, x: num, y: num) = slice(s, -5, len(s)) + [[at, x, y]]
+
+// { x, y } in pixels a millisecond over the last tenth of a second; nothing if it stopped first.
+fn seat_picker_sheet_speed(s, at: num) {
+    if len(s) < 2 { return { x: 0, y: 0 } }
+    let last = s[len(s) - 1]
+    if at - last[0] > 120 { return { x: 0, y: 0 } }
+    let recent = s | filter((p) => last[0] - p[0] <= 100)
+    let first = len(recent) > 1 ? recent[0] : s[len(s) - 2]
+    let took = last[0] - first[0]
+    took <= 0 ? { x: 0, y: 0 } : { x: (last[1] - first[1]) / took, y: (last[2] - first[2]) / took }
+}
+
+// Whether a pull on the handle closes it: far enough, or fast enough, and going down.
+fn seat_picker_sheet_dismissed(dy: num, speed: num, height: num) = speed >= 0.5 && dy > 12 || (dy >= height * 0.28 && speed > -0.2)
+
+component SeatPickerSheet(trigger: str? = null, open: bool = false, title: str = "Choose your seats", count: int = 1, layout: str = "ABC DEF", rows: int = 30, first_row: int = 1,
+                          skip_rows = [], taken = [], exit_rows = [], access_seats = [], base = 0, fares = [], currency: str = "USD", locale: str = "en-US", value = [], name: str? = null,
+                          on_change = null, on_confirm = null, on_close = null, class: str? = null) {
+    style global seat_picker_sheet_css
+    let cabin = seat_picker_sheet_cabin(layout, rows, first_row, skip_rows, taken, exit_rows, access_seats, fares, base)
+    let bands = (type_of(fares) == "list" ? fares : []) | filter((f) => type_of(f) == "map")
+    state dlg = null
+    state view_el = null
+    state plane = null
+    state started = false       // the cabin is made on the first opening: hundreds of buttons nobody may ask for
+    state chosen = type_of(value) == "list" ? value : []
+    state last_seat = null
+    state need = false
+    state cursor = ""           // the seat Tab lands on; arrows move it
+    state say_more = ""
+    // Pan and zoom. Kept out of the markup, so moving does not touch the page: they go straight
+    // to the plane's transform, and only `shown_z` is read by anything, at rest.
+    state x = 0
+    state y = 0
+    state z = 1
+    state shown_z = 1
+    state least = 1
+    // Fingers on the cabin.
+    state downs = []            // [{ id, x, y }]
+    state samples = []
+    state panned = false
+    state pinch_from = null
+    state from_x = 0
+    state from_y = 0
+    // The handle.
+    state grip_y = null
+    state grip_dy = 0
+    state grip_samples = []
+
+    let total = seat_picker_sheet_total(cabin, chosen)
+    let paint = (glide: bool) => {
+        if glide { plane.setAttribute("data-glide", "") } else { plane.removeAttribute("data-glide") }
+        plane.style.transform = `translate(${round(x, 2)}px, ${round(y, 2)}px) scale(${round(z, 4)})`
+    }
+    let settle = (glide: bool) => {
+        let c = seat_picker_sheet_clamp(x, y, z, plane.offsetWidth, plane.offsetHeight, view_el.clientWidth, view_el.clientHeight)
+        x = c.x
+        y = c.y
+        shown_z = z
+        paint(glide)
+    }
+    let fit = () => {
+        least = seat_picker_sheet_fit(plane.offsetWidth, view_el.clientWidth)
+        z = max([z, least])
+        settle(false)
+    }
+    let zoom_about = (to: num, fx: num, fy: num) => {
+        let k = to / z
+        x = fx - (fx - x) * k
+        y = fy - (fy - y) * k
+        z = to
+        settle(true)
+    }
+    let zoom_by = (by: num) => {
+        zoom_about(max([least, min([2.5, z * by])]), view_el.clientWidth / 2, view_el.clientHeight / 2)
+    }
+    // A seat brought into sight, in the plane's own pixels, from where it is.
+    let reveal = (el) => {
+        let left = el.offsetLeft * z + x
+        let top = el.offsetTop * z + y
+        let size = seat_picker_sheet_size * z
+        if left < 8 { x = x - left + 8 }
+        if top < 8 { y = y - top + 8 }
+        if left + size > view_el.clientWidth - 8 { x = x - (left + size - view_el.clientWidth + 8) }
+        if top + size > view_el.clientHeight - 8 { y = y - (top + size - view_el.clientHeight + 8) }
+        settle(true)
+    }
+    let changed = () => { on_change && on_change(chosen, seat_picker_sheet_total(cabin, chosen)) }
+    let take_seat = (id: str) => {
+        let s = seat_picker_sheet_find(cabin, id)
+        cursor = id
+        if !seat_picker_sheet_open(s, need) {
+            say_more = s != null && !s.taken ? "Exit rows need someone able to help in an emergency." : "That seat is taken."
+        } else {
+            chosen = seat_picker_sheet_toggle(chosen, id, count)
+            last_seat = contains(chosen, id) ? id : (len(chosen) > 0 ? chosen[len(chosen) - 1] : null)
+            say_more = s.exit && contains(chosen, id) ? "Exit row: you must be able to help in an emergency." : ""
+            changed()
+        }
+    }
+    let close_it = () => { dlg.close() }
+    let opened = () => {
+        started = true
+        if !dlg.open { dlg.showModal() }
+    }
+    if open && dlg != null && !dlg.open { opened() }
+    if !open && dlg != null && dlg.open && trigger == null { dlg.close() }
+
+    let way = seat_picker_sheet_together(cabin, chosen)
+    let beside = last_seat != null ? seat_picker_sheet_beside(cabin, last_seat, chosen) : ""
+    <div class={ui_cls(["ui-seatps-host", class])} style="display: contents">
+        {trigger != null && <Button size="lg" class="ui-seatps-open" on_click={opened}>{trigger}</Button>}
+        {name != null && <input type="hidden" name={name} value={join(chosen, ",")}/>}
+        <dialog.ui-seatps-dlg aria-label={title} @mount={(el) => { dlg = el }}
+                @close={() => {
+                    dlg.style.removeProperty("transform")
+                    on_close && on_close()
+                }}>
+            <button.ui-seatps-grip type="button" aria-label="Close" @click={() => { if grip_dy < 8 { close_it() } }}
+                    @pointerdown={(e) => {
+                        grip_y = e.clientY
+                        grip_dy = 0
+                        grip_samples = [[e.timeStamp, 0, e.clientY]]
+                        e.target.closest("button").setPointerCapture(e.pointerId)
+                        dlg.style.transition = "none"
+                    }}
+                    @pointermove={(e) => {
+                        if grip_y != null {
+                            grip_dy = max([0, e.clientY - grip_y])
+                            grip_samples = seat_picker_sheet_samples(grip_samples, e.timeStamp, 0, e.clientY)
+                            dlg.style.transform = `translateY(${grip_dy}px)`
+                        }
+                    }}
+                    @pointerup={(e) => {
+                        if grip_y != null {
+                            let speed = seat_picker_sheet_speed(grip_samples, e.timeStamp).y
+                            grip_y = null
+                            dlg.style.removeProperty("transition")
+                            if seat_picker_sheet_dismissed(grip_dy, speed, dlg.offsetHeight) {
+                                dlg.close()
+                            } else {
+                                dlg.style.removeProperty("transform")
+                            }
+                        }
+                    }}
+                    @pointercancel={(_e) => {
+                        grip_y = null
+                        grip_dy = 0
+                        dlg.style.removeProperty("transition")
+                        dlg.style.removeProperty("transform")
+                    }}><span aria-hidden="true"></span></button>
+            <div.ui-seatps-head>
+                <h2>{title}</h2>
+                {started && <button.ui-seatps-icon.ui-seatps-more type="button" aria-label="Zoom in" @click={() => { zoom_by(1.4) }}>+</button>}
+                {started && <button.ui-seatps-icon.ui-seatps-less type="button" aria-label="Zoom out" @click={() => { zoom_by(0.7) }}>-</button>}
+                <button.ui-seatps-icon.ui-seatps-close type="button" aria-label="Close" @click={close_it}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+                </button>
+            </div>
+            {started && <div.ui-seatps-in>
+                <div.ui-seatps-in-row>
+                    <div.ui-seatps-main>
+                        <div.ui-seatps-view data-zoom={shown_z}
+                             @mount={(el) => {
+                                 view_el = el
+                                 let watching = js_new("ResizeObserver", (_x) => { if plane != null { fit() } })
+                                 watching.observe(el)
+                                 () => { watching.disconnect() }
+                             }}
+                             @pointerdown={(e) => {
+                                 let box = view_el.getBoundingClientRect()
+                                 let px = e.clientX - box.left
+                                 let py = e.clientY - box.top
+                                 downs = (downs | filter((d) => d.id != e.pointerId)) + [{ id: e.pointerId, x: px, y: py }]
+                                 samples = [[e.timeStamp, px, py]]
+                                 from_x = x
+                                 from_y = y
+                                 panned = false
+                                 if len(downs) == 2 {
+                                     let a = downs[0]
+                                     let b = downs[1]
+                                     let far = max([1, math.hypot(a.x - b.x, a.y - b.y)])
+                                     pinch_from = { z: z, x: x, y: y, far: far, cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2 }
+                                     panned = true
+                                 }
+                             }}
+                             @pointermove={(e) => {
+                                 let box = view_el.getBoundingClientRect()
+                                 let px = e.clientX - box.left
+                                 let py = e.clientY - box.top
+                                 if len(downs) == 2 && pinch_from != null {
+                                     downs = downs | map((d) => d.id == e.pointerId ? { id: d.id, x: px, y: py } : d)
+                                     let a = downs[0]
+                                     let b = downs[1]
+                                     let p = seat_picker_sheet_pinch(pinch_from.z, pinch_from.x, pinch_from.y, pinch_from.cx, pinch_from.cy,
+                                                                     math.hypot(a.x - b.x, a.y - b.y) / pinch_from.far, (a.x + b.x) / 2, (a.y + b.y) / 2, least, 2.5)
+                                     x = p.x
+                                     y = p.y
+                                     z = p.z
+                                     paint(false)
+                                 } else if len(downs) == 1 && downs[0].id == e.pointerId {
+                                     let dx = px - downs[0].x
+                                     let dy = py - downs[0].y
+                                     if !panned && max([abs(dx), abs(dy)]) >= 8 {
+                                         panned = true
+                                         view_el.setPointerCapture(e.pointerId)
+                                     }
+                                     if panned {
+                                         x = from_x + dx
+                                         y = from_y + dy
+                                         samples = seat_picker_sheet_samples(samples, e.timeStamp, px, py)
+                                         paint(false)
+                                     }
+                                 }
+                             }}
+                             @pointerup={(e) => {
+                                 let was = len(downs)
+                                 downs = downs | filter((d) => d.id != e.pointerId)
+                                 if was == 2 {
+                                     // One finger stays: it goes on panning from here.
+                                     pinch_from = null
+                                     if len(downs) == 1 {
+                                         downs = [{ id: downs[0].id, x: downs[0].x, y: downs[0].y }]
+                                         from_x = x
+                                         from_y = y
+                                     }
+                                 }
+                                 if len(downs) == 0 {
+                                     if panned && was == 1 {
+                                         let v = seat_picker_sheet_speed(samples, e.timeStamp)
+                                         x = x + v.x * 180
+                                         y = y + v.y * 180
+                                     }
+                                     settle(true)
+                                 }
+                             }}
+                             @pointercancel={(e) => {
+                                 downs = downs | filter((d) => d.id != e.pointerId)
+                                 if len(downs) < 2 { pinch_from = null }
+                                 if len(downs) == 0 {
+                                     panned = false
+                                     settle(true)
+                                 }
+                             }}
+                             @click={(e) => {
+                                 let seat = e.target.closest("[data-seat]")
+                                 if seat != null && !panned {
+                                     let id = seat.dataset.seat
+                                     // Too small to be sure of: this tap was for looking.
+                                     if seat_picker_sheet_size * z < 40 {
+                                         let box = view_el.getBoundingClientRect()
+                                         zoom_about(1, e.clientX - box.left, e.clientY - box.top)
+                                         cursor = id
+                                     } else {
+                                         take_seat(id)
+                                     }
+                                 }
+                                 panned = false
+                             }}
+                             @wheel={(e) => {
+                                 y = y - e.deltaY
+                                 x = x - e.deltaX
+                                 settle(false)
+                             }}>
+                            <div.ui-seatps-plane data-small-target="" @mount={(el) => {
+                                     plane = el
+                                     let first = seat_picker_sheet_seats(cabin)
+                                     if len(first) > 0 { cursor = first[0].id }
+                                     z = 0
+                                     fit()
+                                 }}
+                                 @keydown={(e) => {
+                                     let seat = e.target.closest("[data-seat]")
+                                     if seat != null && contains(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"], e.key) {
+                                         e.preventDefault()
+                                         let to = seat_picker_sheet_step(cabin, seat.dataset.seat, e.key)
+                                         let next_el = to == null ? null : plane.querySelector(`[data-seat="${to}"]`)
+                                         if next_el != null {
+                                             cursor = to
+                                             next_el.focus()
+                                             reveal(next_el)
+                                         }
+                                     }
+                                 }}>
+                                {for r in cabin => <div.ui-seatps-rowwrap key={r.row}>
+                                    {r.exit && <div.ui-seatps-exit aria-hidden="true"><span>EXIT</span><span>EXIT</span></div>}
+                                    <div.ui-seatps-row role="group" aria-label={`Row ${r.row}`}>
+                                        <span.ui-seatps-num aria-hidden="true">{r.row}</span>
+                                        {for c in r.cells => c.aisle == true
+                                            ? <span.ui-seatps-gap key={c.id} aria-hidden="true"></span>
+                                            : <button.ui-seatps-seat key={c.id} type="button" data-seat={c.id} data-band={c.band} data-access={c.access ? "" : null}
+                                                      tabindex={cursor == c.id ? "0" : "-1"} aria-pressed={contains(chosen, c.id) ? "true" : "false"}
+                                                      aria-disabled={c.taken || (need && c.exit) ? "true" : null}
+                                                      aria-label={seat_picker_sheet_label(c, currency, locale, need)}>{c.letter}</button>}
+                                    </div>
+                                </div>}
+                            </div>
+                        </div>
+                    </div>
+                    <div.ui-seatps-foot>
+                        <ul.ui-seatps-legend>
+                            {base != 0 && <li><span.ui-seatps-swatch data-band="0"></span>Standard {seat_picker_sheet_money(seat_picker_sheet_dec(base), currency, locale)}</li>}
+                            {for pair in enumerate(bands) => <li key={pair[0]}><span.ui-seatps-swatch data-band={pair[0] + 1}></span>{pair[1].name ?? "Seat"} {seat_picker_sheet_money(seat_picker_sheet_dec(pair[1].price), currency, locale)}</li>}
+                        </ul>
+                        <p.ui-seatps-say role="status">
+                            <span.ui-seatps-held>{len(chosen) == 0 ? `Pick ${count == 1 ? "a seat" : `${count} seats`}.` : `${join(chosen, ", ")}. ${seat_picker_sheet_money(total, currency, locale)}.`}</span>
+                            <span.ui-seatps-note>{join([beside, seat_picker_sheet_party(way), say_more] | filter((t) => t != ""), " ")}</span>
+                        </p>
+                        <div.ui-seatps-tools>
+                            <button.ui-seatps-chip.ui-seatps-find type="button" @click={() => {
+                                let run = seat_picker_sheet_suggest(cabin, max([count, 1]), need)
+                                if len(run) == 0 {
+                                    say_more = `No ${count} seats together.`
+                                } else {
+                                    chosen = run
+                                    last_seat = run[0]
+                                    say_more = ""
+                                    changed()
+                                    let el = plane.querySelector(`[data-seat="${run[0]}"]`)
+                                    if el != null {
+                                        cursor = run[0]
+                                        reveal(el)
+                                    }
+                                }
+                            }}>{count > 1 ? "Find seats together" : "Find a seat"}</button>
+                            <button.ui-seatps-chip.ui-seatps-need type="button" aria-pressed={need ? "true" : "false"} @click={() => {
+                                need = !need
+                                if need {
+                                    let kept = chosen | filter((id) => seat_picker_sheet_open(seat_picker_sheet_find(cabin, id), true))
+                                    if len(kept) != len(chosen) {
+                                        chosen = kept
+                                        changed()
+                                    }
+                                }
+                                say_more = need ? "Green seats have the room or a movable armrest. Exit rows are closed." : ""
+                            }}>Accessible seat</button>
+                        </div>
+                        <Button size="lg" full={true} class="ui-seatps-confirm" disabled={len(chosen) == 0} on_click={() => {
+                            on_confirm && on_confirm(chosen, total)
+                            dlg.close()
+                        }}>{len(chosen) == 0 ? "Confirm" : `Confirm ${len(chosen)} ${len(chosen) == 1 ? "seat" : "seats"}, ${seat_picker_sheet_money(total, currency, locale)}`}</Button>
+                    </div>
+                </div>
+            </div>}
+        </dialog>
+    </div>
+}

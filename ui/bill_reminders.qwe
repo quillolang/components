@@ -1,0 +1,330 @@
+// BillReminders: what is coming due, soonest first, with a word on each saying how close, a way
+// to pay, and a way to put it off. Monthly bills keep their day: one due on the 31st falls on
+// the last of a short month and goes back to the 31st after it, and leap years are the
+// calendar's. A swipe left on a row asks when to be reminded, a swipe right asks to pay, and the
+// buttons on each row do the same. On a tablet what is close stands beside what is not.
+//
+//   import ui/bill_reminders.qwe use BillReminders
+//
+//   component Bills() {
+//       <BillReminders today="2026-11-01" bills={[
+//           { id: "rent", name: "Rent", amount: 950m, day: 1 },
+//           { id: "card", name: "Card", amount: "120.40", day: 31 },
+//           { id: "tax", name: "Car tax", amount: 88m, due: "2026-11-03", once: true }]}
+//                      on_pay={(b) => pay_bill(b.id)} on_snooze={(b, until) => remember(b.id, until)}/>
+//   }
+//
+// bills: each { id, name, amount, currency, day, due, once, until }. day: the day of the month, 1
+// to 31, for a monthly bill. due: the date of the one to pay now; left out, it is the next time
+// `day` comes round, so give it for a bill that is overdue. once: there is no next one, so
+// paying it takes it away. until: a date it is snoozed to, from an earlier on_snooze. today:
+// "YYYY-MM-DD", from your page. soon_days: how close counts as soon (3). currency, locale, label
+// ("Upcoming bills"). on_pay(bill): the bill with its `due`; it may wait for a server fn, and an
+// error value or false says it failed. on_snooze(bill, until): the date chosen. Nothing here
+// is kept: keep what these tell you, and pass `due` and `until` back next time. Snoozing moves
+// a bill down the list and not its date, so it still shows as due, or late.
+//
+// A reminder at a time needs your app: `quilloNative.notify(title, body, seconds)` from on_snooze
+// in a phone app. A page has nothing that can wake it.
+//
+// bill_reminders_next(day, from), bill_reminders_after(day, due), bill_reminders_mark(...) and
+// bill_reminders_snoozes(today) are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/price.qwe use price_text
+import ui/button.qwe use Button
+
+let bill_reminders_css = css`
+.ui-billrem { display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-billrem-sum { display: flex; justify-content: space-between; gap: 12px; margin: 0; color: var(--ui-muted); font-size: 14px; font-variant-numeric: tabular-nums; }
+.ui-billrem-sum strong { color: var(--ui-fg); }
+.ui-billrem-cols { display: grid; gap: 14px; min-width: 0; }
+.ui-billrem-group { display: grid; gap: 6px; min-width: 0; align-content: start; }
+.ui-billrem-group h3 { margin: 0; color: var(--ui-muted); font-size: 13px; font-weight: 600; }
+.ui-billrem-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-billrem-item { position: relative; min-width: 0; overflow: hidden; border-radius: var(--ui-radius); background: var(--ui-subtle); }
+/* What a swipe is coming to, under the row as it moves. */
+.ui-billrem-under { position: absolute; inset: 0; display: flex; justify-content: space-between; align-items: center; padding: 0 16px; color: var(--ui-muted); font-size: 14px; font-weight: 600; }
+.ui-billrem-face {
+  position: relative; box-sizing: border-box; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface);
+  touch-action: pan-y; transition: transform .22s cubic-bezier(.2, .8, .2, 1);
+}
+.ui-billrem-moving { transition: none; user-select: none; -webkit-user-select: none; }
+.ui-billrem-name { min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.ui-billrem-amt { font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-billrem-mark { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; font-size: 13px; color: var(--ui-muted); }
+.ui-billrem-tag { padding: 1px 8px; border-radius: 999px; background: var(--ui-subtle); font-weight: 600; }
+.ui-billrem-late .ui-billrem-tag { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-billrem-today .ui-billrem-tag, .ui-billrem-soon .ui-billrem-tag { background: var(--ui-warning-soft); color: var(--ui-warning); }
+.ui-billrem-late .ui-billrem-face { border-color: var(--ui-danger); }
+.ui-billrem-short { font-style: italic; }
+.ui-billrem-acts { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.ui-billrem-ask { grid-column: 1 / -1; display: grid; gap: 6px; margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--ui-border); }
+.ui-billrem-ask p { margin: 0; }
+.ui-billrem-pick { box-sizing: border-box; display: flex; justify-content: space-between; gap: 12px; width: 100%; min-height: 44px; padding: 8px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: inherit; font: inherit; cursor: pointer; touch-action: manipulation; }
+.ui-billrem-pick span { color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-billrem-pick:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-billrem-err { margin: 0; color: var(--ui-danger); font-size: 14px; }
+.ui-billrem-said { margin: 0; min-height: 20px; color: var(--ui-success); font-size: 14px; }
+.ui-billrem-none { margin: 0; padding: 18px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius); color: var(--ui-muted); text-align: center; }
+@container (min-width: 640px) {
+  .ui-billrem-cols { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; align-items: start; }
+}
+@media (hover: hover) { .ui-billrem-pick:hover { background: var(--ui-subtle); } }
+@media (prefers-reduced-motion: reduce) { .ui-billrem-face { transition: none; } }
+`
+
+// A bill's day in one month: past the end of a short month it is that month's last day.
+fn bill_reminders_in(day: int, year: int, month: int) -> str = date.of(year, month, min([day, date.days_in_month(year, month)]))
+
+// The month after, and what it comes to in December.
+fn bill_reminders_month_after(year: int, month: int) -> map = month == 12 ? { year: year + 1, month: 1 } : { year: year, month: month + 1 }
+
+// The first time `day` comes on or after a date.
+fn bill_reminders_next(day: int, from: str) -> str {
+    let p = date.parts(from)
+    let here = bill_reminders_in(day, p.year, p.month)
+    if here >= from { return here }
+    let m = bill_reminders_month_after(p.year, p.month)
+    bill_reminders_in(day, m.year, m.month)
+}
+
+// The one after a due date: taken from the bill's own day, so the 31st comes back after February
+// where adding a month to a date would stay on the 28th for ever.
+fn bill_reminders_after(day: int, due: str) -> str {
+    let p = date.parts(due)
+    let m = bill_reminders_month_after(p.year, p.month)
+    bill_reminders_in(day, m.year, m.month)
+}
+
+// A bill's day of the month if it has a good one, else 0.
+fn bill_reminders_day(b) -> int {
+    if type_of(b.day) == "int" && b.day >= 1 && b.day <= 31 { return b.day }
+    if type_of(b.due) == "str" && date.valid(b.due, "date") { return date.parts(b.due).day }
+    0
+}
+
+// A bill as shown: its due date worked out, and null for one with no date that can be read.
+fn bill_reminders_row(b, today: str, change, fallback: str) {
+    let day = bill_reminders_day(b)
+    let given = type_of(b.due) == "str" && date.valid(b.due, "date") ? b.due : null
+    let due = get(change, "due", given ?? (day > 0 ? bill_reminders_next(day, today) : null))
+    if due == null || get(change, "gone", false) { return null }
+    let until_given = type_of(b.until) == "str" && date.valid(b.until, "date") ? b.until : null
+    let until = get(change, "until", until_given)
+    { id: b.id, name: str(b.name ?? "Bill"), amount: b.amount, currency: type_of(b.currency) == "str" ? b.currency : fallback, day: day, once: b.once == true, due: due, until: until != null && until > today ? until : null }
+}
+
+// In the order to act on them: by due date, a snoozed one by its new date; the same date by name.
+fn bill_reminders_sorted(rows: list) -> list = rows | sort_by((r) => `${r.until ?? r.due} ${lower(r.name)}`)
+
+// What to say about how close it is: { kind, text }. kind: late, today, soon or later.
+fn bill_reminders_mark(due: str, today: str, soon_days: int) -> map {
+    let days = date.days_between(today, due)
+    if days < 0 { return { kind: "late", text: days == -1 ? "1 day late" : `${-days} days late` } }
+    if days == 0 { return { kind: "today", text: "Due today" } }
+    if days == 1 { return { kind: "soon", text: "Due tomorrow" } }
+    if days <= soon_days { return { kind: "soon", text: `Due in ${days} days` } }
+    { kind: "later", text: `Due ${date.format(due, "MMM D")}` }
+}
+
+// Why a date is not the bill's usual one, or "".
+fn bill_reminders_short(day: int, due: str) -> str {
+    let d = date.parts(due).day
+    day > d ? `Its day, the ${day}${bill_reminders_th(day)}, is not in this month` : ""
+}
+
+// The ending of a day's number.
+fn bill_reminders_th(n: int) -> str {
+    if n >= 11 && n <= 13 { return "th" }
+    match n % 10 {
+        1 => "st"
+        2 => "nd"
+        3 => "rd"
+        _ => "th"
+    }
+}
+
+// How long to put one off. Adding days runs over the end of a month by itself.
+fn bill_reminders_snoozes(today: str) -> list = [
+    { label: "Tomorrow", date: date.add_days(today, 1) },
+    { label: "In 3 days", date: date.add_days(today, 3) },
+    { label: "In a week", date: date.add_days(today, 7) },
+]
+
+// An amount in its currency, or a dash.
+fn bill_reminders_cash(v, currency: str, locale: str?) -> str {
+    let kind = type_of(v)
+    if kind != "dec" && kind != "int" && kind != "float" && kind != "str" { return "—" }
+    let d = dec(v)
+    is_err(d) ? "—" : price_text(d, currency, locale)
+}
+
+// What is to pay among some rows, each currency exact.
+fn bill_reminders_total(rows: list, locale: str?) -> str {
+    let good = rows | filter((r) => {
+        let k = type_of(r.amount)
+        (k == "dec" || k == "int" || k == "float" || k == "str") && !is_err(dec(r.amount))
+    })
+    let by = good | group_by((r) => r.currency)
+    good | map((r) => r.currency) | unique() | map((c) => price_text(get(by, c, []) | map((r) => dec(r.amount)) | sum(), c, locale)) | join(" + ")
+}
+
+// Which way a release goes: -1 asks to snooze, 1 to pay, 0 springs back.
+fn bill_reminders_swipe(dx: num, speed: num, width: num) -> int {
+    let far = abs(dx) >= min([96, width * 0.3])
+    let flick = abs(speed) >= 0.5 && abs(dx) >= 24 && (speed < 0) == (dx < 0)
+    if !far && !flick { return 0 }
+    dx < 0 ? -1 : 1
+}
+
+// The last few points of a drag, for the speed at the release.
+fn bill_reminders_trail(trail: list, x: num, at_ms: num) -> list {
+    let all_of = trail + [{ x: x, at: at_ms }]
+    slice(all_of, max([0, len(all_of) - 6]), len(all_of))
+}
+
+fn bill_reminders_speed(trail: list, x: num, at_ms: num) -> num {
+    let old = trail | filter((p) => at_ms - p.at >= 16 && at_ms - p.at <= 120)
+    if len(old) == 0 { return 0 }
+    (x - old[0].x) / (at_ms - old[0].at)
+}
+
+component BillReminders(bills: list = [], today: str = "", soon_days: int = 3, currency: str = "USD", locale: str? = null, label: str = "Upcoming bills",
+                        on_pay = null, on_snooze = null) {
+    style global bill_reminders_css
+    state changes = {}       // by bill id: { due, until, gone }, what was done here
+    state asking = null      // { id, what }: what = "pay" or "snooze"
+    state paying = null      // the id being paid
+    state failed = ""
+    state said = ""
+    state grab = null        // { x, y, id, el, bill }: where a swipe began
+    state axis = null
+    state trail = []
+    let good_day = type_of(today) == "str" && date.valid(today, "date")
+    let rows = good_day ? bill_reminders_sorted(bills | map((b) => bill_reminders_row(b, today, get(changes, str(b.id), {}), currency)) | filter((r) => r != null)) : []
+    let close_ones = rows | filter((r) => r.until == null && date.days_between(today, r.due) <= soon_days)
+    let far_ones = rows | filter((r) => r.until != null || date.days_between(today, r.due) > soon_days)
+    let month_ones = rows | filter((r) => date.days_between(today, r.due) <= 30)
+    let changed = (the_id, field: str, value) => {
+        let k = str(the_id)
+        changes = set(changes, k, set(get(changes, k, {}), field, value))
+    }
+    let ask_pay = (the_id, what: str) => {
+        failed = ""
+        said = ""
+        asking = asking != null && asking.id == the_id && asking.what == what ? null : { id: the_id, what: what }
+    }
+    let pay = (r) => {
+        if paying == null {
+            paying = r.id
+            failed = ""
+            let answer = on_pay == null ? true : js("Promise.resolve", on_pay(r))
+            paying = null
+            if answer == false || is_err(answer) {
+                failed = `${r.name} could not be paid. Nothing has left your account.`
+            } else {
+                asking = null
+                if r.once || r.day == 0 {
+                    changed(r.id, "gone", true)
+                    said = `Paid ${r.name}.`
+                } else {
+                    let next_one = bill_reminders_after(r.day, r.due)
+                    let k = str(r.id)
+                    changes = set(changes, k, { due: next_one })
+                    said = `Paid ${r.name}. The next is due ${date.format(next_one, "MMM D")}.`
+                }
+            }
+        }
+    }
+    let snooze = (r, until: str) => {
+        changed(r.id, "until", until)
+        asking = null
+        said = `${r.name} moved to ${date.format(until, "MMM D")}.`
+        on_snooze && on_snooze(r, until)
+    }
+    let finish = (e) => {
+        if grab != null && e.pointerId == grab.id {
+            let g = grab
+            let dx = e.clientX - g.x
+            let was = axis
+            let speed = bill_reminders_speed(trail, e.clientX, e.timeStamp)
+            grab = null
+            axis = null
+            g.el.classList.remove("ui-billrem-moving")
+            g.el.style.transform = ""
+            if was == "x" && e.type == "pointerup" {
+                let way = bill_reminders_swipe(dx, speed, g.el.clientWidth)
+                if way != 0 { asking = { id: g.bill, what: way < 0 ? "snooze" : "pay" } }
+            }
+        }
+    }
+    <section.ui-billrem aria-label={label}>
+        {!good_day && len(bills) > 0 && <p.ui-billrem-none>Bills need today's date to be put in order.</p>}
+        {good_day && len(rows) == 0 && <p.ui-billrem-none>No bills coming up.</p>}
+        {len(month_ones) > 0 && <p.ui-billrem-sum><span>Due in the next 30 days</span><strong>{bill_reminders_total(month_ones, locale)}</strong></p>}
+        <p.ui-billrem-said role="status">{said}</p>
+        {len(rows) > 0 && <div.ui-billrem-cols>
+            {for g in [{ title: "Coming up", rows: close_ones, tag: "near" }, { title: "Later", rows: far_ones, tag: "far" }] => <section.ui-billrem-group key={g.tag} aria-label={g.title}>
+                <h3>{g.title}</h3>
+                {len(g.rows) == 0 && <p.ui-billrem-none>Nothing here.</p>}
+                <ul.ui-billrem-list>
+                    {for r in g.rows => <li key={r.id} class={ui_cls(["ui-billrem-item", `ui-billrem-${bill_reminders_mark(r.due, today, soon_days).kind}`])}>
+                        <div.ui-billrem-under aria-hidden="true"><span>Pay</span><span>Snooze</span></div>
+                        <div.ui-billrem-face
+                             @pointerdown={(e) => {
+                                 if e.button == 0 && grab == null {
+                                     grab = { x: e.clientX, y: e.clientY, id: e.pointerId, el: e.target.closest(".ui-billrem-face"), bill: r.id }
+                                     trail = bill_reminders_trail([], e.clientX, e.timeStamp)
+                                     axis = null
+                                 }
+                             }}
+                             @pointermove={(e) => {
+                                 if grab != null && e.pointerId == grab.id {
+                                     let dx = e.clientX - grab.x
+                                     let dy = e.clientY - grab.y
+                                     if axis == null && (abs(dx) > 8 || abs(dy) > 8) {
+                                         axis = abs(dx) > abs(dy) ? "x" : "y"
+                                         if axis == "x" {
+                                             grab.el.setPointerCapture(e.pointerId)
+                                             grab.el.classList.add("ui-billrem-moving")
+                                         }
+                                     }
+                                     if axis == "x" {
+                                         grab.el.style.transform = `translateX(${dx}px)`
+                                         trail = bill_reminders_trail(trail, e.clientX, e.timeStamp)
+                                     }
+                                 }
+                             }}
+                             @pointerup={finish}
+                             @pointercancel={finish}>
+                            <span.ui-billrem-name>{r.name}</span>
+                            <span.ui-billrem-amt>{bill_reminders_cash(r.amount, r.currency, locale)}</span>
+                            <span.ui-billrem-mark>
+                                <span.ui-billrem-tag>{bill_reminders_mark(r.due, today, soon_days).text}</span>
+                                {r.until != null && <span>Snoozed to {date.format(r.until, "MMM D")}</span>}
+                                {bill_reminders_short(r.day, r.due) != "" && <span.ui-billrem-short>{bill_reminders_short(r.day, r.due)}</span>}
+                            </span>
+                            <div.ui-billrem-acts>
+                                <Button size="lg" variant="soft" on_click={() => { ask_pay(r.id, "pay") }}>Pay</Button>
+                                <Button size="lg" variant="ghost" on_click={() => { ask_pay(r.id, "snooze") }}>Snooze</Button>
+                            </div>
+                            {asking != null && asking.id == r.id && asking.what == "pay" && <div.ui-billrem-ask>
+                                <p>Pay {bill_reminders_cash(r.amount, r.currency, locale)} to {r.name} now?</p>
+                                <div.ui-billrem-acts>
+                                    <Button size="lg" loading={paying == r.id} on_click={() => { pay(r) }}>Yes, pay</Button>
+                                    <Button size="lg" variant="ghost" on_click={() => { ask_pay(r.id, "pay") }}>Not now</Button>
+                                </div>
+                                {failed != "" && <p.ui-billrem-err role="alert">{failed}</p>}
+                            </div>}
+                            {asking != null && asking.id == r.id && asking.what == "snooze" && <div.ui-billrem-ask>
+                                <p>Remind me</p>
+                                {for s in bill_reminders_snoozes(today) => <button.ui-billrem-pick key={s.label} type="button" @click={() => { snooze(r, s.date) }}>{s.label}<span>{date.format(s.date, "ddd, MMM D")}</span></button>}
+                            </div>}
+                        </div>
+                    </li>}
+                </ul>
+            </section>}
+        </div>}
+    </section>
+}

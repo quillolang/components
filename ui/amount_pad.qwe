@@ -1,0 +1,156 @@
+// AmountPad: a big amount typed on its own keys, as in a payment app: digits come in from
+// the right, so 1, 2, 3 is $1.23 in dollars, ¥123 in yen and KWD 0.123 in dinars, as the
+// currency has it. Over a limit, the key is refused: the amount shakes, the phone
+// answers, and it says what the limit is. The amount is whole minor units all the way,
+// never a float, and the form gets a plain decimal. Holding delete empties it fast.
+//
+//   <AmountPad label="Send" currency="PHP" locale="en-PH" most="50000" name="amount"/>
+//   <AmountPad label="Tip" currency="EUR" locale="de-DE" least="1" most="200" done_label="Pay"
+//              on_change={(a) => { amount = a }} on_done={(a) => { pay(a) }}/>
+//
+// value: an amount to start with, as text ("12.50"). currency: ISO code ("USD"); one Quillo
+// does not know is written beside the number, with two decimals. locale: how it is
+// written ("en-US"). least, most: the limits, as text or numbers (no least; no limit but
+// 15 digits, which a browser's numbers can hold exactly). label: what it is for. name: a
+// hidden field with the amount ("12.50", empty at zero). done_label: a button for when it
+// is ready, disabled below least (none by default). disabled, class as for every field.
+// on_change(amount): inside one of your components, given a plain decimal after each
+// change, "" when empty. on_done(amount): given it when the button is pressed.
+//
+// A real keyboard works with the focus on the keys. With reduced motion the amount
+// flashes instead of shaking. On a wide container (440 px and up) it stands beside the keys.
+// It needs number_pad.qwe.
+//
+// amount_pad_places, amount_pad_digits, amount_pad_press, amount_pad_decimal and amount_pad_show
+// are the logic.
+
+import ui/theme.qwe use ui_cls
+import ui/number_pad.qwe use NumberPadKeys, number_pad_feel
+
+let amount_pad_css = css`
+.ui-amount-pad { container-type: inline-size; min-width: 0; font: 15px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-amount-pad-body { display: grid; gap: 14px; min-width: 0; }
+.ui-amount-pad-show { display: grid; gap: 4px; min-width: 0; justify-items: center; text-align: center; }
+.ui-amount-pad-label { color: var(--ui-muted); font-weight: 500; }
+.ui-amount-pad-figure { max-width: 100%; font-weight: 700; line-height: 1.15; white-space: nowrap; font-variant-numeric: tabular-nums; font-size: min(52px, calc(150cqi / var(--chars))); }
+.ui-amount-pad-zero { color: var(--ui-muted); }
+.ui-amount-pad-note { min-height: 21px; margin: 0; color: var(--ui-muted); }
+.ui-amount-pad-note[data-bad] { color: var(--ui-danger); }
+.ui-amount-pad-shake-1 .ui-amount-pad-figure { animation: ui-amount-pad-shake-a .36s ease-in-out; }
+.ui-amount-pad-shake-2 .ui-amount-pad-figure { animation: ui-amount-pad-shake-b .36s ease-in-out; }
+/* Two names for one shake: changing the class is what starts it again. */
+@keyframes ui-amount-pad-shake-a { 0%, 100% { transform: none; } 20%, 60% { transform: translateX(-9px); } 40%, 80% { transform: translateX(9px); } }
+@keyframes ui-amount-pad-shake-b { 0%, 100% { transform: none; } 20%, 60% { transform: translateX(-9px); } 40%, 80% { transform: translateX(9px); } }
+@keyframes ui-amount-pad-flash-a { 50% { color: var(--ui-danger); } }
+@keyframes ui-amount-pad-flash-b { 50% { color: var(--ui-danger); } }
+.ui-amount-pad-done {
+  width: 100%; min-height: 50px; margin: 0; border: 0; border-radius: var(--ui-radius); background: var(--ui-accent); color: var(--ui-accent-fg);
+  font: 600 17px var(--ui-font); cursor: pointer; touch-action: manipulation;
+}
+.ui-amount-pad-done:disabled { opacity: .5; cursor: not-allowed; }
+.ui-amount-pad-done:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) {
+  .ui-amount-pad-shake-1 .ui-amount-pad-figure { animation-name: ui-amount-pad-flash-a; }
+  .ui-amount-pad-shake-2 .ui-amount-pad-figure { animation-name: ui-amount-pad-flash-b; }
+}
+@container (min-width: 440px) {
+  .ui-amount-pad-body { grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); align-items: center; gap: 16px; }
+  .ui-amount-pad-show { grid-row: span 2; }
+  .ui-amount-pad-figure { font-size: min(48px, calc(66cqi / var(--chars))); }
+}
+`
+
+// The decimals a currency has: an unknown one gets two, so it can still be typed.
+fn amount_pad_places(currency: str) -> int {
+    let u = money.minor_units(currency)
+    is_err(u) ? 2 : u
+}
+
+fn amount_pad_known(currency: str) -> bool = !is_err(money.minor_units(currency))
+
+// A digit run with no leading zeros.
+fn amount_pad_strip(d: str) -> str = re.replace(d, "^0+", "")
+
+// An amount as text or a number, in whole minor units as digits; "" for 0 or bad input.
+// More decimals than the currency has are cut, not rounded.
+fn amount_pad_digits(value, places: int) -> str {
+    let t = value == null ? "" : str(value)
+    if !re.test(t, "^[0-9]{1,15}([.][0-9]{1,15})?$") { return "" }
+    let parts = split(t, ".")
+    let frac = len(parts) > 1 ? parts[1] : ""
+    let pad = join(range(max([0, places - len(frac)])) | map((_i) => "0"), "")
+    let d = amount_pad_strip(parts[0] + slice(frac, 0, min([places, len(frac)])) + pad)
+    len(d) > 15 ? "" : d
+}
+
+// What a key does: { digits, ok }. A key takes the amount past `cap` (digits, or "" for none),
+// or past 15 digits, and is refused, with ok false.
+fn amount_pad_press(digits: str, k: str, cap: str) {
+    if k == "back" { return { digits: slice(digits, 0, max([0, len(digits) - 1])), ok: true } }
+    let next = amount_pad_strip(digits + k)
+    if len(next) > 15 { return { digits: digits, ok: false } }
+    if cap != "" && len(next) > 0 && int(next) > int(cap) { return { digits: digits, ok: false } }
+    { digits: next, ok: true }
+}
+
+// The amount as a plain decimal, "" when there is none.
+fn amount_pad_decimal(digits: str, places: int) -> str {
+    if digits == "" { return "" }
+    if places == 0 { return digits }
+    let zeros = join(range(max([0, places + 1 - len(digits)])) | map((_i) => "0"), "")
+    let full = zeros + digits
+    `${slice(full, 0, len(full) - places)}.${slice(full, len(full) - places, len(full))}`
+}
+
+// The amount as the currency and locale write it.
+fn amount_pad_show(digits: str, currency: str, locale: str) -> str {
+    let n = digits == "" ? 0 : int(digits)
+    amount_pad_known(currency)
+        ? money.format(money.from_minor(n, currency), locale)
+        : `${currency} ${amount_pad_decimal(digits == "" ? "000" : digits, 2)}`
+}
+
+component AmountPad(value = null, currency: str = "USD", locale: str = "en-US", least = null, most = null, label: str = "Amount", name: str? = null,
+                    done_label: str? = null, disabled: bool = false, on_change = null, on_done = null, class: str? = null) {
+    style global amount_pad_css
+    let places = amount_pad_places(currency)
+    let cap = amount_pad_digits(most, places)
+    let floor_at = amount_pad_digits(least, places)
+    state digits = amount_pad_digits(value, places)
+    state shakes = 0
+    state refused = false
+    let shown = amount_pad_show(digits, currency, locale)
+    let short = floor_at != "" && (digits == "" ? 0 : int(digits)) < int(floor_at)
+    let note = refused ? `Most is ${amount_pad_show(cap, currency, locale)}`
+             : short && digits != "" ? `Least is ${amount_pad_show(floor_at, currency, locale)}`
+             : cap != "" ? `Up to ${amount_pad_show(cap, currency, locale)}` : ""
+    <div class={ui_cls(["ui-amount-pad", shakes > 0 && `ui-amount-pad-shake-${shakes % 2 + 1}`, class])}>
+        <div.ui-amount-pad-body>
+            <div.ui-amount-pad-show>
+                <span.ui-amount-pad-label>{label}</span>
+                <output class={ui_cls(["ui-amount-pad-figure", digits == "" && "ui-amount-pad-zero"])} style={`--chars: ${max([len(shown), 4])}`}
+                        aria-live="polite" aria-label={`${label}: ${shown}`}>{shown}</output>
+                <p.ui-amount-pad-note role="status" data-bad={refused || (short && digits != "") ? "" : null}>{note}</p>
+            </div>
+            <NumberPadKeys extra={places > 0 ? "00" : null} disabled={disabled} label={`${label} keys`} quiet={true}
+                           on_key={(k) => {
+                               // "00" is two presses in one, and the whole of it fits or none does.
+                               let got = amount_pad_press(digits, k, cap)
+                               if got.ok {
+                                   refused = false
+                                   if got.digits != digits {
+                                       digits = got.digits
+                                       on_change && on_change(amount_pad_decimal(got.digits, places))
+                                   }
+                               } else {
+                                   refused = true
+                                   shakes += 1
+                                   number_pad_feel("error")
+                               }
+                           }}/>
+            {done_label != null && <button.ui-amount-pad-done type="button" disabled={disabled || digits == "" || short}
+                                           @click={() => { on_done && on_done(amount_pad_decimal(digits, places)) }}>{done_label}</button>}
+        </div>
+        {name != null && <input type="hidden" name={name} value={amount_pad_decimal(digits, places)}/>}
+    </div>
+}

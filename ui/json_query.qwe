@@ -1,0 +1,623 @@
+// JsonQuery: asks a JSON document with a path, live, and shows each result with the
+// exact path it was found at. Paths are JSONPath: $.items[*].price, $..name, a filter
+// such as $.items[?(@.qty>2)], indexes, slices and lists of them. A path that cannot be
+// read says where it fails and what was expected, with a mark under the place; a path
+// that reads well but finds nothing says at which step the results ran out, and which
+// keys were there instead.
+//
+//   <JsonQuery id="order" text={body} path="$.items[?(@.qty>2)].sku" on_change={(found) => { hits = found }}/>
+//
+// id: a prefix for its ids, unique on the page. text: the JSON document. path: the path
+// it starts with ("$"). title: the heading ("Query JSON"). limit: the most results
+// (500); past it, it says so. max_chars: the most text read (500,000). name: starts
+// the fields' names, `<name>_json` and `<name>_path`, so a plain <form> sends them.
+// on_change(results): inside one of your components, as either field changes, given a
+// list of { path, value }, empty when anything is wrong. class: more classes for its
+// outer element.
+//
+// What a path can say, after its $:
+//
+//   .name  ['a b']       a key                      [0]  [-1]       an index, from the end if negative
+//   .*  [*]              every key or item          [1:3]  [::2]    a slice, as Python's
+//   ..name  ..*  ..[0]   the same at any depth      [0,2]  ['a','b']   several
+//   [?(@.qty > 2)]       the items a test passes
+//
+// A test compares @ (the item), @.key..., $... (from the top), numbers, 'text', "text",
+// true, false and null with == != < <= > >=, and joins them with && || ! and brackets.
+// @.key alone asks whether the key is there, whatever its value: @.active == true
+// asks whether it is true. Values of different kinds are never < or >, and a key that is
+// not there equals nothing, not even null, as RFC 9535 has it.
+//
+// json_query_parse(path) reads a path ({ segs } or { at, why }) and
+// json_query_run(document, segs, limit) follows it, for a program.
+
+import ui/theme.qwe use ui_cls
+
+let json_query_css = css`
+.ui-jsonq { display: grid; gap: 12px; min-width: 0; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-jsonq .ui-jsonq-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-jsonq-field { display: grid; gap: 4px; min-width: 0; }
+.ui-jsonq-field label { font-size: 13px; font-weight: 500; }
+.ui-jsonq-text, .ui-jsonq-path { box-sizing: border-box; width: 100%; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 12.5px/1.5 var(--ui-mono); }
+.ui-jsonq-text { min-height: 140px; padding: 8px 10px; resize: vertical; }
+.ui-jsonq-path { height: 36px; padding: 0 10px; font-size: 13.5px; }
+.ui-jsonq-text:focus, .ui-jsonq-path:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-jsonq-text[aria-invalid="true"], .ui-jsonq-path[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-jsonq-tries { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; color: var(--ui-muted); font-size: 12px; }
+.ui-jsonq-try { padding: 1px 7px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font: 12px var(--ui-mono); cursor: pointer; }
+.ui-jsonq-try:hover { border-color: var(--ui-accent); }
+.ui-jsonq-try:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-jsonq-error { display: grid; gap: 2px; margin: 0; color: var(--ui-danger); font-size: 13px; overflow-wrap: anywhere; }
+.ui-jsonq-mark { margin: 0; overflow: auto; color: var(--ui-fg); font: 12.5px/1.4 var(--ui-mono); white-space: pre; }
+.ui-jsonq-sum { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-jsonq-note { margin: 0; color: var(--ui-warning); font-size: 13px; overflow-wrap: anywhere; }
+.ui-jsonq-list { display: grid; max-height: 340px; margin: 0; padding: 0; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); list-style: none; }
+.ui-jsonq-list:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-jsonq-list li { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 2px 12px; padding: 6px 10px; border-bottom: 1px solid var(--ui-border); font: 12.5px/1.5 var(--ui-mono); }
+.ui-jsonq-list li:last-child { border-bottom: 0; }
+.ui-jsonq-where { color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-jsonq-value { overflow-wrap: anywhere; }
+@media (max-width: 480px) { .ui-jsonq-list li { grid-template-columns: minmax(0, 1fr); } }
+`
+
+// ---- Saying where bad JSON goes wrong ------------------------------------------
+// The parser's own message differs between the server and each browser, and some give no
+// place, so this walks the text as far as it is good. Gives null, or { line, col, why }.
+
+fn json_query_at(chars: list, i: int, why: str) -> map {
+    let before = take(chars, i)
+    let lines = len(before | filter((c) => c == "\n"))
+    let last = reduce(enumerate(before), -1, (b, p) => p[1] == "\n" ? p[0] : b)
+    { line: lines + 1, col: i - last, why }
+}
+
+fn json_query_found(c) -> str = c == null ? "the end of the text" : (c == "\n" ? "a line break" : `"${c}"`)
+
+// Past the string that starts at i: the index after its closing quote, or { i, why }.
+fn json_query_string(chars: list, start: int) {
+    let n = len(chars)
+    let i = start + 1
+    while i < n {
+        let c = chars[i]
+        if c == "\"" { return i + 1 }
+        if c == "\n" { return { i, why: "a line break inside a string" } }
+        if c == "\\" {
+            let e = chars[i + 1]
+            if e == null || !contains("\"\\/bfnrtu", e) { return { i, why: "a bad escape in a string" } }
+            i += 1
+        }
+        i += 1
+    }
+    { i: start, why: "a string that never ends" }
+}
+
+// The first thing wrong with a JSON text, or null. It keeps a stack rather than
+// recursing, so text nested a thousand deep cannot use up the stack.
+fn json_query_scan(text: str) {
+    let chars = split(text, "")
+    let n = len(chars)
+    let stack = []
+    let want = "value"
+    let i = 0
+    while i < n {
+        let c = chars[i]
+        if c == " " || c == "\n" || c == "\t" || c == "\r" {
+            i += 1
+        } else if want == "value" || want == "value_or_end" {
+            if want == "value_or_end" && c == "]" {
+                stack = take(stack, len(stack) - 1)
+                want = "next"
+                i += 1
+            } else if c == "{" {
+                stack = push(stack, c)
+                want = "key_or_end"
+                i += 1
+            } else if c == "[" {
+                stack = push(stack, c)
+                want = "value_or_end"
+                i += 1
+            } else if c == "\"" {
+                let after = json_query_string(chars, i)
+                if type_of(after) == "map" { return json_query_at(chars, after.i, `Found ${after.why}.`) }
+                i = after
+                want = "next"
+            } else {
+                let word = join(slice(chars, i, i + 40), "")
+                let m = re.find(word, "^(true|false|null|-?(0|[1-9]\\d*)(\\.\\d+)?([eE][-+]?\\d+)?)")
+                if m == null { return json_query_at(chars, i, `Expected a value, found ${json_query_found(c)}.`) }
+                i += len(m.text)
+                want = "next"
+            }
+        } else if want == "key" || want == "key_or_end" {
+            if want == "key_or_end" && c == "}" {
+                stack = take(stack, len(stack) - 1)
+                want = "next"
+                i += 1
+            } else if c == "\"" {
+                let after = json_query_string(chars, i)
+                if type_of(after) == "map" { return json_query_at(chars, after.i, `Found ${after.why}.`) }
+                i = after
+                want = "colon"
+            } else {
+                return json_query_at(chars, i, `Expected a key in double quotes, found ${json_query_found(c)}.`)
+            }
+        } else if want == "colon" {
+            if c != ":" { return json_query_at(chars, i, `Expected ":" after the key, found ${json_query_found(c)}.`) }
+            want = "value"
+            i += 1
+        } else {
+            let top = len(stack) > 0 ? stack[-1] : null
+            if top == null { return json_query_at(chars, i, `Expected the end of the text, found ${json_query_found(c)}.`) }
+            if c == "," {
+                want = top == "{" ? "key" : "value"
+                i += 1
+            } else if (top == "{" && c == "}") || (top == "[" && c == "]") {
+                stack = take(stack, len(stack) - 1)
+                i += 1
+            } else {
+                return json_query_at(chars, i, `Expected "," or "${top == "{" ? "}" : "]"}", found ${json_query_found(c)}.`)
+            }
+        }
+    }
+    if want == "next" && len(stack) == 0 { return null }
+    let open = len(stack) > 0 ? (stack[-1] == "{" ? "}" : "]") : null
+    json_query_at(chars, n, open != null ? `The text ends before the closing "${open}".` : "The text ends where a value was expected.")
+}
+
+// ---- Reading a path -----------------------------------------------------------
+// The reader keeps a place in the characters, and each step gives { n, at } or { at, why }.
+// `at` counts from 0; messages count from 1, as a text editor's column does.
+
+fn json_query_stop(at: int, why: str) -> map = { at, why, bad: true }
+
+fn json_query_seen(c) -> str = c == null ? "the end of the path" : `"${c}"`
+
+fn json_query_skip(cs: list, at: int) -> int {
+    let i = at
+    while cs[i] == " " { i += 1 }
+    i
+}
+
+fn json_query_name_char(c, first: bool) -> bool =
+    c != null && (re.test(c, first ? "^[A-Za-z_]$" : "^[A-Za-z0-9_-]$") || !re.test(c, "^[ -~]$"))
+
+// A bare name: { n, at }, or null when none starts here.
+fn json_query_name(cs: list, at: int) {
+    if !json_query_name_char(cs[at], true) { return null }
+    let i = at + 1
+    while json_query_name_char(cs[i], false) { i += 1 }
+    { n: join(slice(cs, at, i), ""), at: i }
+}
+
+// A quoted string at `at`: { n, at }, or a stop.
+fn json_query_quoted(cs: list, at: int) -> map {
+    let q = cs[at]
+    let out = ""
+    let i = at + 1
+    while cs[i] != null {
+        let c = cs[i]
+        if c == q { return { n: out, at: i + 1 } }
+        if c == "\\" {
+            i += 1
+            if cs[i] == null { return json_query_stop(i, "The path ends inside a string.") }
+            out += cs[i]
+        } else {
+            out += c
+        }
+        i += 1
+    }
+    json_query_stop(at, "This string is never closed.")
+}
+
+// A whole number: { n, at }, or null.
+fn json_query_int(cs: list, at: int) {
+    let i = cs[at] == "-" ? at + 1 : at
+    let from = i
+    while cs[i] != null && re.test(cs[i], "^\\d$") { i += 1 }
+    if i == from || i - from > 15 { return null }
+    { n: int(join(slice(cs, at, i), "")), at: i }
+}
+
+// What is between [ and ]: a selector, or a list of them.
+fn json_query_bracket(cs: list, start: int) -> map {
+    let first = json_query_skip(cs, start)
+    let c = cs[first]
+    if c == "*" {
+        let end = json_query_skip(cs, first + 1)
+        return cs[end] == "]" ? { n: { k: "all" }, at: end + 1 } : json_query_stop(end, `Expected "]" after *, found ${json_query_seen(cs[end])}.`)
+    }
+    if c == "?" {
+        let open = json_query_skip(cs, first + 1)
+        let wrapped = cs[open] == "("
+        let body = json_query_or(cs, wrapped ? open + 1 : open, 0)
+        if body.bad { return body }
+        let after = json_query_skip(cs, body.at)
+        if wrapped && cs[after] != ")" { return json_query_stop(after, `Expected ")" to close the test, found ${json_query_seen(cs[after])}.`) }
+        let end = json_query_skip(cs, wrapped ? after + 1 : after)
+        return cs[end] == "]" ? { n: { k: "filter", test: body.n }, at: end + 1 } : json_query_stop(end, `Expected "]" after the test, found ${json_query_seen(cs[end])}.`)
+    }
+    let picks = []
+    let at = first
+    while true {
+        let one = json_query_pick(cs, at)
+        if one.bad { return one }
+        picks = push(picks, one.n)
+        at = json_query_skip(cs, one.at)
+        if cs[at] == "]" { return { n: len(picks) == 1 ? picks[0] : { k: "union", picks }, at: at + 1 } }
+        if cs[at] != "," { return json_query_stop(at, `Expected "," or "]", found ${json_query_seen(cs[at])}.`) }
+        at = json_query_skip(cs, at + 1)
+    }
+    // Never reached: quillo check takes `while true` for a loop that can end.
+    json_query_stop(at, "")
+}
+
+// One key, index or slice in brackets.
+fn json_query_pick(cs: list, at: int) -> map {
+    let c = cs[at]
+    if c == "'" || c == "\"" {
+        let s = json_query_quoted(cs, at)
+        return s.bad ? s : { n: { k: "key", name: s.n }, at: s.at }
+    }
+    let lo = json_query_int(cs, at)
+    let i = json_query_skip(cs, lo != null ? lo.at : at)
+    if cs[i] != ":" {
+        return lo != null ? { n: { k: "index", i: lo.n }, at: lo.at } : json_query_stop(at, `Expected a number, a quoted key, * or ? in the brackets, found ${json_query_seen(c)}.`)
+    }
+    let j = json_query_skip(cs, i + 1)
+    let hi = json_query_int(cs, j)
+    let m = json_query_skip(cs, hi != null ? hi.at : j)
+    if cs[m] != ":" { return { n: { k: "slice", lo: lo.n, hi: hi.n, step: 1 }, at: m } }
+    let k = json_query_skip(cs, m + 1)
+    let step = json_query_int(cs, k)
+    if step != null && step.n == 0 { return json_query_stop(k, "A slice's step cannot be 0.") }
+    { n: { k: "slice", lo: lo.n, hi: hi.n, step: step != null ? step.n : 1 }, at: step != null ? step.at : k }
+}
+
+// The segments from `at` on: { n: segs, at }. In a test, a path stops at what is not its
+// own, and `from` marks each segment's place, to say where results ran out.
+fn json_query_segments(cs: list, start: int, inner: bool) -> map {
+    let segs = []
+    let at = start
+    while cs[at] != null {
+        let c = cs[at]
+        if c == "." && cs[at + 1] == "." {
+            let i = at + 2
+            let next = cs[i]
+            if next == "*" {
+                segs = push(segs, { k: "deep", then: { k: "all" }, from: at, to: i + 1 })
+                at = i + 1
+            } else if next == "[" {
+                let b = json_query_bracket(cs, i + 1)
+                if b.bad { return b }
+                segs = push(segs, { k: "deep", then: b.n, from: at, to: b.at })
+                at = b.at
+            } else {
+                let w = json_query_name(cs, i)
+                if w == null { return json_query_stop(i, `Expected a name, * or [ after "..", found ${json_query_seen(next)}.`) }
+                segs = push(segs, { k: "deep", then: { k: "key", name: w.n }, from: at, to: w.at })
+                at = w.at
+            }
+        } else if c == "." {
+            let next = cs[at + 1]
+            if next == "*" {
+                segs = push(segs, { k: "all", from: at, to: at + 2 })
+                at += 2
+            } else {
+                let w = json_query_name(cs, at + 1)
+                if w == null { return json_query_stop(at + 1, `Expected a key or * after ".", found ${json_query_seen(next)}.`) }
+                segs = push(segs, { k: "key", name: w.n, from: at, to: w.at })
+                at = w.at
+            }
+        } else if c == "[" {
+            let b = json_query_bracket(cs, at + 1)
+            if b.bad { return b }
+            segs = push(segs, { ...b.n, from: at, to: b.at })
+            at = b.at
+        } else if inner {
+            return { n: segs, at }
+        } else {
+            return json_query_stop(at, `Expected ".", ".." or "[", found ${json_query_seen(c)}.`)
+        }
+    }
+    { n: segs, at }
+}
+
+// Tests: or, and, not, a comparison, each deeper than the last. `deep` holds off a
+// text of nothing but brackets.
+fn json_query_or(cs: list, at: int, deep: int) -> map {
+    let left = json_query_and(cs, at, deep)
+    if left.bad { return left }
+    let i = json_query_skip(cs, left.at)
+    if cs[i] == "|" && cs[i + 1] == "|" {
+        let right = json_query_or(cs, i + 2, deep)
+        return right.bad ? right : { n: { t: "or", a: left.n, b: right.n }, at: right.at }
+    }
+    left
+}
+
+fn json_query_and(cs: list, at: int, deep: int) -> map {
+    let left = json_query_not(cs, at, deep)
+    if left.bad { return left }
+    let i = json_query_skip(cs, left.at)
+    if cs[i] == "&" && cs[i + 1] == "&" {
+        let right = json_query_and(cs, i + 2, deep)
+        return right.bad ? right : { n: { t: "and", a: left.n, b: right.n }, at: right.at }
+    }
+    left
+}
+
+fn json_query_not(cs: list, at: int, deep: int) -> map {
+    let i = json_query_skip(cs, at)
+    if deep > 32 { return json_query_stop(i, "This test is nested too deeply.") }
+    if cs[i] == "!" && cs[i + 1] != "=" {
+        let x = json_query_not(cs, i + 1, deep + 1)
+        return x.bad ? x : { n: { t: "not", x: x.n }, at: x.at }
+    }
+    if cs[i] == "(" {
+        let x = json_query_or(cs, i + 1, deep + 1)
+        if x.bad { return x }
+        let end = json_query_skip(cs, x.at)
+        return cs[end] == ")" ? { n: x.n, at: end + 1 } : json_query_stop(end, `Expected ")", found ${json_query_seen(cs[end])}.`)
+    }
+    let left = json_query_operand(cs, i)
+    if left.bad { return left }
+    let j = json_query_skip(cs, left.at)
+    let two = (cs[j] ?? "") + (cs[j + 1] ?? "")
+    let op = contains(["==", "!=", "<=", ">="], two) ? two : (cs[j] == "<" || cs[j] == ">" ? cs[j] : null)
+    if op == null {
+        if cs[j] == "=" { return json_query_stop(j, `A comparison is written "==", not "=".`) }
+        return left.n.t == "path" ? { n: { t: "exists", path: left.n }, at: left.at } : json_query_stop(j, `Expected a comparison after this value, found ${json_query_seen(cs[j])}.`)
+    }
+    let right = json_query_operand(cs, json_query_skip(cs, j + len(op)))
+    right.bad ? right : { n: { t: "cmp", op, a: left.n, b: right.n }, at: right.at }
+}
+
+// One side of a comparison.
+fn json_query_operand(cs: list, at: int) -> map {
+    let c = cs[at]
+    if c == "@" || c == "$" {
+        let p = json_query_segments(cs, at + 1, true)
+        return p.bad ? p : { n: { t: "path", top: c == "$", segs: p.n }, at: p.at }
+    }
+    if c == "'" || c == "\"" {
+        let s = json_query_quoted(cs, at)
+        return s.bad ? s : { n: { t: "lit", v: s.n }, at: s.at }
+    }
+    let rest = join(slice(cs, at, at + 40), "")
+    let num = re.find(rest, "^-?\\d+(\\.\\d+)?([eE][-+]?\\d+)?")
+    if num != null {
+        let v = json.parse(num.text)
+        return is_err(v) ? json_query_stop(at, `"${num.text}" is not a number.`) : { n: { t: "lit", v }, at: at + len(num.text) }
+    }
+    let word = re.find(rest, "^(true|false|null)\\b")
+    if word != null { return { n: { t: "lit", v: word.text == "null" ? null : word.text == "true" }, at: at + len(word.text) } }
+    json_query_stop(at, `Expected @, $, a number, a quoted string, true, false or null, found ${json_query_seen(c)}.`)
+}
+
+// A path: { segs }, or { at, why } with at counting from 0.
+fn json_query_parse(path: str) -> map {
+    let cs = split(trim(path), "")
+    if len(cs) == 0 { return json_query_stop(0, "Write a path, starting with $.") }
+    if cs[0] != "$" { return json_query_stop(0, `A path starts with $, not ${json_query_seen(cs[0])}.`) }
+    let got = json_query_segments(cs, 1, false)
+    got.bad ? got : { segs: got.n }
+}
+
+// ---- Following a path ----------------------------------------------------------
+
+// A value's place written out: .name where that reads, ['a b'] where not.
+fn json_query_step(k: str) -> str =
+    re.test(k, "^[A-Za-z_][A-Za-z0-9_]*$") ? `.${k}` : `['${replace(replace(k, "\\", "\\\\"), "'", "\\'")}']`
+
+// Each child of a value, as a node { path, value }.
+fn json_query_children(node: map) -> list {
+    let v = node.value
+    if type_of(v) == "list" { return for [i, x] in enumerate(v) => { path: `${node.path}[${i}]`, value: x } }
+    type_of(v) == "map" ? keys(v) | map((k) => { path: node.path + json_query_step(k), value: get(v, k) }) : []
+}
+
+// A node and all under it, in document order. It stops at 256 levels, far past what a
+// real document has, so a hostile one cannot use up the stack.
+fn json_query_all_under(node: map, deep: int = 0) -> list =
+    deep > 256 ? [node] : [node, ...flatten(json_query_children(node) | map((c) => json_query_all_under(c, deep + 1)))]
+
+fn json_query_slice(n: int, s: map) -> list {
+    let fix = (x, dflt: int) => x == null ? dflt : (x < 0 ? x + n : x)
+    let step = s.step
+    let lo = step > 0 ? min([n, max([0, fix(s.lo, 0)])]) : min([n - 1, max([-1, fix(s.lo, n - 1)])])
+    let hi = step > 0 ? min([n, max([0, fix(s.hi, n)])]) : min([n - 1, max([-1, s.hi == null ? -1 : fix(s.hi, -1)])])
+    let out = []
+    let i = lo
+    while step > 0 ? i < hi : i > hi {
+        out = push(out, i)
+        i += step
+    }
+    out
+}
+
+// What a selector takes from one node.
+fn json_query_select(seg: map, node: map, top) -> list {
+    let v = node.value
+    match seg.k {
+        "key" => type_of(v) == "map" && has(v, seg.name) ? [{ path: node.path + json_query_step(seg.name), value: get(v, seg.name) }] : []
+        "index" => {
+            if type_of(v) != "list" { return [] }
+            let i = seg.i < 0 ? seg.i + len(v) : seg.i
+            i >= 0 && i < len(v) ? [{ path: `${node.path}[${i}]`, value: v[i] }] : []
+        }
+        "all" => json_query_children(node)
+        "slice" => type_of(v) != "list" ? [] : json_query_slice(len(v), seg) | map((i) => { path: `${node.path}[${i}]`, value: v[i] })
+        "union" => flatten(seg.picks | map((p) => json_query_select(p, node, top)))
+        "filter" => json_query_children(node) | filter((c) => json_query_test(seg.test, c.value, top))
+        _ => []
+    }
+}
+
+// One segment over a list of nodes.
+fn json_query_apply(seg: map, nodes: list, top, cap: int) -> list {
+    if seg.k == "deep" {
+        let under = flatten(nodes | map((n) => json_query_all_under(n)))
+        return take(flatten(under | map((n) => json_query_select(seg.then, n, top))), cap)
+    }
+    take(flatten(nodes | map((n) => json_query_select(seg, n, top))), cap)
+}
+
+// What a side of a comparison is: { v }, or { none: true } for a path that finds nothing.
+fn json_query_side(x: map, at, top) -> map {
+    if x.t == "lit" { return { v: x.v } }
+    let found = reduce(x.segs, [{ path: "$", value: x.top ? top : at }], (nodes, s) => json_query_apply(s, nodes, top, 1000))
+    len(found) == 0 ? { none: true } : { v: found[0].value }
+}
+
+// a op b, for values of any kind: only numbers with numbers and text with text have an order.
+fn json_query_compare(op: str, a: map, b: map) -> bool {
+    if a.none || b.none {
+        let same = a.none == true && b.none == true
+        return op == "==" || op == "<=" || op == ">=" ? same : (op == "!=" ? !same : false)
+    }
+    let x = a.v
+    let y = b.v
+    if op == "==" { return x == y }
+    if op == "!=" { return x != y }
+    let num = (v) => type_of(v) == "int" || type_of(v) == "float"
+    if !(num(x) && num(y)) && !(type_of(x) == "str" && type_of(y) == "str") { return false }
+    match op {
+        "<" => x < y
+        "<=" => x <= y
+        ">" => x > y
+        _ => x >= y
+    }
+}
+
+fn json_query_test(t: map, at, top) -> bool = match t.t {
+    "or" => json_query_test(t.a, at, top) || json_query_test(t.b, at, top)
+    "and" => json_query_test(t.a, at, top) && json_query_test(t.b, at, top)
+    "not" => !json_query_test(t.x, at, top)
+    "exists" => json_query_side(t.path, at, top).none != true
+    _ => json_query_compare(t.op, json_query_side(t.a, at, top), json_query_side(t.b, at, top))
+}
+
+// The path's results: { nodes, more, stopped }. stopped is the segment after which
+// nothing was left, with the keys that were there instead.
+fn json_query_run(document, segs: list, limit: int = 500) -> map {
+    let cap = limit + 1
+    let nodes = [{ path: "$", value: document }]
+    let stopped = null
+    for seg in segs {
+        if stopped == null {
+            let next = json_query_apply(seg, nodes, document, cap)
+            if len(next) == 0 && len(nodes) > 0 {
+                stopped = { seg, there: unique(flatten(nodes | map((n) => type_of(n.value) == "map" ? keys(n.value) : []))) }
+            }
+            nodes = next
+        }
+    }
+    { nodes: take(nodes, limit), more: len(nodes) > limit, stopped }
+}
+
+// A number the same way on the server and in the browser, where a whole float is whole.
+fn json_query_num(v) -> str = type_of(v) == "float" && v == floor(v) && abs(v) < 1000000000000000.0 ? str(int(v)) : str(v)
+
+// A value as compact JSON, numbers as above, so what the server sent is what the browser would make.
+fn json_query_text(v, deep: int = 0) -> str = match type_of(v) {
+    "int" | "float" | "dec" => json_query_num(v)
+    "list" => deep > 40 ? "[…]" : `[${join(v | map((x) => json_query_text(x, deep + 1)), ",")}]`
+    "map" => deep > 40 ? "{…}" : `{${join(keys(v) | map((k) => json.stringify(k) + ":" + json_query_text(get(v, k), deep + 1)), ",")}}`
+    _ => json.stringify(v)
+}
+
+fn json_query_short(s: str) -> str = len(s) > 300 ? slice(s, 0, 300) + "…" : s
+
+// The nearest of some keys to a name, for "did you mean".
+fn json_query_near(name: str, there: list) -> str? {
+    let low = lower(name)
+    let cost = (k: str) => {
+        let a = split(low, "")
+        let b = split(lower(k), "")
+        if abs(len(a) - len(b)) > 2 { return 9 }
+        let prev = for j in 0..(len(b) + 1) => j
+        for [i, c] in enumerate(a) {
+            let left = i + 1
+            let tail = for [j, d] in enumerate(b) => {
+                left = min([prev[j] + (c == d ? 0 : 1), prev[j + 1] + 1, left + 1])
+                left
+            }
+            prev = [i + 1, ...tail]
+        }
+        prev[len(b)]
+    }
+    let close = there | filter((k) => len(k) < 40 && cost(k) <= 2)
+    len(close) > 0 ? sort_by(close, cost)[0] : null
+}
+
+// Where a path found nothing, in words.
+fn json_query_empty_why(path: str, stopped: map?) -> str {
+    if stopped == null { return "Nothing matches." }
+    let part = slice(trim(path), stopped.seg.from, stopped.seg.to)
+    let name = stopped.seg.k == "key" ? stopped.seg.name : (stopped.seg.k == "deep" && stopped.seg.then.k == "key" ? stopped.seg.then.name : null)
+    let near = name != null ? json_query_near(name, stopped.seg.k == "key" ? stopped.there : []) : null
+    let keys_said = len(stopped.there) > 0 && stopped.seg.k == "key" ? ` The keys there are ${join(take(stopped.there, 6), ", ")}${len(stopped.there) > 6 ? ` and ${len(stopped.there) - 6} more` : ""}.` : ""
+    `Nothing matches from ${part} on.${near != null ? ` Did you mean ${near}?` : ""}${keys_said}`
+}
+
+component JsonQuery(id: str, text: str = "", path: str = "$", title: str = "Query JSON", limit: int = 500, max_chars: int = 500000,
+                    name: str? = null, on_change = null, class: str? = null) {
+    style global json_query_css
+    state source = text
+    state query = path
+    let clipped = len(source) > max_chars
+    let body = clipped ? slice(source, 0, max_chars) : source
+    let blank = trim(body) == ""
+    let document = blank ? null : json.parse(body)
+    let bad_json = !blank && is_err(document) ? (json_query_scan(body) ?? { line: 1, col: 1, why: "This is not JSON the browser can read." }) : null
+    let parsed = json_query_parse(query)
+    let ready = !blank && bad_json == null && !parsed.bad
+    let run = ready ? json_query_run(document, parsed.segs, limit) : { nodes: [], more: false, stopped: null }
+    let hits = run.nodes
+    let n = len(hits)
+    let tell = () => {
+        if on_change != null {
+            let d = trim(source) == "" ? null : json.parse(len(source) > max_chars ? slice(source, 0, max_chars) : source)
+            let p = json_query_parse(query)
+            let good = trim(source) != "" && !is_err(d) && !p.bad
+            on_change(good ? json_query_run(d, p.segs, limit).nodes : [])
+        }
+    }
+    let form = (s: str) => name != null ? `${name}_${s}` : null
+    <section class={ui_cls(["ui-jsonq", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-jsonq-title id={`${id}-title`}>{title}</h3>
+        <div.ui-jsonq-field>
+            <label for={`${id}-text`}>JSON document</label>
+            <textarea.ui-jsonq-text id={`${id}-text`} name={form("json")} rows="8" spellcheck="false" autocomplete="off"
+                      aria-invalid={bad_json != null ? "true" : null} aria-describedby={bad_json != null ? `${id}-bad` : null}
+                      @input={(e) => { source = e.value; tell() }}>{source}</textarea>
+        </div>
+        {bad_json != null && <p.ui-jsonq-error id={`${id}-bad`} role="alert">{`Line ${bad_json.line}, column ${bad_json.col}: ${bad_json.why}`}</p>}
+        {clipped && <p.ui-jsonq-note>{`Only the first ${format_number(max_chars, "en-US", 0)} characters are read.`}</p>}
+        <div.ui-jsonq-field>
+            <label for={`${id}-path`}>Path</label>
+            <input.ui-jsonq-path type="text" id={`${id}-path`} name={form("path")} value={query} spellcheck="false" autocomplete="off"
+                   aria-invalid={parsed.bad ? "true" : null} aria-describedby={parsed.bad ? `${id}-where` : null} @input={(e) => { query = e.value; tell() }}/>
+        </div>
+        <div.ui-jsonq-tries>
+            <span>Try</span>
+            {for p in ["$..*", "$.*", "$..[0]"] => <button.ui-jsonq-try key={p} type="button" @click={() => { query = p; tell() }}>{p}</button>}
+        </div>
+        {parsed.bad && <div.ui-jsonq-error id={`${id}-where`} role="alert">
+            <span>{`At character ${parsed.at + 1}: ${parsed.why}`}</span>
+            <pre.ui-jsonq-mark aria-hidden="true">{`${trim(query)}\n${repeat(" ", parsed.at)}^`}</pre>
+        </div>}
+        <p.ui-jsonq-sum aria-live="polite">
+            {!ready ? "" : (n > 0 ? `${n}${run.more ? "+" : ""} result${n == 1 ? "" : "s"}` : json_query_empty_why(query, run.stopped))}
+        </p>
+        {run.more && <p.ui-jsonq-note>{`Only the first ${limit} results are shown.`}</p>}
+        {n > 0 && <ol.ui-jsonq-list tabindex="0" aria-label="Results">
+            {for [i, h] in enumerate(hits) => <li key={i} data-path={h.path}>
+                <span.ui-jsonq-where>{h.path}</span>
+                <span.ui-jsonq-value>{json_query_short(json_query_text(h.value))}</span>
+            </li>}
+        </ol>}
+    </section>
+}

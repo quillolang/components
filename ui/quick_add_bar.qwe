@@ -1,0 +1,614 @@
+// QuickAddBar: one line that becomes a task. As it is typed it finds the day, the time, the
+// list and the priority in the words and marks them in the line itself, so "Call Ana tomorrow
+// 5pm #work !!" is a task called "Call Ana", and each thing found stands as a chip under it.
+// Tapping a chip puts those words back in the title, for the day "may 3" really was a
+// bread recipe. It stays above the on-screen keyboard, and keeps the keyboard up for the
+// next one. Nothing is sent anywhere: the reading is here.
+//
+//   component Inbox() {
+//       <QuickAddBar today="2026-11-01" now="10:20" lists={["Inbox", "Work", "Home"]} docked={true}
+//                    on_add={(task) => { save(task) }}/>
+//   }
+//
+// It reads: today, tonight, tomorrow, monday (the next one, a week off if today is one), next
+// friday (in the week after this), this friday, next week, next month, this weekend, end of
+// month, in 3 days, in 2 weeks, in 2 hours, 3 Nov, Nov 3rd, the 14th, 2026-11-14, 14/11; at 5,
+// 5pm, 17:30, noon, midnight; every day, every monday, daily, weekly, monthly, weekdays;
+// #work, in Work, for Work, work list; !, !!, !!!, p1 to p3, urgent, asap, high priority,
+// low priority. Short day names (mon, sat) count only after on, by, due, next, this or every,
+// as "sat" and "sun" are words. "at 5" with no am or pm is 5 in the afternoon, up to 7.
+//
+// today: "YYYY-MM-DD", the day the words count from; left out, the server's when it renders.
+// now: "HH:MM", for "in 2 hours", and so that a time already gone means tomorrow.
+// lists: the names of the lists. new_lists: a #name matching none is a new list (true).
+// day_first: 14/11 is the 14th (true), or 11/14 is (false). placeholder. label: the field's name
+// for screen readers. docked: stands at the bottom of the screen, above the keyboard and the
+// home bar (false: it stays where it is put). autofocus: takes the focus on arrival, which
+// brings the keyboard up (false). class.
+// on_add(task): inside one of your components, called with { title, date, time, list, list_new,
+// priority, repeat, text }, any left null when not found: date "YYYY-MM-DD", time "HH:MM",
+// priority "high", "medium" or "low", repeat "day", "week", "month", "weekdays", or a day's
+// name in lower case, text the line as typed. on_change(task): the same, at every change.
+
+import ui/theme.qwe use ui_cls
+
+let quick_add_bar_css = css`
+.ui-quick-add { container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); background: var(--ui-surface); }
+.ui-quick-add-docked { position: fixed; left: 0; right: 0; bottom: var(--ui-quick-add-kb, 0px); z-index: 20; padding: 8px max(10px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
+  border-top: 1px solid var(--ui-border); box-shadow: 0 -4px 16px rgba(15, 14, 24, .08); }
+.ui-quick-add-docked[data-up="1"] { padding-bottom: 8px; }
+.ui-quick-add-inner { display: grid; gap: 6px; }
+.ui-quick-add-row { display: flex; gap: 8px; min-width: 0; }
+.ui-quick-add-field { position: relative; flex: 1; min-width: 0; height: 46px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-bg); overflow: hidden; }
+.ui-quick-add-field:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+/* The line is drawn twice, in the same font: the field's own text is clear, its caret shows, and the marks show through it. */
+.ui-quick-add-mirror, .ui-quick-add-input { box-sizing: border-box; position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; padding: 0 12px; border: 0; font: 16px/44px var(--ui-font); letter-spacing: 0; white-space: pre; }
+.ui-quick-add-mirror { overflow: hidden; color: var(--ui-fg); pointer-events: none; }
+.ui-quick-add-input { background: transparent; color: transparent; -webkit-text-fill-color: transparent; caret-color: var(--ui-fg); outline: none; }
+.ui-quick-add-input::placeholder { color: var(--ui-muted); -webkit-text-fill-color: var(--ui-muted); opacity: 1; }
+.ui-quick-add-mark { border-radius: 3px; }
+.ui-quick-add-mark[data-kind="date"], .ui-quick-add-mark[data-kind="time"], .ui-quick-add-mark[data-kind="repeat"] { background: var(--ui-info-soft); color: var(--ui-info); }
+.ui-quick-add-mark[data-kind="list"] { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-quick-add-mark[data-kind="priority"] { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-quick-add-add { flex: none; min-width: 64px; min-height: 46px; padding: 0 14px; border: 0; border-radius: var(--ui-radius); background: var(--ui-accent); color: var(--ui-accent-fg); font: 600 15px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-quick-add-add:disabled { background: var(--ui-subtle); color: var(--ui-muted); cursor: default; }
+.ui-quick-add-add:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-quick-add-chips { display: flex; gap: 6px; min-height: 44px; overflow-x: auto; scrollbar-width: none; overscroll-behavior-x: contain; }
+.ui-quick-add-chips:empty { display: none; }
+.ui-quick-add-chips::-webkit-scrollbar { display: none; }
+.ui-quick-add-chip { flex: none; display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 10px; border: 0; border-radius: 999px; background: var(--ui-subtle); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); white-space: nowrap; cursor: pointer; }
+.ui-quick-add-chip[data-kind="date"] { background: var(--ui-info-soft); color: var(--ui-info); }
+.ui-quick-add-chip[data-kind="list"] { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-quick-add-chip[data-kind="priority"] { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-quick-add-chip svg { width: 12px; height: 12px; }
+.ui-quick-add-chip:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-quick-add-say { min-height: 18px; margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-quick-add-say:empty { display: none; }
+/* On a tablet what was found stands beside the line, so the bar stays one row tall. */
+@container (min-width: 600px) {
+  .ui-quick-add-inner { grid-template-columns: minmax(0, 1fr) minmax(180px, 40%); align-items: center; }
+  .ui-quick-add-chips { justify-content: flex-end; }
+  .ui-quick-add-chips:empty { display: flex; }
+  .ui-quick-add-say { grid-column: 1 / -1; }
+}
+`
+
+let quick_add_bar_days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+let quick_add_bar_short_days = [["mon"], ["tue", "tues"], ["wed", "weds"], ["thu", "thur", "thurs"], ["fri"], ["sat"], ["sun"]]
+let quick_add_bar_months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
+let quick_add_bar_counts = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"]
+
+fn quick_add_bar_pad(n: int) -> str = n < 10 ? `0${n}` : str(n)
+
+// The words of a line with where each starts and ends, in characters. A word's closing commas
+// and stops are not part of it; it is a whole `!!` that counts as priority.
+fn quick_add_bar_words(text: str) -> list {
+    let out = []
+    let at = 0
+    for piece in split(text, " ") {
+        if piece != "" {
+            let bare = re.replace(piece, "[,.;:?!]+$", "")
+            let kept = bare != "" ? bare : piece
+            out = out + [{ raw: piece, w: lower(kept), s: at, e: at + len(kept) }]
+        }
+        at += len(piece) + 1
+    }
+    out
+}
+
+fn quick_add_bar_word(ws: list, i: int) -> str = i >= 0 && i < len(ws) ? ws[i].w : ""
+
+// 1 for Monday to 7 for Sunday, or null. Short names only where asked for.
+fn quick_add_bar_weekday(w: str, short: bool) {
+    let long = index_of(quick_add_bar_days, w)
+    if long != null { return long + 1 }
+    if !short { return null }
+    let hits = enumerate(quick_add_bar_short_days) | filter((p) => contains(p[1], w))
+    len(hits) > 0 ? hits[0][0] + 1 : null
+}
+
+// 1 to 12, or null: a month's name, whole or from three letters.
+fn quick_add_bar_month(w: str) {
+    if len(w) < 3 { return null }
+    let hits = enumerate(quick_add_bar_months) | filter((p) => p[1] == w || (len(w) <= 4 && starts_with(p[1], w)) || (w == "sept" && p[1] == "september"))
+    len(hits) > 0 ? hits[0][0] + 1 : null
+}
+
+// The day after today that falls on a weekday; `same` lets it be today.
+fn quick_add_bar_upcoming(today: str, wd: int, same: bool) -> str {
+    let ahead = (wd - date.weekday(today) + 7) % 7
+    date.add_days(today, ahead == 0 && !same ? 7 : ahead)
+}
+
+// That weekday in the week after this one, weeks starting on Monday.
+fn quick_add_bar_next_week(today: str, wd: int) -> str = date.add_days(today, 7 - date.weekday(today) + wd)
+
+fn quick_add_bar_iso(y: int, m: int, d: int) {
+    if y < 1 || y > 9999 || m < 1 || m > 12 || d < 1 || d > 31 { return null }
+    let s = `${y}-${quick_add_bar_pad(m)}-${quick_add_bar_pad(d)}`
+    date.valid(s, "date") ? s : null
+}
+
+// A month and a day with no year: the next time it comes.
+fn quick_add_bar_dated(m: int, d: int, year, today: str) {
+    let y = int(slice(today, 0, 4))
+    if year != null { return quick_add_bar_iso(year, m, d) }
+    let first = quick_add_bar_iso(y, m, d)
+    if first != null && first >= today { return first }
+    let y2 = y + 1
+    let y3 = y + 4
+    let after = quick_add_bar_iso(y2, m, d)
+    if after != null { return after }
+    quick_add_bar_iso(y3 - y3 % 4, m, d)
+}
+
+// "14", "14th": the number of a day, or null.
+fn quick_add_bar_ordinal(w: str) {
+    if !re.test(w, "^[0-9]{1,2}(st|nd|rd|th)?$") { return null }
+    let n = int(re.replace(w, "[a-z]+$", ""))
+    n >= 1 && n <= 31 ? n : null
+}
+
+// "the 14th": the next 14th there is.
+fn quick_add_bar_nth(n: int, today: str) {
+    let y = int(slice(today, 0, 4))
+    let m = int(slice(today, 5, 7))
+    let here = quick_add_bar_iso(y, m, n)
+    if here != null && here >= today { return here }
+    let next = date.start_of_month(date.add_months(today, 1))
+    let there = quick_add_bar_iso(int(slice(next, 0, 4)), int(slice(next, 5, 7)), n)
+    if there != null { return there }
+    let later = date.start_of_month(date.add_months(today, 2))
+    quick_add_bar_iso(int(slice(later, 0, 4)), int(slice(later, 5, 7)), n)
+}
+
+fn quick_add_bar_count(w: str) {
+    if w == "a" || w == "an" { return 1 }
+    if re.test(w, "^[0-9]{1,3}$") { return int(w) }
+    index_of(quick_add_bar_counts, w)
+}
+
+fn quick_add_bar_year(w: str) = re.test(w, "^[0-9]{4}$") ? int(w) : null
+
+// What a time reads as, or null: "5pm", "5:30pm", "17:30", and "5" when `spoken`, after "at".
+// Without am or pm, 1 to 7 is the afternoon, unless written 07:30.
+fn quick_add_bar_time(w: str, spoken: bool) {
+    if w == "noon" { return "12:00" }
+    if w == "midnight" { return "00:00" }
+    let half = ends_with(w, "am") ? "am" : ends_with(w, "pm") ? "pm" : ""
+    let digits = half != "" ? slice(w, 0, len(w) - 2) : w
+    let bits = split(digits, ":")
+    if len(bits) > 2 || !re.test(bits[0], "^[0-9]{1,2}$") { return null }
+    if len(bits) == 2 && !re.test(bits[1], "^[0-9]{2}$") { return null }
+    if len(bits) == 1 && half == "" && !spoken { return null }
+    let h = int(bits[0])
+    let m = len(bits) == 2 ? int(bits[1]) : 0
+    if m > 59 { return null }
+    if half != "" {
+        if h < 1 || h > 12 { return null }
+        let h24 = half == "pm" ? (h == 12 ? 12 : h + 12) : (h == 12 ? 0 : h)
+        return `${quick_add_bar_pad(h24)}:${quick_add_bar_pad(m)}`
+    }
+    if h > 23 { return null }
+    let padded = len(bits[0]) == 2 && h < 10
+    `${quick_add_bar_pad(h >= 1 && h <= 7 && !padded ? h + 12 : h)}:${quick_add_bar_pad(m)}`
+}
+
+fn quick_add_bar_time_at(ws: list, i: int) {
+    let a = quick_add_bar_word(ws, i)
+    let b = quick_add_bar_word(ws, i + 1)
+    let c = quick_add_bar_word(ws, i + 2)
+    if a == "at" || a == "@" {
+        if (c == "am" || c == "pm") && re.test(b, "^[0-9:]{1,5}$") {
+            let t = quick_add_bar_time(b + c, true)
+            if t != null { return { n: 3, time: t } }
+        }
+        let t2 = quick_add_bar_time(b, true)
+        return t2 != null ? { n: 2, time: t2 } : null
+    }
+    if (b == "am" || b == "pm") && re.test(a, "^[0-9:]{1,5}$") {
+        let t3 = quick_add_bar_time(a + b, true)
+        if t3 != null { return { n: 2, time: t3 } }
+    }
+    let t4 = quick_add_bar_time(a, false)
+    t4 != null ? { n: 1, time: t4 } : null
+}
+
+fn quick_add_bar_repeat_at(ws: list, i: int, today: str) {
+    let a = quick_add_bar_word(ws, i)
+    let b = quick_add_bar_word(ws, i + 1)
+    if a == "daily" { return { n: 1, date: today, repeat: "day" } }
+    if a == "weekly" { return { n: 1, date: today, repeat: "week" } }
+    if a == "monthly" { return { n: 1, date: today, repeat: "month" } }
+    if a == "weekdays" { return { n: 1, date: quick_add_bar_weekdays_from(today), repeat: "weekdays" } }
+    if a != "every" { return null }
+    if b == "day" || b == "week" || b == "month" { return { n: 2, date: today, repeat: b } }
+    if b == "weekday" { return { n: 2, date: quick_add_bar_weekdays_from(today), repeat: "weekdays" } }
+    let wd = quick_add_bar_weekday(b, true)
+    if wd == null { return null }
+    { n: 2, date: quick_add_bar_upcoming(today, wd, true), repeat: quick_add_bar_days[wd - 1] }
+}
+
+// The first working day from today.
+fn quick_add_bar_weekdays_from(today: str) -> str {
+    let wd = date.weekday(today)
+    wd > 5 ? date.add_days(today, 8 - wd) : today
+}
+
+// The day words starting at word i, without a leading on, by or due. `said`: one of those came
+// first, so a short day name means a day.
+fn quick_add_bar_date_core(ws: list, i: int, today: str, day_first: bool, said: bool) {
+    let a = quick_add_bar_word(ws, i)
+    let b = quick_add_bar_word(ws, i + 1)
+    let c = quick_add_bar_word(ws, i + 2)
+    let e = quick_add_bar_word(ws, i + 3)
+    if a == "today" || a == "tod" { return { n: 1, date: today } }
+    if a == "tonight" { return { n: 1, date: today, time: "20:00" } }
+    if a == "tomorrow" || a == "tmrw" || a == "tmr" { return { n: 1, date: date.add_days(today, 1) } }
+    if a == "day" && b == "after" && c == "tomorrow" { return { n: 3, date: date.add_days(today, 2) } }
+    if a == "next" {
+        let wd = quick_add_bar_weekday(b, true)
+        if wd != null { return { n: 2, date: quick_add_bar_next_week(today, wd) } }
+        if b == "week" { return { n: 2, date: quick_add_bar_next_week(today, 1) } }
+        if b == "month" { return { n: 2, date: date.start_of_month(date.add_months(today, 1)) } }
+        if b == "year" { return { n: 2, date: `${int(slice(today, 0, 4)) + 1}-01-01` } }
+        return null
+    }
+    if a == "this" {
+        if b == "weekend" { return { n: 2, date: quick_add_bar_upcoming(today, 6, true) } }
+        let wd2 = quick_add_bar_weekday(b, true)
+        return wd2 != null ? { n: 2, date: quick_add_bar_upcoming(today, wd2, true) } : null
+    }
+    if a == "weekend" { return { n: 1, date: quick_add_bar_upcoming(today, 6, true) } }
+    if a == "eom" { return { n: 1, date: date.end_of_month(today) } }
+    if a == "eow" { return { n: 1, date: quick_add_bar_upcoming(today, 7, true) } }
+    if a == "end" && b == "of" {
+        let n = c == "the" ? 4 : 3
+        let unit = c == "the" ? e : c
+        if unit == "month" { return { n, date: date.end_of_month(today) } }
+        if unit == "week" { return { n, date: quick_add_bar_upcoming(today, 7, true) } }
+        return null
+    }
+    let wd3 = quick_add_bar_weekday(a, said)
+    if wd3 != null { return { n: 1, date: quick_add_bar_upcoming(today, wd3, false) } }
+    // Nov 3, Nov 3rd, Nov 3 2027.
+    let m = quick_add_bar_month(a)
+    if m != null {
+        let d = quick_add_bar_ordinal(b)
+        if d != null {
+            let y = quick_add_bar_year(c)
+            let found = quick_add_bar_dated(m, d, y, today)
+            return found != null ? { n: y != null ? 3 : 2, date: found } : null
+        }
+    }
+    // 3 Nov, 3rd of November, the 3rd.
+    let skip = a == "the" ? 1 : 0
+    let d2 = quick_add_bar_ordinal(quick_add_bar_word(ws, i + skip))
+    if d2 != null {
+        let of = quick_add_bar_word(ws, i + skip + 1) == "of" ? 1 : 0
+        let m2 = quick_add_bar_month(quick_add_bar_word(ws, i + skip + 1 + of))
+        if m2 != null {
+            let y2 = quick_add_bar_year(quick_add_bar_word(ws, i + skip + 2 + of))
+            let found2 = quick_add_bar_dated(m2, d2, y2, today)
+            return found2 != null ? { n: skip + 2 + of + (y2 != null ? 1 : 0), date: found2 } : null
+        }
+        if skip == 1 || (said && re.test(quick_add_bar_word(ws, i), "[a-z]$")) {
+            let nth = quick_add_bar_nth(d2, today)
+            return nth != null ? { n: 1 + skip, date: nth } : null
+        }
+    }
+    if re.test(a, "^[0-9]{4}-[0-9]{2}-[0-9]{2}$") { return date.valid(a, "date") ? { n: 1, date: a } : null }
+    if re.test(a, "^[0-9]{1,2}/[0-9]{1,2}$") {
+        let bits = split(a, "/")
+        let one = int(bits[0])
+        let two = int(bits[1])
+        let found3 = quick_add_bar_dated(day_first ? two : one, day_first ? one : two, null, today)
+        return found3 != null ? { n: 1, date: found3 } : null
+    }
+    null
+}
+
+// "in 3 days" and the like, or null. Hours need the clock, and carry the day over.
+fn quick_add_bar_in_at(ws: list, i: int, today: str, now) {
+    if quick_add_bar_word(ws, i) != "in" { return null }
+    let n = quick_add_bar_count(quick_add_bar_word(ws, i + 1))
+    if n == null { return null }
+    let unit = re.replace(quick_add_bar_word(ws, i + 2), "s$", "")
+    if unit == "day" { return { n: 3, date: date.add_days(today, n) } }
+    if unit == "week" { return { n: 3, date: date.add_days(today, n * 7) } }
+    if unit == "month" { return { n: 3, date: date.add_months(today, n) } }
+    if unit == "year" { return { n: 3, date: date.add_years(today, n) } }
+    if (unit == "hour" || unit == "hr" || unit == "minute" || unit == "min") && now != null {
+        let mins = int(slice(now, 0, 2)) * 60 + int(slice(now, 3, 5)) + (unit == "hour" || unit == "hr" ? n * 60 : n)
+        let t = `${quick_add_bar_pad(int((mins % 1440) / 60))}:${quick_add_bar_pad(mins % 60)}`
+        return { n: 3, date: date.add_days(today, int(mins / 1440)), time: t }
+    }
+    null
+}
+
+fn quick_add_bar_date_at(ws: list, i: int, today: str, now, day_first: bool) {
+    let a = quick_add_bar_word(ws, i)
+    let every = quick_add_bar_repeat_at(ws, i, today)
+    if every != null { return every }
+    let span = quick_add_bar_in_at(ws, i, today, now)
+    if span != null { return span }
+    if a == "on" || a == "by" || a == "due" {
+        let inner = quick_add_bar_date_core(ws, i + 1, today, day_first, true)
+        return inner != null ? { ...inner, n: inner.n + 1 } : null
+    }
+    quick_add_bar_date_core(ws, i, today, day_first, false)
+}
+
+fn quick_add_bar_priority_at(ws: list, i: int) {
+    let raw = ws[i].raw
+    let a = quick_add_bar_word(ws, i)
+    let b = quick_add_bar_word(ws, i + 1)
+    if raw == "!!!" || a == "p1" || a == "urgent" || a == "asap" { return { n: 1, priority: "high" } }
+    if raw == "!!" || a == "p2" { return { n: 1, priority: "medium" } }
+    if raw == "!" || a == "p3" { return { n: 1, priority: "low" } }
+    if b == "priority" && contains(["high", "medium", "low"], a) { return { n: 2, priority: a } }
+    if a == "priority" && contains(["high", "medium", "low"], b) { return { n: 2, priority: b } }
+    null
+}
+
+// The list a #word means: one of `lists` by its name or its start, or a new one.
+fn quick_add_bar_hash(name: str, lists: list, new_lists: bool) {
+    let want = lower(name)
+    let same = lists | filter((l) => lower(l) == want)
+    if len(same) > 0 { return { list: same[0], list_new: false } }
+    let start = lists | filter((l) => starts_with(lower(l), want))
+    if len(start) > 0 { return { list: start[0], list_new: false } }
+    new_lists ? { list: name, list_new: true } : null
+}
+
+// How many words a known list's name takes from word i, or 0.
+fn quick_add_bar_named(ws: list, i: int, name: str) -> int {
+    let parts = split(lower(name), " ")
+    let got = range(0, len(parts)) | filter((k) => quick_add_bar_word(ws, i + k) == parts[k])
+    len(got) == len(parts) ? len(parts) : 0
+}
+
+fn quick_add_bar_list_at(ws: list, i: int, lists: list, new_lists: bool) {
+    let a = quick_add_bar_word(ws, i)
+    if starts_with(a, "#") && len(a) > 1 {
+        let hit = quick_add_bar_hash(slice(ws[i].raw, 1, 1 + ws[i].e - ws[i].s - 1), lists, new_lists)
+        return hit != null ? { ...hit, n: 1 } : null
+    }
+    let lead = contains(["in", "for", "to"], a) ? 1 : 0
+    let hits = lists | map((l) => ({ l, k: quick_add_bar_named(ws, i + lead, l) })) | filter((h) => h.k > 0)
+    if len(hits) == 0 { return null }
+    let h = hits[0]
+    let closes = quick_add_bar_word(ws, i + lead + h.k) == "list"
+    if lead == 1 { return { n: 1 + h.k + (closes ? 1 : 0), list: h.l, list_new: false } }
+    closes ? { n: h.k + 1, list: h.l, list_new: false } : null
+}
+
+// What the line says. `dropped`: the found words, in lower case, that were tapped away and
+// stand as plain words. The first of each kind counts; a later one stays in the title.
+fn quick_add_bar_read(text: str, today: str, now, lists: list, new_lists: bool, day_first: bool, dropped: list) {
+    let ws = quick_add_bar_words(text)
+    let n = len(ws)
+    let tokens = []
+    let used = []
+    let found = { date: null, time: null, list: null, list_new: false, priority: null, repeat: null }
+    let i = 0
+    while i < n {
+        let try_kind = ""
+        let hit = null
+        if found.priority == null {
+            hit = quick_add_bar_priority_at(ws, i)
+            try_kind = "priority"
+        }
+        if hit == null && found.list == null {
+            hit = quick_add_bar_list_at(ws, i, lists, new_lists)
+            try_kind = "list"
+        }
+        if hit == null && found.time == null {
+            hit = quick_add_bar_time_at(ws, i)
+            try_kind = "time"
+        }
+        if hit == null && found.date == null {
+            hit = quick_add_bar_date_at(ws, i, today, now, day_first)
+            try_kind = "date"
+        }
+        let span = hit != null ? slice(text, ws[i].s, ws[i + hit.n - 1].e) : ""
+        if hit != null && !contains(dropped, lower(span)) {
+            let kind = try_kind == "date" && get(hit, "repeat") != null ? "repeat" : try_kind
+            tokens = tokens + [{ s: ws[i].s, e: ws[i + hit.n - 1].e, kind, text: span }]
+            used = used + range(i, i + hit.n)
+            found = { ...found, ...hit }
+            i += hit.n
+        } else {
+            i += 1
+        }
+    }
+    let title = enumerate(ws) | filter((p) => !contains(used, p[0])) | map((p) => p[1].raw) | join(" ")
+    { ...found, title, tokens }
+}
+
+// The line cut at what was found, each piece { t, kind }, for the marks.
+fn quick_add_bar_pieces(text: str, tokens: list) -> list {
+    let chars = split(text, "")
+    let at = 0
+    let out = []
+    for tok in sort_by(tokens, (x) => x.s) {
+        if tok.s > at { out = out + [{ t: slice(chars, at, tok.s) | join(""), kind: "" }] }
+        out = out + [{ t: slice(chars, tok.s, tok.e) | join(""), kind: tok.kind }]
+        at = tok.e
+    }
+    if at < len(chars) { out = out + [{ t: slice(chars, at, len(chars)) | join(""), kind: "" }] }
+    out
+}
+
+// A time already gone today, with no day given, means tomorrow.
+fn quick_add_bar_settle_day(read, today: str, now) {
+    if read.time == null || read.date != null { return read }
+    let gone = now != null && read.time <= now
+    { ...read, date: gone ? date.add_days(today, 1) : today }
+}
+
+// How a found day and time read on a chip.
+fn quick_add_bar_when(d, t, today: str) -> str {
+    if d == null { return t != null ? t : "" }
+    let n = date.days_between(today, d)
+    let day = n == 0 ? "Today" : n == 1 ? "Tomorrow" : n > 1 && n < 7 ? date.format(d, "dddd")
+        : slice(d, 0, 4) == slice(today, 0, 4) ? date.format(d, "ddd D MMM") : date.format(d, "D MMM YYYY")
+    t != null ? `${day} ${t}` : day
+}
+
+fn quick_add_bar_repeat_words(r) -> str = match r {
+    "day" => "Every day"
+    "week" => "Every week"
+    "month" => "Every month"
+    "weekdays" => "Weekdays"
+    _ => `Every ${upper(slice(r, 0, 1))}${slice(r, 1, len(r))}`
+}
+
+// The chips: what was found, each with the words it came from, to give them back.
+fn quick_add_bar_chips(read, today: str) -> list {
+    let of = (kinds: list) => read.tokens | filter((t) => contains(kinds, t.kind)) | map((t) => lower(t.text))
+    let when = quick_add_bar_when(read.date, read.time, today)
+    let chips = [
+        when != "" ? { kind: "date", label: when, words: of(["date", "time", "repeat"]) } : null,
+        read.repeat != null ? { kind: "date", label: quick_add_bar_repeat_words(read.repeat), words: of(["repeat"]) } : null,
+        read.list != null ? { kind: "list", label: read.list_new ? `New list: ${read.list}` : read.list, words: of(["list"]) } : null,
+        read.priority != null ? { kind: "priority", label: `${upper(slice(read.priority, 0, 1))}${slice(read.priority, 1, len(read.priority))} priority`, words: of(["priority"]) } : null,
+    ]
+    chips | filter((c) => c != null)
+}
+
+// The #word the caret stands at the end of, without its #, or null.
+fn quick_add_bar_partial(text: str, caret: int) {
+    let before = slice(text, 0, caret)
+    let last = before == "" || ends_with(before, " ") ? "" : split(before, " ")[len(split(before, " ")) - 1]
+    starts_with(last, "#") ? slice(last, 1, len(last)) : null
+}
+
+fn quick_add_bar_lists(lists) -> list = type_of(lists) == "list" ? lists | filter((l) => type_of(l) == "str" && trim(l) != "") : []
+
+component QuickAddBar(today: str = "", now: str = "", lists = [], new_lists: bool = true, day_first: bool = true, label: str = "Add a task",
+                      placeholder: str = "Call Ana tomorrow 5pm #work !!", docked: bool = false, autofocus: bool = false, on_add = null, on_change = null, class: str? = null) {
+    style global quick_add_bar_css
+    state day = date.valid(today, "date") ? today : date.today()
+    state text = ""
+    state caret = 0
+    state dropped = []
+    state said = ""
+    state typing = false
+    state input = null
+    state mirror = null
+    let clock = re.test(now, "^[0-2][0-9]:[0-5][0-9]$") ? now : null
+    let names = quick_add_bar_lists(lists)
+    let read = quick_add_bar_settle_day(quick_add_bar_read(text, day, clock, names, new_lists, day_first, dropped), day, clock)
+    let pieces = quick_add_bar_pieces(text, read.tokens)
+    let chips = quick_add_bar_chips(read, day)
+    let part = quick_add_bar_partial(text, caret)
+    let offers = part != null ? names | filter((l) => starts_with(lower(l), lower(part)) && l != read.list) | take(8) : []
+    let blank = trim(read.title) == ""
+    let task = (r) => ({ title: r.title, date: r.date, time: r.time, list: r.list, list_new: r.list_new, priority: r.priority, repeat: r.repeat, text })
+    let line_up = () => { mirror.scrollLeft = input.scrollLeft }
+    let changed = (v: str) => {
+        said = ""
+        if on_change != null {
+            let r = quick_add_bar_settle_day(quick_add_bar_read(v, day, clock, names, new_lists, day_first, dropped), day, clock)
+            on_change({ ...task(r), text: v })
+        }
+    }
+    let add = () => {
+        if blank {
+            said = text == "" ? "" : "Add a few words for the task itself."
+        } else {
+            let t = task(read)
+            let name = read.title
+            let when = quick_add_bar_when(read.date, read.time, day)
+            text = ""
+            caret = 0
+            dropped = []
+            input.value = ""
+            mirror.scrollLeft = 0
+            said = when != "" ? `Added ${name}, ${when}.` : `Added ${name}.`
+            on_add && on_add(t)
+        }
+    }
+    <form class={ui_cls(["ui-quick-add", docked && "ui-quick-add-docked", class])} autocomplete="off"
+          @mount={(me) => {
+              input = me.querySelector(".ui-quick-add-input")
+              mirror = me.querySelector(".ui-quick-add-mirror")
+              if autofocus { input.focus() }
+              let win = js("window")
+              let v = win.visualViewport
+              if docked && v != null {
+                  // The two systems differ: Android usually shrinks the page itself, so this reads 0;
+                  // iOS leaves the layout alone, and the keyboard is what the visible part lost.
+                  let fit = (_e = null) => {
+                      let gap = max([0, win.innerHeight - v.height - v.offsetTop])
+                      me.style.setProperty("--ui-quick-add-kb", `${gap}px`)
+                      me.dataset.up = gap > 80 ? "1" : ""
+                  }
+                  fit()
+                  v.addEventListener("resize", fit)
+                  v.addEventListener("scroll", fit)
+                  return () => {
+                      v.removeEventListener("resize", fit)
+                      v.removeEventListener("scroll", fit)
+                  }
+              }
+          }}
+          @submit={(e) => {
+              e.preventDefault()
+              add()
+          }}>
+        <div.ui-quick-add-inner>
+            <div.ui-quick-add-row>
+                <div.ui-quick-add-field>
+                    <div.ui-quick-add-mirror aria-hidden="true">{for p in pieces => <span class={p.kind != "" ? "ui-quick-add-mark" : null} data-kind={p.kind != "" ? p.kind : null}>{p.t}</span>}</div>
+                    <input.ui-quick-add-input type="text" value={text} placeholder={placeholder} aria-label={label} maxlength="300"
+                           enterkeyhint="done" autocapitalize="sentences" spellcheck="false" autocomplete="off"
+                           @input={(e) => {
+                               let v = e.value
+                               let units = e.target.selectionStart
+                               text = v
+                               caret = len(v)
+                               if v == "" { dropped = [] }
+                               changed(v)
+                               line_up()
+                               // The field counts in UTF-16 units and a line in characters.
+                               let before = js_new("String", v).slice(0, units)
+                               caret = len(before)
+                               js("requestAnimationFrame", (_t = null) => { line_up() })
+                           }}
+                           @scroll={() => { line_up() }}/>
+                </div>
+                <button.ui-quick-add-add type="submit" disabled={text != "" && blank ? true : null}
+                        @mousedown={(e) => { e.preventDefault() }}>Add</button>
+            </div>
+            <div.ui-quick-add-chips>
+                {for o in offers => <button.ui-quick-add-chip type="button" key={`o-${o}`} data-kind="list" aria-label={`Use the list ${o}`}
+                        @mousedown={(e) => { e.preventDefault() }}
+                        @click={() => {
+                            let cut = slice(text, 0, caret - len(part) - 1)
+                            let rest = slice(text, caret, len(text))
+                            let v = `${cut}#${o} ${trim(rest)}`
+                            let spot = len(cut) + len(o) + 2
+                            text = v
+                            caret = spot
+                            input.value = v
+                            input.focus()
+                            let units = js_new("String", slice(v, 0, spot)).length
+                            input.setSelectionRange(units, units)
+                            changed(v)
+                        }}>{o}</button>}
+                {for c in chips => <button.ui-quick-add-chip type="button" key={`c-${c.kind}-${c.label}`} data-kind={c.kind} aria-label={`${c.label}: keep these as plain words`}
+                        @mousedown={(e) => { e.preventDefault() }}
+                        @click={() => {
+                            dropped = dropped + c.words
+                            changed(text)
+                        }}>
+                    {c.label}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>}
+            </div>
+            <p.ui-quick-add-say role="status">{said}</p>
+        </div>
+    </form>
+}

@@ -1,0 +1,460 @@
+// ComposerBar: the message box at the bottom of a chat on a phone. It grows with what
+// is written up to a limit and then scrolls inside itself; the button at its end is a
+// microphone while it is empty and Send once there is something to send; the + opens a
+// tray of ways to attach; it rides above the on-screen keyboard on both systems. Pasting
+// is safe: text comes in plain and cleaned, cut to the limit with a word on screen, and
+// a pasted picture becomes an attachment.
+//
+//   <ComposerBar action="/chat/42"/>
+//   <ComposerBar on_send={(m) => { post(m.text, m.files) }} on_voice={(v) => { keep(v.url, v.seconds) }}/>
+//   <ComposerBar keyboard={false} on_send={send}><p>Replying to Ana</p></ComposerBar>
+//
+// In a page it is a real <form method={method} action={action}>: the text is sent as
+// `name` ("message") and the files as `name`_files. Inside one of your components:
+// on_send({ text, files }): text trimmed, files the browser's File objects.
+// on_voice({ blob, url, seconds, type }): a finished voice message; without it there is
+// no microphone, and voice={false} leaves it out too. Recording is the web's own
+// getUserMedia and MediaRecorder, in the phone apps as well. Refused, it says so, with a
+// way to Settings in an app. on_change(text): as it is typed.
+// label ("Message"), placeholder ("Message"), value: what it starts with. max_rows: how
+// many lines it grows to (6). limit: most characters, counted as Quillo counts them (4000).
+// attach: false leaves out the +. accept: what may be picked ("image/*,video/*,application/pdf").
+// max_files (10), max_mb (25): for each message, each file. max_seconds: longest recording (120).
+// keyboard: false when something around it, such as ChatScreen, keeps it above the
+// keyboard. enter_sends: "auto" sends on a hardware keyboard and starts a line on a touch
+// screen; true or false to say which. send_label ("Send"). disabled. method ("post"), action:
+// for a plain form. id: the form's, and the box's is id-field. class: for the form.
+// children: shown over the box, such as what is being replied to.
+//
+// Its two helpers keep anything above the keyboard, and ChatScreen, CommentSheet and
+// MentionTray use them.
+
+import ui/theme.qwe use ui_cls
+
+let composer_bar_css = css`
+.ui-composer-bar { position: sticky; bottom: 0; z-index: 3; container-type: inline-size; min-width: 0; font: 16px/22px var(--ui-font); color: var(--ui-fg); }
+.ui-composer-bar-lifted {
+  position: relative; display: grid; gap: 6px; padding: 8px 8px max(8px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--ui-border); background: var(--ui-surface); transform: translateY(calc(-1 * var(--ui-composer-bar-lift, 0px)));
+}
+.ui-composer-bar-up .ui-composer-bar-lifted { padding-bottom: 8px; }
+.ui-composer-bar-top:empty { display: none; }
+.ui-composer-bar-row { display: flex; align-items: flex-end; gap: 4px; min-width: 0; }
+.ui-composer-bar-field {
+  flex: 1; display: block; box-sizing: border-box; min-width: 0; height: 44px; margin: 0; padding: 10px 14px; resize: none; overflow-y: hidden;
+  border: 1px solid var(--ui-border); border-radius: 22px; background: var(--ui-bg); color: var(--ui-fg); font: inherit;
+  overscroll-behavior: contain; -webkit-appearance: none; appearance: none;
+}
+.ui-composer-bar-field[hidden] { display: none; }
+.ui-composer-bar-field::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-composer-bar-field:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-composer-bar-field:disabled { opacity: .55; }
+.ui-composer-bar-btn {
+  flex: none; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%;
+  background: transparent; color: var(--ui-muted); cursor: pointer; touch-action: manipulation;
+}
+.ui-composer-bar-btn svg { width: 24px; height: 24px; transition: transform .15s; }
+.ui-composer-bar-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-composer-bar-btn:disabled { opacity: .5; cursor: default; }
+.ui-composer-bar-plus[aria-expanded="true"] svg { transform: rotate(45deg); }
+.ui-composer-bar-main { background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-composer-bar-main.ui-composer-bar-voice { background: var(--ui-subtle); color: var(--ui-fg); }
+.ui-composer-bar-stop { background: var(--ui-danger-soft); color: var(--ui-danger); }
+@media (hover: hover) { .ui-composer-bar-btn:hover:not(:disabled) { color: var(--ui-fg); background: var(--ui-subtle); } .ui-composer-bar-main:hover:not(:disabled):not(.ui-composer-bar-voice) { color: var(--ui-accent-fg); background: var(--ui-accent); } }
+.ui-composer-bar-rec { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; height: 44px; padding: 0 12px; font-variant-numeric: tabular-nums; }
+.ui-composer-bar-rec i { width: 10px; height: 10px; border-radius: 50%; background: var(--ui-danger); animation: ui-composer-bar-beat 1.2s infinite; }
+@keyframes ui-composer-bar-beat { 50% { opacity: .3; } }
+.ui-composer-bar-note { margin: 0; padding: 0 8px; color: var(--ui-muted); font-size: 13px; line-height: 18px; }
+.ui-composer-bar-note:empty { display: none; }
+.ui-composer-bar-count { margin: 0; padding: 0 8px; color: var(--ui-muted); font-size: 12px; line-height: 16px; text-align: right; font-variant-numeric: tabular-nums; }
+.ui-composer-bar-count-full { color: var(--ui-danger); }
+.ui-composer-bar-settings { min-height: 44px; padding: 0 12px; border: 0; border-radius: var(--ui-radius-sm); background: var(--ui-accent-soft); color: var(--ui-accent); font: 500 14px var(--ui-font); cursor: pointer; }
+.ui-composer-bar-files { display: flex; gap: 8px; margin: 0; padding: 2px; overflow-x: auto; list-style: none; overscroll-behavior-x: contain; scrollbar-width: none; }
+.ui-composer-bar-file {
+  position: relative; flex: none; width: 64px; height: 64px; overflow: hidden; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-subtle); color: var(--ui-muted); font-size: 11px; line-height: 14px;
+}
+.ui-composer-bar-file img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.ui-composer-bar-file span { display: block; padding: 6px 4px 0; overflow-wrap: anywhere; }
+.ui-composer-bar-drop {
+  position: absolute; top: 0; right: 0; display: grid; place-items: start end; width: 44px; height: 44px; padding: 2px; border: 0;
+  background: transparent; color: #fff; cursor: pointer;
+}
+.ui-composer-bar-drop svg { width: 18px; height: 18px; padding: 3px; border-radius: 50%; background: rgba(15, 14, 24, .7); }
+.ui-composer-bar-drop:focus-visible { outline: none; }
+.ui-composer-bar-drop:focus-visible svg { box-shadow: var(--ui-focus); }
+.ui-composer-bar-tray { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.ui-composer-bar-way {
+  display: grid; justify-items: center; gap: 2px; min-height: 64px; padding: 8px 4px; border: 0; border-radius: var(--ui-radius);
+  background: var(--ui-subtle); color: var(--ui-fg); font: 500 13px/18px var(--ui-font); cursor: pointer;
+}
+.ui-composer-bar-way svg { width: 22px; height: 22px; color: var(--ui-accent); }
+.ui-composer-bar-way:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-composer-bar-pickers { display: none; }
+/* A tablet has room to leave the box alone: the tray is a card by the +, not a row under it. */
+@container (min-width: 600px) {
+  .ui-composer-bar-tray {
+    position: absolute; left: 8px; bottom: calc(100% + 6px); width: 300px; padding: 8px; border: 1px solid var(--ui-border);
+    border-radius: var(--ui-radius); background: var(--ui-surface); box-shadow: var(--ui-shadow-lg);
+  }
+  .ui-composer-bar-lifted { padding-left: 16px; padding-right: 16px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-composer-bar-btn svg { transition: none; } .ui-composer-bar-rec i { animation: none; } }
+`
+
+// How far something whose bottom edge is at `bottom` must rise to clear the keyboard.
+// `inner` is the window's height and the rest are visualViewport's. iOS leaves the window
+// as it is and shrinks only the visual viewport, and may slide it down too; Android's web
+// view may shrink both, and then nothing is covered and nothing need rise. A person
+// zooming also shrinks it, and scale says so.
+fn composer_bar_lift(bottom: num, inner: num, top: num, height: num, scale: num) -> int {
+    if scale > 1.05 { return 0 }
+    let keyboard = inner - height
+    if keyboard < 60 { return 0 }
+    round(max([0, min([keyboard, bottom - (top + height)])]))
+}
+
+// Calls on_lift(lift, top, height, open) now and whenever the keyboard or the visual
+// viewport moves, for `host`, whose own place must not depend on the lift: how far to
+// rise, the visual viewport's top and height, and whether a keyboard is up at all. Gives
+// back what stops it.
+fn composer_bar_follow(host, on_lift) {
+    let vv = js("window.visualViewport")
+    if vv == null || is_err(vv) { return () => null }
+    let measure = (_e = null) => {
+        let inner = js("innerHeight")
+        on_lift(composer_bar_lift(host.getBoundingClientRect().bottom, inner, vv.offsetTop, vv.height, vv.scale), vv.offsetTop, vv.height,
+                composer_bar_lift(inner, inner, 0, vv.height, vv.scale) > 0)
+    }
+    vv.addEventListener("resize", measure)
+    vv.addEventListener("scroll", measure)
+    measure()
+    () => {
+        vv.removeEventListener("resize", measure)
+        vv.removeEventListener("scroll", measure)
+    }
+}
+
+// Pasted text, safe to keep: its line ends made one kind, and what cannot be seen but can
+// do harm taken out: control characters and the marks that turn text around, with which
+// a file name or a link can be made to read as something else. Joiners stay: emoji need them.
+fn composer_bar_clean(text) -> str =
+    re.replace(re.replace(str(text ?? ""), "\\r\\n?", "\n"), "[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F\\u202A-\\u202E\\u2066-\\u2069\\uFEFF]", "")
+
+// What fits of a paste in `room` characters: { text, cut }, the characters left out.
+fn composer_bar_fit(text, room: int) {
+    // Cut first: cleaning a megabyte to keep four thousand of it would hold up the page.
+    let taken = slice(str(text ?? ""), 0, max([room, 0]) + 2000)
+    let clean = composer_bar_clean(taken)
+    let keep = max([room, 0])
+    { text: slice(clean, 0, keep), cut: max([len(clean) - keep, 0]) + len(str(text ?? "")) - len(taken) }
+}
+
+// What the end button is: "send" with something to send, "voice" with nothing, and
+// "send" when there is no microphone to offer.
+fn composer_bar_mode(text: str, files: int, voice: bool) -> str =
+    trim(text) != "" || files > 0 || !voice ? "send" : "voice"
+
+// How tall the box is for what it holds: it grows line by line up to max_rows.
+fn composer_bar_height(content: num, line: num, max_rows: int) -> num =
+    min([max([content, 44]), line * max([max_rows, 1]) + 22])
+
+// Whether Enter sends. A person on a touch screen has no Shift to start a line with.
+fn composer_bar_enter(setting, fine_pointer: bool, shift: bool, composing: bool) -> bool {
+    if shift || composing { return false }
+    setting == "auto" ? fine_pointer : setting == true
+}
+
+// Which of `picked` (each { name, size, stamp }) may join `count` already there:
+// { take, note }, note saying why any were left out.
+fn composer_bar_take(picked: list, have: list, max_files: int, max_mb: num) {
+    let limit = max_mb * 1048576
+    let same = (a, b) => a.name == b.name && a.size == b.size && a.stamp == b.stamp
+    let fresh = picked | filter((p) => !any(have, (h) => same(h, p)))
+    let small = fresh | filter((p) => (p.size ?? 0) <= limit)
+    let room = max([max_files - len(have), 0])
+    let take = slice(small, 0, room)
+    let note = len(small) < len(fresh) ? `Files over ${max_mb} MB were left out.`
+        : (len(take) < len(small) ? `${max_files} files at most in one message.` : "")
+    { take, note }
+}
+
+// 7 seconds is 0:07.
+fn composer_bar_clock(seconds: num) -> str {
+    let s = max([floor(seconds), 0])
+    let rest = s % 60
+    `${floor(s / 60)}:${rest < 10 ? "0" : ""}${rest}`
+}
+
+component ComposerBar(name: str = "message", label: str = "Message", placeholder: str = "Message", value: str = "",
+                      max_rows: int = 6, limit: int = 4000, attach: bool = true, accept: str = "image/*,video/*,application/pdf",
+                      max_files: int = 10, max_mb: num = 25, voice: bool = true, max_seconds: int = 120, keyboard: bool = true,
+                      enter_sends = "auto", send_label: str = "Send", disabled: bool = false, method: str = "post", action: str? = null,
+                      on_send = null, on_voice = null, on_change = null, id: str? = null, class: str? = null, children) {
+    style global composer_bar_css
+    state text = value
+    state files = []           // { key, name, size, stamp, type, url, file }
+    state tray = false
+    state note = ""
+    state refused = false
+    state native = false
+    state host = null
+    state box = null
+    state store = null          // the field a plain form sends the files in
+    state picker = null
+    state camera = null
+    state fine = true
+    state up = false
+    state rec = null            // the recorder, while there is one
+    state rec_keep = false
+    state rec_parts = []
+    state rec_from = 0
+    state rec_for = 0
+    let can_voice = voice && on_voice != null
+    let mode = composer_bar_mode(text, len(files), can_voice)
+    let left = limit - len(text)
+    let name_id = id ?? `ui-composer-bar-${name}`
+    let grow = (_e = null) => {
+        if box != null {
+            box.style.height = "auto"
+            let full = box.scrollHeight + 2
+            let height = composer_bar_height(full, 22, max_rows)
+            box.style.height = `${height}px`
+            box.style.overflowY = full > height ? "auto" : "hidden"
+        }
+    }
+    let changed = () => {
+        grow()
+        on_change && on_change(text)
+    }
+    let cap = (e) => {
+        if !e.isComposing && len(box.value) > limit {
+            let at = box.selectionStart
+            box.value = slice(box.value, 0, limit)
+            box.selectionStart = at
+            box.selectionEnd = at
+            text = box.value
+            note = `The limit is ${limit} characters.`
+        }
+    }
+    let keep_store = () => {
+        // A plain form sends what this one field holds, so it follows the list.
+        let carrier = js_new("DataTransfer")
+        for f in files { carrier.items.add(f.file) }
+        store.files = carrier.files
+    }
+    let add = (list) => {
+        let picked = list | map((f) => { name: f.name, size: f.size, stamp: f.lastModified, type: f.type, file: f })
+        let kept = composer_bar_take(picked, files, max_files, max_mb)
+        let made = kept.take | map((f) => {
+            ...f,
+            key: `${f.name}-${f.size}-${f.stamp}`,
+            url: starts_with(f.type ?? "", "image/") ? js("URL.createObjectURL", f.file) : null
+        })
+        files = files + made
+        note = kept.note
+        tray = false
+        keep_store()
+    }
+    let drop = (key) => {
+        for f in files { if f.key == key && f.url != null { js("URL.revokeObjectURL", f.url) } }
+        files = files | filter((f) => f.key != key)
+        note = ""
+        keep_store()
+    }
+    let send = () => {
+        let body = trim(text)
+        if !disabled && (body != "" || len(files) > 0) {
+            let sent = files | map((f) => f.file)
+            for f in files { if f.url != null { js("URL.revokeObjectURL", f.url) } }
+            text = ""
+            files = []
+            tray = false
+            note = ""
+            keep_store()
+            js("requestAnimationFrame", (_t = null) => { grow() })
+            on_send && on_send({ text: body, files: sent })
+        }
+    }
+    let stop_rec = (keep: bool) => {
+        // A second tap of a double tap lands on this button, where the microphone was: that is not an answer to it.
+        if rec != null && now() - rec_from > 400 {
+            rec_keep = keep
+            rec.stop()
+        }
+    }
+    if rec != null { every(250, () => {
+        rec_for = (now() - rec_from) / 1000
+        if rec_for >= max_seconds { stop_rec(true) }
+    }) }
+    let record = () => {
+        tray = false
+        refused = false
+        note = ""
+        // Read as fields: js("MediaRecorder") would call the class, which throws.
+        let w = js("window")
+        native = w.quilloNative != null
+        let can = w.MediaRecorder
+        let md = w.navigator.mediaDevices
+        if can == null || md == null {
+            note = "This device cannot record here."
+        } else {
+            let stream = js("navigator.mediaDevices.getUserMedia", { audio: true })
+            if is_err(stream) {
+                note = native ? "The microphone is off for this app." : "The microphone was refused. Allow it in this site's settings to record."
+                refused = true
+            } else {
+                // A recorder can refuse the stream by throwing, which would stop this function with the microphone on.
+                let made = js("Promise.resolve", js_new("Promise", (done) => { done(js_new("MediaRecorder", stream)) }))
+                if is_err(made) {
+                    for t in js("Array.from", stream.getTracks()) { t.stop() }
+                    note = "This device cannot record here."
+                    return null
+                }
+                rec_parts = []
+                rec_keep = false
+                made.addEventListener("dataavailable", (e) => { rec_parts = rec_parts + [e.data] })
+                made.addEventListener("stop", (_e = null) => {
+                    for t in js("Array.from", stream.getTracks()) { t.stop() }
+                    let seconds = round((now() - rec_from) / 1000, 1)
+                    let kind = made.mimeType
+                    rec = null
+                    if rec_keep && on_voice != null {
+                        let blob = js_new("Blob", rec_parts, { type: kind })
+                        on_voice({ blob, url: js("URL.createObjectURL", blob), seconds, type: kind })
+                    }
+                    rec_parts = []
+                })
+                made.start()
+                rec_from = now()
+                rec_for = 0
+                rec = made
+            }
+        }
+    }
+    <form class={ui_cls(["ui-composer-bar", up && "ui-composer-bar-up", class])} method={method} action={action} enctype="multipart/form-data"
+          id={id} aria-label={label}
+          @submit={on_send != null ? (e) => { e.preventDefault(); send() } : null}
+          @mount={(el) => {
+              let pointer = js("matchMedia", "(pointer: fine)").matches
+              host = el
+              fine = pointer
+              let wide = el.clientWidth
+              let turned = js_new("ResizeObserver", (_r = null) => {
+                  // Turning the phone rewraps the text.
+                  if el.clientWidth != wide {
+                      wide = el.clientWidth
+                      grow()
+                  }
+              })
+              turned.observe(el)
+              grow()
+              let stop = keyboard ? composer_bar_follow(el, (lift, _top, _height, _open) => {
+                  up = lift > 0
+                  el.style.setProperty("--ui-composer-bar-lift", `${lift}px`)
+              }) : () => null
+              () => {
+                  stop()
+                  turned.disconnect()
+                  for f in files { if f.url != null { js("URL.revokeObjectURL", f.url) } }
+                  if rec != null {
+                      rec_keep = false
+                      rec.stop()
+                  }
+              }
+          }}>
+        <div.ui-composer-bar-lifted>
+            <div.ui-composer-bar-top>{children}</div>
+            {len(files) > 0 && <ul.ui-composer-bar-files aria-label="Attached">
+                {for f in files => <li.ui-composer-bar-file key={f.key}>
+                    {f.url != null ? <img src={f.url} alt={f.name}/> : <span>{f.name}</span>}
+                    <button.ui-composer-bar-drop type="button" aria-label={`Remove ${f.name}`} @click={() => { drop(f.key) }}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                    </button>
+                </li>}
+            </ul>}
+            <p.ui-composer-bar-note role="status">{note}</p>
+            {refused && native && <button.ui-composer-bar-settings type="button" @click={() => { js("quilloNative.openSettings") }}>Open Settings</button>}
+            {left < limit / 10 && <p class={ui_cls(["ui-composer-bar-count", left <= 0 && "ui-composer-bar-count-full"])}>{left} left</p>}
+            <div.ui-composer-bar-row>
+                {attach && rec == null && <button.ui-composer-bar-btn.ui-composer-bar-plus type="button" aria-label="Attach" aria-expanded={tray ? "true" : "false"}
+                        disabled={disabled} @mousedown={(e) => { e.preventDefault() }} @click={() => { tray = !tray }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                </button>}
+                {rec != null && <button.ui-composer-bar-btn type="button" aria-label="Throw this recording away" @click={() => { stop_rec(false) }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>
+                </button>}
+                {rec != null && <div.ui-composer-bar-rec role="timer" aria-label="Recording"><i></i>{composer_bar_clock(rec_for)}</div>}
+                <textarea.ui-composer-bar-field id={`${name_id}-field`} name={name} rows="1" aria-label={label} placeholder={placeholder}
+                          enterkeyhint={composer_bar_enter(enter_sends, fine, false, false) ? "send" : "enter"} autocomplete="off" disabled={disabled}
+                          hidden={rec != null} bind:value={text}
+                          @mount={(el) => { box = el }}
+                          @input={(e) => {
+                              cap(e)
+                              changed()
+                          }}
+                          @compositionend={(e) => {
+                              cap(e)
+                              changed()
+                          }}
+                          @keydown={(e) => {
+                              if e.key == "Enter" && composer_bar_enter(enter_sends, fine, e.shiftKey, e.isComposing) {
+                                  e.preventDefault()
+                                  if on_send != null { send() } else { host.requestSubmit() }
+                              }
+                          }}
+                          @paste={(e) => {
+                              // Nothing that waits comes before preventDefault: the browser would paste it as well.
+                              let plain = e.clipboardData.getData("text/plain")
+                              let holds = e.clipboardData.files.length
+                              if plain != "" || (attach && holds > 0) { e.preventDefault() }
+                              let got = holds > 0 ? js("Array.from", e.clipboardData.files) : []
+                              if plain != "" {
+                                  let picked = box.selectionEnd - box.selectionStart
+                                  let fit = composer_bar_fit(plain, limit - len(box.value) + picked)
+                                  box.setRangeText(fit.text, box.selectionStart, box.selectionEnd, "end")
+                                  text = box.value
+                                  note = fit.cut > 0 ? `${fit.cut} characters did not fit and were left out.` : ""
+                                  changed()
+                              } else if attach && len(got) > 0 {
+                                  add(got)
+                              }
+                          }}></textarea>
+                {rec != null
+                    ? <button.ui-composer-bar-btn.ui-composer-bar-main.ui-composer-bar-stop type="button" aria-label="Finish and send the recording" @click={() => { stop_rec(true) }}>
+                          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+                      </button>
+                    : <button class={ui_cls(["ui-composer-bar-btn", "ui-composer-bar-main", mode == "voice" && "ui-composer-bar-voice"])}
+                              type={mode == "send" ? "submit" : "button"} aria-label={mode == "send" ? send_label : "Record a voice message"}
+                              disabled={disabled || (mode == "send" && trim(text) == "" && len(files) == 0)}
+                              @mousedown={(e) => { e.preventDefault() }}
+                              @click={() => { if mode == "voice" { record() } }}>
+                          {mode == "send"
+                              ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+                              : <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>}
+                      </button>}
+            </div>
+            {tray && <div.ui-composer-bar-tray role="group" aria-label="Attach">
+                <button.ui-composer-bar-way type="button" @click={() => { picker.setAttribute("accept", "image/*,video/*"); picker.click() }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 16 5-5 4 4 3-3 6 6"/></svg>
+                    Photos
+                </button>
+                <button.ui-composer-bar-way type="button" @click={() => { camera.click() }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+                    Camera
+                </button>
+                <button.ui-composer-bar-way type="button" @click={() => { picker.setAttribute("accept", accept); picker.click() }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l5 5v13H6zM14 3v5h5"/></svg>
+                    Files
+                </button>
+            </div>}
+            <div.ui-composer-bar-pickers>
+                <input type="file" name={`${name}_files`} multiple tabindex="-1" aria-hidden="true" @mount={(el) => { store = el }}/>
+                <input type="file" multiple accept={accept} tabindex="-1" aria-hidden="true" @mount={(el) => { picker = el }}
+                       @change={(e) => { add(js("Array.from", e.target.files)); e.target.value = "" }}/>
+                <input type="file" accept="image/*" capture="environment" tabindex="-1" aria-hidden="true" @mount={(el) => { camera = el }}
+                       @change={(e) => { add(js("Array.from", e.target.files)); e.target.value = "" }}/>
+            </div>
+        </div>
+    </form>
+}

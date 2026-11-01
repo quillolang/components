@@ -1,0 +1,326 @@
+// PinDropper: pick a place by moving the map under a pin that stays in the middle, as a phone's
+// own map apps do, since a finger on a pin hides the very spot it is setting. The coordinates
+// follow as the map moves, the pin lifts while it does, and pressing "Use this place" calls
+// on_pick. Pinching and double taps zoom about the pin, so it never leaves its spot. Keys and
+// buttons do all of it too: the arrows nudge, + and - zoom, and Enter picks. The map is Leaflet's,
+// on tiles from the network; with no script the nudges still move the coordinates, and it
+// says the map could not load.
+//
+//   import ui/pin_dropper.qwe use PinDropper
+//
+//   <div style="height: 100dvh">
+//       <PinDropper center={[38.7139, -9.1394]} name="place" on_pick={(lat, lng) => { spot = [lat, lng] }}/>
+//   </div>
+//
+// It fills the height it is given, 320 px at least. center: [lat, lng] to start from, and a new
+// value moves it there. zoom: 2 to 19 (16). nudge: pixels an arrow moves the map (40); with
+// Shift, four times that. confirm: the button's words ("Use this place"). label: what screen
+// readers call the map ("Move the map to put the pin on a place"). name: a hidden input
+// for a plain <form>, as "lat,lng". tiles, attribution: where the tiles come from (OpenStreetMap's).
+// on_pick(lat, lng): a place chosen. on_move(lat, lng): the map has come to rest somewhere
+// new. Both inside one of your components, both to six places. The location button asks the
+// app's location services, then the web's, and says why when neither can.
+//
+// pin_dropper_nudged, pin_dropper_metres_per_pixel and pin_dropper_places are the working.
+
+import ui/theme.qwe use ui_cls
+client "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js" use L
+
+let pin_dropper_css = css`
+/* set elsewhere: leaflet- (Leaflet's script sets them) */
+.ui-pindrop { position: relative; isolation: isolate; box-sizing: border-box; display: flex; flex-direction: column; height: 100%; min-height: 320px; container-type: size; overflow: hidden; background: var(--ui-subtle); color: var(--ui-fg); font: 15px/1.35 var(--ui-font); }
+.ui-pindrop-in { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.ui-pindrop-stage { position: relative; flex: 1; min-height: 0; outline: none; touch-action: none; -webkit-touch-callout: none; user-select: none; }
+.ui-pindrop-stage:focus-visible { box-shadow: inset var(--ui-focus); }
+.ui-pindrop-map { position: absolute; inset: 0; }
+.ui-pindrop .leaflet-container { background: var(--ui-subtle); font: 11px/1.4 var(--ui-font); }
+/* The pin's tip is the middle of the map. It takes no touches: they go to the map. */
+.ui-pindrop-pin { position: absolute; left: 50%; top: 50%; z-index: 500; width: 40px; height: 52px; margin: -52px 0 0 -20px; pointer-events: none; color: var(--ui-accent); filter: drop-shadow(0 2px 3px rgb(0 0 0 / .4)); transition: transform .15s; }
+.ui-pindrop-pin svg { display: block; width: 40px; height: 52px; }
+.ui-pindrop-shadow { position: absolute; left: 50%; top: 50%; z-index: 499; width: 12px; height: 5px; margin: -2px 0 0 -6px; border-radius: 50%; background: rgb(0 0 0 / .4); pointer-events: none; transition: transform .15s, opacity .15s; }
+.ui-pindrop[data-moving] .ui-pindrop-pin { transform: translateY(-12px); }
+.ui-pindrop[data-moving] .ui-pindrop-shadow { transform: scale(.6); opacity: .6; }
+.ui-pindrop-side { position: absolute; right: max(8px, env(safe-area-inset-right)); top: max(8px, env(safe-area-inset-top)); z-index: 600; display: grid; gap: 6px; }
+.ui-pindrop-btn {
+  box-sizing: border-box; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 600 20px/1 var(--ui-font); cursor: pointer; box-shadow: var(--ui-shadow); -webkit-tap-highlight-color: transparent;
+}
+.ui-pindrop-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-pindrop-btn:disabled { opacity: .45; cursor: default; }
+.ui-pindrop-btn svg { width: 22px; height: 22px; }
+.ui-pindrop-panel { flex: none; display: grid; gap: 8px; padding: 10px 12px max(10px, env(safe-area-inset-bottom)); border-top: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-pindrop-where { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 2px 10px; }
+.ui-pindrop-coords { font: 600 16px/1.3 var(--ui-mono); font-variant-numeric: tabular-nums; }
+.ui-pindrop-near { color: var(--ui-muted); font-size: 13px; }
+.ui-pindrop-pad { display: grid; grid-template-columns: repeat(4, 44px); justify-content: center; gap: 8px; }
+.ui-pindrop-go {
+  box-sizing: border-box; min-height: 48px; padding: 0 16px; border: 0; border-radius: var(--ui-radius); background: var(--ui-accent); color: var(--ui-accent-fg); font: 600 16px/1 var(--ui-font); cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.ui-pindrop-go:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-pindrop-say { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-pindrop-say:empty { display: none; }
+/* Their room is kept, so that a word here does not resize the map under the pin. */
+.ui-pindrop-notes { min-height: 36px; }
+.ui-pindrop-picked { margin: 0; font-size: 13px; font-weight: 600; }
+/* With the room, the controls stand beside the map and leave it all its height. */
+@container (min-width: 600px) {
+  .ui-pindrop-in { flex-direction: row; }
+  .ui-pindrop-panel { flex: 0 0 280px; align-content: start; padding: 16px; border-top: 0; border-left: 1px solid var(--ui-border); }
+  .ui-pindrop-where { display: grid; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-pindrop-pin, .ui-pindrop-shadow { transition: none; } }
+`
+
+fn pin_dropper_num(x) = (type_of(x) == "int" || type_of(x) == "float" || type_of(x) == "dec") && math.isfinite(float(x))
+
+// Web Mercator stops here: the map has no north of it.
+let pin_dropper_top = 85.05112878
+
+// { lat, lng } from a pair or a map, in the map's bounds, or null if it is no place.
+fn pin_dropper_point(p) {
+    if p == null { return null }
+    let lat = type_of(p) == "list" ? (len(p) > 1 ? p[0] : null) : p.lat
+    let lng = type_of(p) == "list" ? (len(p) > 1 ? p[1] : null) : (p.lng ?? p.lon)
+    if !pin_dropper_num(lat) || !pin_dropper_num(lng) || lat < -90 || lat > 90 { return null }
+    { lat: max([0 - pin_dropper_top, min([pin_dropper_top, float(lat)])]), lng: pin_dropper_wrap(float(lng)) }
+}
+
+// A longitude back into -180 to 180, as a map can go round the world.
+fn pin_dropper_wrap(lng: num) {
+    let x = (lng + 180) % 360
+    (x < 0 ? x + 360 : x) - 180
+}
+
+fn pin_dropper_zoom(z) = pin_dropper_num(z) ? max([2, min([19, round(float(z))])]) : 16
+
+// A map pixel at this latitude and zoom, in metres on the ground.
+fn pin_dropper_metres_per_pixel(lat: num, zoom: num) = 156543.03392 * math.cos(math.radians(lat)) / pow(2, zoom)
+
+// How many decimal places mean something at a zoom: a screen pixel, no finer.
+fn pin_dropper_places(zoom: num) = zoom >= 18 ? 6 : (zoom >= 15 ? 5 : (zoom >= 11 ? 4 : 3))
+
+// The place `dx` pixels right and `dy` pixels down of a place on the Web Mercator map, whose
+// world is 256 x 2^zoom pixels across. A map moved left shows what was to the right of it.
+fn pin_dropper_nudged(lat: num, lng: num, zoom: num, dx: num, dy: num) {
+    let world = 256 * pow(2, zoom)
+    let y = 0.5 - math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) / (2 * math.pi)
+    let moved = y + dy / world
+    let new_lat = math.degrees(2 * math.atan(math.exp((0.5 - moved) * 2 * math.pi)) - math.pi / 2)
+    { lat: max([0 - pin_dropper_top, min([pin_dropper_top, new_lat])]), lng: pin_dropper_wrap(lng + dx / world * 360) }
+}
+
+fn pin_dropper_fixed(x: num, zoom: num) = format_number(x, "en-US", pin_dropper_places(zoom))
+
+fn pin_dropper_text(p, zoom: num) = `${pin_dropper_fixed(p.lat, zoom)}, ${pin_dropper_fixed(p.lng, zoom)}`
+
+fn pin_dropper_near(lat: num, zoom: num) {
+    let m = pin_dropper_metres_per_pixel(lat, zoom)
+    m < 10 ? `About ${format_number(m, "en-US", 1)} m a pixel` : (m < 1000 ? `About ${format_number(round(m), "en-US", 0)} m a pixel` : `About ${format_number(m / 1000, "en-US", 1)} km a pixel`)
+}
+
+fn pin_dropper_six(x: num) = round(x * 1000000) / 1000000
+
+// A place the map was sent to and the place it stopped at agree to within two pixels: Leaflet
+// rounds its middle to a pixel, and a place given exactly must stay exact.
+fn pin_dropper_arrived(a, b, zoom: num) {
+    let two = 2 * 360 / (256 * pow(2, zoom))
+    abs(a.lat - b.lat) <= two && abs(a.lng - b.lng) <= two
+}
+
+fn pin_dropper_same(a, b) = abs(a.lat - b.lat) < 0.0000005 && abs(a.lng - b.lng) < 0.0000005
+
+fn pin_dropper_message(status, in_app) = match status {
+    "asking" => "Finding where you are."
+    "refused" => in_app ? "Location is turned off for this app. You can allow it in Settings." :
+        "Location is blocked for this page. Allow it in your browser's site settings."
+    "off" => "No location came. Check that location services are on."
+    "none" => "This browser cannot give a location."
+    "insecure" => "Browsers give a location only to pages on https."
+    "nomap" => "The map could not load. The arrows still move the coordinates."
+    _ => ""
+}
+
+component PinDropper(center: list = [0, 0], zoom: int = 16, nudge: num = 40, confirm: str = "Use this place", label: str = "Move the map to put the pin on a place",
+                     name: str? = null, tiles: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png", attribution: str = "© OpenStreetMap",
+                     on_pick = null, on_move = null, class: str? = null) {
+    style global pin_dropper_css
+    state at = pin_dropper_point(center) ?? { lat: 0, lng: 0 }
+    state level = pin_dropper_zoom(zoom)
+    state seen_center = center
+    state leaflet = null
+    state moving = false
+    state status = "idle"
+    state in_app = false
+    state picked = ""
+    state readout = null
+    state to_settings = false
+    state aim = null            // where the map was last sent, until it gets there
+
+    let calm = () => js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+    // A new place, by whichever way: through the map when there is one.
+    let go = (p) => {
+        if leaflet != null {
+            aim = p
+            leaflet.panTo([p.lat, p.lng], { animate: !calm(), duration: 0.15 })
+        } else {
+            at = p
+        }
+    }
+    let shift = (dx: num, dy: num) => { go(pin_dropper_nudged(at.lat, at.lng, level, dx, dy)) }
+    let zoom_by = (by: int) => {
+        let to = pin_dropper_zoom(level + by)
+        if leaflet != null {
+            aim = at
+            leaflet.setZoom(to, { animate: !calm() })
+        } else {
+            level = to
+        }
+    }
+    let pick = () => {
+        let lat = pin_dropper_six(at.lat)
+        let lng = pin_dropper_six(at.lng)
+        picked = `Picked ${pin_dropper_text(at, level)}`
+        on_pick && on_pick(lat, lng)
+    }
+    let locate = () => {
+        let win = js("window")
+        status = "asking"
+        if win.quilloNative != null {
+            in_app = true
+            let r = js("quilloNative.location")
+            if is_err(r) {
+                let t = lower(str(r.error))
+                status = contains(t, "for this app") || contains(t, "denied") || contains(t, "not allowed") ? "refused" : "off"
+            } else {
+                let p = pin_dropper_point([r.lat, r.lon])
+                status = p == null ? "off" : "idle"
+                if p != null { go(p) }
+            }
+        } else if win.navigator.geolocation == null {
+            status = "none"
+        } else if win.isSecureContext != true {
+            status = "insecure"
+        } else {
+            js("navigator.geolocation.getCurrentPosition",
+                (pos) => {
+                    status = "idle"
+                    go({ lat: pos.coords.latitude, lng: pos.coords.longitude })
+                },
+                (e) => { status = e.code == 1 ? "refused" : "off" },
+                { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 })
+        }
+    }
+    if center != seen_center {
+        seen_center = center
+        let p = pin_dropper_point(center)
+        if p != null { go(p) }
+    }
+
+    let say = pin_dropper_message(status, in_app)
+    <div class={ui_cls(["ui-pindrop", class])} data-moving={moving ? "" : null} @mount={(_el) => {
+        let d = js("document")
+        let back = (_e = null) => {
+            if to_settings && js("document.visibilityState") == "visible" {
+                to_settings = false
+                locate()
+            }
+        }
+        d.addEventListener("visibilitychange", back)
+        () => { d.removeEventListener("visibilitychange", back) }
+    }}>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+        <div.ui-pindrop-in>
+            <div.ui-pindrop-stage tabindex="0" role="application" aria-label={label} aria-roledescription="map"
+                 @keydown={(e) => {
+                     let far = e.shiftKey ? nudge * 4 : nudge
+                     if e.key == "ArrowLeft" { e.preventDefault(); shift(0 - far, 0) }
+                     if e.key == "ArrowRight" { e.preventDefault(); shift(far, 0) }
+                     if e.key == "ArrowUp" { e.preventDefault(); shift(0, 0 - far) }
+                     if e.key == "ArrowDown" { e.preventDefault(); shift(0, far) }
+                     if e.key == "+" || e.key == "=" { e.preventDefault(); zoom_by(1) }
+                     if e.key == "-" { e.preventDefault(); zoom_by(-1) }
+                     if e.key == "Enter" { e.preventDefault(); pick() }
+                 }}>
+                <div.ui-pindrop-map @mount={(el) => {
+                    // Zooms by pinch, double tap and wheel are about the middle, so the pin stays
+                    // on its place. Leaflet's own keys are off: these go by whole steps.
+                    let m = L.map(el, { zoomControl: false, keyboard: false, touchZoom: "center", doubleClickZoom: "center", scrollWheelZoom: "center",
+                                        minZoom: 2, maxZoom: 19, zoomSnap: 1, maxBounds: [[0 - pin_dropper_top, -1000000], [pin_dropper_top, 1000000]], maxBoundsViscosity: 1, inertia: !calm() })
+                    if is_err(m) {
+                        status = "nomap"
+                        return null
+                    }
+                    m.attributionControl.setPrefix(false)
+                    m.setView([at.lat, at.lng], level, { animate: false })
+                    L.tileLayer(tiles, { maxZoom: 19, attribution: escape(attribution) }).addTo(m)
+                    m.on("movestart", () => { moving = true })
+                    // Written straight to the text, as this is every frame of a drag.
+                    m.on("move", () => {
+                        let c = m.getCenter()
+                        if readout != null { readout.firstChild.nodeValue = pin_dropper_text({ lat: c.lat, lng: pin_dropper_wrap(c.lng) }, m.getZoom()) }
+                    })
+                    m.on("moveend", () => {
+                        let c = m.getCenter()
+                        let seen = { lat: c.lat, lng: pin_dropper_wrap(c.lng) }
+                        let p = aim != null && pin_dropper_arrived(aim, seen, m.getZoom()) ? aim : seen
+                        let changed = !pin_dropper_same(p, at)
+                        aim = null
+                        moving = false
+                        level = m.getZoom()
+                        at = p
+                        if changed {
+                            picked = ""
+                            on_move && on_move(pin_dropper_six(p.lat), pin_dropper_six(p.lng))
+                        }
+                    })
+                    let watching = js_new("ResizeObserver", (_x) => {
+                        // On the way somewhere, it stays on the way there.
+                        let to = aim ?? at
+                        aim = to
+                        m.invalidateSize({ pan: false, animate: false })
+                        aim = to
+                        m.setView([to.lat, to.lng], level, { animate: false })
+                    })
+                    watching.observe(el)
+                    leaflet = m
+                    () => {
+                        watching.disconnect()
+                        m.remove()
+                    }
+                }}></div>
+                <span.ui-pindrop-shadow aria-hidden="true"></span>
+                <span.ui-pindrop-pin aria-hidden="true"><svg viewBox="0 0 40 52" fill="currentColor"><path d="M20 0a18 18 0 0 0-18 18c0 12.5 18 34 18 34s18-21.5 18-34A18 18 0 0 0 20 0Z"/><circle cx="20" cy="18" r="7" fill="#fff"/></svg></span>
+                <div.ui-pindrop-side>
+                    <button.ui-pindrop-btn.ui-pindrop-in-z type="button" aria-label="Zoom in" disabled={level >= 19} @click={() => { zoom_by(1) }}>+</button>
+                    <button.ui-pindrop-btn.ui-pindrop-out-z type="button" aria-label="Zoom out" disabled={level <= 2} @click={() => { zoom_by(-1) }}>-</button>
+                    <button.ui-pindrop-btn.ui-pindrop-locate type="button" aria-label="Go to my location" @click={locate}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2" fill="currentColor"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+                    </button>
+                </div>
+            </div>
+            <div.ui-pindrop-panel>
+                <p.ui-pindrop-where style="margin: 0">
+                    <span.ui-pindrop-coords @mount={(el) => { readout = el }}>{pin_dropper_text(at, level)}</span>
+                    <span.ui-pindrop-near>{pin_dropper_near(at.lat, level)}</span>
+                </p>
+                <div.ui-pindrop-pad role="group" aria-label="Move the map">
+                    <button.ui-pindrop-btn.ui-pindrop-west type="button" aria-label="Move the pin west" @click={() => { shift(0 - nudge, 0) }}><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style="transform: rotate(-90deg)"><path d="M12 5 5 16h14Z"/></svg></button>
+                    <button.ui-pindrop-btn.ui-pindrop-north type="button" aria-label="Move the pin north" @click={() => { shift(0, 0 - nudge) }}><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 5 5 16h14Z"/></svg></button>
+                    <button.ui-pindrop-btn.ui-pindrop-south type="button" aria-label="Move the pin south" @click={() => { shift(0, nudge) }}><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style="transform: rotate(180deg)"><path d="M12 5 5 16h14Z"/></svg></button>
+                    <button.ui-pindrop-btn.ui-pindrop-east type="button" aria-label="Move the pin east" @click={() => { shift(nudge, 0) }}><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style="transform: rotate(90deg)"><path d="M12 5 5 16h14Z"/></svg></button>
+                </div>
+                <button.ui-pindrop-go type="button" @click={pick}>{confirm}</button>
+                <div.ui-pindrop-notes>
+                    <p.ui-pindrop-say role="status">{say}</p>
+                    <p.ui-pindrop-picked role="status">{picked}</p>
+                </div>
+                {status == "refused" && in_app && <button.ui-pindrop-go.ui-pindrop-settings type="button" @click={() => {
+                    to_settings = true
+                    js("quilloNative.openSettings")
+                }}>Open Settings</button>}
+            </div>
+        </div>
+        {name != null && <input type="hidden" name={name} value={`${pin_dropper_six(at.lat)},${pin_dropper_six(at.lng)}`}/>}
+    </div>
+}

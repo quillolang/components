@@ -1,0 +1,519 @@
+// PhotoEvidence: photos for a record, each stamped into the picture with the time and
+// the place it was taken, so the stamp goes wherever the picture goes. It says which
+// photos are still wanted (two of the damage, one of the plate), moves on to the next
+// by itself, and keeps working with no connection: photos wait here and go when it
+// comes back.
+//
+// A place comes from the phone's location services in the Quillo app (quilloNative), the
+// web's geolocation in a browser. With none, or a refusal, the photo is still kept and
+// its stamp says "Place not known", as a person with no signal still has a job to do.
+//
+//   import ui/photo_evidence.qwe use PhotoEvidence
+//
+//   <PhotoEvidence job="Job 4471" required={[{ tag: "Front", count: 1 }, { tag: "Damage", count: 2 }]}
+//                  tags={["Other"]} on_send={(p) => upload(p)} on_done={(ps) => { photos = ps }}/>
+//
+// required: what must be taken, each { tag, count }. tags: more tags that may be used, as
+// text. title: the heading ("Photos"). job: a line on each stamp. limit: how many in all
+// (30). use_place: asks for the place (true). library: also offers photos already on
+// the phone, whose stamp says "From library" and gives the time they were added, not
+// taken (false). id: a prefix for its ids, unique on the page ("ui-phev").
+//
+// What must last: in the phone apps localStorage comes back empty, so take `saved` (a
+// list of photos, as on_change gave them) from your own store. store: a key to keep them
+// under in this browser's localStorage as well, for a reload with no connection; a full
+// browser says so on screen. Each photo is about 200 KB of text.
+//
+// on_change(photos): after each change. on_send(photo): called for each photo, in turn,
+// when online; answer false, an error, or a Promise of either to leave it waiting.
+// on_done(photos): when Done is pressed and nothing is missing.
+// A photo: { id, tag, url (a JPEG as a data URL), at (ms), offset (minutes east of UTC),
+// lat, lon, accuracy, place ("ok" or why not), source ("camera" or "library"), stamp,
+// width, height, bytes, sent }.
+//
+// PhotoEvidenceAdd is the button alone, for a form that wants a stamped photo:
+//   <PhotoEvidenceAdd tag="Crack" job="Unit 12" on_add={(p) => { shots = shots + [p] }}/>
+// label ("Take photo"), tag, job, use_place, library, max_px (1600), quality (0.72),
+// disabled, on_add(photo). PhotoEvidenceThumbs(photos, on_remove) shows what was taken.
+//
+// photo_evidence_when(ms, offset), photo_evidence_place_text(place),
+// photo_evidence_progress(required, photos), photo_evidence_missing(required, photos)
+// and photo_evidence_tags(required, tags) are the plain logic. photo_evidence_place(ms),
+// from a handler as js("Promise.resolve", photo_evidence_place(8000)), asks where the
+// phone is, allowing a place fresh_ms old (30000, a second argument): { lat, lon, accuracy } or { error, in_app }, error being "refused", "off",
+// "timeout", "none" or "insecure".
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let photo_evidence_css = css`
+.ui-phev { display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-phev h3 { margin: 0; font-size: 18px; }
+.ui-phev-cols { display: grid; gap: 12px; min-width: 0; }
+.ui-phev-side { display: grid; gap: 12px; min-width: 0; align-content: start; }
+.ui-phev-tags { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-phev-tags legend { padding: 0 0 4px; color: var(--ui-muted); font-size: 13px; }
+.ui-phev-tag { position: relative; display: inline-flex; align-items: center; gap: 6px; min-height: 48px; padding: 0 14px; border: 2px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); font-weight: 600; cursor: pointer; touch-action: manipulation; }
+.ui-phev-tag input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.ui-phev-tag:has(input:checked) { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-phev-tag:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-phev-tag small { color: var(--ui-muted); font: 500 13px var(--ui-mono); }
+.ui-phev-tag[data-met] small { color: var(--ui-success); }
+.ui-phev-add { display: grid; gap: 8px; min-width: 0; }
+.ui-phev-add-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-phev-add-row > * { flex: 1 1 140px; }
+.ui-phev-say { margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-phev-say:empty { display: none; }
+.ui-phev-bad { color: var(--ui-danger); font-weight: 600; }
+.ui-phev-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-size: 14px; }
+.ui-phev-line[data-off] { background: var(--ui-warning-soft); }
+.ui-phev-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; min-width: 0; }
+.ui-phev-grid li { position: relative; min-width: 0; }
+.ui-phev-thumb { position: relative; display: block; width: 100%; aspect-ratio: 1; padding: 0; overflow: hidden; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); cursor: pointer; touch-action: manipulation; }
+.ui-phev-thumb:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-phev-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.ui-phev-mark { position: absolute; left: 4px; bottom: 4px; max-width: calc(100% - 8px); padding: 1px 6px; overflow: hidden; border-radius: 4px; background: rgba(0, 0, 0, .72); color: #fff; font: 600 12px/1.5 var(--ui-font); text-overflow: ellipsis; white-space: nowrap; }
+.ui-phev-wait { position: absolute; right: 4px; top: 4px; padding: 1px 6px; border-radius: 4px; background: var(--ui-warning-soft); color: var(--ui-fg); font: 600 12px/1.5 var(--ui-font); }
+.ui-phev-drop { position: absolute; right: 0; top: 0; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; background: transparent; cursor: pointer; }
+.ui-phev-drop span { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 999px; background: rgba(0, 0, 0, .72); color: #fff; font-size: 16px; line-height: 1; }
+.ui-phev-drop:focus-visible { outline: none; }
+.ui-phev-drop:focus-visible span { box-shadow: var(--ui-focus); }
+.ui-phev-empty { margin: 0; padding: 20px 12px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius-sm); color: var(--ui-muted); text-align: center; }
+.ui-phev-view { box-sizing: border-box; width: min(100vw, 860px); max-width: 100vw; max-height: 100dvh; padding: 0 0 env(safe-area-inset-bottom); border: 0; border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); overscroll-behavior: contain; }
+.ui-phev-view::backdrop { background: var(--ui-overlay); }
+.ui-phev-view img { display: block; width: 100%; max-height: 66dvh; object-fit: contain; background: #0f0e17; }
+.ui-phev-view-foot { display: grid; gap: 8px; padding: 12px; }
+.ui-phev-view-foot p { margin: 0; font: 13px/1.4 var(--ui-mono); overflow-wrap: anywhere; }
+.ui-phev-view-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-phev-view-acts > * { flex: 1 1 120px; }
+.ui-phev-foot { display: grid; gap: 8px; }
+@container (min-width: 640px) {
+  .ui-phev-cols { grid-template-columns: 280px minmax(0, 1fr); gap: 20px; align-items: start; }
+  .ui-phev-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-phev-tag { transition: none; } }
+`
+
+fn photo_evidence_pad(n, width: int = 2) -> str {
+    let t = str(n)
+    len(t) >= width ? t : join(for _i in range(0, width - len(t)) => "0", "") + t
+}
+
+// Year, month and day of a count of days from 1970-01-01, by the proleptic Gregorian
+// calendar, with no zone or locale in it: a stamp must not depend on the phone's settings.
+fn photo_evidence_civil(days: int) -> map {
+    let z = days + 719468
+    let era = floor(z / 146097)
+    let doe = z - era * 146097
+    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+    let mp = floor((5 * doy + 2) / 153)
+    let d = doy - floor((153 * mp + 2) / 5) + 1
+    let m = mp < 10 ? mp + 3 : mp - 9
+    { y: yoe + era * 400 + (m <= 2 ? 1 : 0), m: m, d: d }
+}
+
+// When, as a stamp writes it: 2026-11-01 14:05:09 -04:00. offset is minutes east of UTC.
+fn photo_evidence_when(ms, offset = 0) -> str {
+    if type_of(ms) != "int" && type_of(ms) != "float" { return "Time not known" }
+    let off = type_of(offset) == "int" || type_of(offset) == "float" ? floor(offset) : 0
+    let local = floor(ms) + off * 60000
+    let days = floor(local / 86400000)
+    let c = photo_evidence_civil(days)
+    let rest = floor((local - days * 86400000) / 1000)
+    let sign = off < 0 ? "-" : "+"
+    let a = abs(off)
+    let pad = photo_evidence_pad
+    `${pad(c.y, 4)}-${pad(c.m)}-${pad(c.d)} ${pad(floor(rest / 3600))}:${pad(floor(rest / 60) % 60)}:${pad(rest % 60)} ${sign}${pad(floor(a / 60))}:${pad(a % 60)}`
+}
+
+fn photo_evidence_is_num(x) -> bool = (type_of(x) == "int" || type_of(x) == "float") && math.isfinite(x)
+
+// The place as a stamp writes it: 45.50170, -73.56730 within 12 m. Five places is about a
+// metre, which is more than a phone knows.
+fn photo_evidence_place_text(p) -> str {
+    let num = photo_evidence_is_num
+    if type_of(p) != "map" || !num(get(p, "lat")) || !num(get(p, "lon")) { return "Place not known" }
+    let side = (v) => (v < 0 ? "-" : "") + format_number(abs(v), "en-US", 5)
+    let near = num(get(p, "accuracy")) ? ` within ${format_number(round(p.accuracy), "en-US", 0)} m` : ""
+    `${side(p.lat)}, ${side(p.lon)}${near}`
+}
+
+// Every tag, those required first, each once and none empty.
+fn photo_evidence_tags(required: list, tags: list) -> list {
+    let want = required | filter((r) => type_of(r) == "map") | map((r) => str(get(r, "tag") ?? ""))
+    (want + (tags | map((t) => str(t ?? "")))) | filter((t) => trim(t) != "") | unique()
+}
+
+// For each required tag: { tag, need, have, left }. Bad counts ask for none.
+fn photo_evidence_progress(required: list, photos: list) -> list {
+    let groups = group_by(photos, (p) => str(get(p, "tag") ?? ""))
+    required | filter((r) => type_of(r) == "map") | map((r) => {
+        let tag = str(get(r, "tag") ?? "")
+        let raw = get(r, "count") ?? 1
+        let need = photo_evidence_is_num(raw) ? max([0, floor(raw)]) : 0
+        let have = len(get(groups, tag, []))
+        { tag: tag, need: need, have: have, left: max([0, need - have]) }
+    })
+}
+
+// What is still wanted, in words: ["Damage: 1 more"].
+fn photo_evidence_missing(required: list, photos: list) -> list =
+    photo_evidence_progress(required, photos) | filter((p) => p.left > 0) | map((p) => `${p.tag}: ${p.left} more`)
+
+// The tag to go on with: this one while it wants more, else the first that does.
+fn photo_evidence_next_tag(required: list, photos: list, chosen) {
+    let rows = photo_evidence_progress(required, photos)
+    let open = rows | filter((r) => r.left > 0)
+    if open | any((r) => r.tag == chosen) { return chosen }
+    len(open) > 0 ? open[0].tag : chosen
+}
+
+fn photo_evidence_refused(text) -> str {
+    let t = lower(str(text))
+    if contains(t, "for this app") || contains(t, "denied") || contains(t, "not allowed") { return "refused" }
+    contains(t, "timed out") || contains(t, "timeout") ? "timeout" : "off"
+}
+
+// What a reason for no place says, in a sentence.
+fn photo_evidence_no_place(why, in_app: bool) -> str = match why {
+    "refused" => in_app ? "Location is off for this app, so there is no place on it." : "Location is blocked for this page, so there is no place on it."
+    "timeout" => "No place came in time, so there is none on it."
+    "none" => "This device cannot give a place."
+    "insecure" => "Browsers give a place only to pages on https."
+    _ => "No place came, so there is none on it. Check that location services are on."
+}
+
+// Where the phone is. The app's call has no timeout, so it races quilloNative.wait; a
+// method's Promise is not waited for, which is what lets both run.
+//
+// These three are written with Promises and `then`, since a top-level fn does not wait for
+// what js() gives it, as a component's handler does. A caller writes
+// js("Promise.resolve", photo_evidence_place(8000)), which does.
+fn photo_evidence_place(wait_ms: int = 8000, fresh_ms: int = 30000) {
+    let w = js("window")
+    let n = w.quilloNative
+    if n != null {
+        let got = (r) => type_of(r) == "map" && get(r, "lat") != null
+            ? { lat: r.lat, lon: r.lon, accuracy: get(r, "accuracy"), in_app: true }
+            : { error: "timeout", in_app: true }
+        let lost = (e) => ({ error: photo_evidence_refused(e.message ?? e), in_app: true })
+        return (n.wait != null ? js("Promise.race", [n.location(), n.wait(wait_ms)]) : n.location()).then(got, lost)
+    }
+    if js("isSecureContext") != true { return { error: "insecure", in_app: false } }
+    let g = js("navigator").geolocation
+    if g == null { return { error: "none", in_app: false } }
+    js("Promise.resolve", js_new("Promise", (done) => {
+        g.getCurrentPosition(
+            (pos) => { done({ lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy, in_app: false }) },
+            (e) => { done({ error: e.code == 1 ? "refused" : (e.code == 3 ? "timeout" : "off"), in_app: false }) },
+            // fresh_ms: a place from half a minute ago is the same place for a photo taken
+            // now, and not for a punch at a gate.
+            { enableHighAccuracy: true, timeout: wait_ms, maximumAge: fresh_ms })
+    }))
+}
+
+// The picture on a canvas, smaller and with the stamp drawn along the bottom.
+fn photo_evidence_draw(img, lines: list, max_px: int, quality) -> map {
+    let scale = min([1, max_px / max([img.naturalWidth, img.naturalHeight])])
+    let w = max([1, round(img.naturalWidth * scale)])
+    let h = max([1, round(img.naturalHeight * scale)])
+    let c = js("document").createElement("canvas")
+    c.width = w
+    c.height = h
+    let g = c.getContext("2d")
+    g.drawImage(img, 0, 0, w, h)
+    let size = max([12, round(min([w, h]) / 30)])
+    let lead = round(size * 1.3)
+    let bar = lead * len(lines) + round(size * 0.7)
+    g.fillStyle = "rgba(0, 0, 0, 0.72)"
+    g.fillRect(0, h - bar, w, bar)
+    g.fillStyle = "#fff"
+    g.font = `${size}px ui-monospace, Menlo, Consolas, monospace`
+    g.textBaseline = "alphabetic"
+    for [i, line] in enumerate(lines) {
+        // fillText's last argument squeezes a line too long rather than cutting it.
+        g.fillText(line, round(size * 0.5), h - bar + lead * (i + 1), w - size)
+    }
+    let url = c.toDataURL("image/jpeg", quality)
+    { url: url, width: w, height: h, bytes: floor(len(url) * 3 / 4) }
+}
+
+// The picture, made small enough to keep, with its stamp: { url, width, height, bytes },
+// or { error }. An <img> turns a phone's photo the right way up from its EXIF, on every
+// engine this kit runs on.
+fn photo_evidence_make(file, lines: list, max_px: int, quality) {
+    let img = js("document").createElement("img")
+    let address = js("URL.createObjectURL", file)
+    js("Promise.resolve", js_new("Promise", (done) => {
+        let unreadable = { error: "That file could not be read as a picture." }
+        img.addEventListener("load", (_e = null) => {
+            let made = img.naturalWidth > 0 ? photo_evidence_draw(img, lines, max_px, quality) : unreadable
+            js("URL.revokeObjectURL", address)
+            done(made)
+        })
+        img.addEventListener("error", (_e = null) => {
+            js("URL.revokeObjectURL", address)
+            done(unreadable)
+        })
+        img.src = address
+    }))
+}
+
+// Keeps text in localStorage, or says it could not: a full store or a private window throws.
+fn photo_evidence_keep(name: str, text: str) {
+    js_new("Promise", (done) => {
+        js("localStorage.setItem", name, text)
+        done(true)
+    }).then((_ok = null) => true, (_e = null) => false)
+}
+
+// What was kept, or null. Both wait for the caller's js("Promise.resolve", ...).
+fn photo_evidence_kept(name: str) {
+    js_new("Promise", (done) => {
+        let text = js("localStorage.getItem", name)
+        let v = text == null ? null : json.parse(text)
+        done(is_err(v) ? null : v)
+    }).then((v = null) => v, (_e = null) => null)
+}
+
+// The button that takes a photo, with its file fields, and the message under it.
+component PhotoEvidenceAdd(label: str = "Take photo", tag: str? = null, job: str? = null, use_place: bool = true, library: bool = false,
+                           max_px: int = 1600, quality: num = 0.72, disabled: bool = false, on_add = null, class: str? = null) {
+    style global photo_evidence_css
+    state busy = false
+    state picker = null
+    state album = null
+    state said = ""
+    state bad = false
+    state settings = false
+    let take = (file, source) => {
+        busy = true
+        said = "Stamping the photo…"
+        bad = false
+        settings = false
+        // The moment of the press that matters is the picture's, so the clock is read
+        // first: a place can take seconds.
+        let at = now()
+        let offset = 0 - js_new("Date").getTimezoneOffset()
+        let place = use_place ? js("Promise.resolve", photo_evidence_place(6000)) : null
+        let where = place != null && get(place, "error") == null ? place : null
+        let when_text = photo_evidence_when(at, offset)
+        let names = [job, tag] | filter((x) => x != null && x != "")
+        let lines = [source == "library" ? `From library, added ${when_text}` : when_text, photo_evidence_place_text(where)] + (len(names) > 0 ? [join(names, "  ")] : [])
+        let made = js("Promise.resolve", photo_evidence_make(file, lines, max_px, quality))
+        busy = false
+        if is_err(made) || get(made, "error") != null {
+            said = is_err(made) ? "That photo could not be read." : made.error
+            bad = true
+        } else {
+            let why = !use_place ? "off" : (where != null ? "ok" : (place.error))
+            said = !use_place || where != null ? "" : photo_evidence_no_place(why, place.in_app)
+            settings = why == "refused" && place != null && place.in_app == true
+            on_add && on_add({ id: `p${at}-${round(random() * 100000)}`, tag: tag, url: made.url, at: at, offset: offset,
+                lat: where != null ? where.lat : null, lon: where != null ? where.lon : null, accuracy: where != null ? where.accuracy : null,
+                place: why, source: source, stamp: lines | join("\n"), width: made.width, height: made.height, bytes: made.bytes, sent: false })
+        }
+    }
+    <div class={ui_cls(["ui-phev-add", class])}>
+        <div.ui-phev-add-row>
+            <Button size="lg" loading={busy} disabled={disabled} on_click={() => { picker.click() }}>{busy ? "Stamping" : label}</Button>
+            {library && <Button size="lg" variant="outline" disabled={disabled || busy} on_click={() => { album.click() }}>From library</Button>}
+        </div>
+        <input type="file" accept="image/*" capture="environment" hidden={true} aria-label={label} class="ui-phev-file"
+               @mount={(el) => { picker = el }}
+               @change={(e) => {
+                   let f = e.target.files[0]
+                   if f != null { take(f, "camera") }
+                   e.value = ""
+               }}/>
+        {library && <input type="file" accept="image/*" hidden={true} aria-label="From library" class="ui-phev-album"
+               @mount={(el) => { album = el }}
+               @change={(e) => {
+                   let f = e.target.files[0]
+                   if f != null { take(f, "library") }
+                   e.value = ""
+               }}/>}
+        <p class={ui_cls(["ui-phev-say", bad && "ui-phev-bad"])} role="status">{said}</p>
+        {settings && <Button size="lg" variant="outline" on_click={() => { js("quilloNative.openSettings") }}>Open Settings</Button>}
+    </div>
+}
+
+// Small pictures of what was taken, each with a way to take it out.
+view PhotoEvidenceThumbs(photos: list = [], on_remove = null) {
+    style global photo_evidence_css
+    <ul.ui-phev-grid>
+        {for p in photos => <li key={p.id}>
+            <span.ui-phev-thumb><img src={p.url} alt={`Photo: ${p.stamp}`}/></span>
+            {on_remove != null && <button.ui-phev-drop type="button" aria-label={`Remove the photo from ${photo_evidence_when(p.at, p.offset)}`}
+                @click={() => { on_remove(p) }}><span aria-hidden="true">×</span></button>}
+        </li>}
+    </ul>
+}
+
+component PhotoEvidence(title: str = "Photos", required: list = [], tags: list = [], job: str? = null, limit: int = 30, use_place: bool = true,
+                        library: bool = false, saved: list? = null, store: str? = null, id: str = "ui-phev", on_change = null, on_send = null,
+                        on_done = null, class: str? = null) {
+    style global photo_evidence_css
+    state photos = saved ?? []
+    state chosen = photo_evidence_next_tag(required, saved ?? [], len(photo_evidence_tags(required, tags)) > 0 ? photo_evidence_tags(required, tags)[0] : null)
+    state online = true
+    state sending = false
+    state said = ""
+    state bad = false
+    state full = false       // the browser's store would not take them
+    state shown = null       // the photo in the large view
+    state dlg = null
+    state gone = null        // the photo last taken out, for Undo: { photo, at }
+    let names = photo_evidence_tags(required, tags)
+    let rows = photo_evidence_progress(required, photos)
+    let missing = photo_evidence_missing(required, photos)
+    let waiting = on_send != null ? photos | filter((p) => !p.sent) | len() : 0
+    let told = () => {
+        on_change && on_change(photos)
+        if store != null {
+            let ok = js("Promise.resolve", photo_evidence_keep(`ui-phev-${store}`, json.stringify(photos)))
+            full = !ok
+        }
+    }
+    let flush = () => {
+        if on_send != null && online && !sending {
+            sending = true
+            let going = true
+            for p in photos {
+                if going && !p.sent {
+                    let r = js("Promise.resolve", on_send(p))
+                    if r == false || is_err(r) {
+                        going = false
+                    } else {
+                        photos = photos | map((x) => x.id == p.id ? set(x, "sent", true) : x)
+                    }
+                }
+            }
+            sending = false
+            told()
+        }
+    }
+    let added = (p) => {
+        if len(photos) >= limit {
+            said = `That is the limit of ${limit} photos.`
+            bad = true
+        } else {
+            photos = photos + [set(p, "tag", chosen)]
+            chosen = photo_evidence_next_tag(required, photos, chosen)
+            said = `Photo kept, ${photo_evidence_place_text(p)}.`
+            bad = false
+            told()
+            flush()
+        }
+    }
+    let drop = (p) => {
+        let i = photos | index_of(p)
+        gone = { photo: p, at: i ?? len(photos) }
+        photos = photos | filter((x) => x.id != p.id)
+        if dlg != null && dlg.open { dlg.close() }
+        said = ""
+        told()
+    }
+    if gone != null { every(10000, () => { gone = null }) }
+    <section class={ui_cls(["ui-phev", class])}
+             @mount={(_el) => {
+                 let w = js("window")
+                 online = js("navigator").onLine != false
+                 if saved == null && store != null {
+                     let back = js("Promise.resolve", photo_evidence_kept(`ui-phev-${store}`))
+                     if type_of(back) == "list" && len(back) > 0 {
+                         photos = back | filter((p) => type_of(p) == "map" && type_of(get(p, "url")) == "str" && type_of(get(p, "id")) == "str")
+                         chosen = photo_evidence_next_tag(required, photos, chosen)
+                         said = `${len(photos)} kept from before.`
+                     }
+                 }
+                 let up = (_e = null) => {
+                     online = true
+                     flush()
+                 }
+                 let down = (_e = null) => { online = false }
+                 w.addEventListener("online", up)
+                 w.addEventListener("offline", down)
+                 flush()
+                 () => {
+                     w.removeEventListener("online", up)
+                     w.removeEventListener("offline", down)
+                 }
+             }}>
+        <h3>{title}</h3>
+        <div.ui-phev-cols>
+            <div.ui-phev-side>
+                {len(names) > 0 && <fieldset.ui-phev-tags>
+                    <legend>What is this photo of?</legend>
+                    {for t in names {
+                        let row = rows | find((r) => r.tag == t)
+                        <label class="ui-phev-tag" key={t} data-met={row != null && row.left == 0 ? "" : null}>
+                            <input type="radio" name={`${id}-tag`} value={t} checked={chosen == t} @change={() => { chosen = t }}/>
+                            <span>{t}</span>
+                            {row != null && <small>{row.have}/{row.need}</small>}
+                        </label>
+                    }}
+                </fieldset>}
+                <PhotoEvidenceAdd tag={chosen} job={job} use_place={use_place} library={library} disabled={len(photos) >= limit} on_add={added}/>
+                <p class={ui_cls(["ui-phev-say", bad && "ui-phev-bad"])} role="status">{said}</p>
+                {(!online || waiting > 0) && <p.ui-phev-line data-off={!online ? "" : null}>
+                    <b>{online ? "Online" : "No connection"}</b>
+                    <span>{waiting > 0 ? `${waiting} waiting to send` : "Photos stay on this device."}</span>
+                </p>}
+                {full && <p.ui-phev-line data-off="">This browser is full: keep this page open until the photos are sent.</p>}
+                {gone != null && <p.ui-phev-line>
+                    <span>Photo taken out.</span>
+                    <Button size="lg" variant="ghost" on_click={() => {
+                        let g = gone
+                        gone = null
+                        photos = slice(photos, 0, g.at) + [g.photo] + slice(photos, g.at, len(photos))
+                        told()
+                    }}>Undo</Button>
+                </p>}
+            </div>
+            <div.ui-phev-side>
+                {len(photos) == 0
+                    ? <p.ui-phev-empty>No photos yet.</p>
+                    : <ul.ui-phev-grid>
+                        {for p in photos => <li key={p.id}>
+                            <button.ui-phev-thumb type="button" aria-label={`Open the photo of ${p.tag ?? "this"}, ${photo_evidence_when(p.at, p.offset)}`}
+                                    @click={() => {
+                                        shown = p
+                                        dlg.showModal()
+                                    }}>
+                                <img src={p.url} alt=""/>
+                                {p.tag != null && <span.ui-phev-mark>{p.tag}</span>}
+                                {on_send != null && !p.sent && <span.ui-phev-wait>Waiting</span>}
+                            </button>
+                        </li>}
+                    </ul>}
+                <div.ui-phev-foot>
+                    <p.ui-phev-say>{len(missing) > 0 ? `Still needed: ${join(missing, ", ")}` : (len(required) > 0 ? "All the photos needed are here." : `${len(photos)} of ${limit}`)}</p>
+                    <Button size="lg" full={true} variant={len(missing) > 0 ? "outline" : "solid"} on_click={() => {
+                        if len(missing) > 0 {
+                            said = `Not yet. Still needed: ${join(missing, ", ")}`
+                            bad = true
+                        } else {
+                            said = "Done."
+                            bad = false
+                            on_done && on_done(photos)
+                        }
+                    }}>Done</Button>
+                </div>
+            </div>
+        </div>
+        <dialog.ui-phev-view aria-label="Photo" @mount={(el) => { dlg = el }} @close={() => { shown = null }}>
+            {shown != null && <div>
+                <img src={shown.url} alt={`Photo: ${shown.stamp}`}/>
+                <div.ui-phev-view-foot>
+                    <p>{shown.stamp}</p>
+                    <div.ui-phev-view-acts>
+                        <Button size="lg" variant="outline" on_click={() => { dlg.close() }}>Close</Button>
+                        <Button size="lg" variant="outline" tone="danger" on_click={() => { drop(shown) }}>Take out</Button>
+                    </div>
+                </div>
+            </div>}
+        </dialog>
+    </section>
+}

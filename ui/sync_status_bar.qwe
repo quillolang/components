@@ -1,0 +1,177 @@
+// SyncStatusBar: where this device's data stands: saved, syncing, offline or failed, with
+// when it last synced as a relative time, how many changes are waiting, and a Retry after
+// a failure. It watches the connection itself, so it says offline without being told.
+//
+//   import ui/sync_status_bar.qwe use SyncStatusBar
+//
+//   <SyncStatusBar status="saved" last_synced={1793534400000} now={date.now()}/>
+//   <SyncStatusBar status={sync} last_synced={last} now={stamp} pending={len(queue)} error={why} on_retry={() => { sync_now() }}/>
+//
+// status: "saved", "syncing", "offline" or "failed". last_synced: when it last synced, in
+// milliseconds or as a date-time; null is never. now: the time at render, in the same
+// forms, so server and browser say the same thing; the page then counts on from its own
+// clock, and catches up when it comes back from the background, where timers stop.
+// pending: changes waiting (0). error: why it failed, in plain words. on_retry(): the
+// button after a failure, and it may wait; false or an error value says it failed again.
+// Set `status` from what comes of it. follow_network: false stops it saying offline by
+// itself (true). stale_minutes: past this, a saved state shows as a warning, for data that
+// should not be old (off). place: "inline", "top" or "bottom": the last two are fixed to the
+// screen, clear of the notch and the home bar. words: a map from status to its word. id,
+// class. wait_ms: how long a retry may take before it counts as failed (30000).
+//
+// sync_status_bar_ago(ms) writes a time gone by, and sync_status_bar_shown(status, offline,
+// busy) picks the state to show: a retry under way wins, then being offline.
+
+import ui/theme.qwe use ui_cls
+
+let sync_status_bar_css = css`
+.ui-syncbar { container-type: inline-size; box-sizing: border-box; min-width: 0; color: var(--ui-fg); font: 14px/1.35 var(--ui-font); }
+.ui-syncbar-top { position: fixed; z-index: 40; top: 0; left: 0; right: 0; padding-top: env(safe-area-inset-top); background: var(--ui-surface); box-shadow: var(--ui-shadow); }
+.ui-syncbar-bottom { position: fixed; z-index: 40; bottom: 0; left: 0; right: 0; padding-bottom: env(safe-area-inset-bottom); background: var(--ui-surface); box-shadow: var(--ui-shadow); }
+.ui-syncbar-in { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 6px 12px; padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-syncbar-top .ui-syncbar-in, .ui-syncbar-bottom .ui-syncbar-in { border: 0; border-radius: 0; }
+.ui-syncbar[data-state="saved"] { --ui-syncbar-tone: var(--ui-success); }
+.ui-syncbar[data-state="syncing"] { --ui-syncbar-tone: var(--ui-accent); }
+.ui-syncbar[data-state="offline"], .ui-syncbar[data-stale] { --ui-syncbar-tone: var(--ui-warning); }
+.ui-syncbar[data-state="failed"] { --ui-syncbar-tone: var(--ui-danger); }
+.ui-syncbar-icon { flex: none; width: 20px; height: 20px; color: var(--ui-syncbar-tone); }
+.ui-syncbar[data-state="syncing"] .ui-syncbar-icon { animation: ui-syncbar-turn 1.1s linear infinite; }
+.ui-syncbar-text { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.ui-syncbar-word { font-weight: 600; }
+.ui-syncbar-detail { overflow-wrap: anywhere; color: var(--ui-muted); font-size: 13px; }
+.ui-syncbar-retry { flex: none; min-width: 72px; min-height: 44px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-syncbar-retry:disabled { color: var(--ui-muted); cursor: default; }
+.ui-syncbar-retry:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-syncbar-retry:hover:enabled { border-color: var(--ui-strong); background: var(--ui-subtle); } }
+@container (min-width: 520px) {
+  .ui-syncbar-text { flex-direction: row; align-items: baseline; gap: 10px; }
+}
+@keyframes ui-syncbar-turn { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .ui-syncbar[data-state="syncing"] .ui-syncbar-icon { animation: none; } }
+`
+
+let sync_status_bar_words = { saved: "Saved", syncing: "Syncing…", offline: "Offline", failed: "Sync failed" }
+
+// A time as milliseconds, or null when it is not one.
+fn sync_status_bar_ms(t) {
+    if type_of(t) == "int" { return t }
+    if type_of(t) == "float" { return int(t) }
+    if type_of(t) == "str" && date.valid(t) { return date.ms(t) }
+    null
+}
+
+// The device's clock. A top-level function, as the `now` prop hides the builtin in the component.
+fn sync_status_bar_clock() -> int = now()
+
+// A time gone by. A clock that is behind gives "just now", not a time to come.
+fn sync_status_bar_ago(ms: int) -> str {
+    if ms < 45000 { return "just now" }
+    if ms < 3600000 { return `${max([1, floor(ms / 60000)])} min ago` }
+    if ms < 86400000 { return `${floor(ms / 3600000)} h ago` }
+    let days = floor(ms / 86400000)
+    if days == 1 { return "yesterday" }
+    days < 31 ? `${days} days ago` : "over a month ago"
+}
+
+// The state to show. A retry under way is syncing; offline wins over what the program said.
+fn sync_status_bar_shown(status: str, offline: bool, busy: bool) -> str {
+    if busy { return "syncing" }
+    if offline { return "offline" }
+    contains(["saved", "syncing", "offline", "failed"], status) ? status : "saved"
+}
+
+fn sync_status_bar_changes(n: int) -> str = n == 1 ? "1 change" : `${n} changes`
+
+// The smaller line.
+fn sync_status_bar_detail(shown: str, last, moment, pending: int, error) -> str {
+    let ago = last != null && moment != null ? `Last synced ${sync_status_bar_ago(moment - last)}` : "Not synced yet"
+    match shown {
+        "syncing" => pending > 0 ? `${sync_status_bar_changes(pending)} going` : ago
+        "offline" => pending > 0 ? `${sync_status_bar_changes(pending)} will sync when you are back` : ago
+        "failed" => type_of(error) == "str" && error != "" ? error : ago
+        _ => pending > 0 ? `${sync_status_bar_changes(pending)} waiting. ${ago}` : ago
+    }
+}
+
+fn sync_status_bar_failed(r) -> bool = is_err(r) || r == false || (type_of(r) == "map" && r.ok == false)
+
+// True when what shows as saved is older than was asked for.
+fn sync_status_bar_is_stale(shown: str, last, moment, minutes) -> bool =
+    shown == "saved" && type_of(minutes) == "int" && last != null && moment != null && moment - last > minutes * 60000
+
+view SyncStatusBarIcon(shown: str) =
+    <svg.ui-syncbar-icon viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        {match shown {
+            "syncing" => <path d="M20 12a8 8 0 1 1-2.5-5.8M20 3v5h-5"/>
+            "offline" => <path d="M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0M12 19.5h.01M3 3l18 18"/>
+            "failed" => <path d="M12 8v5M12 16.5h.01M5 20h14L12 5z"/>
+            _ => <path d="M5 12.5l4 4 10-10"/>
+        }}
+    </svg>
+
+component SyncStatusBar(status: str = "saved", last_synced = null, now = null, pending: int = 0, error: str? = null, on_retry = null,
+                        follow_network: bool = true, stale_minutes: int? = null, place: str = "inline", words: map = {}, wait_ms: int = 30000,
+                        id: str? = null, class: str? = null) {
+    style global sync_status_bar_css
+    state moment = sync_status_bar_ms(now)
+    state gap = 0
+    state offline = false
+    state busy = false
+    state again = null      // what the last retry came to, until the status changes
+    let last = sync_status_bar_ms(last_synced)
+    let shown = sync_status_bar_shown(status, offline, busy)
+    let stale = sync_status_bar_is_stale(shown, last, moment, stale_minutes)
+    let word = get(words, shown, get(sync_status_bar_words, shown, shown))
+    let line = again ?? sync_status_bar_detail(shown, last, moment, pending, error)
+    let tick = () => { moment = sync_status_bar_clock() + gap }
+    every(15000, tick)
+    let call = () => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            js("AbortSignal.timeout", wait_ms).addEventListener("abort", (_e = null) => { done(err("no answer")) })
+            js("Promise.resolve", on_retry()).then(done, (_e = null) => { done(err("failed")) })
+        }))
+    }
+    <div class={ui_cls(["ui-syncbar", place == "top" && "ui-syncbar-top", place == "bottom" && "ui-syncbar-bottom", class])} id={id}
+         data-state={shown} data-stale={stale ? "" : null}
+         @mount={(_el) => {
+             let w = js("window")
+             let d = js("document")
+             let given = sync_status_bar_ms(now)
+             let mine = sync_status_bar_clock()
+             gap = given != null ? given - mine : 0
+             moment = mine + gap
+             let went = (_e = null) => { if follow_network { offline = true } }
+             let came = (_e = null) => {
+                 offline = false
+                 tick()
+             }
+             let back = (_e = null) => { if !d.hidden { tick() } }
+             if follow_network && js("navigator.onLine") == false { offline = true }
+             w.addEventListener("offline", went)
+             w.addEventListener("online", came)
+             d.addEventListener("visibilitychange", back)
+             () => {
+                 w.removeEventListener("offline", went)
+                 w.removeEventListener("online", came)
+                 d.removeEventListener("visibilitychange", back)
+             }
+         }}>
+        <div.ui-syncbar-in>
+            <SyncStatusBarIcon shown={shown}/>
+            <div.ui-syncbar-text role="status">
+                <span.ui-syncbar-word>{word}</span>
+                <span.ui-syncbar-detail>{line}</span>
+            </div>
+            {on_retry != null && (status == "failed" || busy) && !offline && <button.ui-syncbar-retry type="button" disabled={busy}
+                @click={() => {
+                    if !busy {
+                        busy = true
+                        again = null
+                        let r = call()
+                        busy = false
+                        again = sync_status_bar_failed(r) ? "Still could not sync." : null
+                    }
+                }}>{busy ? "Trying" : "Retry"}</button>}
+        </div>
+    </div>
+}

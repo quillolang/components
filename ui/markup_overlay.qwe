@@ -1,0 +1,522 @@
+// MarkupOverlay: mark up an image or a page with a pen, a highlighter, text and arrows. What
+// is drawn sits over the picture as data of its own, in the picture's units: the image is
+// never touched, so a mark can be moved, removed or thrown away, and turning the tablet
+// changes nothing. A side list names every mark, for those who work with keys or a screen reader.
+//
+//   import ui/markup_overlay.qwe use MarkupOverlay
+//
+//   component Review(photo: str) {
+//       state saved = load_marks()
+//       <div style="height: 80dvh">
+//           <MarkupOverlay src={photo} alt="The kitchen wall" width={1600} height={1200}
+//                          marks={saved} on_change={(m) => { save_marks(m) }}/>
+//       </div>
+//   }
+//
+// src, alt: the image. Without src, children are the page marked up, and page={true} says so.
+// width, height: the picture's own size, which marks are measured in (1000 by 750). marks:
+// what to start from, each { kind, color, points: [[x, y], ...] }, kind being "pen",
+// "highlight", "arrow" (two points) or "text" (one point, and text); what is not of
+// that shape is left out, and marks are given their own ids. colors: to choose from.
+// label: its name for screen readers. name: a hidden input carries the marks as JSON. class.
+// on_change(marks): inside one of your components, called after each mark, move, removal,
+// undo and redo.
+//
+// Fingers draw until a pen is seen; then only the pen does and a finger scrolls, and the
+// Finger button turns that back. A finger may still place text and pick marks. Select picks a mark to drag, or to move with the arrow keys
+// with Shift going further; Delete or Backspace takes it off. Text is typed where the page was
+// tapped, Enter keeping it and Escape leaving it. Ctrl or Cmd with Z undoes, with Shift redoes.
+
+import ui/theme.qwe use ui_cls
+
+let markup_overlay_css = css`
+.ui-markup-overlay { position: relative; display: flex; flex-direction: column; box-sizing: border-box; width: 100%; height: 100%; min-height: 360px; container-type: inline-size;
+  color: var(--ui-fg); background: var(--ui-subtle); font: 14px/1.4 var(--ui-font); }
+.ui-markup-overlay-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; flex: none; padding: 6px max(8px, env(safe-area-inset-right)) 6px max(8px, env(safe-area-inset-left)); border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-markup-overlay-btn { min-width: 44px; height: 44px; padding: 0 10px; border: 1px solid transparent; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-markup-overlay-btn[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-markup-overlay-btn:disabled { color: var(--ui-muted); opacity: .55; cursor: default; }
+.ui-markup-overlay-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-markup-overlay-swatch { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid transparent; border-radius: var(--ui-radius-sm); background: transparent; cursor: pointer; }
+.ui-markup-overlay-swatch[aria-pressed="true"] { border-color: var(--ui-accent); }
+.ui-markup-overlay-swatch:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-markup-overlay-swatch span { width: 24px; height: 24px; border: 1px solid var(--ui-border); border-radius: 50%; }
+.ui-markup-overlay-sep { width: 1px; height: 28px; margin: 0 2px; background: var(--ui-border); }
+@media (hover: hover) { .ui-markup-overlay-btn:not(:disabled):hover, .ui-markup-overlay-swatch:hover { background: var(--ui-subtle); } }
+.ui-markup-overlay-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.ui-markup-overlay-stage { display: grid; place-items: center; flex: 1; min-height: 0; padding: 8px; container-type: size; }
+.ui-markup-overlay-frame { position: relative; width: min(100cqw, calc(100cqh * var(--w) / var(--h))); aspect-ratio: var(--w) / var(--h); overflow: hidden; outline: none; background: var(--ui-surface); box-shadow: var(--ui-shadow); }
+.ui-markup-overlay-frame:focus-visible { box-shadow: 0 0 0 2px var(--ui-accent); }
+.ui-markup-overlay-frame img { display: block; width: 100%; height: 100%; object-fit: contain; -webkit-user-drag: none; user-select: none; -webkit-user-select: none; }
+.ui-markup-overlay-page { width: 100%; height: 100%; overflow: hidden; box-sizing: border-box; }
+.ui-markup-overlay-layer { position: absolute; inset: 0; display: block; width: 100%; height: 100%; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: crosshair; touch-action: none; }
+.ui-markup-overlay-pans { touch-action: pan-x pan-y pinch-zoom; }
+.ui-markup-overlay-picking { cursor: default; }
+.ui-markup-overlay-layer path, .ui-markup-overlay-layer line { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.ui-markup-overlay-high { mix-blend-mode: multiply; }
+.ui-markup-overlay-picked { filter: drop-shadow(0 0 3px var(--ui-accent)); }
+.ui-markup-overlay-text { font: 600 26px var(--ui-font); }
+.ui-markup-overlay-field { position: absolute; box-sizing: border-box; width: 240px; max-width: 80%; height: 44px; padding: 0 10px; border: 2px solid var(--ui-accent); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px var(--ui-font); }
+.ui-markup-overlay-field:focus { outline: none; box-shadow: var(--ui-focus); }
+.ui-markup-overlay-off { position: absolute; inset: 0; display: grid; place-items: center; padding: 16px; text-align: center; color: var(--ui-muted); pointer-events: none; }
+.ui-markup-overlay-side { display: flex; flex-direction: column; flex: none; gap: 8px; max-height: 190px; overflow-y: auto; padding: 8px max(10px, env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)); border-top: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-markup-overlay-side h3 { margin: 0; font-size: 13px; font-weight: 600; color: var(--ui-muted); }
+.ui-markup-overlay-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-markup-overlay-row { display: flex; gap: 4px; }
+.ui-markup-overlay-name { flex: 1; min-width: 0; min-height: 44px; padding: 0 10px; overflow: hidden; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 14px var(--ui-font); text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.ui-markup-overlay-name[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-markup-overlay-name:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-markup-overlay-note { display: flex; gap: 4px; }
+.ui-markup-overlay-note input { flex: 1; min-width: 0; height: 44px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px var(--ui-font); }
+.ui-markup-overlay-note input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+/* In the width of a turned tablet the list stands beside the picture and takes its height. */
+@container (min-width: 900px) {
+  .ui-markup-overlay-body { flex-direction: row; }
+  .ui-markup-overlay-side { width: 260px; max-height: none; border-top: 0; border-left: 1px solid var(--ui-border); }
+}
+`
+
+fn markup_overlay_is_point(p) -> bool {
+    if type_of(p) != "list" || len(p) < 2 { return false }
+    let a = type_of(p[0])
+    let b = type_of(p[1])
+    (a == "int" || a == "float") && (b == "int" || b == "float")
+}
+
+// Marks from outside: known kinds with points that make sense, numbered here.
+fn markup_overlay_clean(marks) -> list {
+    if type_of(marks) != "list" { return [] }
+    let shaped = marks | filter((m) => {
+        if type_of(m) != "map" || type_of(get(m, "points")) != "list" { return false }
+        let pts = m.points | filter(markup_overlay_is_point)
+        let kind = get(m, "kind")
+        if len(pts) != len(m.points) || len(pts) == 0 { return false }
+        if kind == "pen" || kind == "highlight" { return true }
+        if kind == "arrow" { return len(pts) == 2 }
+        kind == "text" && type_of(get(m, "text")) == "str" && trim(m.text) != ""
+    })
+    enumerate(shaped) | map((p) => {
+        let m = p[1]
+        { ...m, id: `m${p[0] + 1}`, color: type_of(get(m, "color")) == "str" ? m.color : "#c62a2f" }
+    })
+}
+
+fn markup_overlay_r1(n: num) -> num {
+    round(n * 10) / 10
+}
+
+// A smooth line through the points, bending at each and running through the middles.
+fn markup_overlay_path(points: list) -> str {
+    let n = len(points)
+    if n == 0 { return "" }
+    if n == 1 { return `M${points[0][0]} ${points[0][1]} L${points[0][0]} ${points[0][1]}` }
+    let bends = range(1, n - 1) | map((i) => {
+        let p = points[i]
+        let q = points[i + 1]
+        `Q${p[0]} ${p[1]} ${markup_overlay_r1((p[0] + q[0]) / 2)} ${markup_overlay_r1((p[1] + q[1]) / 2)}`
+    })
+    let last = points[n - 1]
+    join([`M${points[0][0]} ${points[0][1]}`, ...bends, `L${last[0]} ${last[1]}`], " ")
+}
+
+// The arrow's head at b, for a line from a: three corners, as an SVG polygon's points.
+fn markup_overlay_head(a: list, b: list, size: num) -> str {
+    let dx = b[0] - a[0]
+    let dy = b[1] - a[1]
+    let long = max([math.sqrt(dx * dx + dy * dy), 0.001])
+    let ux = dx / long
+    let uy = dy / long
+    let bx = b[0] - ux * size
+    let by = b[1] - uy * size
+    let wide = size * 0.5
+    `${b[0]},${b[1]} ${markup_overlay_r1(bx - uy * wide)},${markup_overlay_r1(by + ux * wide)} ${markup_overlay_r1(bx + uy * wide)},${markup_overlay_r1(by - ux * wide)}`
+}
+
+// From a point to the segment a..b.
+fn markup_overlay_gap(a: list, b: list, x: num, y: num) -> num {
+    let dx = b[0] - a[0]
+    let dy = b[1] - a[1]
+    let across = dx * dx + dy * dy
+    let at = across == 0 ? 0 : max([0, min([1, ((x - a[0]) * dx + (y - a[1]) * dy) / across])])
+    let ex = a[0] + at * dx - x
+    let ey = a[1] + at * dy - y
+    math.sqrt(ex * ex + ey * ey)
+}
+
+// How far a mark is from a point. A text counts as the box it fills.
+fn markup_overlay_reach(m, x: num, y: num) -> num {
+    let pts = m.points
+    if m.kind == "text" {
+        let w = len(m.text) * 15
+        let dx = max([pts[0][0] - x, 0, x - pts[0][0] - w])
+        let dy = max([pts[0][1] - 26 - y, 0, y - pts[0][1]])
+        return math.sqrt(dx * dx + dy * dy)
+    }
+    let n = len(pts)
+    min(range(0, n) | map((i) => markup_overlay_gap(pts[i], pts[i + 1 < n ? i + 1 : i], x, y)))
+}
+
+// The nearest mark within reach, the top one if two are as near. Null when none is.
+fn markup_overlay_pick(marks: list, x: num, y: num, reach: num) {
+    let near = marks | map((m) => [m.id, markup_overlay_reach(m, x, y)]) | filter((p) => p[1] <= reach)
+    if len(near) == 0 { return null }
+    let best = min(near | map((p) => p[1]))
+    let ties = near | filter((p) => p[1] == best)
+    ties[len(ties) - 1][0]
+}
+
+// The mark moved by dx, dy.
+fn markup_overlay_shift(m, dx: num, dy: num) {
+    { ...m, points: m.points | map((p) => [markup_overlay_r1(p[0] + dx), markup_overlay_r1(p[1] + dy)]) }
+}
+
+// What the list calls a mark.
+fn markup_overlay_name(m, i: int) -> str {
+    match m.kind {
+        "pen" => `${i + 1}. Pen line`
+        "highlight" => `${i + 1}. Highlight`
+        "arrow" => `${i + 1}. Arrow`
+        _ => `${i + 1}. Text: ${m.text}`
+    }
+}
+
+// May this touch not scroll? See handwritten_note_stops_scroll.
+fn markup_overlay_stops_scroll(touch_type, pen_down: bool) -> bool {
+    touch_type == "stylus" || pen_down
+}
+
+view MarkupOverlayMark(m, picked: bool) {
+    let cls = picked ? "ui-markup-overlay-picked" : null
+    match m.kind {
+        "pen" => <path class={cls} data-id={m.id} d={markup_overlay_path(m.points)} stroke={m.color} stroke-width="4"></path>
+        "highlight" => <path class={ui_cls(["ui-markup-overlay-high", cls])} data-id={m.id} d={markup_overlay_path(m.points)} stroke={m.color} stroke-width="26" stroke-opacity="0.4"></path>
+        "arrow" => <g class={cls} data-id={m.id}>
+            <line x1={m.points[0][0]} y1={m.points[0][1]} x2={m.points[1][0]} y2={m.points[1][1]} stroke={m.color} stroke-width="5"></line>
+            <polygon points={markup_overlay_head(m.points[0], m.points[1], 26)} fill={m.color}></polygon>
+        </g>
+        _ => <text class={ui_cls(["ui-markup-overlay-text", cls])} data-id={m.id} x={m.points[0][0]} y={m.points[0][1]} fill={m.color}>{m.text}</text>
+    }
+}
+
+component MarkupOverlay(src: str? = null, alt: str = "", page: bool = false, width: int = 1000, height: int = 750, marks = [],
+                        colors: list = ["#c62a2f", "#0b6bcb", "#f3b54a", "#18794e"], label: str = "Markup", name: str? = null,
+                        on_change = null, class: str? = null, children) {
+    style global markup_overlay_css
+    state kept = markup_overlay_clean(marks)
+    state seq = len(markup_overlay_clean(marks))
+    state past = []
+    state ahead = []
+    state tool = "pen"
+    state color = colors[0] ?? "#c62a2f"
+    state finger = true
+    state pen_seen = false
+    state picked = ""
+    state typing = null        // { x, y } while text is being written on the picture
+    state draft = ""
+    state note = ""            // the side list's new note
+    state broken = false
+    state said = ""
+    state layer = null
+    state wet = null
+    state tip = null
+    // What the handlers keep to themselves.
+    state g_mode = ""
+    state g_pid = null
+    state g_pen_down = false
+    state g_start = null
+    state g_tail = []
+    state g_done = []
+    state g_d = ""
+    state g_end = null
+    state g_moved = false
+    let w_units = max([1, width])
+    let h_units = max([1, height])
+    let shown = kept
+    let told = () => { on_change && on_change(kept) }
+    let change = (next: list) => {
+        past = slice(past, -99, len(past)) | push(kept)
+        ahead = []
+        kept = next
+    }
+    let next_id = () => {
+        seq += 1
+        `m${seq}`
+    }
+    let add = (m) => {
+        change(kept | push({ ...m, id: next_id() }))
+        said = `${markup_overlay_name(m, len(kept) - 1)} added.`
+        told()
+    }
+    let undo = () => {
+        if len(past) > 0 {
+            ahead = ahead | push(kept)
+            kept = past[len(past) - 1]
+            past = slice(past, 0, len(past) - 1)
+            if find(kept, (m) => m.id == picked) == null { picked = "" }
+            said = "Undone."
+            told()
+        }
+    }
+    let redo = () => {
+        if len(ahead) > 0 {
+            past = past | push(kept)
+            kept = ahead[len(ahead) - 1]
+            ahead = slice(ahead, 0, len(ahead) - 1)
+            if find(kept, (m) => m.id == picked) == null { picked = "" }
+            said = "Done again."
+            told()
+        }
+    }
+    let remove = (id: str) => {
+        change(kept | filter((m) => m.id != id))
+        if picked == id { picked = "" }
+        said = "Mark removed."
+        told()
+    }
+    let move_by = (id: str, dx: num, dy: num) => {
+        change(kept | map((m) => m.id == id ? markup_overlay_shift(m, dx, dy) : m))
+        told()
+    }
+    let to_units = (e) => {
+        let r = layer.getBoundingClientRect()
+        [markup_overlay_r1((e.clientX - r.left) * w_units / r.width), markup_overlay_r1((e.clientY - r.top) * h_units / r.height)]
+    }
+    let close_typing = (keep: bool) => {
+        if typing != null {
+            let at = typing
+            let text = trim(draft)
+            typing = null
+            draft = ""
+            if keep && text != "" { add({ kind: "text", color, points: [[at.x, at.y]], text }) }
+        }
+    }
+    let clear_live = () => {
+        wet.setAttribute("d", "")
+        tip.setAttribute("points", "")
+        tip.setAttribute("x1", "0")
+    }
+    let down = (e) => {
+        let kind = e.pointerType
+        if kind == "pen" {
+            g_pen_down = true
+            if !pen_seen {
+                pen_seen = true
+                finger = false
+            }
+            if g_mode != "" {
+                g_mode = ""
+                clear_live()
+            }
+        }
+        if typing != null { close_typing(true) }
+        if g_mode == "" && e.button == 0 && (kind != "touch" || (finger && !g_pen_down) || tool == "select" || tool == "text") {
+            let p = to_units(e)
+            e.preventDefault()
+            g_pid = e.pointerId
+            g_start = p
+            g_moved = false
+            if tool == "select" {
+                picked = markup_overlay_pick(kept, p[0], p[1], kind == "touch" ? 30 : 16) ?? ""
+                if picked != "" {
+                    g_mode = "move"
+                    layer.setPointerCapture(e.pointerId)
+                }
+            } else {
+                picked = ""
+                g_mode = tool
+                layer.setPointerCapture(e.pointerId)
+                if tool == "pen" || tool == "highlight" {
+                    g_tail = [p]
+                    g_done = []
+                    g_d = `M${p[0]} ${p[1]}`
+                    wet.setAttribute("stroke", color)
+                    wet.setAttribute("stroke-width", tool == "pen" ? "4" : "26")
+                    wet.setAttribute("stroke-opacity", tool == "pen" ? "1" : "0.4")
+                    wet.setAttribute("d", g_d)
+                }
+                if tool == "arrow" {
+                    g_end = p
+                    wet.setAttribute("stroke", color)
+                    wet.setAttribute("stroke-width", "5")
+                    wet.setAttribute("stroke-opacity", "1")
+                    tip.setAttribute("fill", color)
+                }
+            }
+        }
+    }
+    let moved = (e) => {
+        if g_mode != "" && e.pointerId == g_pid {
+            let p = to_units(e)
+            if abs(p[0] - g_start[0]) + abs(p[1] - g_start[1]) > 6 { g_moved = true }
+            if g_mode == "pen" || g_mode == "highlight" {
+                let many = e.getCoalescedEvents != null ? e.getCoalescedEvents() : []
+                for one in (len(many) > 0 ? many : [e]) {
+                    let q = to_units(one)
+                    g_tail = g_tail | push(q)
+                    if len(g_tail) >= 200 {
+                        g_done = g_done | push(g_tail)
+                        g_tail = []
+                    }
+                    g_d = `${g_d} L${q[0]} ${q[1]}`
+                }
+                wet.setAttribute("d", g_d)
+            }
+            if g_mode == "arrow" {
+                g_end = p
+                wet.setAttribute("d", `M${g_start[0]} ${g_start[1]} L${p[0]} ${p[1]}`)
+                tip.setAttribute("points", markup_overlay_head(g_start, p, 26))
+            }
+            if g_mode == "move" && g_moved {
+                let el = layer.querySelector(`[data-id="${picked}"]`)
+                if el != null { el.setAttribute("transform", `translate(${p[0] - g_start[0]} ${p[1] - g_start[1]})`) }
+            }
+        }
+    }
+    let lifted = (e, cancel: bool) => {
+        if e.pointerType == "pen" { g_pen_down = false }
+        if g_mode != "" && e.pointerId == g_pid {
+            let mode = g_mode
+            g_mode = ""
+            g_pid = null
+            let p = to_units(e)
+            clear_live()
+            if mode == "move" {
+                let el = layer.querySelector(`[data-id="${picked}"]`)
+                if el != null { el.removeAttribute("transform") }
+                if !cancel && g_moved { move_by(picked, p[0] - g_start[0], p[1] - g_start[1]) }
+            } else if !cancel {
+                if mode == "pen" || mode == "highlight" {
+                    add({ kind: mode, color, points: flatten(g_done) + g_tail })
+                }
+                if mode == "arrow" {
+                    // A press with no length is not an arrow.
+                    if g_moved { add({ kind: "arrow", color, points: [g_start, p] }) }
+                }
+                if mode == "text" && !g_moved {
+                    typing = { x: g_start[0], y: g_start[1] }
+                    draft = ""
+                }
+            }
+        }
+    }
+    let on_key = (e) => {
+        let command = e.ctrlKey || e.metaKey
+        if command && lower(e.key) == "z" {
+            e.preventDefault()
+            if e.shiftKey { redo() } else { undo() }
+        } else if picked != "" && (e.key == "Delete" || e.key == "Backspace") && typing == null {
+            e.preventDefault()
+            remove(picked)
+        } else if picked != "" && typing == null {
+            let by = e.shiftKey ? 40 : 10
+            let to = match e.key {
+                "ArrowLeft" => [-by, 0]
+                "ArrowRight" => [by, 0]
+                "ArrowUp" => [0, -by]
+                "ArrowDown" => [0, by]
+                _ => null
+            }
+            if to != null {
+                e.preventDefault()
+                move_by(picked, to[0], to[1])
+            }
+        }
+    }
+    <div class={ui_cls(["ui-markup-overlay", class])}>
+        <div.ui-markup-overlay-bar role="toolbar" aria-label="Markup tools">
+            {for t in [["pen", "Pen"], ["highlight", "Highlight"], ["arrow", "Arrow"], ["text", "Text"], ["select", "Select"]] => <button.ui-markup-overlay-btn key={t[0]} type="button"
+                    aria-pressed={tool == t[0] ? "true" : "false"} @click={() => {
+                        tool = t[0]
+                        close_typing(true)
+                    }}>{t[1]}</button>}
+            <span.ui-markup-overlay-sep aria-hidden="true"></span>
+            {for c in colors => <button.ui-markup-overlay-swatch key={c} type="button" aria-label={`Colour ${c}`} aria-pressed={color == c ? "true" : "false"}
+                    @click={() => { color = c }}><span style={`background: ${c}`}></span></button>}
+            <span.ui-markup-overlay-sep aria-hidden="true"></span>
+            <button.ui-markup-overlay-btn type="button" aria-pressed={finger ? "true" : "false"} aria-label="Fingers mark" @click={() => { finger = !finger }}>Finger</button>
+            <button.ui-markup-overlay-btn type="button" disabled={len(past) == 0} @click={undo}>Undo</button>
+            <button.ui-markup-overlay-btn type="button" disabled={len(ahead) == 0} @click={redo}>Redo</button>
+            <button.ui-markup-overlay-btn type="button" disabled={picked == ""} @click={() => { remove(picked) }}>Delete</button>
+        </div>
+        <div.ui-markup-overlay-body>
+            <div.ui-markup-overlay-stage>
+                <div.ui-markup-overlay-frame tabindex="0" role="group" aria-label={`${label}, ${len(kept)} marks`} style={`--w: ${w_units}; --h: ${h_units}`}
+                     @keydown={on_key}>
+                    {src != null ? <img src={src} alt={alt} draggable="false"
+                         @mount={(img) => {
+                             if img.complete && img.naturalWidth == 0 { broken = true }
+                         }}
+                         @error={() => { broken = true }}/> : <div.ui-markup-overlay-page>{page && children}</div>}
+                    {broken && <div.ui-markup-overlay-off>The image could not be loaded. The marks are kept.</div>}
+                    <svg class={ui_cls(["ui-markup-overlay-layer", tool == "select" && "ui-markup-overlay-picking", !finger && tool != "select" && "ui-markup-overlay-pans"])}
+                         viewBox={`0 0 ${w_units} ${h_units}`} aria-hidden="true"
+                         @mount={(me) => {
+                             layer = me
+                             wet = me.querySelector(".ui-markup-overlay-live")
+                             tip = me.querySelector(".ui-markup-overlay-tip")
+                             let hold = (e) => {
+                                 let t = e.touches[0]
+                                 if e.cancelable && markup_overlay_stops_scroll(t != null ? t.touchType : null, g_pen_down) { e.preventDefault() }
+                             }
+                             me.addEventListener("touchstart", hold, { passive: false })
+                             me.addEventListener("touchmove", hold, { passive: false })
+                             () => {
+                                 me.removeEventListener("touchstart", hold)
+                                 me.removeEventListener("touchmove", hold)
+                             }
+                         }}
+                         @pointerdown={down}
+                         @pointermove={moved}
+                         @pointerup={(e) => { lifted(e, false) }}
+                         @pointercancel={(e) => { lifted(e, true) }}
+                         @contextmenu={(e) => { e.preventDefault() }}>
+                        {for m in shown => <MarkupOverlayMark key={m.id} m={m} picked={m.id == picked}/>}
+                        <path class="ui-markup-overlay-live"></path>
+                        <polygon class="ui-markup-overlay-tip"></polygon>
+                    </svg>
+                    {typing != null && <input.ui-markup-overlay-field type="text" aria-label="Text for the mark" placeholder="Type here"
+                         style={`left: min(${typing.x * 100 / w_units}%, calc(100% - 244px)); top: min(${typing.y * 100 / h_units}%, calc(100% - 48px))`}
+                         value={draft} enterkeyhint="done"
+                         @mount={(me) => { me.focus({ preventScroll: true }) }}
+                         @input={(e) => { draft = e.value }}
+                         @keydown={(e) => {
+                             if e.key == "Enter" {
+                                 e.preventDefault()
+                                 close_typing(true)
+                             }
+                             if e.key == "Escape" {
+                                 e.preventDefault()
+                                 close_typing(false)
+                             }
+                         }}/>}
+                </div>
+            </div>
+            <aside.ui-markup-overlay-side aria-label="Marks">
+                <h3>{len(kept)} marks</h3>
+                <ul.ui-markup-overlay-list>
+                    {for p in enumerate(kept) => <li.ui-markup-overlay-row key={p[1].id}>
+                        <button.ui-markup-overlay-name type="button" aria-pressed={picked == p[1].id ? "true" : "false"}
+                                @click={() => {
+                                    picked = picked == p[1].id ? "" : p[1].id
+                                    tool = "select"
+                                }}>{markup_overlay_name(p[1], p[0])}</button>
+                        <button.ui-markup-overlay-btn type="button" aria-label={`Remove ${markup_overlay_name(p[1], p[0])}`} @click={() => { remove(p[1].id) }}>Remove</button>
+                    </li>}
+                </ul>
+                <form.ui-markup-overlay-note @submit={(e) => {
+                    e.preventDefault()
+                    let text = trim(note)
+                    if text != "" {
+                        add({ kind: "text", color, points: [[markup_overlay_r1(w_units * 0.1), markup_overlay_r1(h_units * 0.1 + len(kept) * 34)]], text })
+                        note = ""
+                    }
+                }}>
+                    <input type="text" aria-label="A note to add to the picture" placeholder="Add a note" value={note} @input={(e) => { note = e.value }}/>
+                    <button.ui-markup-overlay-btn type="submit">Add</button>
+                </form>
+            </aside>
+        </div>
+        {name != null && <input type="hidden" name={name} value={json.stringify(kept)}/>}
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

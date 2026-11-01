@@ -1,0 +1,613 @@
+// StylusCanvas: a page to draw on with a pen, as on a tablet. The line follows the pen's
+// pressure and tilt, a palm or a finger resting on the glass draws nothing once a pen has
+// been seen, and two fingers zoom and move the page. Strokes are kept as data, so undo and
+// the eraser work on whole strokes and the page stays sharp at any zoom. What is drawn
+// comes out as a PNG or as the strokes themselves.
+//
+//   import ui/stylus_canvas.qwe use StylusCanvas
+//
+//   component Sketch() {
+//       state saved = load_strokes()
+//       <div style="height: 80dvh">
+//           <StylusCanvas strokes={saved} on_change={(s) => { save_strokes(s) }}
+//                         on_export={(kind, data) => { keep(kind, data) }}/>
+//       </div>
+//   }
+//
+// width, height: the page's size in its own units (1200 by 800); strokes are in these
+// units, so they do not change when the tablet turns. strokes: drawing to start from,
+// each { color, points: [[x, y, w], ...] }, w being the line's width at that point; what
+// is not of that shape is left out. size: the pen's width at middling pressure (4).
+// colors: the pens to choose from, "ink" being the theme's text colour. palm: "auto"
+// lets a finger draw until a pen is seen, then only the pen does; "pen" keeps fingers off
+// from the start; "any" lets everything draw. A button changes this by hand, for a
+// tablet with no pen. Fingers that do not draw move the page when it is zoomed. paper:
+// the PNG's background ("#ffffff"). label: its name for screen readers. name: a hidden
+// input carries the strokes as JSON, so a plain <form> sends them. class.
+// on_change(strokes): inside one of your components, called after a stroke, an erasure,
+// an undo or a redo. on_export(kind, data): called with "png" and a data URL, or "data"
+// and JSON text; without it a link to save the file appears. In a phone app a web view may
+// ignore that link, so an app passes on_export.
+//
+// A pen's own eraser, on a pen that reports one, as a Surface pen's end does, erases while it
+// is used, with no tool chosen. Keys on the page: Ctrl or Cmd with Z undoes, with Shift
+// redoes; + and - zoom, 0 fits, the arrows move a zoomed page. Drawing itself has no
+// equal on a keyboard; on_change and the strokes prop are the way in for anyone who cannot draw.
+//
+// stylus_canvas_width and stylus_canvas_paint are what it draws with, for other components:
+// handwritten_note needs this file.
+
+import ui/theme.qwe use ui_cls
+
+let stylus_canvas_css = css`
+.ui-stylus-canvas { position: relative; display: flex; flex-direction: column; box-sizing: border-box; width: 100%; height: 100%; min-height: 320px; container-type: inline-size;
+  color: var(--ui-fg); background: var(--ui-subtle); font: 14px/1.4 var(--ui-font); }
+.ui-stylus-canvas-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.ui-stylus-canvas-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; flex: none; padding: 6px max(8px, env(safe-area-inset-right)) 6px max(8px, env(safe-area-inset-left)); border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-stylus-canvas-group { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.ui-stylus-canvas-group + .ui-stylus-canvas-group { padding-left: 6px; border-left: 1px solid var(--ui-border); }
+.ui-stylus-canvas-btn { min-width: 44px; height: 44px; padding: 0 10px; border: 1px solid transparent; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-stylus-canvas-btn[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-stylus-canvas-btn:disabled { color: var(--ui-muted); opacity: .55; cursor: default; }
+.ui-stylus-canvas-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-stylus-canvas-swatch { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid transparent; border-radius: var(--ui-radius-sm); background: transparent; cursor: pointer; }
+.ui-stylus-canvas-swatch[aria-pressed="true"] { border-color: var(--ui-accent); }
+.ui-stylus-canvas-swatch:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-stylus-canvas-swatch span { width: 24px; height: 24px; border: 1px solid var(--ui-border); border-radius: 50%; }
+.ui-stylus-canvas-zoom { min-width: 48px; text-align: center; font-variant-numeric: tabular-nums; color: var(--ui-muted); }
+@media (hover: hover) { .ui-stylus-canvas-btn:not(:disabled):hover, .ui-stylus-canvas-swatch:hover { background: var(--ui-subtle); } }
+.ui-stylus-canvas-view { position: relative; flex: 1; min-height: 0; overflow: hidden; outline: none; touch-action: none; overscroll-behavior: none;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: crosshair; }
+.ui-stylus-canvas-view:focus-visible { box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-stylus-canvas-page { position: absolute; left: 0; top: 0; display: block; transform-origin: 0 0; background: var(--ui-surface); box-shadow: var(--ui-shadow); color: var(--ui-fg); }
+.ui-stylus-canvas-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex: none; min-height: 28px; padding: 4px max(10px, env(safe-area-inset-right)) calc(4px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)); border-top: 1px solid var(--ui-border); background: var(--ui-surface); color: var(--ui-muted); font-size: 13px; }
+.ui-stylus-canvas-save { display: inline-flex; align-items: center; min-height: 44px; padding: 0 8px; color: var(--ui-accent); font-weight: 500; }
+/* With the width of a turned tablet the tools stand down the side, and the page keeps its height. */
+@container (min-width: 1000px) {
+  .ui-stylus-canvas-body { flex-direction: row; }
+  .ui-stylus-canvas-bar { flex-direction: column; flex-wrap: nowrap; width: 108px; overflow-y: auto; padding: 8px 6px; border-right: 1px solid var(--ui-border); border-bottom: 0; }
+  .ui-stylus-canvas-group { justify-content: center; }
+  .ui-stylus-canvas-group + .ui-stylus-canvas-group { padding: 6px 0 0; border-top: 1px solid var(--ui-border); border-left: 0; }
+}
+`
+
+fn stylus_canvas_is_num(v) -> bool {
+    let t = type_of(v)
+    t == "int" || t == "float"
+}
+
+// Drawing from outside: strokes with points, each point three numbers; the rest is left out.
+fn stylus_canvas_clean(strokes) -> list {
+    if type_of(strokes) != "list" { return [] }
+    let shaped = strokes | filter((s) => type_of(s) == "map" && type_of(get(s, "points")) == "list")
+    let kept = shaped | map((s) => {
+        let pts = s.points | filter((p) => type_of(p) == "list" && len(p) >= 3 && stylus_canvas_is_num(p[0]) && stylus_canvas_is_num(p[1]) && stylus_canvas_is_num(p[2]))
+        { color: type_of(get(s, "color")) == "str" ? s.color : "ink", points: pts }
+    })
+    kept | filter((s) => len(s.points) > 0)
+}
+
+// The line's width at a point. Pressure gives a quarter of the size at nothing to about
+// twice at full. A pen laid over past 30 degrees draws with its side, as a pencil does, up
+// to three times as wide at 70. A pointer that reports no pressure counts as pressing evenly.
+fn stylus_canvas_width(size: num, pressure: num, tilt_x: num, tilt_y: num) -> num {
+    let p = pressure <= 0 ? 0.5 : min([pressure, 1])
+    let tilt = max([abs(tilt_x), abs(tilt_y)])
+    let side = tilt <= 30 ? 1 : 1 + (min([tilt, 70]) - 30) / 40 * 2
+    round(size * (0.25 + 1.5 * p) * side * 100) / 100
+}
+
+// Whose touch is this? The pen and a mouse draw. A touch while a pen is down, or as broad as
+// a palm, does nothing. A finger draws when it may, else it moves the page.
+fn stylus_canvas_role(kind: str, finger: bool, pen_down: bool, broad: bool) -> str {
+    if kind != "touch" { return "draw" }
+    if pen_down || broad { return "none" }
+    finger ? "draw" : "pan"
+}
+
+// From a point to the segment a..b.
+fn stylus_canvas_gap(ax: num, ay: num, bx: num, by: num, x: num, y: num) -> num {
+    let dx = bx - ax
+    let dy = by - ay
+    let across = dx * dx + dy * dy
+    let at = across == 0 ? 0 : max([0, min([1, ((x - ax) * dx + (y - ay) * dy) / across])])
+    let ex = ax + at * dx - x
+    let ey = ay + at * dy - y
+    math.sqrt(ex * ex + ey * ey)
+}
+
+// Does a round eraser of radius r at x, y touch this stroke?
+fn stylus_canvas_hit(stroke, x: num, y: num, r: num) -> bool {
+    let pts = stroke.points
+    let n = len(pts)
+    for i in range(0, n) {
+        let a = pts[i]
+        let b = pts[i + 1 < n ? i + 1 : i]
+        if stylus_canvas_gap(a[0], a[1], b[0], b[1], x, y) <= r + a[2] / 2 { return true }
+    }
+    false
+}
+
+// The zoom's next stop up or down, between 1 (the page fits) and 6.
+fn stylus_canvas_step(zoom: num, by: int) -> num {
+    let next = by > 0 ? zoom * 1.5 : zoom / 1.5
+    let near = round(next * 100) / 100
+    max([1, min([6, near])])
+}
+
+// Where the page's corner may be. A page narrower than the view stands in its middle;
+// a wider one keeps the view covered.
+fn stylus_canvas_pan(at: num, shown: num, room: num) -> num {
+    if shown <= room { return round((room - shown) / 2) }
+    max([room - shown, min([0, at])])
+}
+
+// A curve from the middle of a..b to the middle of b..c, bending at b and as wide as b says.
+fn stylus_canvas_bit(ctx, a, b, c) {
+    ctx.lineWidth = b[2]
+    ctx.beginPath()
+    ctx.moveTo((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+    ctx.quadraticCurveTo(b[0], b[1], (b[0] + c[0]) / 2, (b[1] + c[1]) / 2)
+    ctx.stroke()
+}
+
+// A stroke on a canvas whose units are the page's. ink: the colour "ink" stands for.
+fn stylus_canvas_paint(ctx, stroke, ink: str) {
+    let pts = stroke.points
+    let n = len(pts)
+    let color = stroke.color == "ink" ? ink : stroke.color
+    ctx.strokeStyle = color
+    ctx.fillStyle = color
+    ctx.lineCap = "round"
+    ctx.lineJoin = "round"
+    if n == 1 {
+        ctx.beginPath()
+        ctx.arc(pts[0][0], pts[0][1], pts[0][2] / 2, 0, 6.2832)
+        ctx.fill()
+    } else {
+        for i in range(0, n) {
+            let a = pts[i > 0 ? i - 1 : 0]
+            let c = pts[i + 1 < n ? i + 1 : i]
+            stylus_canvas_bit(ctx, a, pts[i], c)
+        }
+    }
+}
+
+component StylusCanvas(width: int = 1200, height: int = 800, strokes = [], size: num = 4, colors: list = ["ink", "#c62a2f", "#0b6bcb", "#18794e"],
+                       palm: str = "auto", paper: str = "#ffffff", label: str = "Drawing", name: str? = null, on_change = null, on_export = null, class: str? = null) {
+    style global stylus_canvas_css
+    state kept = stylus_canvas_clean(strokes)
+    state past = []
+    state ahead = []
+    state tool = "pen"
+    state color = colors[0] ?? "ink"
+    state weight = size
+    state finger = palm != "pen"
+    state pen_seen = false
+    state zoom = 1
+    state shown = 100          // the zoom as a percentage, for the bar
+    state stage = null
+    state page = null
+    state ctx = null
+    state win = null
+    state saved = null         // { href, file, text } once something is exported without a callback
+    state said = ""
+    // What the handlers keep to themselves. Nothing in the markup reads these, so setting
+    // one on each move costs nothing.
+    state g_fit = 1
+    state g_zoom = 1
+    state g_base = 1           // the zoom the canvas was last made for
+    state g_px = 0
+    state g_py = 0
+    state g_res = 1
+    state g_mode = ""
+    state g_pid = null
+    state g_color = ""
+    state g_done = []          // points of the stroke under way, in blocks, as adding to one long list copies it
+    state g_tail = []
+    state g_a = null           // its last two points
+    state g_b = null
+    state g_pen = false
+    state g_pen_down = false
+    state g_touches = []
+    state g_pinch = null
+    state g_drag = null
+    state g_before = null
+    state g_rubbed = false
+    let sheet_w = max([1, width])
+    let sheet_h = max([1, height])
+    // Through `win`, as js() would make these wait, and a move cannot be late.
+    let ink = () => win.getComputedStyle(page).color
+    let repaint = () => {
+        ctx.setTransform(1, 0, 0, 1, 0, 0)
+        ctx.clearRect(0, 0, page.width, page.height)
+        ctx.setTransform(g_res, 0, 0, g_res, 0, 0)
+        let color_now = ink()
+        for s in kept { stylus_canvas_paint(ctx, s, color_now) }
+    }
+    // The page's place and size in the stage: all set by hand, as during a pinch.
+    let place = () => {
+        let z = g_fit * g_zoom
+        let w = sheet_w * z
+        let h = sheet_h * z
+        g_px = stylus_canvas_pan(g_px, w, stage.clientWidth)
+        g_py = stylus_canvas_pan(g_py, h, stage.clientHeight)
+        page.style.width = `${round(w)}px`
+        page.style.height = `${round(h)}px`
+        page.style.transform = `translate(${g_px}px, ${g_py}px)`
+        g_base = g_zoom
+    }
+    // Sharp at this zoom, as far as a canvas may be large.
+    let sharpen = () => {
+        let dpr = win.devicePixelRatio ?? 1
+        let res = min([dpr * g_fit * g_zoom, 4096 / sheet_w, 4096 / sheet_h])
+        g_res = res
+        page.width = round(sheet_w * res)
+        page.height = round(sheet_h * res)
+        repaint()
+    }
+    let fit_view = () => {
+        g_fit = min([stage.clientWidth / sheet_w, stage.clientHeight / sheet_h])
+        place()
+        sharpen()
+    }
+    let set_zoom = (next: num, fx: num, fy: num) => {
+        let by = next / g_zoom
+        g_px = fx - (fx - g_px) * by
+        g_py = fy - (fy - g_py) * by
+        g_zoom = next
+        zoom = next
+        shown = round(next * 100)
+        place()
+        sharpen()
+    }
+    let middle = () => [stage.clientWidth / 2, stage.clientHeight / 2]
+    let nudge = (by: int) => {
+        let c = middle()
+        set_zoom(stylus_canvas_step(g_zoom, by), c[0], c[1])
+    }
+    let told = () => { on_change && on_change(kept) }
+    let change = (next: list) => {
+        past = slice(past, -99, len(past)) | push(kept)
+        ahead = []
+        kept = next
+    }
+    let undo = () => {
+        if len(past) > 0 {
+            ahead = ahead | push(kept)
+            kept = past[len(past) - 1]
+            past = slice(past, 0, len(past) - 1)
+            repaint()
+            said = "Undone."
+            told()
+        }
+    }
+    let redo = () => {
+        if len(ahead) > 0 {
+            past = past | push(kept)
+            kept = ahead[len(ahead) - 1]
+            ahead = slice(ahead, 0, len(ahead) - 1)
+            repaint()
+            said = "Done again."
+            told()
+        }
+    }
+    let wipe = () => {
+        if len(kept) > 0 {
+            change([])
+            repaint()
+            said = "Page cleared."
+            told()
+        }
+    }
+    let to_page = (x: num, y: num) => {
+        let r = page.getBoundingClientRect()
+        [(x - r.left) * sheet_w / r.width, (y - r.top) * sheet_h / r.height]
+    }
+    let rub = (x: num, y: num) => {
+        let at = to_page(x, y)
+        let left = kept | filter((s) => !stylus_canvas_hit(s, at[0], at[1], 12))
+        if len(left) != len(kept) {
+            kept = left
+            g_rubbed = true
+            repaint()
+        }
+    }
+    // A point of the stroke under way, drawn at once.
+    let ink_point = (e) => {
+        let at = to_page(e.clientX, e.clientY)
+        let w = stylus_canvas_width(weight, g_pen ? e.pressure : 0.5, e.tiltX ?? 0, e.tiltY ?? 0)
+        let p = [round(at[0] * 10) / 10, round(at[1] * 10) / 10, w]
+        g_tail = g_tail | push(p)
+        if len(g_tail) >= 200 {
+            g_done = g_done | push(g_tail)
+            g_tail = []
+        }
+        if g_a != null { stylus_canvas_bit(ctx, g_a, g_b, p) }
+        g_a = g_b
+        g_b = p
+    }
+    let begin = (e, erasing: bool) => {
+        stage.setPointerCapture(e.pointerId)
+        g_pid = e.pointerId
+        g_pen = e.pointerType == "pen"
+        if erasing {
+            g_mode = "erase"
+            g_before = kept
+            g_rubbed = false
+            rub(e.clientX, e.clientY)
+        } else {
+            g_mode = "draw"
+            g_color = color
+            g_done = []
+            g_tail = []
+            g_a = null
+            g_b = null
+            let c = color == "ink" ? ink() : color
+            ctx.strokeStyle = c
+            ctx.fillStyle = c
+            ctx.lineCap = "round"
+            ctx.lineJoin = "round"
+            ink_point(e)
+        }
+    }
+    let finish = () => {
+        let mode = g_mode
+        g_mode = ""
+        g_pid = null
+        if mode == "draw" {
+            change(kept | push({ color: g_color, points: flatten(g_done) + g_tail }))
+            repaint()
+            told()
+        }
+        if mode == "erase" && g_rubbed {
+            let now = kept
+            kept = g_before
+            change(now)
+            told()
+        }
+    }
+    // A stroke that was not meant: a palm that came before the pen, or one the system took.
+    let drop = () => {
+        let mode = g_mode
+        g_mode = ""
+        g_pid = null
+        if mode == "erase" && g_rubbed { kept = g_before }
+        if mode != "" { repaint() }
+    }
+    let spread = () => {
+        let t = g_touches
+        if len(t) < 2 { return null }
+        let a = t[0]
+        let b = t[1]
+        { gap: math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y)), x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+    }
+    let touch_set = (e) => {
+        let v = stage.getBoundingClientRect()
+        g_touches = (g_touches | filter((t) => t.id != e.pointerId)) | push({ id: e.pointerId, x: e.clientX - v.left, y: e.clientY - v.top })
+    }
+    let touch_count = () => len(g_touches)
+    let down = (e) => {
+        e.preventDefault()
+        stage.focus({ preventScroll: true })
+        let kind = e.pointerType
+        if kind == "pen" {
+            if !pen_seen {
+                pen_seen = true
+                if palm == "auto" { finger = false }
+            }
+            g_pen_down = true
+            // A palm can land before the pen does: what it drew goes, and the pen's stroke starts clean.
+            if g_mode != "" { drop() }
+            g_pinch = null
+            g_drag = null
+        }
+        if kind == "touch" {
+            let broad = max([e.width, e.height]) >= 60
+            let role = stylus_canvas_role(kind, finger, g_pen_down, broad)
+            if role != "none" {
+                touch_set(e)
+                stage.setPointerCapture(e.pointerId)
+                if touch_count() >= 2 {
+                    if g_mode != "" { drop() }
+                    let s = spread()
+                    g_drag = null
+                    g_pinch = { gap: s.gap, x: s.x, y: s.y, zoom: g_zoom, px: g_px, py: g_py }
+                }
+                if touch_count() == 1 {
+                    if role == "draw" {
+                        begin(e, tool == "eraser")
+                    } else {
+                        g_drag = { x: e.clientX, y: e.clientY, px: g_px, py: g_py }
+                    }
+                }
+            }
+        } else if e.button == 0 || e.button == 5 {
+            let erasing = tool == "eraser" || e.button == 5 || math.floor(e.buttons / 32) % 2 == 1
+            begin(e, erasing)
+        }
+    }
+    let moved = (e) => {
+        if e.pointerType == "touch" && find(g_touches, (t) => t.id == e.pointerId) != null { touch_set(e) }
+        if g_mode != "" && e.pointerId == g_pid {
+            if g_mode == "draw" {
+                let many = e.getCoalescedEvents != null ? e.getCoalescedEvents() : []
+                if len(many) > 0 {
+                    for one in many { ink_point(one) }
+                } else {
+                    ink_point(e)
+                }
+            } else {
+                rub(e.clientX, e.clientY)
+            }
+        } else if g_pinch != null {
+            let s = spread()
+            if s != null {
+                let by = s.gap / g_pinch.gap
+                let z = max([1, min([6, g_pinch.zoom * by])])
+                let ratio = z / g_pinch.zoom
+                let x = s.x - (g_pinch.x - g_pinch.px) * ratio
+                let y = s.y - (g_pinch.y - g_pinch.py) * ratio
+                g_zoom = z
+                g_px = x
+                g_py = y
+                // The picture only, until the fingers lift: a canvas remade on each move would stutter.
+                page.style.transform = `translate(${x}px, ${y}px) scale(${z / g_base})`
+            }
+        } else if g_drag != null {
+            g_px = g_drag.px + e.clientX - g_drag.x
+            g_py = g_drag.py + e.clientY - g_drag.y
+            place()
+        }
+    }
+    let lifted = (e, cancel: bool) => {
+        if e.pointerType == "pen" { g_pen_down = false }
+        if e.pointerType == "touch" { g_touches = g_touches | filter((t) => t.id != e.pointerId) }
+        if g_mode != "" && e.pointerId == g_pid {
+            if cancel { drop() } else { finish() }
+        }
+        if g_pinch != null && touch_count() < 2 {
+            g_pinch = null
+            zoom = g_zoom
+            shown = round(g_zoom * 100)
+            place()
+            sharpen()
+            g_drag = null
+        }
+        if touch_count() == 0 { g_drag = null }
+    }
+    let export_png = () => {
+        let out = js("document.createElement", "canvas")
+        out.width = sheet_w
+        out.height = sheet_h
+        let c = out.getContext("2d")
+        c.fillStyle = paper
+        c.fillRect(0, 0, sheet_w, sheet_h)
+        for s in kept { stylus_canvas_paint(c, s, "#17161f") }
+        let png = out.toDataURL("image/png")
+        if on_export != null {
+            on_export("png", png)
+        } else {
+            saved = { href: png, file: "drawing.png", text: "Save the image" }
+        }
+        said = `Image ready, ${sheet_w} by ${sheet_h}.`
+    }
+    let export_data = () => {
+        let text = json.stringify({ width: sheet_w, height: sheet_h, strokes: kept })
+        if on_export != null {
+            on_export("data", text)
+        } else {
+            saved = { href: `data:application/json,${url_encode(text)}`, file: "drawing.json", text: "Save the strokes" }
+        }
+        said = `Strokes ready, ${len(kept)} of them.`
+    }
+    let on_key = (e) => {
+        let command = e.ctrlKey || e.metaKey
+        if command && lower(e.key) == "z" {
+            e.preventDefault()
+            if e.shiftKey { redo() } else { undo() }
+        } else if e.key == "+" || e.key == "=" {
+            e.preventDefault()
+            nudge(1)
+        } else if e.key == "-" {
+            e.preventDefault()
+            nudge(-1)
+        } else if e.key == "0" {
+            e.preventDefault()
+            let c = middle()
+            set_zoom(1, c[0], c[1])
+        } else {
+            let by = match e.key {
+                "ArrowLeft" => [40, 0]
+                "ArrowRight" => [-40, 0]
+                "ArrowUp" => [0, 40]
+                "ArrowDown" => [0, -40]
+                _ => null
+            }
+            if by != null {
+                e.preventDefault()
+                g_px += by[0]
+                g_py += by[1]
+                place()
+            }
+        }
+    }
+    <div class={ui_cls(["ui-stylus-canvas", class])}>
+        <div.ui-stylus-canvas-body>
+            <div.ui-stylus-canvas-bar role="toolbar" aria-label="Drawing tools">
+                <div.ui-stylus-canvas-group>
+                    <button.ui-stylus-canvas-btn type="button" aria-pressed={tool == "pen" ? "true" : "false"} @click={() => { tool = "pen" }}>Pen</button>
+                    <button.ui-stylus-canvas-btn type="button" aria-pressed={tool == "eraser" ? "true" : "false"} @click={() => { tool = "eraser" }}>Eraser</button>
+                    <button.ui-stylus-canvas-btn type="button" aria-pressed={finger ? "true" : "false"} aria-label="Fingers draw" @click={() => { finger = !finger }}>Finger</button>
+                </div>
+                <div.ui-stylus-canvas-group>
+                    {for c in colors => <button.ui-stylus-canvas-swatch key={c} type="button" aria-label={c == "ink" ? "Ink" : `Colour ${c}`} aria-pressed={color == c ? "true" : "false"}
+                            @click={() => {
+                                color = c
+                                tool = "pen"
+                            }}><span style={`background: ${c == "ink" ? "var(--ui-fg)" : c}`}></span></button>}
+                </div>
+                <div.ui-stylus-canvas-group>
+                    <button.ui-stylus-canvas-btn type="button" disabled={len(past) == 0} @click={undo}>Undo</button>
+                    <button.ui-stylus-canvas-btn type="button" disabled={len(ahead) == 0} @click={redo}>Redo</button>
+                    <button.ui-stylus-canvas-btn type="button" disabled={len(kept) == 0} @click={wipe}>Clear</button>
+                </div>
+                <div.ui-stylus-canvas-group>
+                    <button.ui-stylus-canvas-btn type="button" aria-label="Zoom out" disabled={zoom <= 1} @click={() => { nudge(-1) }}>-</button>
+                    <span.ui-stylus-canvas-zoom>{shown}%</span>
+                    <button.ui-stylus-canvas-btn type="button" aria-label="Zoom in" disabled={zoom >= 6} @click={() => { nudge(1) }}>+</button>
+                </div>
+                <div.ui-stylus-canvas-group>
+                    <button.ui-stylus-canvas-btn type="button" @click={export_png}>Image</button>
+                    <button.ui-stylus-canvas-btn type="button" @click={export_data}>Data</button>
+                </div>
+            </div>
+            <div.ui-stylus-canvas-view tabindex="0" role="group" aria-label={`${label}, ${len(kept)} strokes. Plus and minus zoom, the arrow keys move the page.`}
+                 @mount={(me) => {
+                     win = js("window")
+                     stage = me
+                     let sheet = me.querySelector("canvas")
+                     page = sheet
+                     ctx = sheet.getContext("2d")
+                     fit_view()
+                     // Turning the tablet refits the page: strokes are in the page's units, and the zoom is relative to it.
+                     let ro = js_new("ResizeObserver", () => { fit_view() })
+                     ro.observe(me)
+                     let scheme = js("matchMedia", "(prefers-color-scheme: dark)")
+                     let shade = (_e) => { repaint() }
+                     scheme.addEventListener("change", shade)
+                     () => {
+                         ro.disconnect()
+                         scheme.removeEventListener("change", shade)
+                     }
+                 }}
+                 @pointerdown={down}
+                 @pointermove={moved}
+                 @pointerup={(e) => { lifted(e, false) }}
+                 @pointercancel={(e) => { lifted(e, true) }}
+                 @lostpointercapture={(e) => { if g_mode != "" && e.pointerId == g_pid { drop() } }}
+                 @contextmenu={(e) => { e.preventDefault() }}
+                 @wheel={(e) => {
+                     e.preventDefault()
+                     if e.ctrlKey {
+                         let v = stage.getBoundingClientRect()
+                         let z = max([1, min([6, g_zoom * math.exp(-e.deltaY / 200)])])
+                         set_zoom(z, e.clientX - v.left, e.clientY - v.top)
+                     } else {
+                         g_px -= e.deltaX
+                         g_py -= e.deltaY
+                         place()
+                     }
+                 }}
+                 @keydown={on_key}>
+                <canvas.ui-stylus-canvas-page width={sheet_w} height={sheet_h} aria-hidden="true"></canvas>
+            </div>
+        </div>
+        <div.ui-stylus-canvas-foot>
+            <span>{pen_seen ? (finger ? "Pen found. Fingers still draw." : "Pen found. Fingers move the page and zoom; a palm draws nothing.") : "Draw with a pen. Two fingers zoom."}</span>
+            {saved != null && <a.ui-stylus-canvas-save href={saved.href} download={saved.file}>{saved.text}</a>}
+        </div>
+        {name != null && <input type="hidden" name={name} value={json.stringify(kept)}/>}
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

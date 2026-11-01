@@ -1,0 +1,392 @@
+// SnapCarousel: a product's pictures, swiped by the browser's own scroll snapping, with
+// dots, a count on each picture, and a tap opening a viewer to pinch, zoom and pan in. With
+// no script at all it still swipes, each dot is a link to its picture, the count is
+// on the picture, and a tap opens the large image. It keeps its place through a turn of the
+// phone, through the viewer (close it on another picture and the carousel is there) and
+// when the visitor comes back in the same tab. On a tablet it shows two pictures at a time.
+//
+//   import ui/snap_carousel.qwe use SnapCarousel
+//
+//   <SnapCarousel id="boots" label="Pictures of the boots"
+//                 images={[{ src: "/img/1.jpg", full: "/img/1-big.jpg", alt: "The boots from the side" }, { src: "/img/2.jpg", alt: "The sole" }]}/>
+//
+// images: each { src, full, alt }, or just the address; full is what the viewer shows
+// (src when left out). id: a prefix for its ids, unique on the page, and what its place is
+// kept under for this tab ("ui-snapc"). label: what screen readers call it. start: the
+// picture to begin on (0). on_change(index): inside one of your components, when the
+// picture changes.
+//
+// The viewer: a finger pans, two pinch, a double tap zooms, a swipe goes to the next
+// picture, a pull down closes. Its buttons and the keys do the same: the arrows, + and -,
+// 0 to fit, Escape. More than eight pictures show the count without the dots.
+
+let snap_carousel_css = css`
+.ui-snapc { position: relative; display: grid; gap: 4px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 14px/1.4 var(--ui-font); }
+/* The browser does the swiping, so it works before and without any script. */
+.ui-snapc-track {
+  display: flex; min-width: 0; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch; scrollbar-width: none; border-radius: var(--ui-radius); background: var(--ui-subtle); outline: none;
+}
+.ui-snapc-track::-webkit-scrollbar { display: none; }
+.ui-snapc-track:focus-visible { box-shadow: var(--ui-focus); }
+.ui-snapc-slide { position: relative; flex: 0 0 100%; min-width: 0; aspect-ratio: 1; scroll-snap-align: start; scroll-snap-stop: always; }
+.ui-snapc-zoom { display: block; width: 100%; height: 100%; -webkit-touch-callout: none; }
+.ui-snapc-zoom:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: -2px; }
+.ui-snapc-slide img { display: block; width: 100%; height: 100%; object-fit: contain; -webkit-user-drag: none; user-select: none; -webkit-user-select: none; }
+.ui-snapc-count {
+  position: absolute; top: 10px; right: 10px; padding: 2px 8px; border-radius: 999px; background: rgba(15, 14, 24, .62); color: #fff;
+  font-size: 12px; font-variant-numeric: tabular-nums; pointer-events: none;
+}
+.ui-snapc-dots { display: flex; justify-content: center; }
+.ui-snapc-dot { display: grid; place-items: center; width: 44px; height: 44px; border-radius: 50%; touch-action: manipulation; }
+.ui-snapc-dot::before { content: ""; width: 8px; height: 8px; border-radius: 999px; background: var(--ui-strong); transition: width .2s, background .2s; }
+.ui-snapc-dot[data-seen]::before { background: var(--ui-accent); }
+.ui-snapc-dot[aria-current="true"]::before { width: 20px; }
+.ui-snapc-dot:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-snapc-empty { margin: 0; padding: 24px; text-align: center; color: var(--ui-muted); }
+@container (min-width: 640px) { .ui-snapc-slide { flex-basis: 50%; } }
+
+.ui-snapc-viewer {
+  box-sizing: border-box; position: fixed; inset: 0; width: 100vw; max-width: none; height: 100dvh; max-height: none; margin: 0; padding: 0; overflow: hidden;
+  border: 0; background: #000; color: #fff; font: 14px/1.4 var(--ui-font); overscroll-behavior: none;
+}
+.ui-snapc-viewer[open] { display: flex; flex-direction: column; }
+.ui-snapc-viewer::backdrop { background: #000; }
+/* Everything a finger does here is ours: the page must neither scroll nor zoom behind it. */
+.ui-snapc-stage { position: relative; flex: 1; min-height: 0; overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: grab; }
+.ui-snapc-big { display: block; width: 100%; height: 100%; object-fit: contain; transform-origin: 50% 50%; will-change: transform; -webkit-user-drag: none; pointer-events: none; }
+.ui-snapc-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 4px max(8px, env(safe-area-inset-right, 0px)) calc(4px + env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px));
+}
+.ui-snapc-top {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: calc(4px + env(safe-area-inset-top, 0px)) max(8px, env(safe-area-inset-right, 0px)) 4px max(12px, env(safe-area-inset-left, 0px));
+}
+.ui-snapc-tool {
+  display: grid; place-items: center; min-width: 44px; height: 44px; padding: 0 8px; border: 0; border-radius: var(--ui-radius-sm); background: transparent;
+  color: #fff; font: 600 20px var(--ui-font); cursor: pointer; touch-action: manipulation;
+}
+.ui-snapc-tool:disabled { color: rgba(255, 255, 255, .35); cursor: default; }
+.ui-snapc-tool:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }
+.ui-snapc-tool svg { width: 22px; height: 22px; }
+.ui-snapc-where, .ui-snapc-level { font-variant-numeric: tabular-nums; }
+.ui-snapc-level { min-width: 52px; text-align: center; }
+@media (hover: hover) { .ui-snapc-tool:hover:not(:disabled) { background: rgba(255, 255, 255, .14); } }
+@media (prefers-reduced-motion: reduce) { .ui-snapc-dot::before { transition: none; } }
+`
+
+// The pictures that can be shown: an address, or a map with src.
+fn snap_carousel_clean(images) -> list {
+    if type_of(images) != "list" { return [] }
+    images | filter((x) => (type_of(x) == "str" && x != "") || (type_of(x) == "map" && type_of(get(x, "src")) == "str"))
+           | map((x) => type_of(x) == "str" ? { src: x, full: x, alt: "" }
+                                            : { src: x.src, full: get(x, "full") ?? x.src, alt: str(get(x, "alt") ?? "") })
+}
+
+// A place to go to, kept within the pictures; what cannot be read is the first.
+fn snap_carousel_place(v, count: int) -> int {
+    let n = int(str(v ?? 0))
+    if is_err(n) || count <= 0 { return 0 }
+    max([0, min([n, count - 1])])
+}
+
+// Which picture a scroll shows.
+fn snap_carousel_nearest(left, width, count: int) -> int = width <= 0 ? 0 : snap_carousel_place(round(left / width), count)
+
+fn snap_carousel_zoom(z) = max([1, min([z, 4])])
+
+// How far a picture may pan each way, at a zoom, so its edge never leaves the side.
+fn snap_carousel_bound(v, zoom, size) {
+    let most = (zoom - 1) * size / 2
+    max([0 - most, min([v, most])])
+}
+
+// What a swipe in the viewer does at release: -1 back, 1 on, 0 stays. A quarter of the
+// width does it, or a flick of 0.5 px/ms over at least 30 px, and only if the speed
+// at the end still goes that way.
+fn snap_carousel_turn(dx, speed, width) -> int {
+    if dx <= 0 - width / 4 || (dx <= -30 && speed <= -0.5) { return speed > 0.3 ? 0 : 1 }
+    if dx >= width / 4 || (dx >= 30 && speed >= 0.5) { return speed < -0.3 ? 0 : -1 }
+    0
+}
+
+// Speed at release comes from where the finger was a little before it, not at the last
+// move, which may be a moment old and give nothing: mark keeps two points, moving on every 50 ms.
+fn snap_carousel_mark(x, y, t) -> map = { a: { x: x, y: y, t: t }, b: { x: x, y: y, t: t } }
+fn snap_carousel_marked(mark: map, x, y, t) -> map = t - mark.b.t > 50 ? { a: mark.b, b: { x: x, y: y, t: t } } : mark
+fn snap_carousel_speed(from_at, to_at, from_t, to_t) = (to_at - from_at) / max([1, to_t - from_t])
+
+fn snap_carousel_gap(a, b) = sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y))
+
+component SnapCarousel(images = [], id: str = "ui-snapc", label: str = "Product pictures", start: int = 0, on_change = null) {
+    style global snap_carousel_css
+    let pics = snap_carousel_clean(images)
+    let count = len(pics)
+    state at = snap_carousel_place(start, count)
+    state aim = null         // the picture a dot or the viewer asked for, while the scroll gets there
+    state view_n = 1         // pictures in view at once: with two, the scroll ends one short of the last
+    state track = null
+    state wide = 0           // the width last seen: a scroll while it changes is the turn of the phone
+    state still = false
+    state viewer = null
+    state stage = null
+    state big = null
+    state vi = 0             // the picture in the viewer
+    state zoom = 1           // committed at each release
+    state px = 0
+    state py = 0
+    state now_at = { z: 1, x: 0, y: 0 }   // where the fingers have it now: no markup reads this, so moves render nothing
+    state pts = {}           // the fingers down, by pointer id
+    state mode = ""          // "", "pan", "swipe", "pull" or "pinch"
+    state from = null        // where it began
+    state mark = null        // points not long ago, for the speed at release
+    state tapped = null      // the last tap, for a double tap
+    let size = () => track.firstElementChild.offsetWidth
+    let settled = (i) => {
+        if i != at {
+            at = i
+            on_change && on_change(i)
+            // Some private windows throw: the wrapper makes that an error value, and the place is simply not kept.
+            let kept = js("Promise.resolve", js_new("Promise", (done) => { done(js("sessionStorage.setItem", `ui-snapc-${id}`, str(i))) }))
+            is_err(kept)
+        }
+    }
+    // A scroll that has nowhere to go sends no event, and `aim` would wait for it for good.
+    let scroll_to = (i, how) => {
+        let left = i * size()
+        aim = abs(track.scrollLeft - left) > 1 ? i : null
+        track.scrollTo({ left: left, behavior: how })
+    }
+    let go = (i, instant = false) => {
+        let to = min([snap_carousel_place(i, count), max([0, count - view_n])])
+        scroll_to(to, instant || still ? "instant" : "smooth")
+        settled(to)
+    }
+    let place = (z, x, y) => {
+        now_at = { z: z, x: x, y: y }
+        big.style.transform = `translate(${x}px, ${y}px) scale(${z})`
+    }
+    let commit = () => {
+        zoom = now_at.z
+        px = now_at.x
+        py = now_at.y
+    }
+    let settle_to = (z, x, y) => {
+        big.style.transition = still ? "none" : "transform .2s cubic-bezier(.2, .8, .2, 1)"
+        stage.style.opacity = ""
+        place(z, x, y)
+        commit()
+    }
+    let show = (i) => {
+        vi = snap_carousel_place(i, count)
+        big.style.transition = "none"
+        place(1, 0, 0)
+        commit()
+    }
+    // The next one is ready before the finger gets there. js_new waits, so this comes after what must not.
+    let ahead = () => { if vi + 1 < count { js_new("Image").src = pics[vi + 1].full } }
+    let zoom_to = (z) => {
+        let to = snap_carousel_zoom(z)
+        settle_to(to, snap_carousel_bound(px, to, stage.clientWidth), snap_carousel_bound(py, to, stage.clientHeight))
+    }
+    let turn = (by) => {
+        let to = vi + by
+        if to >= 0 && to < count {
+            show(to)
+            ahead()
+        } else {
+            settle_to(1, 0, 0)
+        }
+    }
+    let open_at = (i) => {
+        show(i)
+        viewer.showModal()
+        ahead()
+    }
+    let up = (e) => {
+        let id_was = str(e.pointerId)
+        if has(pts, id_was) {
+            let p = get(pts, id_was)
+            pts = remove(pts, id_was)
+            let dx = e.clientX - from.x
+            let dy = e.clientY - from.y
+            let was = mode
+            if was == "pinch" {
+                commit()
+                let rest = values(pts)
+                mode = ""
+                if len(rest) > 0 {
+                    from = { x: rest[0].x, y: rest[0].y }
+                    mark = snap_carousel_mark(rest[0].x, rest[0].y, e.timeStamp)
+                }
+            } else if len(keys(pts)) == 0 {
+                mode = ""
+                if e.type == "pointercancel" {
+                    settle_to(zoom, px, py)
+                } else if was == "swipe" {
+                    let by = snap_carousel_turn(dx, snap_carousel_speed(mark.a.x, e.clientX, mark.a.t, e.timeStamp), stage.clientWidth)
+                    if by == 0 { settle_to(1, 0, 0) } else { turn(by) }
+                } else if was == "pull" {
+                    if dy > 120 || (dy > 30 && snap_carousel_speed(mark.a.y, e.clientY, mark.a.t, e.timeStamp) > 0.6) { viewer.close() } else { settle_to(1, 0, 0) }
+                } else if was == "pan" {
+                    commit()
+                } else {
+                    // A tap, then another near it soon after, zooms there and back.
+                    if tapped != null && e.timeStamp - tapped.t < 320 && snap_carousel_gap(tapped, p) < 30 {
+                        tapped = null
+                        if zoom > 1 {
+                            settle_to(1, 0, 0)
+                        } else {
+                            let r = stage.getBoundingClientRect()
+                            let to = 2.5
+                            let x = (r.width / 2 - (e.clientX - r.left)) * (to - 1)
+                            let y = (r.height / 2 - (e.clientY - r.top)) * (to - 1)
+                            settle_to(to, snap_carousel_bound(x, to, r.width), snap_carousel_bound(y, to, r.height))
+                        }
+                    } else {
+                        tapped = { x: e.clientX, y: e.clientY, t: e.timeStamp }
+                    }
+                }
+            }
+        }
+    }
+    {count == 0
+        ? <p.ui-snapc-empty>No pictures.</p>
+        : <div.ui-snapc role="group" aria-roledescription="carousel" aria-label={label}
+               @keydown={(e) => {
+                   if e.target.closest("dialog") == null {
+                       if e.key == "ArrowLeft" { e.preventDefault(); go(at - 1) }
+                       if e.key == "ArrowRight" { e.preventDefault(); go(at + 1) }
+                   }
+               }}>
+        <div.ui-snapc-track id={`${id}-track`} tabindex="0" aria-label="Pictures, use the arrow keys"
+             @mount={(el) => {
+                 // js() waits, and what reads `track` runs during a wait, so these come first.
+                 let quiet = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+                 let kept = js("Promise.resolve", js_new("Promise", (done) => { done(js("sessionStorage.getItem", `ui-snapc-${id}`)) }))
+                 still = quiet
+                 track = el
+                 wide = el.clientWidth
+                 view_n = round(el.clientWidth / max([1, size()]))
+                 if !is_err(kept) && kept != null { at = min([snap_carousel_place(kept, count), max([0, count - view_n])]) }
+                 if at > 0 { scroll_to(at, "instant") }
+                 // A turn changes the width: the picture stays and the scroll follows it.
+                 let grown = js_new("ResizeObserver", (_x) => {
+                     if el.clientWidth != wide {
+                         wide = el.clientWidth
+                         view_n = round(el.clientWidth / max([1, size()]))
+                         go(at, true)
+                     }
+                 })
+                 grown.observe(el)
+                 () => grown.disconnect()
+             }}
+             @pointerdown={(_e) => { aim = null }}
+             @scroll={(e) => {
+                 if e.clientWidth == wide {
+                     let i = snap_carousel_nearest(e.scrollLeft, size(), count)
+                     if aim == null { settled(i) } else if i == aim { aim = null }
+                 }
+             }}>
+            {for [i, p] in enumerate(pics) => <div.ui-snapc-slide id={`${id}-${i + 1}`} key={i} role="group" aria-roledescription="slide" aria-label={`${i + 1} of ${count}`}>
+                <a.ui-snapc-zoom href={p.full} draggable="false" aria-label={`Zoom picture ${i + 1} of ${count}: ${p.alt}`}
+                   @click={(e) => {
+                       if !e.metaKey && !e.ctrlKey {
+                           e.preventDefault()
+                           open_at(i)
+                       }
+                   }}>
+                    <img src={p.src} alt={p.alt} loading={i == 0 ? "eager" : "lazy"} draggable="false"/>
+                </a>
+                <span.ui-snapc-count aria-hidden="true">{i + 1} / {count}</span>
+            </div>}
+        </div>
+        {count > 1 && count <= 8 && <nav.ui-snapc-dots aria-label="Pick a picture">
+            {for [i, _p] in enumerate(pics) => <a.ui-snapc-dot key={i} href={`#${id}-${i + 1}`} aria-label={`Picture ${i + 1}`} aria-current={at == i ? "true" : "false"} data-seen={i >= at && i < at + view_n ? "true" : null}
+                @click={(e) => {
+                    e.preventDefault()
+                    go(i)
+                }}></a>}
+        </nav>}
+        <span.ui-sr role="status">Picture {at + 1} of {count}</span>
+        <dialog.ui-snapc-viewer aria-label={`${label}, large`}
+                @mount={(el) => { viewer = el }}
+                @close={() => {
+                    let to = vi
+                    go(to, true)
+                    track.querySelectorAll(".ui-snapc-zoom")[to].focus({ preventScroll: true })
+                }}
+                @keydown={(e) => {
+                    let k = e.key
+                    if k == "ArrowLeft" { e.preventDefault(); turn(-1) }
+                    if k == "ArrowRight" { e.preventDefault(); turn(1) }
+                    if k == "+" || k == "=" { e.preventDefault(); zoom_to(zoom + 0.5) }
+                    if k == "-" { e.preventDefault(); zoom_to(zoom - 0.5) }
+                    if k == "0" { e.preventDefault(); settle_to(1, 0, 0) }
+                }}>
+            <div.ui-snapc-top>
+                <span.ui-snapc-where role="status">{vi + 1} / {count}</span>
+                <button.ui-snapc-tool type="button" aria-label="Close" @click={() => { viewer.close() }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div.ui-snapc-stage
+                 @mount={(el) => { stage = el }}
+                 @pointerdown={(e) => {
+                     stage.setPointerCapture(e.pointerId)
+                     pts = set(pts, str(e.pointerId), { x: e.clientX, y: e.clientY })
+                     let all_down = values(pts)
+                     big.style.transition = "none"
+                     if len(all_down) == 2 {
+                         mode = "pinch"
+                         from = { x: e.clientX, y: e.clientY, d: max([1, snap_carousel_gap(all_down[0], all_down[1])]), z: zoom, px: px, py: py }
+                         mark = snap_carousel_mark(e.clientX, e.clientY, e.timeStamp)
+                     } else if len(all_down) == 1 {
+                         mode = ""
+                         from = { x: e.clientX, y: e.clientY }
+                         mark = snap_carousel_mark(e.clientX, e.clientY, e.timeStamp)
+                     }
+                 }}
+                 @pointermove={(e) => {
+                     let key = str(e.pointerId)
+                     if has(pts, key) {
+                         pts = set(pts, key, { x: e.clientX, y: e.clientY })
+                         let dx = e.clientX - from.x
+                         let dy = e.clientY - from.y
+                         if mode == "pinch" {
+                             let two = values(pts)
+                             if len(two) >= 2 {
+                                 let z = snap_carousel_zoom(from.z * snap_carousel_gap(two[0], two[1]) / from.d)
+                                 place(z, snap_carousel_bound(from.px, z, stage.clientWidth), snap_carousel_bound(from.py, z, stage.clientHeight))
+                             }
+                         } else {
+                             if mode == "" && (abs(dx) > 10 || abs(dy) > 10) {
+                                 mode = zoom > 1.01 ? "pan" : abs(dx) > abs(dy) ? "swipe" : "pull"
+                             }
+                             if mode == "pan" {
+                                 place(zoom, snap_carousel_bound(px + dx, zoom, stage.clientWidth), snap_carousel_bound(py + dy, zoom, stage.clientHeight))
+                             }
+                             if mode == "swipe" { place(1, dx, 0) }
+                             if mode == "pull" {
+                                 place(1, 0, max([dy, 0]))
+                                 stage.style.opacity = str(max([0.4, 1 - max([dy, 0]) / 400]))
+                             }
+                             mark = snap_carousel_marked(mark, e.clientX, e.clientY, e.timeStamp)
+                         }
+                     }
+                 }}
+                 @pointerup={up}
+                 @pointercancel={up}>
+                <img.ui-snapc-big src={pics[vi].full} alt={pics[vi].alt} draggable="false" @mount={(el) => { big = el }}/>
+            </div>
+            <div.ui-snapc-bar>
+                <button.ui-snapc-tool type="button" aria-label="Previous picture" disabled={vi == 0} @click={() => { turn(-1) }}>‹</button>
+                <button.ui-snapc-tool type="button" aria-label="Zoom out" disabled={zoom <= 1} @click={() => { zoom_to(zoom - 0.5) }}>−</button>
+                <span.ui-snapc-level role="status">{round(zoom * 100)}%</span>
+                <button.ui-snapc-tool type="button" aria-label="Zoom in" disabled={zoom >= 4} @click={() => { zoom_to(zoom + 0.5) }}>+</button>
+                <button.ui-snapc-tool type="button" aria-label="Next picture" disabled={vi == count - 1} @click={() => { turn(1) }}>›</button>
+            </div>
+        </dialog>
+    </div>}
+}

@@ -1,0 +1,305 @@
+// ReceiptShare: a receipt to send on. It draws the receipt as a picture for the share sheet, from
+// the same lines the screen shows, so what goes out cannot say other than what is here, and
+// adds them up to be sure. Where a picture cannot be shared it sends the same words as text,
+// and with no share sheet at all it copies them, or shows them to copy. On a tablet the picture
+// stands beside the receipt.
+//
+//   import ui/receipt_share.qwe use ReceiptShare
+//
+//   <ReceiptShare receipt={{ title: "Harbour Lettings", status: "Paid", at: "2026-11-01T09:43:00Z", ref: "TX-0042",
+//       from: "Everyday •• 4021", lines: [{ label: "Rent, November", amount: 950m }, { label: "Fee", amount: 1.50m }], total: 951.50m }}/>
+//
+// receipt: { title, status, at, ref, from, to, note, lines, total, currency }. lines: each
+// { label, amount }, amount a decimal, an int or numeric text. total: what was charged; left
+// out, the lines' sum. at: a date or a date-time. currency ("USD"), locale. file_name
+// ("receipt.png"). label ("Receipt"). on_share(how): "image" or "text" went to a share sheet,
+// "copied" to the clipboard.
+//
+// If the lines do not add up to the total, or an amount cannot be read, it says so on the
+// screen, the picture and the text alike. A receipt that does not add up is not quietly fixed.
+//
+// The picture is ready before it is asked for, because a browser allows a share only straight
+// after a tap. In the phone apps quilloNative.share takes text and an https address, not a
+// file, so on Android, where the web view has no share of its own, a receipt goes as text, and
+// the screen says that.
+//
+// receipt_share_view(receipt, currency, locale) gives the words, receipt_share_text(v) the text,
+// and receipt_share_plan(v) what the picture draws.
+
+import ui/theme.qwe use ui_cls
+import ui/price.qwe use price_text
+import ui/button.qwe use Button
+
+let receipt_share_css = css`
+.ui-rcptshare { display: grid; gap: 14px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-rcptshare-lay { display: grid; gap: 14px; min-width: 0; }
+.ui-rcptshare-paper { box-sizing: border-box; display: grid; gap: 10px; min-width: 0; padding: 16px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-rcptshare-paper h3 { margin: 0; font-size: 19px; overflow-wrap: anywhere; }
+.ui-rcptshare-status { margin: 0; color: var(--ui-success); font-weight: 600; }
+.ui-rcptshare-facts, .ui-rcptshare-lines { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 14px; margin: 0; }
+.ui-rcptshare-facts dt { color: var(--ui-muted); }
+.ui-rcptshare-facts dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+.ui-rcptshare-lines { padding-top: 8px; border-top: 1px solid var(--ui-border); }
+.ui-rcptshare-lines dt { overflow-wrap: anywhere; }
+.ui-rcptshare-lines dd { margin: 0; font-variant-numeric: tabular-nums; text-align: right; }
+.ui-rcptshare-total { display: flex; justify-content: space-between; gap: 14px; margin: 0; padding-top: 8px; border-top: 2px solid var(--ui-fg); font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ui-rcptshare-warn { margin: 0; color: var(--ui-danger); font-weight: 600; }
+.ui-rcptshare-pic { display: none; min-width: 0; margin: 0; }
+.ui-rcptshare-pic-on { display: block; }
+.ui-rcptshare-pic img { display: block; width: 100%; max-width: 360px; height: auto; margin: 0 auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); -webkit-touch-callout: default; }
+.ui-rcptshare-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-rcptshare-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-rcptshare-copy { box-sizing: border-box; width: 100%; min-height: 150px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px/1.35 var(--ui-font); }
+.ui-rcptshare-save { display: inline-flex; align-items: center; min-height: 46px; padding: 0 14px; color: var(--ui-accent); font-weight: 600; }
+.ui-rcptshare-canvas { display: none; }
+@container (min-width: 600px) {
+  .ui-rcptshare-lay { grid-template-columns: minmax(0, 1fr) minmax(0, 340px); align-items: start; gap: 24px; }
+  .ui-rcptshare-pic { display: block; }
+  .ui-rcptshare-eye { display: none; }
+}
+`
+
+// An amount as a decimal, or null.
+fn receipt_share_dec(v) {
+    let kind = type_of(v)
+    if kind != "dec" && kind != "int" && kind != "float" && kind != "str" { return null }
+    let d = dec(v)
+    is_err(d) ? null : d
+}
+
+// A date or a date-time as words, or "" for what is neither.
+fn receipt_share_when(at) -> str {
+    if type_of(at) != "str" || !date.valid(at) { return "" }
+    date.format(at, date.valid(at, "date-time") ? "MMM D, YYYY HH:mm" : "MMM D, YYYY")
+}
+
+// All the words of a receipt, worked out once: the screen, the picture and the text each take
+// them from here, so they cannot differ. Amounts are exact, and written once.
+fn receipt_share_view(r, fallback: str = "USD", locale: str? = null) -> map {
+    let currency = type_of(r.currency) == "str" ? r.currency : fallback
+    let cash = (v) => price_text(v, currency, locale)
+    let lines = type_of(r.lines) == "list" ? r.lines : []
+    let rows = lines | map((l) => {
+        let d = receipt_share_dec(l.amount)
+        { label: str(l.label ?? ""), amount: d, text: d == null ? "—" : cash(d) }
+    })
+    let unread = len(rows | filter((l) => l.amount == null))
+    let added = sum(rows | filter((l) => l.amount != null) | map((l) => l.amount))
+    let given = receipt_share_dec(r.total)
+    let total = given ?? added
+    let warning = unread > 0 ? "An amount here could not be read"
+        : len(rows) > 0 && given != null && round(added, 4) != round(given, 4) ? `The lines add up to ${cash(added)}, not ${cash(given)}` : ""
+    let facts = [
+        { label: "When", text: receipt_share_when(r.at) },
+        { label: "From", text: str(r.from ?? "") },
+        { label: "To", text: str(r.to ?? "") },
+        { label: "Reference", text: str(r.ref ?? "") },
+        { label: "Note", text: str(r.note ?? "") },
+    ] | filter((f) => f.text != "")
+    { title: str(r.title ?? "Receipt"), status: str(r.status ?? ""), facts: facts, lines: rows, total: cash(total), warning: warning }
+}
+
+// The same words as text, for where a picture cannot go.
+fn receipt_share_text(v) -> str {
+    let top = [v.title, v.status] | filter((s) => s != "")
+    let facts = v.facts | map((f) => `${f.label}: ${f.text}`)
+    let lines = v.lines | map((l) => `${l.label}: ${l.text}`)
+    let warn = v.warning != "" ? [v.warning] : []
+    (top + facts + lines + [`Total: ${v.total}`] + warn) | join("\n")
+}
+
+// Words broken to fit a width counted in characters, a word too long being cut.
+fn receipt_share_wrap(text: str, width: int) -> list {
+    let words = split(text, " ") | map((w) => {
+        let c = split(w, "")
+        let n = len(c)
+        n <= width ? [w] : range(0, ceil(n / width)) | map((i) => slice(c, i * width, min([(i + 1) * width, n])) | join(""))
+    }) | flatten()
+    let lines = words | reduce([""], (acc, w) => {
+        let last_line = acc[len(acc) - 1]
+        if last_line == "" { return slice(acc, 0, len(acc) - 1) + [w] }
+        len(last_line) + 1 + len(w) <= width ? slice(acc, 0, len(acc) - 1) + [`${last_line} ${w}`] : acc + [w]
+    })
+    lines
+}
+
+let receipt_share_width = 1080
+
+// What the picture draws: each piece of text with where it goes, top to bottom, and the height it
+// comes to. Nothing here measures anything, so it can be checked against the words.
+fn receipt_share_plan(v) -> map {
+    let m = 80
+    let right = receipt_share_width - m
+    let parts = [
+        receipt_share_wrap(v.title, 26) | map((t) => { { text: t, size: 56, weight: 700, x: m, align: "left", step: 72, tint: "#17161f" } }),
+        v.status != "" ? [{ text: v.status, size: 38, weight: 600, x: m, align: "left", step: 60, tint: "#18794e" }] : [],
+        [{ gap: 28 }],
+        v.facts | map((f) => {
+            let more = receipt_share_wrap(f.text, 34)
+            [{ text: f.label, size: 34, weight: 400, x: m, align: "left", step: 0, tint: "#5e5c6e" }] + (enumerate(more) | map((p) => { { text: p[1], size: 34, weight: 400, x: right, align: "right", step: 48, tint: "#17161f" } }))
+        }) | flatten(),
+        [{ rule: 2, gap: 40 }],
+        v.lines | map((l) => {
+            let more = receipt_share_wrap(l.label, 28)
+            let first = enumerate(more) | map((p) => { { text: p[1], size: 38, weight: 400, x: m, align: "left", step: p[0] == len(more) - 1 ? 0 : 50, tint: "#17161f" } })
+            first + [{ text: l.text, size: 38, weight: 500, x: right, align: "right", step: 58, tint: "#17161f" }]
+        }) | flatten(),
+        [{ rule: 4, gap: 44 }],
+        [{ text: "Total", size: 48, weight: 700, x: m, align: "left", step: 0, tint: "#17161f" }, { text: v.total, size: 48, weight: 700, x: right, align: "right", step: 72, tint: "#17161f" }],
+        v.warning != "" ? receipt_share_wrap(v.warning, 42) | map((t) => { { text: t, size: 34, weight: 600, x: m, align: "left", step: 46, tint: "#c62a2f" } }) : [],
+    ]
+    let steps = flatten(parts)
+    let tops = steps | reduce({ at: 120, rows: [] }, (acc, s) => {
+        let lower_by = s.gap ?? 0
+        { at: acc.at + lower_by + (s.step ?? 0), rows: acc.rows + [set(s, "y", acc.at + (s.rule != null ? round(lower_by / 2) : 0))] }
+    })
+    { rows: tops.rows, height: tops.at + 60 }
+}
+
+component ReceiptShare(receipt: map = {}, currency: str = "USD", locale: str? = null, file_name: str = "receipt.png", label: str = "Receipt", on_share = null) {
+    style global receipt_share_css
+    state win = null
+    state image = ""         // the picture, as an address for the page to show
+    state file = null        // the picture, as a file for the share sheet
+    state drawn = ""         // the words it was drawn from
+    state failed = false     // this browser could not draw it
+    state showing = false    // the picture is shown on a phone
+    state said = ""
+    state typed_out = ""     // the text to copy by hand
+    let v = receipt_share_view(receipt, currency, locale)
+    let text = receipt_share_text(v)
+    let draw = () => {
+        let doc = win.document
+        let c = doc.createElement("canvas")
+        let plan = receipt_share_plan(v)
+        let g = c.getContext("2d")
+        if g == null {
+            failed = true
+        } else {
+            c.width = receipt_share_width
+            c.height = plan.height
+            // Light whatever the theme, as a receipt goes to phones in other modes.
+            g.fillStyle = "#ffffff"
+            g.fillRect(0, 0, c.width, c.height)
+            g.textBaseline = "alphabetic"
+            for s in plan.rows {
+                if s.rule != null {
+                    g.fillStyle = "#b9b7c6"
+                    g.fillRect(80, s.y, c.width - 160, s.rule)
+                } else if s.text != null {
+                    g.font = `${s.weight} ${s.size}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`
+                    g.textAlign = s.align
+                    g.fillStyle = s.tint
+                    // The widest it can go: a long word is pressed and not cut off.
+                    g.fillText(s.text, s.x, s.y + s.size, c.width - 160)
+                }
+            }
+            image = c.toDataURL("image/png")
+            c.toBlob((blob) => {
+                if blob == null {
+                    failed = true
+                } else {
+                    file = js_new("File", [blob], file_name, { type: "image/png" })
+                }
+            }, "image/png")
+        }
+    }
+    let by_hand = () => {
+        typed_out = text
+        said = "This can't be sent from here. Copy the words below."
+    }
+    let copy_text = () => {
+        let nav = win.navigator
+        if nav.clipboard == null {
+            by_hand()
+        } else {
+            let r = js("Promise.resolve", nav.clipboard.writeText(text))
+            if is_err(r) {
+                by_hand()
+            } else {
+                said = "Copied as text."
+                on_share && on_share("copied")
+            }
+        }
+    }
+    let share_text = () => {
+        said = ""
+        typed_out = ""
+        let nav = win.navigator
+        if win.quilloNative != null {
+            let r = js("quilloNative.share", text)
+            if is_err(r) {
+                copy_text()
+            } else if type_of(r) != "map" || r.shared != false {
+                // iOS answers { shared }, Android only true, as it cannot tell.
+                on_share && on_share("text")
+            }
+        } else if nav.share != null {
+            let r = js("Promise.resolve", nav.share({ title: v.title, text: text }))
+            if !is_err(r) {
+                on_share && on_share("text")
+            } else if !re.test(lower(str(r)), "abort|cancel") {
+                copy_text()
+            }
+        } else {
+            copy_text()
+        }
+    }
+    let share_image = () => {
+        said = ""
+        typed_out = ""
+        // Straight from the tap: nothing here waits before the share, or a browser refuses it.
+        let nav = win.navigator
+        let can = file != null && nav.canShare != null && nav.canShare({ files: [file] })
+        if can {
+            let r = js("Promise.resolve", nav.share({ files: [file], title: v.title }))
+            if !is_err(r) {
+                on_share && on_share("image")
+            } else if !re.test(lower(str(r)), "abort|cancel") {
+                share_text()
+            }
+        } else {
+            said = "A picture cannot be shared from here, so it goes as text."
+            let kept = said
+            share_text()
+            if said == "" { said = kept }
+        }
+    }
+    // The picture is drawn at the start, and again whenever the words change.
+    if win != null && drawn != text {
+        drawn = text
+        draw()
+    }
+    <section.ui-rcptshare aria-label={label}
+             @mount={(_el) => {
+                 let w = js("window")
+                 win = w
+             }}>
+        <div.ui-rcptshare-lay>
+            <div.ui-rcptshare-paper>
+                <h3>{v.title}</h3>
+                {v.status != "" && <p.ui-rcptshare-status>{v.status}</p>}
+                {len(v.facts) > 0 && <dl.ui-rcptshare-facts>
+                    {for f in v.facts => <div style="display: contents" key={f.label}><dt>{f.label}</dt><dd>{f.text}</dd></div>}
+                </dl>}
+                {len(v.lines) > 0 && <dl.ui-rcptshare-lines>
+                    {for p in enumerate(v.lines) => <div style="display: contents" key={p[0]}><dt>{p[1].label}</dt><dd>{p[1].text}</dd></div>}
+                </dl>}
+                <p.ui-rcptshare-total><span>Total</span><span>{v.total}</span></p>
+                {v.warning != "" && <p.ui-rcptshare-warn role="alert">{v.warning}</p>}
+            </div>
+            <figure class={ui_cls(["ui-rcptshare-pic", showing && "ui-rcptshare-pic-on"])}>
+                {image != "" && <img src={image} alt={text} width={receipt_share_width}/>}
+            </figure>
+        </div>
+        <div.ui-rcptshare-acts>
+            <Button size="lg" disabled={file == null && !failed} on_click={share_image}>Share picture</Button>
+            <Button size="lg" variant="outline" on_click={share_text}>Share as text</Button>
+            {image != "" && <span.ui-rcptshare-eye><Button size="lg" variant="ghost" on_click={() => { showing = !showing }}>{showing ? "Hide picture" : "See picture"}</Button></span>}
+            {image != "" && win != null && win.quilloNative == null && <a.ui-rcptshare-save href={image} download={file_name}>Save picture</a>}
+        </div>
+        {failed && <p.ui-rcptshare-note>The picture could not be drawn here. The words can still be shared.</p>}
+        {said != "" && <p.ui-rcptshare-note role="status">{said}</p>}
+        {typed_out != "" && <textarea.ui-rcptshare-copy readonly aria-label="Receipt as text" value={typed_out}></textarea>}
+    </section>
+}

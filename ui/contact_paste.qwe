@@ -1,0 +1,438 @@
+// ContactPaste: paste an email signature or a blurb and the details fill themselves in.
+// It picks out the name, email, phone, website, company and address, puts each in an
+// editable field, and marks how sure it is of each, with the reason, because a guess
+// should look like one. What someone has edited is theirs: pasting again fills the
+// other fields, never that one, and offers what it found beside it.
+//
+//   <ContactPaste id="lead" text={signature}/>
+//   <ContactPaste id="new-contact" prefix="contact_" on_change={(c) => { contact = c }}/>
+//
+// id: a prefix for its ids, unique on the page. label: the paste box's label ("Paste a
+// signature or a blurb"). text: what the box starts with. prefix: before each field's name,
+// in a form: name, email, phone, website, company, address. placeholder, hint, disabled
+// as for every field. class: more classes. on_change(values): inside one of your
+// components, a map of those six fields' text after each paste or edit.
+//
+// Sure means a label said so, or the pattern allows nothing else: "Tel:", an email
+// address, a line ending "GmbH", a name under "Best regards". Likely means the shape
+// fits. A guess means it was worked out from something else: a company from the
+// email's domain, a name from "jane.doe@". A free mail domain says nothing of a company.
+// Only the first 5,000 characters and 60 lines are read, and it says so; addresses
+// are read in the forms of the US, UK, Germany and neighbours, and the Latin alphabet.
+//
+// contact_paste_extract(text) is the reading, for a program's own use: { fields, cut },
+// each of the six fields being { value, sure, why }, sure "high", "medium", "low", or
+// null when it found nothing.
+
+import ui/slug_input.qwe use slug_input_transliterate
+import ui/theme.qwe use ui_cls
+
+let contact_paste_css = css`
+.ui-contactpaste { display: grid; gap: 12px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-contactpaste-label { font-size: 13px; font-weight: 500; }
+.ui-contactpaste-source { display: grid; gap: 6px; min-width: 0; }
+.ui-contactpaste-box { box-sizing: border-box; width: 100%; min-height: 120px; margin: 0; padding: 8px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.5 var(--ui-font); resize: vertical; transition: border-color .15s, box-shadow .15s; }
+.ui-contactpaste-box::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-contactpaste-box:hover { border-color: var(--ui-strong); }
+.ui-contactpaste-box:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-contactpaste-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-contactpaste-sum { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-contactpaste-again { padding: 0; border: 0; border-radius: 3px; background: none; color: var(--ui-accent); font: 500 13px var(--ui-font); cursor: pointer; text-decoration: underline; }
+.ui-contactpaste-again:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-contactpaste-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 12px 14px; }
+.ui-contactpaste-field { display: grid; gap: 4px; min-width: 0; align-content: start; }
+.ui-contactpaste-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 2px 8px; }
+.ui-contactpaste-tag { font-size: 11px; font-weight: 600; color: var(--ui-muted); }
+.ui-contactpaste-tag[data-sure="high"] { color: var(--ui-success); }
+.ui-contactpaste-tag[data-sure="medium"] { color: var(--ui-info); }
+.ui-contactpaste-tag[data-sure="low"] { color: var(--ui-warning); }
+.ui-contactpaste-control { box-sizing: border-box; width: 100%; height: 36px; margin: 0; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1 var(--ui-font); transition: border-color .15s, box-shadow .15s; }
+.ui-contactpaste-control:hover { border-color: var(--ui-strong); }
+.ui-contactpaste-control:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-contactpaste-control:disabled { opacity: .55; cursor: not-allowed; }
+.ui-contactpaste-low .ui-contactpaste-control { border-style: dashed; }
+.ui-contactpaste-why { margin: 0; font-size: 12px; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-contactpaste-use { padding: 0; border: 0; border-radius: 3px; background: none; color: var(--ui-accent); font: 500 12px var(--ui-font); text-align: left; cursor: pointer;
+  text-decoration: underline; overflow-wrap: anywhere; }
+.ui-contactpaste-use:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) { .ui-contactpaste-box, .ui-contactpaste-control { transition: none; } }
+`
+
+let contact_paste_read_limit = 5000
+let contact_paste_line_limit = 60
+let contact_paste_fields = ["name", "email", "phone", "website", "company", "address"]
+let contact_paste_titles = { name: "Name", email: "Email", phone: "Phone", website: "Website", company: "Company", address: "Address" }
+let contact_paste_sure_words = { high: "Sure", medium: "Likely", low: "A guess" }
+let contact_paste_labels = { name: "name", "full name": "name", contact: "name", email: "email", "e-mail": "email", mail: "email", e: "email", tel: "phone", telephone: "phone", phone: "phone",
+    ph: "phone", p: "phone", t: "phone", m: "phone", mob: "phone", mobile: "phone", cell: "phone", direct: "phone", web: "website", website: "website", site: "website", w: "website", url: "website",
+    company: "company", organisation: "company", organization: "company", org: "company", employer: "company", firm: "company", address: "address", addr: "address", location: "address",
+    office: "address", a: "address", fax: "skip", f: "skip", title: "skip", role: "skip", position: "skip" }
+let contact_paste_signoff = "best|best regards|best wishes|kind regards|warm regards|warmest regards|regards|many thanks|thanks|thank you|cheers|sincerely|yours|yours truly|yours sincerely|cordially|respectfully|ciao|mit freundlichen grüßen|mit freundlichen gruessen|viele grüße|cordialement|saludos|atentamente"
+let contact_paste_job_re = "\\b(?:ceo|cto|cfo|coo|cmo|vp|svp|evp|president|director|manager|head|lead|chief|founder|co-founder|cofounder|engineer|developer|designer|consultant|officer|partner|analyst|architect|sales|marketing|assistant|associate|specialist|advisor|adviser|attorney|lawyer|professor|teacher|recruiter|editor|writer|owner|principal|senior|junior|team|department|dept|support|leiter|leiterin|geschäftsführer|geschäftsführerin)\\b"
+let contact_paste_legal_re = "(?:\\b(?:inc|incorporated|llc|ltd|limited|gmbh|ag|kg|s\\.?a\\.?s?|s\\.?l\\.?|s\\.?r\\.?l\\.?|b\\.?v\\.?|n\\.?v\\.?|plc|corp|corporation|pty|sarl|oy|ab|llp|lda)\\.?)$"
+let contact_paste_soft_re = "\\b(?:co|company|group|holdings|partners|labs|studio|studios|agency|associates|consulting|solutions|systems|technologies|bank|university|college|foundation)\\.?$"
+let contact_paste_street_re = "\\b(?:st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|sq|square|pkwy|parkway|hwy|highway|suite|ste|floor|fl|unit|apt)\\b\\.?"
+let contact_paste_street_eu_re = "(?:strasse|straße|str\\.|gasse|weg|platz|allee|plein|laan|gracht)\\s+\\d|^(?:rue|via|calle|carrer|rua|plaza|avenida|avenue)\\s"
+let contact_paste_city_re = "\\b[A-Z]{2}\\s+\\d{5}(?:-\\d{4})?\\b|\\b[A-Z]{1,2}\\d[A-Z\\d]?\\s*\\d[A-Z]{2}\\b|^\\d{4,5}\\s+\\S"
+let contact_paste_social_re = "linkedin\\.|twitter\\.|facebook\\.|instagram\\.|youtube\\.|tiktok\\.|github\\.|\\bx\\.com"
+let contact_paste_free_re = "^(?:gmail|googlemail|yahoo|ymail|hotmail|outlook|live|msn|icloud|me|mac|aol|proton|protonmail|pm|gmx|web|mail|email|yandex|qq|163|fastmail|hey|zoho|comcast|verizon|att)\\."
+let contact_paste_shared_re = "^(?:info|sales|contact|hello|hi|support|admin|office|team|enquiries|inquiries|mail|help|billing|accounts?)@"
+
+fn contact_paste_found(value: str, sure: str, why: str) = { value, sure, why }
+
+fn contact_paste_none() = { value: "", sure: null, why: null }
+
+// The lines, a signature's "a | b" being two, with quoting and rules gone.
+fn contact_paste_lines(text: str) {
+    let out = []
+    for line in split(re.replace(text, "\\r\\n?", "\n"), "\n") {
+        let plain = trim(re.replace(line, "^[>\\s]+", ""))
+        for part in re.split(plain, "\\s+[|•·]\\s*|[|•·]\\s+") {
+            let piece = trim(slice(part, 0, 300))
+            if piece != "" && !re.test(piece, "^(?:[-_=*~]{2,}|sent from my .*|get outlook for .*|confidential.*|this (?:e-?mail|message) .*|disclaimer.*|please consider the environment.*)$", "i") {
+                out = push(out, piece)
+            }
+        }
+    }
+    out
+}
+
+// A line's label, as { field, rest }, or null. Only a colon counts: "W. Smith" is a name.
+fn contact_paste_label(line: str) {
+    let m = re.find(line, "^([A-Za-z][A-Za-z -]{0,14})\\.?\\s*:\\s*(.+)$")
+    if m == null { return null }
+    let field = contact_paste_labels[lower(trim(m.groups[0]))]
+    field != null ? { field, rest: trim(m.groups[1]) } : null
+}
+
+fn contact_paste_digits(s: str) = len(re.replace(s, "[^\\d]", ""))
+
+// Phone numbers in a piece of text, leaving out what only looks like one: a date, a
+// postcode, a short run of digits.
+fn contact_paste_phones(s: str) {
+    let clean = re.replace(s, "[^\\s@]+@[^\\s@]+|https?://\\S+|www\\.\\S+", " ")
+    re.find_all(clean, "(?:\\+|\\(|\\b\\d)[\\d ().\\/-]{5,}\\d(?:\\s*(?:x|ext\\.?)\\s*\\d{1,5})?", "i")
+        | map((m) => trim(m.text))
+        | filter((p) => {
+            let n = contact_paste_digits(p)
+            n >= 7 && n <= 16 && !re.test(p, "^\\d{4}[-.\\/]\\d{1,2}[-.\\/]\\d{1,2}$|^\\d{1,2}[-.\\/]\\d{1,2}[-.\\/]\\d{2,4}$")
+        })
+}
+
+fn contact_paste_tidy_url(s: str) = re.replace(s, "[.,;:!?)]+$", "")
+
+// The address: street lines, then the city's. Each is found by its shape.
+fn contact_paste_address(lines: list, skip) {
+    let streets = []
+    let at = -1
+    for [i, line] in enumerate(lines) {
+        let free = !has(skip, str(i)) && !contains(line, "@")
+        let street = free && (re.test(line, "^\\d") && re.test(line, contact_paste_street_re, "i") || re.test(line, contact_paste_street_eu_re, "i") && re.test(line, "\\d"))
+        if street && at < 0 {
+            at = i
+            streets = [line]
+        }
+    }
+    let city_at = find(range(len(lines)), (i) => !has(skip, str(i)) && (at < 0 || i > at) && re.test(lines[i], contact_paste_city_re) && !re.test(lines[i], "@"))
+    if at >= 0 && contact_paste_digits(streets[0]) > 0 && re.test(streets[0], contact_paste_city_re) {
+        return { value: streets[0], sure: "high", why: "A street and a city", used: [at] }
+    }
+    if at >= 0 {
+        let gap = at + 1
+        let more = gap < len(lines) && !has(skip, str(gap)) && re.test(lines[gap], contact_paste_street_re, "i") && (city_at == null || gap < city_at) ? [lines[gap]] : []
+        let parts = [...streets, ...more]
+        if city_at != null && city_at - at <= 3 {
+            return { value: join([...parts, lines[city_at]], ", "), sure: "high", why: "A street and a city", used: [at, at + len(more), city_at] }
+        }
+        return { value: join(parts, ", "), sure: "medium", why: "Looks like a street", used: [at, at + len(more)] }
+    }
+    if city_at != null { return { value: lines[city_at], sure: "low", why: "A city and postcode, with no street", used: [city_at] } }
+    null
+}
+
+fn contact_paste_plain(s: str) = re.replace(lower(slug_input_transliterate(s)), "[^a-z0-9]", "")
+
+fn contact_paste_capital(word: str) {
+    let c = slice(word, 0, 1)
+    c != lower(c)
+}
+
+// A name, as people write one, without its Dr. or its PhD; or null.
+fn contact_paste_as_name(line: str) {
+    let s = re.replace(line, "^(?:dr|mr|mrs|ms|mx|prof|sir)\\.?\\s+", "", "i")
+    s = trim(re.replace(s, "[,]\\s*(?:ph\\.?d|m\\.?d|mba|cpa|esq|jr|sr|ii|iii|msc|bsc)\\.?$", "", "i"))
+    if re.test(s, "[\\d@/:;!?()]") || re.test(s, contact_paste_job_re, "i") || re.test(s, contact_paste_legal_re, "i") || re.test(s, contact_paste_soft_re, "i") { return null }
+    let words = split(re.replace(s, "\\s+", " "), " ")
+    if len(words) < 2 || len(words) > 4 { return null }
+    let fine = all(words, (w) => contact_paste_capital(w) || contains(["van", "von", "de", "der", "del", "da", "di", "la", "le", "bin", "ibn"], w))
+    fine && contact_paste_capital(words[0]) ? s : null
+}
+
+// Whether a name fits the part before the @.
+fn contact_paste_fits_email(name: str, email: str) {
+    let local = contact_paste_plain(split(email, "@")[0])
+    let words = split(name, " ") | map(contact_paste_plain) | filter((w) => len(w) >= 2)
+    any(words, (w) => contains(local, w))
+}
+
+fn contact_paste_name_from_email(email: str) {
+    let parts = re.split(split(email, "@")[0], "[._-]+") | filter((p) => len(p) >= 2 && !re.test(p, "\\d"))
+    if len(parts) < 2 { return null }
+    parts | map((p) => upper(slice(p, 0, 1)) + slice(p, 1, len(p))) | join(" ")
+}
+
+fn contact_paste_company_from_domain(domain: str) {
+    let head = split(domain, ".")[0]
+    re.split(head, "-") | map((p) => upper(slice(p, 0, 1)) + slice(p, 1, len(p))) | join(" ")
+}
+
+// The whole reading: see the opening comment.
+fn contact_paste_extract(text) {
+    let raw = str(text ?? "")
+    let cut = len(raw) > contact_paste_read_limit
+    let whole = slice(raw, 0, contact_paste_read_limit)
+    let all_lines = contact_paste_lines(whole)
+    let lines = slice(all_lines, 0, contact_paste_line_limit)
+    let got = { name: null, email: null, phone: null, website: null, company: null, address: null }
+    let skip = {}
+    let take = (i: int) => { skip = set(skip, str(i), true) }
+
+    // What a label says comes first: nothing here is surer.
+    for [i, line] in enumerate(lines) {
+        let l = contact_paste_label(line)
+        if l != null {
+            take(i)
+            if l.field != "skip" && got[l.field] == null && l.field != "phone" && l.field != "email" {
+                let value = l.field == "website" ? contact_paste_tidy_url(l.rest) : l.rest
+                got = set(got, l.field, contact_paste_found(value, "high", `Labelled "${trim(split(line, ":")[0])}"`))
+            }
+        }
+    }
+    let text_only = join(lines, "\n")
+
+    // Email.
+    let emails = re.find_all(text_only, "[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*\\.[A-Za-z]{2,}") | map((m) => m.text)
+    let personal = find(emails, (e) => !re.test(e, contact_paste_shared_re, "i"))
+    if personal != null {
+        got = set(got, "email", contact_paste_found(personal, "high", "An email address"))
+    } else if len(emails) > 0 {
+        got = set(got, "email", contact_paste_found(emails[0], "medium", "A shared address, not a person's"))
+    } else {
+        let spoken = re.find(text_only, "([A-Za-z0-9._-]+)\\s*(?:\\[at\\]|\\(at\\)|\\sat\\s)\\s*([A-Za-z0-9-]+)\\s*(?:\\[dot\\]|\\(dot\\)|\\sdot\\s)\\s*([A-Za-z]{2,})", "i")
+        if spoken != null {
+            let g = spoken.groups
+            got = set(got, "email", contact_paste_found(`${g[0]}@${g[1]}.${g[2]}`, "medium", "Spelled out in words"))
+        }
+    }
+    let email = got.email != null ? got.email.value : ""
+    let domain = email != "" ? lower(split(email, "@")[1]) : ""
+    let free_mail = domain == "" || re.test(domain, contact_paste_free_re)
+
+    // Website.
+    if got.website == null {
+        let bare = re.replace(text_only, "[^\\s@]+@[^\\s@]+", " ")
+        let urls = re.find_all(bare, "https?://[^\\s,;<>()|]+|\\bwww\\.[^\\s,;<>()|]+", "i") | map((m) => contact_paste_tidy_url(m.text))
+        let own = find(urls, (u) => !re.test(u, contact_paste_social_re, "i"))
+        if own != null {
+            got = set(got, "website", contact_paste_found(own, "high", "A web address"))
+        } else {
+            let plain = re.find_all(bare, "\\b[a-z0-9][a-z0-9-]*(?:\\.[a-z0-9-]+)*\\.(?:com|org|net|io|ai|app|dev|edu|gov|biz|info|co\\.uk|de|fr|es|it|nl|eu|ph|ca|au)\\b(?:/[^\\s,;<>()|]*)?", "i") | map((m) => contact_paste_tidy_url(m.text))
+            let site = find(plain, (u) => !re.test(u, contact_paste_social_re, "i"))
+            if site != null {
+                got = set(got, "website", contact_paste_found(site, "medium", "Looks like a web address"))
+            } else if !free_mail {
+                got = set(got, "website", contact_paste_found(domain, "low", "From the email's domain"))
+            }
+        }
+    }
+
+    // Lines that were only a link or an address of email are spent.
+    for [i, line] in enumerate(lines) {
+        if re.test(line, "^\\S+@\\S+$|^https?://\\S+$|^www\\.\\S+$") { take(i) }
+        if re.test(line, "^(?:[a-z0-9-]+\\.)+[a-z]{2,}$", "i") { take(i) }
+    }
+
+    // Phone: a labelled one first, and a mobile over a landline only in that order.
+    for line in lines {
+        let l = contact_paste_label(line)
+        if got.phone == null && l != null && l.field == "phone" {
+            let found = contact_paste_phones(l.rest)
+            if len(found) > 0 { got = set(got, "phone", contact_paste_found(found[0], "high", `Labelled "${trim(split(line, ":")[0])}"`)) }
+        }
+    }
+    for [i, line] in enumerate(lines) {
+        let l = contact_paste_label(line)
+        let refused = l != null && (l.field == "skip" || l.field == "address")
+        let found = refused ? [] : contact_paste_phones(l != null ? l.rest : line)
+        if len(found) > 0 {
+            if contact_paste_digits(line) - contact_paste_digits(found[0]) == 0 && len(re.replace(line, "[\\d\\s().+/-]", "")) < 6 { take(i) }
+            if got.phone == null {
+                let p = found[0]
+                let sure = starts_with(p, "+") ? "high" : contact_paste_digits(p) >= 10 ? "medium" : "low"
+                got = set(got, "phone", contact_paste_found(p, sure, sure == "high" ? "An international number" : sure == "medium" ? "Has the digits of a phone number" : "Short for a phone number"))
+            }
+        }
+    }
+
+    // Address.
+    if got.address == null {
+        let a = contact_paste_address(lines, skip)
+        if a != null {
+            for i in a.used { take(i) }
+            got = set(got, "address", contact_paste_found(a.value, a.sure, a.why))
+        }
+    }
+
+    // Company: a legal ending is as good as a label; a job's "at", or the email's domain, less.
+    if got.company == null {
+        for [i, line] in enumerate(lines) {
+            if got.company == null && !has(skip, str(i)) && re.test(line, contact_paste_legal_re, "i") && !re.test(line, "[@]") {
+                got = set(got, "company", contact_paste_found(line, "high", "Ends like a company's name"))
+                take(i)
+            }
+        }
+    }
+    if got.company == null && !free_mail {
+        let stem = contact_paste_plain(split(domain, ".")[0])
+        for [i, line] in enumerate(lines) {
+            let plain = contact_paste_plain(line)
+            if got.company == null && !has(skip, str(i)) && len(plain) >= 3 && len(line) <= 60 && (plain == stem || (starts_with(plain, stem) && contact_paste_as_name(line) == null)) && !contains(line, "@") {
+                got = set(got, "company", contact_paste_found(line, "medium", "Matches the email's domain"))
+                take(i)
+            }
+        }
+    }
+    if got.company == null {
+        for [i, line] in enumerate(lines) {
+            let at_job = re.find(line, "^(.*\\S)\\s+(?:at|@)\\s+(\\S.*)$")
+            if got.company == null && at_job != null && re.test(at_job.groups[0], contact_paste_job_re, "i") {
+                got = set(got, "company", contact_paste_found(trim(at_job.groups[1]), "medium", "After a job title"))
+                take(i)
+            }
+            if got.company == null && !has(skip, str(i)) && re.test(line, contact_paste_soft_re, "i") && len(line) <= 60 && contact_paste_capital(line) {
+                got = set(got, "company", contact_paste_found(line, "medium", "Reads like a company's name"))
+                take(i)
+            }
+        }
+    }
+    if got.company == null {
+        let works = re.find(text_only, "\\b(?:works? (?:at|for)|employed (?:at|by)|joined|team at)\\s+([A-Z][\\w&.-]*(?:\\s+[A-Z][\\w&.-]*){0,3})")
+        if works != null { got = set(got, "company", contact_paste_found(re.replace(works.groups[0], "[.]$", ""), "medium", "Said in the text")) }
+    }
+    if got.company == null && !free_mail {
+        got = set(got, "company", contact_paste_found(contact_paste_company_from_domain(domain), "low", "From the email's domain"))
+    }
+
+    // Name: under a sign-off, beside an address in brackets, said in the text, the first
+    // line shaped like one, and last from the email.
+    if got.name == null {
+        let header = re.find(text_only, "(?:^|\\n)(?:from:\\s*)?\"?([^\"<>\\n@:]+?)\"?\\s*<[^<>@\\s]+@[^<>\\s]+>", "i")
+        if header != null {
+            let n = contact_paste_as_name(trim(header.groups[0]))
+            if n != null { got = set(got, "name", contact_paste_found(n, "high", "Beside the email address")) }
+        }
+    }
+    if got.name == null {
+        let after_signoff = false
+        for [i, line] in enumerate(lines) {
+            let cut_line = lower(re.replace(line, "[,.!]+$", ""))
+            let inline = re.find(line, `^(?:${contact_paste_signoff})[,.!]?\\s+(\\S.*)$`, "i")
+            if got.name == null && inline != null {
+                let n = contact_paste_as_name(inline.groups[0])
+                if n != null { got = set(got, "name", contact_paste_found(n, "high", "Under a sign-off")) }
+            }
+            if got.name == null && after_signoff && !has(skip, str(i)) {
+                let n = contact_paste_as_name(line)
+                if n != null {
+                    got = set(got, "name", contact_paste_found(n, "high", "Under a sign-off"))
+                    take(i)
+                }
+            }
+            after_signoff = contains(split(contact_paste_signoff, "|"), cut_line)
+            if after_signoff { take(i) }
+        }
+    }
+    if got.name == null {
+        let said = re.find(text_only, "\\b(?:reach|contact|call|email|ask for|meet|i am|i'm|this is|my name is|name is)\\s+([A-Z]\\S+(?:\\s+[A-Z]\\S+){1,2})")
+        if said != null {
+            let n = contact_paste_as_name(re.replace(said.groups[0], "[,.;]$", ""))
+            if n != null { got = set(got, "name", email != "" && contact_paste_fits_email(n, email) ? contact_paste_found(n, "high", "Fits the email address") : contact_paste_found(n, "medium", "Said in the text")) }
+        }
+    }
+    if got.name == null {
+        let shaped = range(len(lines)) | filter((i) => !has(skip, str(i))) | map((i) => contact_paste_as_name(lines[i])) | filter((n) => n != null)
+        let fitting = email != "" ? find(shaped, (n) => contact_paste_fits_email(n, email)) : null
+        if fitting != null {
+            got = set(got, "name", contact_paste_found(fitting, "high", "Fits the email address"))
+        } else if len(shaped) > 0 {
+            got = set(got, "name", contact_paste_found(shaped[0], "medium", "A line shaped like a name"))
+        }
+    }
+    if got.name == null && email != "" {
+        let n = contact_paste_name_from_email(email)
+        if n != null { got = set(got, "name", contact_paste_found(n, "low", "From the email address")) }
+    }
+    let fields = reduce(contact_paste_fields, {}, (m, f) => set(m, f, got[f] ?? contact_paste_none()))
+    { fields, cut: cut || len(all_lines) > contact_paste_line_limit }
+}
+
+component ContactPaste(id: str, label: str = "Paste a signature or a blurb", text: str = "", prefix: str = "", placeholder: str = "Paste an email signature here", hint: str? = null,
+                       disabled: bool = false, on_change = null, class: str? = null) {
+    style global contact_paste_css
+    state paste = text
+    // What the person typed: it stands over any guess, from any paste, until they start over.
+    state edits = {}
+    let guess = contact_paste_extract(paste)
+    let found = len(contact_paste_fields | filter((f) => guess.fields[f].value != ""))
+    let value_of = (f: str) => has(edits, f) ? edits[f] : guess.fields[f].value
+    let tell = (from_guess, from_edits) => {
+        if on_change != null {
+            on_change(reduce(contact_paste_fields, {}, (m, f) => set(m, f, has(from_edits, f) ? from_edits[f] : from_guess.fields[f].value)))
+        }
+    }
+    <section class={ui_cls(["ui-contactpaste", class])} aria-label="Contact from pasted text">
+        <div.ui-contactpaste-source>
+            <label.ui-contactpaste-label for={id}>{label}</label>
+            <textarea.ui-contactpaste-box id={id} value={paste} placeholder={placeholder} disabled={disabled} spellcheck="false" aria-describedby={ui_cls([hint != null && `${id}-hint`, `${id}-sum`])}
+                      @input={(e) => {
+                          paste = e.value
+                          tell(contact_paste_extract(e.value), edits)
+                      }}></textarea>
+            {hint != null && <p.ui-contactpaste-hint id={`${id}-hint`}>{hint}</p>}
+        </div>
+        <p.ui-contactpaste-sum id={`${id}-sum`} aria-live="polite">
+            <span>
+                {trim(paste) == "" ? "Nothing pasted yet." : found == 0 ? "Found nothing to fill in: is this a signature?" : `Found ${found} of ${len(contact_paste_fields)} details.`}
+                {guess.cut ? " Only the first 5,000 characters and 60 lines were read." : ""}
+            </span>
+            {(trim(paste) != "" || len(keys(edits)) > 0) && <button.ui-contactpaste-again type="button" @click={() => {
+                paste = ""
+                edits = {}
+                tell(contact_paste_extract(""), {})
+            }}>Start over</button>}
+        </p>
+        <div.ui-contactpaste-grid>
+            {for f in contact_paste_fields => <div key={f} data-field={f} class={ui_cls(["ui-contactpaste-field", !has(edits, f) && guess.fields[f].sure == "low" && "ui-contactpaste-low"])}>
+                <div.ui-contactpaste-head>
+                    <label.ui-contactpaste-label for={`${id}-${f}`}>{contact_paste_titles[f]}</label>
+                    {has(edits, f) ? <span.ui-contactpaste-tag data-sure="edited">Edited by you</span>
+                        : guess.fields[f].sure != null ? <span.ui-contactpaste-tag data-sure={guess.fields[f].sure}>{contact_paste_sure_words[guess.fields[f].sure]}</span>
+                        : null}
+                </div>
+                <input.ui-contactpaste-control id={`${id}-${f}`} name={prefix + f} type={f == "email" ? "email" : f == "phone" ? "tel" : "text"} value={value_of(f)} disabled={disabled}
+                       autocomplete="off" spellcheck="false" @input={(e) => {
+                           edits = set(edits, f, e.value)
+                           tell(guess, edits)
+                       }}/>
+                {has(edits, f) ? (guess.fields[f].value != "" && guess.fields[f].value != edits[f]
+                        ? <button.ui-contactpaste-use type="button" @click={() => {
+                            edits = remove(edits, f)
+                            tell(guess, edits)
+                        }}>Found {guess.fields[f].value}: use that</button> : null)
+                    : guess.fields[f].why != null ? <p.ui-contactpaste-why>{guess.fields[f].why}</p> : null}
+            </div>}
+        </div>
+    </section>
+}

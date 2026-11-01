@@ -1,0 +1,201 @@
+// ResumeRefresh: refreshes what is on the screen when someone comes back to the app after a
+// time, and leaves it alone if it is recent. The row at the top of the screen stays where
+// it was, even when new rows land above it, and a small notice says what happened.
+//
+//   import ui/resume_refresh.qwe use ResumeRefresh
+//
+//   component Feed(rows: list, at: int) {
+//       state list = rows
+//       let reload = () => {
+//           let fresh = load_feed()
+//           let added = len(fresh) - len(list)
+//           list = fresh
+//           { added }
+//       }
+//       <ResumeRefresh on_refresh={reload} refreshed_at={at}>
+//           {for r in list => <article key={r.id} data-key={r.id}>{r.title}</article>}
+//       </ResumeRefresh>
+//   }
+//
+// children: what it looks after. Give each row a data-key that stays with it. on_refresh():
+// loads, and may wait: false or an error value is a failure, and { added: n } makes the
+// notice say how many. after_ms: how old data may be before coming back refreshes it (300000).
+// refreshed_at: when the data was made, in milliseconds (when the page started).
+// notice_ms: how long the notice stays (4000). A failure stays until tried again. wait_ms:
+// how long a refresh may take (20000). id, class.
+//
+// It acts on returning to a visible page, on a page restored from the back-forward cache, and
+// on the connection coming back. On iOS the app's own server sleeps with the app, so the
+// first request on return can fail: a failure is tried once more, 800 ms later, before anyone
+// is told. If the person is at the very top nothing is held, so new rows are simply seen.
+// Scrolled down, the first row in view stays put to the pixel, in whichever box scrolls:
+// browsers without scroll anchoring, Safari among them, would let it jump.
+//
+// resume_refresh_plan(now_ms, last, after_ms, busy) says "refresh", "recent" or "busy".
+
+import ui/theme.qwe use ui_cls
+
+let resume_refresh_css = css`
+.ui-rsmr { position: relative; min-width: 0; }
+/* No height of its own, so showing the notice moves nothing under the finger. */
+.ui-rsmr-bar { position: sticky; z-index: 6; top: calc(8px + env(safe-area-inset-top)); display: flex; justify-content: center; height: 0; pointer-events: none; }
+.ui-rsmr-note { display: inline-flex; align-items: center; gap: 8px; box-sizing: border-box; max-width: calc(100% - 24px); min-height: 44px; padding: 4px 8px 4px 16px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow); font: 14px/1.3 var(--ui-font); pointer-events: auto; animation: ui-rsmr-in .18s ease-out; }
+.ui-rsmr-note:not(:has(button)) { padding-right: 16px; }
+.ui-rsmr-note[data-kind="failed"] { border-color: color-mix(in srgb, var(--ui-danger) 45%, var(--ui-border)); }
+.ui-rsmr-btn { flex: none; min-width: 44px; min-height: 44px; margin: -4px -4px -4px 0; padding: 0 12px; border: 0; border-radius: 999px; background: transparent; color: var(--ui-accent); font: 600 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-rsmr-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@keyframes ui-rsmr-in { from { transform: translateY(-10px); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .ui-rsmr-note { animation: none; } }
+`
+
+// What coming back should do.
+fn resume_refresh_plan(now_ms: int, last, after_ms: int, busy: bool) -> str {
+    if busy { return "busy" }
+    if last == null { return "refresh" }
+    let age = now_ms - last
+    // A clock moved back gives a negative age, and data of an unknown age is old.
+    age < 0 || age >= after_ms ? "refresh" : "recent"
+}
+
+fn resume_refresh_failed(r) -> bool = is_err(r) || r == false || (type_of(r) == "map" && r.ok == false)
+
+fn resume_refresh_words(r) -> map {
+    if resume_refresh_failed(r) { return { kind: "failed", text: "Could not update. This is what you had." } }
+    let added = type_of(r) == "map" && type_of(r.added) == "int" ? r.added : 0
+    if added == 1 { return { kind: "new", text: "1 new item" } }
+    added > 1 ? { kind: "new", text: `${added} new items` } : { kind: "updated", text: "Up to date" }
+}
+
+component ResumeRefresh(on_refresh = null, after_ms: int = 300000, refreshed_at: int? = null, notice_ms: int = 4000, wait_ms: int = 20000, id: str? = null, class: str? = null, children) {
+    style global resume_refresh_css
+    state box = null
+    state last = refreshed_at
+    state busy = false
+    state note = null
+    state again = false
+    state scroller = null
+    let call = () => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            js("AbortSignal.timeout", wait_ms).addEventListener("abort", (_e = null) => { done(err("no answer")) })
+            js("Promise.resolve", on_refresh()).then(done, (_e = null) => { done(err("failed")) })
+        }))
+    }
+    let frame = () => {
+        js("Promise.resolve", js_new("Promise", (done) => { js("requestAnimationFrame", (_t) => { done(true) }) }))
+    }
+    // What scrolls: the nearest box that does, or the page.
+    let find_scroller = () => {
+        let el = box.parentElement
+        let found = null
+        while el != null && found == null {
+            let over = js("getComputedStyle", el).overflowY
+            if (over == "auto" || over == "scroll") && el.scrollHeight > el.clientHeight {
+                found = el
+            }
+            el = el.parentElement
+        }
+        found ?? js("document").scrollingElement
+    }
+    let top_of = (s) => s.isSameNode(js("document").scrollingElement) ? 0 : s.getBoundingClientRect().top
+    // The first row in view and how far it sits from the top; null at the top, with nothing to hold.
+    let read_place = () => {
+        let s = find_scroller()
+        scroller = s
+        if s.scrollTop <= 0 { return null }
+        let top = top_of(s)
+        let rows = js("Array.from", box.querySelectorAll("[data-key]"))
+        let first = rows | find((r) => r.getBoundingClientRect().bottom > top)
+        first == null ? null : { key: first.getAttribute("data-key"), gap: first.getBoundingClientRect().top - top }
+    }
+    // The rows are drawn a moment after the data changes, and images may move them again, so
+    // the place is set each frame until it has held.
+    let hold = (place: map) => {
+        let steady = 0
+        let round_ = 0
+        while round_ < 30 && steady < 4 {
+            frame()
+            let rows = js("Array.from", box.querySelectorAll("[data-key]"))
+            let row = rows | find((r) => r.getAttribute("data-key") == place.key)
+            if row == null {
+                steady = 4
+            } else {
+                let off = row.getBoundingClientRect().top - top_of(scroller) - place.gap
+                if abs(off) > 0.5 {
+                    scroller.scrollTop = scroller.scrollTop + off
+                    steady = 0
+                } else {
+                    steady += 1
+                }
+            }
+            round_ += 1
+        }
+    }
+    let run = () => {
+        if !busy && on_refresh != null {
+            busy = true
+            let place = read_place()
+            let r = call()
+            if resume_refresh_failed(r) {
+                busy = false
+                again = true
+            } else {
+                last = now()
+                if place != null { hold(place) }
+                note = resume_refresh_words(r)
+                busy = false
+            }
+        }
+    }
+    // The second and last try before saying so.
+    if again {
+        every(800, () => {
+            again = false
+            busy = true
+            let place = read_place()
+            let r = call()
+            if !resume_refresh_failed(r) {
+                last = now()
+                if place != null { hold(place) }
+            }
+            note = resume_refresh_words(r)
+            busy = false
+        })
+    }
+    if note != null && note.kind != "failed" { every(notice_ms, () => { note = null }) }
+    let came_back = () => {
+        if resume_refresh_plan(now(), last, after_ms, busy) == "refresh" { run() }
+    }
+    <div class={ui_cls(["ui-rsmr", class])} id={id} data-busy={busy ? "" : null}
+         @mount={(el) => {
+             let w = js("window")
+             let d = js("document")
+             box = el
+             if last == null { last = now() }
+             let turned = (_e = null) => { if !d.hidden { came_back() } }
+             let shown = (e) => { if e.persisted == true { came_back() } }
+             let online = (_e = null) => { came_back() }
+             d.addEventListener("visibilitychange", turned)
+             w.addEventListener("pageshow", shown)
+             w.addEventListener("online", online)
+             () => {
+                 d.removeEventListener("visibilitychange", turned)
+                 w.removeEventListener("pageshow", shown)
+                 w.removeEventListener("online", online)
+             }
+         }}>
+        <div.ui-rsmr-bar role="status">
+            {note != null && <div.ui-rsmr-note data-kind={note.kind}>
+                <span>{note.text}</span>
+                {note.kind == "failed" && <button.ui-rsmr-btn type="button" @click={() => {
+                    note = null
+                    run()
+                }}>Try again</button>}
+                {note.kind == "new" && scroller != null && scroller.scrollTop > 0 && <button.ui-rsmr-btn type="button" @click={() => {
+                    scroller.scrollTop = 0
+                    note = null
+                }}>Show</button>}
+            </div>}
+        </div>
+        {children}
+    </div>
+}

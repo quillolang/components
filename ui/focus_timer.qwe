@@ -1,0 +1,528 @@
+// FocusTimer: sessions of work and rest, with a ring, a streak of days, and an end nobody can
+// miss. Time is kept as the moment the session ends, not as a count, so a phone that sleeps,
+// a tab the browser slows or an app the system suspends loses nothing: on coming back the
+// clock is right, and one that ended meanwhile is counted, with when it ended. The screen stays
+// on while it runs, through the app or the web's Wake Lock, which is taken again on coming
+// back, and it says when that cannot be done. The end is a sound, a buzz and a line on the
+// screen; when the app leaves the screen the phone itself is asked to alert at the end, and a
+// browser that allows it shows a notification. On a tablet, or a phone on its side, the
+// figures stand beside the ring, with the week.
+//
+//   component Work() {
+//       <FocusTimer today="2026-11-04" sessions={past} resume={saved}
+//                   on_session={(s) => { save_session(s) }} on_state={(s) => { save_state(s) }}/>
+//   }
+//
+// What must last is the program's to keep: localStorage comes back empty at each launch of a
+// phone app. Give past sessions as `sessions`, and what on_state last gave as `resume`.
+//
+// today: "YYYY-MM-DD"; left out, the server's when it renders. It moves on with the clock.
+// sessions: each { date, minutes } or a date, those done before. focus_minutes (25), break_minutes
+// (5), long_minutes (15): up to 600, and a fraction will do. rounds: focus sessions before the
+// long break (4). choices: the lengths offered before starting ([15, 25, 45, 60]). keep_awake:
+// the switch starts on (true). sound: a sound at the end (true). resume: what on_state gave. label: its
+// name for screen readers. class.
+// on_session(s): inside one of your components, a focus session was finished: { date, minutes,
+// started_at, ended_at }, those two in milliseconds, started_at null when it cannot be known. A
+// session stopped early does not count. on_state(s): at each start, pause and end: { phase, status,
+// ends_at, left, round, minutes }.
+//
+// quilloNative has no way to take a notification back, so one set as the app left the screen
+// still comes if the session is paused or stopped after; it says so.
+
+import ui/theme.qwe use ui_cls
+
+let focus_timer_css = css`
+.ui-focus-timer { container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-focus-timer-inner { display: grid; gap: 16px; justify-items: center; }
+.ui-focus-timer-main { display: grid; gap: 12px; justify-items: center; width: 100%; min-width: 0; }
+.ui-focus-timer-ring { position: relative; display: grid; place-items: center; width: min(72cqw, 280px); aspect-ratio: 1; }
+.ui-focus-timer-ring svg { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); }
+.ui-focus-timer-track, .ui-focus-timer-arc { fill: none; stroke-width: 7; }
+.ui-focus-timer-track { stroke: var(--ui-border); }
+.ui-focus-timer-arc { stroke: var(--ui-accent); stroke-linecap: round; transition: stroke-dashoffset .3s linear; }
+.ui-focus-timer[data-phase="break"] .ui-focus-timer-arc, .ui-focus-timer[data-phase="long"] .ui-focus-timer-arc { stroke: var(--ui-success); }
+.ui-focus-timer-mid { position: relative; display: grid; justify-items: center; gap: 2px; text-align: center; }
+.ui-focus-timer-phase { color: var(--ui-muted); font-size: 14px; font-weight: 600; }
+.ui-focus-timer-time { font-size: clamp(40px, 15cqw, 60px); font-weight: 600; line-height: 1.05; font-variant-numeric: tabular-nums; }
+.ui-focus-timer-round { color: var(--ui-muted); font-size: 13px; }
+.ui-focus-timer-keys { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; width: 100%; }
+.ui-focus-timer-go, .ui-focus-timer-off { min-width: 120px; min-height: 52px; padding: 0 20px; border: 0; border-radius: 999px; background: var(--ui-accent); color: var(--ui-accent-fg); font: 600 16px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.ui-focus-timer-off { min-width: 88px; border: 1px solid var(--ui-border); background: var(--ui-surface); color: var(--ui-fg); }
+.ui-focus-timer-times { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
+.ui-focus-timer-time-btn { min-width: 52px; min-height: 44px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-focus-timer-time-btn[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-focus-timer-say { width: 100%; margin: 0; color: var(--ui-muted); text-align: center; overflow-wrap: anywhere; }
+.ui-focus-timer-say:empty { display: none; }
+.ui-focus-timer-say[data-done] { padding: 10px 12px; border-radius: var(--ui-radius); background: var(--ui-success-soft); color: var(--ui-success); font-weight: 600; }
+.ui-focus-timer-side { display: grid; gap: 12px; width: 100%; min-width: 0; }
+.ui-focus-timer-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.ui-focus-timer-stat { padding: 8px; border-radius: var(--ui-radius); background: var(--ui-subtle); text-align: center; }
+.ui-focus-timer-stat dt { color: var(--ui-muted); font-size: 12px; }
+.ui-focus-timer-stat dd { margin: 0; font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-focus-timer-week { display: none; }
+.ui-focus-timer-row { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 52px; padding: 6px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: inherit; font: inherit; text-align: left; cursor: pointer; touch-action: manipulation; }
+.ui-focus-timer-row span:first-child { flex: 1; min-width: 0; }
+.ui-focus-timer-note { display: block; color: var(--ui-muted); font-size: 13px; }
+.ui-focus-timer-note[data-bad] { color: var(--ui-danger); }
+.ui-focus-timer-track-sw { position: relative; flex: none; width: 46px; height: 28px; border-radius: 999px; background: var(--ui-strong); transition: background .15s; }
+.ui-focus-timer-track-sw::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .25); transition: transform .15s; }
+.ui-focus-timer-row[aria-checked="true"] .ui-focus-timer-track-sw { background: var(--ui-accent); }
+.ui-focus-timer-row[aria-checked="true"] .ui-focus-timer-track-sw::after { transform: translateX(18px); }
+.ui-focus-timer-link { min-width: 44px; min-height: 44px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm); background: var(--ui-accent-soft); color: var(--ui-accent); font: 600 14px/1 var(--ui-font); cursor: pointer; }
+.ui-focus-timer-line { display: flex; align-items: center; gap: 10px; min-height: 44px; }
+.ui-focus-timer-line .ui-focus-timer-note { flex: 1; min-width: 0; }
+.ui-focus-timer :is(.ui-focus-timer-go, .ui-focus-timer-off, .ui-focus-timer-time-btn, .ui-focus-timer-row, .ui-focus-timer-link):focus-visible { outline: none; box-shadow: var(--ui-focus); }
+/* With the width, on a tablet or a phone on its side, the ring stands beside the figures, and the week shows. */
+@container (min-width: 560px) {
+  .ui-focus-timer-inner { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: center; gap: 24px; }
+  .ui-focus-timer-ring { width: min(38cqw, 300px); }
+  .ui-focus-timer-week { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; align-items: end; height: 96px; margin: 0; padding: 0; list-style: none; }
+  .ui-focus-timer-day { display: grid; grid-template-rows: 1fr auto; gap: 4px; height: 100%; color: var(--ui-muted); font-size: 12px; text-align: center; }
+  .ui-focus-timer-bar { align-self: end; min-height: 3px; border-radius: 3px 3px 0 0; background: var(--ui-accent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-focus-timer-arc, .ui-focus-timer-track-sw, .ui-focus-timer-track-sw::after { transition: none; }
+}
+`
+
+fn focus_timer_pad(n: int) -> str = n < 10 ? `0${n}` : str(n)
+
+// 25:00, 0:07, 1:05:00.
+fn focus_timer_clock(secs: num) -> str {
+    let all = int(max([secs, 0]))
+    let h = int(all / 3600)
+    let m = int((all % 3600) / 60)
+    let s = focus_timer_pad(all % 60)
+    h > 0 ? `${h}:${focus_timer_pad(m)}:${s}` : `${m}:${s}`
+}
+
+// A length in minutes that can be used, or the fallback.
+fn focus_timer_span(x, fallback: num) -> num = (type_of(x) == "int" || type_of(x) == "float") && x > 0 && x <= 600 ? x : fallback
+
+// Past sessions as { date, minutes }; plain dates count as 25 minutes, bad ones not at all.
+fn focus_timer_clean(sessions) -> list {
+    if type_of(sessions) != "list" { return [] }
+    let read = sessions | map((s) => {
+        let d = type_of(s) == "str" ? s : type_of(s) == "map" ? get(s, "date") : null
+        let m = type_of(s) == "map" ? get(s, "minutes") : null
+        type_of(d) == "str" && date.valid(d, "date") ? { date: d, minutes: focus_timer_span(m, 25) } : null
+    })
+    read | filter((s) => s != null)
+}
+
+// Days in a row with a session, ending today, or yesterday while today has none yet.
+fn focus_timer_streak(log: list, today: str) -> int {
+    let days = unique(log | map((s) => s.date))
+    let at = contains(days, today) ? today : date.add_days(today, -1)
+    let n = 0
+    while contains(days, at) && n < 3660 {
+        n += 1
+        at = date.add_days(at, -1)
+    }
+    n
+}
+
+// The longest run of days there has been.
+fn focus_timer_best(log: list) -> int {
+    let days = sort(unique(log | map((s) => s.date)))
+    let best = 0
+    let run = 0
+    let last = ""
+    for d in days {
+        run = last != "" && date.days_between(last, d) == 1 ? run + 1 : 1
+        if run > best { best = run }
+        last = d
+    }
+    best
+}
+
+fn focus_timer_on_day(log: list, day: str) -> list = log | filter((s) => s.date == day)
+
+fn focus_timer_sum(log: list) -> num = round(sum(log | map((s) => s.minutes)))
+
+// The seven days ending today, with their minutes and a height as a share of the fullest.
+fn focus_timer_week(log: list, today: str) -> list {
+    let days = range(-6, 1) | map((i) => date.add_days(today, i))
+    let mins = days | map((d) => sum(focus_timer_on_day(log, d) | map((s) => s.minutes)))
+    let top = max(mins + [1])
+    enumerate(days) | map((p) => ({ date: p[1], minutes: mins[p[0]], share: mins[p[0]] / top, name: date.format(p[1], "ddd") }))
+}
+
+// What follows a phase.
+fn focus_timer_next(phase: str, round: int, rounds: int) {
+    if phase != "focus" { return { phase: "focus", round: phase == "long" ? 1 : round + 1 } }
+    round >= rounds ? { phase: "long", round } : { phase: "break", round }
+}
+
+fn focus_timer_word(phase: str) -> str = match phase {
+    "break" => "Short break"
+    "long" => "Long break"
+    _ => "Focus"
+}
+
+fn focus_timer_days(n: int) -> str = n == 1 ? "1 day" : `${n} days`
+
+// What a saved state comes to at time t: null when there is none to use, and { over: true }
+// when it ended while nobody was there. A running end further off than its whole length is
+// a clock that changed, and starts from the whole again.
+fn focus_timer_restored(s, t: num) {
+    if type_of(s) != "map" { return null }
+    let status = get(s, "status")
+    let phase = contains(["focus", "break", "long"], get(s, "phase")) ? s.phase : "focus"
+    let mins = focus_timer_span(get(s, "minutes"), 25)
+    let whole = mins * 60000
+    let turn = type_of(get(s, "round")) == "int" && s.round >= 1 ? s.round : 1
+    if status == "paused" {
+        let left = get(s, "left")
+        let kept = (type_of(left) == "int" || type_of(left) == "float") && left > 0 ? min([left, whole]) : whole
+        return { phase, status, left: kept, ends_at: 0, round: turn, minutes: mins, over: false }
+    }
+    let end = get(s, "ends_at")
+    if status != "running" || (type_of(end) != "int" && type_of(end) != "float") { return null }
+    if end <= t { return { phase, status: "running", left: 0, ends_at: end, round: turn, minutes: mins, over: true } }
+    let rest = min([end - t, whole])
+    { phase, status: "running", left: rest, ends_at: t + rest, round: turn, minutes: mins, over: false }
+}
+
+component FocusTimer(today: str = "", sessions = [], focus_minutes: num = 25, break_minutes: num = 5, long_minutes: num = 15, rounds: int = 4, choices = [15, 25, 45, 60],
+                     keep_awake: bool = true, sound: bool = true, resume = null, label: str = "Focus timer", on_session = null, on_state = null, class: str? = null) {
+    style global focus_timer_css
+    state day = date.valid(today, "date") ? today : date.today()
+    state base_day = day
+    state base_clock = ""
+    state log = focus_timer_clean(sessions)
+    state phase = "focus"
+    state status = "idle"    // idle, running, paused
+    state mins = focus_timer_span(focus_minutes, 25)
+    state left = mins * 60000
+    state ends_at = 0
+    state started_at = null
+    state turn = 1
+    state keep = keep_awake
+    state awake = "off"      // off, on, away, none, refused
+    state lock = null
+    state alerts = "wait"    // wait, app, ask, on, blocked, none
+    state told = false       // the phone has an alert set for this end
+    state said = ""
+    state over = false       // said is the end of a session
+    state ctx = null
+    state win = null
+    let long_mins = focus_timer_span(long_minutes, 15)
+    let break_mins = focus_timer_span(break_minutes, 5)
+    let round_count = rounds >= 1 ? rounds : 4
+    let phase_mins = phase == "focus" ? mins : phase == "long" ? long_mins : break_mins
+    let whole = phase_mins * 60000
+    let share = whole > 0 ? max([0, min([1, left / whole])]) : 0
+    let streak = focus_timer_streak(log, day)
+    let best = focus_timer_best(log)
+    let on_today = focus_timer_on_day(log, day)
+    let week = focus_timer_week(log, day)
+    let offers = type_of(choices) == "list" ? choices | filter((c) => focus_timer_span(c, 0) > 0) : []
+    let main_word = status == "running" ? "Pause" : status == "paused" ? "Resume" : phase == "focus" ? "Start" : "Start break"
+    let other_word = status != "idle" ? "Stop" : phase != "focus" ? "Skip break" : ""
+    let awake_words = match awake {
+        "on" => "The screen stays on."
+        "away" => "It will hold the screen again on coming back."
+        "none" => "This browser cannot hold the screen on, so it will dim as usual."
+        "refused" => "The system refused. Low Power Mode can do this."
+        _ => "While a session runs."
+    }
+    let alert_words = match alerts {
+        "app" => "The phone will alert you at the end if the app is away."
+        "on" => "A notification will come at the end if this page is away."
+        "ask" => "Allow notifications to hear of the end while this page is away."
+        "blocked" => "Notifications are blocked. The end shows here when you come back."
+        "refused" => "Notifications are off for this app. The end shows here when you come back."
+        "none" => "No notifications here. The end shows when you come back."
+        _ => ""
+    }
+    let share_state = () => {
+        on_state && on_state({ phase, status, ends_at, left, round: turn, minutes: phase_mins })
+    }
+    // The day a moment falls on, counted from `today`, so a `today` given as a prop keeps its place.
+    let day_of = (ms: num) => {
+        let t = js_new("Date", ms)
+        let here = date.of(t.getFullYear(), t.getMonth() + 1, t.getDate())
+        date.add_days(base_day, date.days_between(base_clock, here))
+    }
+    let let_screen_go = () => {
+        if lock != null {
+            let l = lock
+            lock = null
+            l.release()
+        }
+        if win.quilloNative != null { js("quilloNative.keepAwake", false) }
+        if awake == "on" || awake == "away" { awake = "off" }
+    }
+    let hold_screen = () => {
+        if !keep {
+            awake = "off"
+        } else if win.quilloNative != null {
+            let r = js("quilloNative.keepAwake", true)
+            awake = is_err(r) ? "refused" : "on"
+        } else if win.navigator.wakeLock == null {
+            awake = "none"
+        } else {
+            let got = js("navigator.wakeLock.request", "screen")
+            if is_err(got) {
+                awake = "refused"
+            } else if status != "running" || !keep {
+                got.release()
+            } else {
+                lock = got
+                awake = "on"
+                got.addEventListener("release", (_e = null) => {
+                    // Let go by us clears `lock` first; this is the browser, as the page left.
+                    if lock != null {
+                        lock = null
+                        if status == "running" { awake = "away" }
+                    }
+                })
+            }
+        }
+    }
+    let wake_sound = () => {
+        if sound && ctx == null && win.AudioContext != null {
+            // From the tap: both systems start sound only from one.
+            let c = js("Promise.resolve", js_new("Promise", (done) => { done(js_new("AudioContext")) }))
+            if !is_err(c) { ctx = c }
+        }
+        if ctx != null { ctx.resume() }
+    }
+    let bell = () => {
+        if ctx != null {
+            let t0 = ctx.currentTime
+            for i in range(0, 3) {
+                let osc = ctx.createOscillator()
+                let vol = ctx.createGain()
+                osc.frequency.value = 880
+                vol.gain.value = 0.2
+                osc.connect(vol)
+                vol.connect(ctx.destination)
+                osc.start(t0 + i * 0.3)
+                osc.stop(t0 + i * 0.3 + 0.18)
+            }
+        }
+    }
+    let buzz = () => {
+        if win.quilloNative != null {
+            js("quilloNative.haptic", "success")
+        } else if win.navigator.vibrate != null {
+            win.navigator.vibrate([200, 100, 200])
+        }
+    }
+    let tell_browser = (text: str) => {
+        if alerts == "on" && js("document.visibilityState") == "hidden" {
+            // Android's browsers refuse this and want a service worker; the screen says it all the same.
+            js("Promise.resolve", js_new("Promise", (done) => { done(js_new("Notification", focus_timer_word(phase), { body: text })) }))
+        }
+    }
+    let finish = (end: num) => {
+        let was = phase
+        let done_mins = phase_mins
+        let began = started_at
+        let next = focus_timer_next(was, turn, round_count)
+        status = "idle"
+        told = false
+        phase = next.phase
+        turn = next.round
+        left = (next.phase == "focus" ? mins : next.phase == "long" ? long_mins : break_mins) * 60000
+        ends_at = 0
+        started_at = null
+        let t = js("Date.now")
+        let late = t - end
+        let ended = js_new("Date", end)
+        let at = `${ended.getHours()}:${focus_timer_pad(ended.getMinutes())}`
+        let on = day_of(end)
+        let text = was == "focus" ? (next.phase == "long" ? "Session done. Time for a long break." : "Session done. Time for a break.") : "Break over. Ready when you are."
+        over = true
+        said = late >= 5000 ? `${text} It ended at ${at}, while you were away.` : text
+        let_screen_go()
+        let s = { date: on, minutes: done_mins, started_at: began, ended_at: end }
+        if was == "focus" { log = log + [{ date: on, minutes: done_mins }] }
+        if late < 5000 {
+            bell()
+            buzz()
+            tell_browser(text)
+        }
+        if was == "focus" { on_session && on_session(s) }
+        share_state()
+    }
+    let tick = () => {
+        let t = js("Date.now")
+        if status == "running" {
+            let rest = ends_at - t
+            if rest <= 0 {
+                left = 0
+                finish(ends_at)
+            } else {
+                left = rest
+            }
+        }
+    }
+    let begin = () => {
+        wake_sound()
+        let t = js("Date.now")
+        said = ""
+        over = false
+        if started_at == null { started_at = t }
+        ends_at = t + left
+        status = "running"
+        told = false
+        share_state()
+        hold_screen()
+    }
+    let pause = () => {
+        let t = js("Date.now")
+        left = max([ends_at - t, 1])
+        status = "paused"
+        said = told ? "The alert the phone was given cannot be taken back, so it will still come." : ""
+        told = false
+        let_screen_go()
+        share_state()
+    }
+    let stop = () => {
+        let was_told = told
+        status = "idle"
+        told = false
+        left = whole
+        ends_at = 0
+        started_at = null
+        over = false
+        said = was_told ? "Stopped, and not counted. The alert the phone was given will still come." : "Stopped, and not counted."
+        let_screen_go()
+        share_state()
+    }
+    let skip = () => {
+        let next = focus_timer_next(phase, turn, round_count)
+        phase = next.phase
+        turn = next.round
+        left = mins * 60000
+        said = ""
+        over = false
+        share_state()
+    }
+    // The app goes to sleep with the page, so the phone is told while there is still time.
+    let tell_phone = () => {
+        if win.quilloNative != null && !told && status == "running" {
+            let secs = max([1, int(ceil((ends_at - js("Date.now")) / 1000))])
+            let text = phase == "focus" ? "Session done. Time for a break." : "Break over. Ready when you are."
+            let r = js("quilloNative.notify", focus_timer_word(phase), text, secs)
+            if is_err(r) { alerts = "refused" } else { told = true }
+        }
+    }
+    let come_back = (_e = null) => {
+        let shown = js("document.visibilityState") == "visible"
+        if status == "running" {
+            if !shown { tell_phone() }
+            tick()
+            if shown && status == "running" && lock == null && keep { hold_screen() }
+        }
+        if shown {
+            let t = js_new("Date")
+            let here = date.of(t.getFullYear(), t.getMonth() + 1, t.getDate())
+            day = date.add_days(base_day, date.days_between(base_clock, here))
+        }
+    }
+    if status == "running" { every(250, tick) }
+    <section class={ui_cls(["ui-focus-timer", class])} aria-label={label} data-phase={phase}
+             @mount={(_el) => {
+                 // Asked first: nothing here may run with the state half set.
+                 let w = js("window")
+                 let d = js("document")
+                 let t0 = js("Date.now")
+                 let t = js_new("Date")
+                 let clock_day = date.of(t.getFullYear(), t.getMonth() + 1, t.getDate())
+                 let perm = js("Notification.permission")
+                 win = w
+                 base_clock = clock_day
+                 alerts = w.quilloNative != null ? "app" : is_err(perm) ? "none" : perm == "granted" ? "on" : perm == "denied" ? "blocked" : "ask"
+                 d.addEventListener("visibilitychange", come_back)
+                 w.addEventListener("pageshow", come_back)
+                 w.addEventListener("focus", come_back)
+                 let saved = focus_timer_restored(resume, t0)
+                 if saved != null {
+                     phase = saved.phase
+                     turn = saved.round
+                     if saved.phase == "focus" { mins = saved.minutes }
+                     left = saved.left
+                     ends_at = saved.ends_at
+                     status = saved.status
+                     if saved.over { finish(saved.ends_at) } else if saved.status == "running" { hold_screen() }
+                 }
+                 () => {
+                     d.removeEventListener("visibilitychange", come_back)
+                     w.removeEventListener("pageshow", come_back)
+                     w.removeEventListener("focus", come_back)
+                     let_screen_go()
+                 }
+             }}>
+        <div.ui-focus-timer-inner>
+            <div.ui-focus-timer-main>
+                <div.ui-focus-timer-ring>
+                    <svg viewBox="0 0 200 200" aria-hidden="true">
+                        <circle.ui-focus-timer-track cx="100" cy="100" r="92"/>
+                        <circle.ui-focus-timer-arc cx="100" cy="100" r="92" pathLength="100" stroke-dasharray="100" stroke-dashoffset={100 - share * 100}/>
+                    </svg>
+                    <div.ui-focus-timer-mid>
+                        <span.ui-focus-timer-phase>{focus_timer_word(phase)}</span>
+                        <span.ui-focus-timer-time role="timer" aria-label={`${focus_timer_clock(ceil(left / 1000))} left`}>{focus_timer_clock(ceil(left / 1000))}</span>
+                        <span.ui-focus-timer-round>Round {turn} of {round_count}</span>
+                    </div>
+                </div>
+                <div.ui-focus-timer-keys>
+                    <button.ui-focus-timer-go type="button"
+                            @click={() => {
+                                if status == "running" { pause() } else { begin() }
+                            }}>{main_word}</button>
+                    {other_word != "" && <button.ui-focus-timer-off type="button"
+                            @click={() => {
+                                if status == "idle" { skip() } else { stop() }
+                            }}>{other_word}</button>}
+                </div>
+                {status == "idle" && phase == "focus" && len(offers) > 0 && <div.ui-focus-timer-times role="group" aria-label="Length of a session">
+                    {for c in offers => <button.ui-focus-timer-time-btn type="button" key={str(c)} aria-pressed={c == mins ? "true" : "false"}
+                            aria-label={`${c} minutes`}
+                            @click={() => {
+                                mins = c
+                                left = c * 60000
+                            }}>{c}</button>}
+                </div>}
+                <p.ui-focus-timer-say role="status" data-done={over ? "" : null}>{said}</p>
+            </div>
+            <div.ui-focus-timer-side>
+                <dl.ui-focus-timer-stats>
+                    <div.ui-focus-timer-stat><dt>Streak</dt><dd>{focus_timer_days(streak)}</dd></div>
+                    <div.ui-focus-timer-stat><dt>Today</dt><dd>{focus_timer_sum(on_today)} min</dd></div>
+                    <div.ui-focus-timer-stat><dt>Best</dt><dd>{focus_timer_days(best)}</dd></div>
+                </dl>
+                <ul.ui-focus-timer-week aria-label="The last seven days">
+                    {for d in week => <li.ui-focus-timer-day key={d.date} aria-label={`${d.name}: ${round(d.minutes)} minutes`}>
+                        <span.ui-focus-timer-bar style={`height: ${round(d.share * 100)}%`}></span>
+                        <span aria-hidden="true">{d.name}</span>
+                    </li>}
+                </ul>
+                <button.ui-focus-timer-row type="button" role="switch" aria-checked={keep ? "true" : "false"}
+                        @click={() => {
+                            keep = !keep
+                            if !keep { let_screen_go() } else if status == "running" { hold_screen() }
+                        }}>
+                    <span>Keep the screen on
+                        <span.ui-focus-timer-note data-bad={awake == "none" || awake == "refused" ? "" : null}>{awake_words}</span>
+                    </span>
+                    <span.ui-focus-timer-track-sw aria-hidden="true"></span>
+                </button>
+                <div.ui-focus-timer-line>
+                    <span.ui-focus-timer-note>{alert_words}</span>
+                    {alerts == "ask" && <button.ui-focus-timer-link type="button"
+                            @click={() => {
+                                let a = js("Notification.requestPermission")
+                                alerts = !is_err(a) && a == "granted" ? "on" : !is_err(a) && a == "denied" ? "blocked" : "ask"
+                            }}>Allow</button>}
+                    {alerts == "refused" && <button.ui-focus-timer-link type="button" @click={() => { js("quilloNative.openSettings") }}>Settings</button>}
+                </div>
+            </div>
+        </div>
+    </section>
+}

@@ -1,0 +1,284 @@
+// SloCalculator: from a reliability target and a window, how much failure is allowed
+// and how much is left. It gives the downtime the target allows (in the window, a
+// week and a day), the error budget left after the bad minutes or bad events so far,
+// the burn rate (how many times faster than the target allows the budget is going),
+// when the budget runs out if that goes on, and the thresholds of a multi-window burn
+// rule: alert when both a long and a short window burn past a rate worked out from
+// the share of the budget that may go in the long window. All of it is exact decimal
+// arithmetic, rounded only to show.
+//
+//   <SloCalculator target="99.9" window_days={30} elapsed_days={10} bad={20}/>
+//   <SloCalculator target="99.95" measure="events" bad={1200} total={4000000} today="2026-11-01"
+//                  on_change={(f) => { burn = f.burn }}/>
+//
+// target: the target in percent (numbers or text, as all of these; 99.9). window_days:
+// the window's length in days (30). elapsed_days: days of it gone (left out, the burn
+// rate waits for it). measure: what is counted, "minutes" (the default) or "events".
+// bad: the bad minutes or events so far. total: all the events so far (events only).
+// today: the date the projection counts from ("2026-11-01"; left out, the browser's,
+// once it has started, so nothing about today is in the server's page). rules: the
+// burn rules, a list of { label, budget (percent of the budget), long_hours,
+// short_minutes }; left out, the Google SRE workbook's three (page at 2% in 1 hour and
+// 5 minutes, page at 5% in 6 hours and 30 minutes, ticket at 10% in 3 days and 6 hours).
+// title: its heading. id: a prefix for its ids, unique on the page. name: a prefix for
+// the fields' names (target, window_days, elapsed_days, measure, bad, total), which two
+// on one page need. on_change(figures): inside one of your components, given what
+// slo_calculator_figures gives, after each change that leaves good figures. class:
+// more classes for its outer element.
+//
+// slo_calculator_figures(target, window_days, elapsed_days, measure, bad, total) is the
+// arithmetic, for a program's own use, taking text or numbers: { allowed_minutes,
+// budget, used, left, left_amount, rate, burn, days_to_empty, status } as decimals
+// (fractions, not percent), or { field, error } saying what is wrong. status is "safe",
+// "burning", "empty" or "unknown". slo_calculator_rule(budget, window_days, rule) is one
+// burn rule's { burn, threshold, exhausts_days, problem }.
+
+import ui/theme.qwe use ui_cls
+
+let slo_calculator_css = css`
+.ui-slo-calc { display: grid; gap: 16px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-slo-calc .ui-slo-calc-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-slo-calc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px 14px; }
+.ui-slo-calc-field { display: grid; gap: 5px; min-width: 0; align-content: start; }
+.ui-slo-calc-field label, .ui-slo-calc-measure legend { font-size: 13px; font-weight: 500; }
+.ui-slo-calc-box { box-sizing: border-box; display: flex; align-items: center; gap: 6px; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-slo-calc-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-slo-calc-box input { flex: 1; width: 0; min-width: 0; height: 100%; padding: 0; border: 0; outline: none; background: transparent; color: var(--ui-fg);
+  font: 14px var(--ui-font); font-variant-numeric: tabular-nums; text-align: right; }
+.ui-slo-calc-box span { flex: none; color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-slo-calc-bad .ui-slo-calc-box { border-color: var(--ui-danger); }
+.ui-slo-calc-measure { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; margin: 0; padding: 0; border: 0; }
+.ui-slo-calc-measure legend { float: left; margin-right: 6px; padding: 0; }
+.ui-slo-calc-measure label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ui-slo-calc-measure input { margin: 0; accent-color: var(--ui-accent); }
+.ui-slo-calc-measure input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-slo-calc-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-slo-calc-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 0; }
+.ui-slo-calc-out > div { padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-slo-calc-out dt { color: var(--ui-muted); font-size: 12px; }
+.ui-slo-calc-out dd { margin: 2px 0 0; font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-slo-calc-out dd small { display: block; color: var(--ui-muted); font-size: 12px; font-weight: 400; }
+.ui-slo-calc-meter { position: relative; height: 8px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-slo-calc-meter span { position: absolute; inset: 0 auto 0 0; border-radius: 999px; background: var(--ui-success); }
+.ui-slo-calc-low .ui-slo-calc-meter span { background: var(--ui-warning); }
+.ui-slo-calc-empty .ui-slo-calc-meter span { background: var(--ui-danger); }
+.ui-slo-calc-say { margin: 0; padding: 10px 12px; border-left: 4px solid var(--ui-success); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-slo-calc-burning .ui-slo-calc-say { border-left-color: var(--ui-warning); }
+.ui-slo-calc-gone .ui-slo-calc-say { border-left-color: var(--ui-danger); }
+.ui-slo-calc-scroll { overflow-x: auto; }
+.ui-slo-calc-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-slo-calc table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-slo-calc caption { padding: 0 0 6px; text-align: left; font-weight: 600; }
+.ui-slo-calc th, .ui-slo-calc td { padding: 6px 8px; border-bottom: 1px solid var(--ui-border); text-align: right; white-space: nowrap; }
+.ui-slo-calc th:first-child, .ui-slo-calc td:first-child { text-align: left; }
+.ui-slo-calc thead th { color: var(--ui-muted); font-weight: 500; }
+.ui-slo-calc-problem { color: var(--ui-warning); white-space: normal; text-align: left; }
+.ui-slo-calc td.ui-slo-calc-problem { text-align: left; }
+.ui-slo-calc-rule-note { margin: 6px 0 0; color: var(--ui-muted); font-size: 12px; }
+`
+
+let slo_calculator_default_rules = [
+    { label: "Page", budget: "2", long_hours: 1, short_minutes: 5 },
+    { label: "Page", budget: "5", long_hours: 6, short_minutes: 30 },
+    { label: "Ticket", budget: "10", long_hours: 72, short_minutes: 360 },
+]
+
+// Text or a number as a decimal: null when empty, an error value when it is not one
+// or is past what the sums can hold, as the sums multiply it by thousands.
+fn slo_calculator_read(x) {
+    if x == null { return null }
+    let t = trim(replace(str(x), ",", ""))
+    if t == "" { return null }
+    if !re.test(t, "^[-+]?(\\d{1,15}(\\.\\d{0,12})?|\\.\\d{1,12})$") { return err("not a number") }
+    dec(t)
+}
+
+// A decimal to `places` places at most, without zeros at the end: "14.4", "3".
+fn slo_calculator_num(d, places: int) -> str {
+    let s = str(round(d, places, "half_up"))
+    contains(s, ".") ? re.replace(s, "\\.?0+$", "") : s
+}
+
+fn slo_calculator_pct(fraction, places: int = 2) -> str = `${slo_calculator_num(fraction * 100, places)}%`
+
+fn slo_calculator_grouped(d, places: int = 2) -> str {
+    let t = slo_calculator_num(d, places)
+    let at = index_of(t, ".")
+    let places_left = at == null ? 0 : len(t) - at - 1
+    format_number(dec(t), "en-US", places_left)
+}
+
+// Minutes in words, to the second, the three largest units at most: "43 min 12 s",
+// "3 days 2 h". Less than half a second says so, rather than a false zero.
+fn slo_calculator_duration(minutes) -> str {
+    let neg = minutes < 0
+    let total = int(round(abs(minutes) * 60, 0, "half_up"))
+    if total == 0 { return minutes == 0 ? "0 s" : "under a second" }
+    let d = floor(total / 86400)
+    let h = floor((total % 86400) / 3600)
+    let m = floor((total % 3600) / 60)
+    let s = total % 60
+    let parts = [d > 0 ? `${d} ${d == 1 ? "day" : "days"}` : null, h > 0 ? `${h} h` : null, m > 0 ? `${m} min` : null, s > 0 ? `${s} s` : null]
+    let text = join(take(parts | filter((p) => p != null), 3), " ")
+    neg ? `minus ${text}` : text
+}
+
+// The figures, or { field, error }. See the top of the file.
+fn slo_calculator_figures(target, window_days, elapsed_days, measure: str, bad, total = null) -> map {
+    let tv = slo_calculator_read(target)
+    let wv = slo_calculator_read(window_days)
+    let ev = slo_calculator_read(elapsed_days)
+    let bv = slo_calculator_read(bad)
+    let av = slo_calculator_read(total)
+    let events = measure == "events"
+    let no = (field: str, error: str) => { field, error }
+    if tv == null || is_err(tv) { return no("target", "The target must be a number, such as 99.9.") }
+    if tv >= 100 { return no("target", "A target of 100% allows no failure at all, so there is no budget to work out.") }
+    if tv <= 0 { return no("target", "The target must be above 0%.") }
+    if wv == null || is_err(wv) || wv <= 0 { return no("window", "The window must be a number of days above 0.") }
+    if wv > 3660 { return no("window", "The window is limited to 3660 days, about ten years.") }
+    if is_err(ev) || (ev != null && ev < 0) { return no("elapsed", "Days elapsed must be a number of 0 or more.") }
+    if ev != null && ev > wv { return no("elapsed", `Days elapsed cannot be more than the ${str(wv)} day window.`) }
+    if is_err(bv) || (bv != null && bv < 0) { return no("bad", `Bad ${events ? "events" : "minutes"} must be a number of 0 or more.`) }
+    if is_err(av) || (av != null && av < 0) { return no("total", "All events must be a number of 0 or more.") }
+    let spent = bv ?? 0m
+    if !events && ev != null && spent > ev * 1440 { return no("bad", `${str(spent)} bad minutes is more than the ${str(ev * 1440)} minutes elapsed.`) }
+    if events && spent > (av ?? 0m) { return no("bad", `${str(spent)} bad events is more than the ${str(av ?? 0m)} events in all.`) }
+    let budget = (100m - tv) / 100
+    let allowed_minutes = wv * 1440 * budget
+    let seen = events ? (av ?? 0m) : (ev == null ? null : ev * 1440)
+    let rate = seen == null || seen == 0 ? null : spent / seen
+    let burn = rate == null ? null : rate / budget
+    // Events are spent against what the whole window will carry, at today's traffic.
+    let allowed_amount = events ? (ev != null && ev > 0 && av != null ? av * wv / ev * budget : null) : allowed_minutes
+    let used = allowed_amount == null ? null : (allowed_amount == 0 ? null : spent / allowed_amount)
+    let left = used == null ? null : 1m - used
+    let left_amount = allowed_amount == null ? null : allowed_amount - spent
+    let days_to_empty = burn == null || used == null || burn <= 1 || used >= 1 ? null : (1m - used) * wv / burn
+    let status = used == null || burn == null ? "unknown" : (used >= 1 ? "empty" : (burn > 1 ? "burning" : "safe"))
+    { budget, allowed_minutes, allowed_amount, used, left, left_amount, rate, burn, days_to_empty, status, spent,
+      window_days: wv, elapsed_days: ev, events }
+}
+
+// One burn rule on a budget (a fraction): the burn rate that spends `rule.budget`
+// percent of it in the long window, that as an error rate, how long a whole budget
+// lasts at it, and what makes the rule useless, if anything.
+fn slo_calculator_rule(budget, window_days, rule: map) -> map {
+    let share = dec(str(rule.budget)) / 100
+    let window_hours = window_days * 24
+    let long_hours = dec(str(rule.long_hours))
+    let burn = share * window_hours / long_hours
+    let threshold = burn * budget
+    let problem = long_hours > window_hours ? "Its long window is longer than the SLO window."
+        : (threshold > 1 ? "It needs over 100% errors, so it can never fire."
+        : (burn < 1 ? "It fires below a burn of 1, which the budget can bear." : null))
+    { label: rule.label, budget_share: share, long_hours, short_minutes: dec(str(rule.short_minutes)), burn, threshold, exhausts_days: window_days / burn, problem }
+}
+
+fn slo_calculator_hours(h) -> str = slo_calculator_duration(h * 60)
+
+// What the figures come to, in a sentence.
+fn slo_calculator_saying(f: map, day: str?) -> str {
+    if f.status == "unknown" {
+        return f.events ? "Enter days elapsed and all the events to see the burn rate." : "Enter days elapsed to see the burn rate."
+    }
+    if f.status == "empty" {
+        let over = 0m - f.left_amount
+        return `The budget is gone: overspent by ${f.events ? `${slo_calculator_grouped(over, 0)} events` : slo_calculator_duration(over)}.`
+    }
+    if f.status == "safe" {
+        return f.burn == 0 ? "Nothing spent yet: the budget is whole." : `At this rate the budget lasts the window, with ${slo_calculator_pct(1m - f.burn, 1)} of it to spare.`
+    }
+    let days = f.days_to_empty
+    let when = day != null ? `, around ${date.add_days(day, int(floor(days)))}` : ""
+    `At this rate the budget runs out in ${slo_calculator_duration(days * 1440)}${when}, before the window ends.`
+}
+
+view SloCalculatorField(id: str, name: str, label: str, value: str, unit: str, bad: bool, on_input, hint: str = "") =
+    <div class={ui_cls(["ui-slo-calc-field", bad && "ui-slo-calc-bad"])}>
+        <label for={id}>{label}</label>
+        <div.ui-slo-calc-box>
+            <input type="text" inputmode="decimal" id={id} name={name} value={value} placeholder={hint} autocomplete="off"
+                   aria-invalid={bad ? "true" : null} @input={on_input}/>
+            <span aria-hidden="true">{unit}</span>
+        </div>
+    </div>
+
+component SloCalculator(target = "99.9", window_days = 30, elapsed_days = null, measure: str = "minutes", bad = null, total = null,
+                        today: str? = null, rules = null, title: str = "SLO error budget", id: str = "slo-calculator", name: str? = null,
+                        on_change = null, class: str? = null) {
+    style global slo_calculator_css
+    state goal = str(target)
+    state days = str(window_days)
+    state gone = elapsed_days == null ? "" : str(elapsed_days)
+    state unit = measure == "events" ? "events" : "minutes"
+    state spent = bad == null ? "" : str(bad)
+    state all_events = total == null ? "" : str(total)
+    state day = today
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let f = slo_calculator_figures(goal, days, gone, unit, spent, all_events)
+    let good = f.error == null
+    let rows = good ? (rules ?? slo_calculator_default_rules) | map((r) => slo_calculator_rule(f.budget, f.window_days, r)) : []
+    let tell = () => {
+        let g = slo_calculator_figures(goal, days, gone, unit, spent, all_events)
+        if on_change != null && g.error == null { on_change(g) }
+    }
+    let width = good && f.left != null ? (f.left <= 0 ? "0" : (f.left >= 1 ? "100" : str(round(f.left * 100, 1, "half_up")))) : "100"
+    let tone = !good || f.status == "unknown" || f.status == "safe" ? null : (f.status == "empty" ? "ui-slo-calc-gone" : "ui-slo-calc-burning")
+    let meter = good && f.left != null && f.left <= 0 ? "ui-slo-calc-empty" : (good && f.left != null && f.left < 0.25m ? "ui-slo-calc-low" : null)
+    <section class={ui_cls(["ui-slo-calc", tone, meter, class])} aria-labelledby={`${id}-title`} @mount={() => { if day == null { day = date.today() } }}>
+        <h3.ui-slo-calc-title id={`${id}-title`}>{title}</h3>
+        <div.ui-slo-calc-grid>
+            <SloCalculatorField id={`${id}-target`} name={named("target")} label="Target" value={goal} unit="%" bad={f.field == "target"}
+                                on_input={(e) => { goal = e.value; tell() }}/>
+            <SloCalculatorField id={`${id}-window`} name={named("window_days")} label="Window" value={days} unit="days" bad={f.field == "window"}
+                                on_input={(e) => { days = e.value; tell() }}/>
+            <SloCalculatorField id={`${id}-elapsed`} name={named("elapsed_days")} label="Elapsed" value={gone} unit="days" bad={f.field == "elapsed"}
+                                on_input={(e) => { gone = e.value; tell() }}/>
+        </div>
+        <fieldset.ui-slo-calc-measure>
+            <legend>Counting</legend>
+            <label><input type="radio" name={named("measure")} value="minutes" checked={unit == "minutes"} @change={() => { unit = "minutes"; tell() }}/> Bad minutes</label>
+            <label><input type="radio" name={named("measure")} value="events" checked={unit == "events"} @change={() => { unit = "events"; tell() }}/> Bad events</label>
+        </fieldset>
+        <div.ui-slo-calc-grid>
+            <SloCalculatorField id={`${id}-bad`} name={named("bad")} label={unit == "events" ? "Bad events so far" : "Bad minutes so far"} value={spent}
+                                unit={unit == "events" ? "events" : "min"} bad={f.field == "bad"} hint="0" on_input={(e) => { spent = e.value; tell() }}/>
+            {unit == "events" && <SloCalculatorField id={`${id}-total`} name={named("total")} label="All events so far" value={all_events} unit="events"
+                                bad={f.field == "total"} hint="0" on_input={(e) => { all_events = e.value; tell() }}/>}
+        </div>
+        {!good && <p.ui-slo-calc-error role="alert">{f.error}</p>}
+        {good && <div.ui-slo-calc-grid aria-hidden="true"><div.ui-slo-calc-meter style={`grid-column: 1 / -1`}><span style={`width: ${width}%`}></span></div></div>}
+        {good && <dl.ui-slo-calc-out>
+            <div data-stat="allowed"><dt>Allowed downtime</dt><dd>{slo_calculator_duration(f.allowed_minutes)}<small>{`in ${str(f.window_days)} days at ${goal}%`}</small></dd></div>
+            <div data-stat="week"><dt>Per week</dt><dd>{slo_calculator_duration(f.budget * 10080)}</dd></div>
+            <div data-stat="day"><dt>Per day</dt><dd>{slo_calculator_duration(f.budget * 1440)}</dd></div>
+            <div data-stat="left"><dt>Budget left</dt><dd>{f.left == null ? "—" : slo_calculator_pct(f.left, 1)}
+                <small>{f.left_amount == null ? "needs elapsed days" : (f.events ? `${slo_calculator_grouped(f.left_amount, 0)} of ${slo_calculator_grouped(f.allowed_amount, 0)} events` : `${slo_calculator_duration(f.left_amount)} of it`)}</small></dd></div>
+            <div data-stat="burn"><dt>Burn rate</dt><dd>{f.burn == null ? "—" : slo_calculator_num(f.burn, 2)}<small>{f.rate == null ? "needs elapsed time" : `${slo_calculator_pct(f.rate, 4)} errors`}</small></dd></div>
+        </dl>}
+        {good && <p.ui-slo-calc-say aria-live="polite">{slo_calculator_saying(f, day)}</p>}
+        {good && <div.ui-slo-calc-scroll tabindex="0" role="region" aria-label="Burn rate alerts">
+            <table>
+                <caption>Multi-window burn rate alerts</caption>
+                <thead><tr><th scope="col">Alert</th><th scope="col">Budget</th><th scope="col">Long</th><th scope="col">Short</th><th scope="col">Burn rate</th><th scope="col">Errors above</th><th scope="col">Budget lasts</th></tr></thead>
+                <tbody>
+                    {for r in rows => <tr key={`${r.label}-${str(r.long_hours)}`}>
+                        <td>{r.label}</td>
+                        <td>{slo_calculator_pct(r.budget_share, 2)}</td>
+                        <td>{slo_calculator_hours(r.long_hours)}</td>
+                        <td>{slo_calculator_duration(r.short_minutes)}</td>
+                        <td>{slo_calculator_num(r.burn, 2)}</td>
+                        <td>{slo_calculator_pct(r.threshold, 4)}</td>
+                        <td>{slo_calculator_duration(r.exhausts_days * 1440)}</td>
+                    </tr>}
+                </tbody>
+            </table>
+            {for r in rows | filter((x) => x.problem != null) => <p.ui-slo-calc-rule-note key={`${r.label}-${str(r.long_hours)}`}>
+                <span.ui-slo-calc-problem>{`${r.label}, ${slo_calculator_hours(r.long_hours)}: ${r.problem}`}</span></p>}
+            <p.ui-slo-calc-rule-note>An alert fires when the error rate is above its figure over both the long and the short window.</p>
+        </div>}
+    </section>
+}

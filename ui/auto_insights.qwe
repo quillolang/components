@@ -1,0 +1,398 @@
+// AutoInsights: reads rows of data and says in plain sentences what stands out: the
+// highest and lowest, the biggest change over time, a share of the total, how
+// concentrated a column is, and columns that move together, strongest first. Each
+// thing it could say has a strength, from 0 to 100, and what falls short is left out,
+// so a table with nothing in it gets nothing said about it.
+//
+//   <AutoInsights rows={[{ region: "North", revenue: 1200 }, { region: "East", revenue: 9400 }]}/>
+//   <AutoInsights rows={orders} min_strength={60} limit={5} on_change={(found) => { top = found }}/>
+//
+// How strength is worked out. Highest and lowest: robust deviations from the median
+// (MAD), 14 points each, so about 3 deviations reach 40. Biggest change: the same on
+// the steps between dates. Share: how far the top item's share is from an even split,
+// 0 for even and 100 for all of it. Concentration: the same for the top fifth. Columns
+// that move together: Pearson's r, taken at the low end of its 95% interval, so that
+// few rows have to show more. Correlation says nothing about cause.
+//
+// What it looks at. A column is numbers when nine in ten of its values are, with
+// commas, currency signs or a % allowed (1,200.50 and $9 and 12%); dates, when all are
+// dates; a column called id or year, or counting 1, 2, 3, is not added up. The first
+// column of text names the rows, and rows sharing a name are added together, or
+// averaged where a sum means nothing (a rate, a score, a price). Totals are decimals,
+// so that they add up exactly. Only columns of positive amounts have shares.
+//
+// rows: a list of maps. The reader can paste over them, in the box named data: JSON (a
+// list of maps) or CSV with a line of headings, separated by commas, semicolons or
+// tabs. The first 2,000 rows and 20 columns of numbers are read, and 200,000
+// characters. min_strength: the weakest thing it says, 25, 40 or 60 (40), which the
+// reader can change, in the field named strength. limit: the most sentences (8). title:
+// the heading ("What stands out"). id: a prefix for its ids ("auto-insights"), unique on
+// the page. name: a prefix for the fields' names. on_change(found): inside one of
+// your components, given the list below after each change.
+//
+// auto_insights_read(text) gives { rows, problems }, and auto_insights_find(rows) gives
+// { insights, rows, numbers }, for a program's own use, each insight being
+// { kind, column, text, strength }, strongest first.
+
+import ui/theme.qwe use ui_cls
+
+let auto_insights_css = css`
+.ui-auto-insights { display: grid; gap: 12px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-auto-insights .ui-auto-insights-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-auto-insights-bar { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 8px 16px; }
+.ui-auto-insights-field { display: grid; gap: 4px; font-size: 13px; }
+.ui-auto-insights-field select { height: 34px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); }
+.ui-auto-insights-field select:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-auto-insights-seen { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-auto-insights-live { display: grid; gap: 8px; min-width: 0; }
+.ui-auto-insights-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-auto-insights-item { display: grid; grid-template-columns: minmax(0, 1fr) 76px; gap: 4px 14px; align-items: center; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-auto-insights-strength { display: grid; gap: 3px; color: var(--ui-muted); font-size: 11px; text-align: right; font-variant-numeric: tabular-nums; }
+.ui-auto-insights-track { display: block; height: 4px; border-radius: 2px; background: var(--ui-border); overflow: hidden; }
+.ui-auto-insights-fill { display: block; height: 100%; background: var(--ui-accent); }
+.ui-auto-insights-none { margin: 0; color: var(--ui-muted); }
+.ui-auto-insights-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-auto-insights-data summary { color: var(--ui-muted); font-size: 13px; cursor: pointer; }
+.ui-auto-insights-data summary:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-auto-insights-box { box-sizing: border-box; width: 100%; min-height: 120px; margin-top: 6px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.4 var(--ui-mono); resize: vertical; }
+.ui-auto-insights-box:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+`
+
+let auto_insights_row_cap = 2000
+let auto_insights_number_cap = 20
+let auto_insights_text_cap = 200000
+let auto_insights_bars = [{ value: 60, label: "Only the strongest" }, { value: 40, label: "What stands out" }, { value: 25, label: "A little more" }]
+
+// A number with commas and up to two decimals, in whole numbers so that the server
+// and the browser write the same text.
+fn auto_insights_num(v: num) -> str {
+    let units = round(abs(v) * 100)
+    let whole = floor(units / 100)
+    let frac = units - whole * 100
+    let tail = frac == 0 ? "" : (frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${frac < 10 ? "0" : ""}${frac}`)
+    `${v < 0 && units > 0 ? "-" : ""}${auto_insights_group(whole)}${tail}`
+}
+
+fn auto_insights_group(n: num) -> str {
+    if n < 1000 { return str(n) }
+    let rest = str(n % 1000)
+    `${auto_insights_group(floor(n / 1000))},${repeat("0", 3 - len(rest))}${rest}`
+}
+
+fn auto_insights_one(v: num) -> str {
+    let tenths = round(abs(v) * 10)
+    `${v < 0 && tenths > 0 ? "-" : ""}${auto_insights_group(floor(tenths / 10))}.${tenths % 10}`
+}
+
+fn auto_insights_pct(share: num) -> str = `${auto_insights_one(share * 100)}%`
+
+fn auto_insights_two(v: num) -> str {
+    let units = round(abs(v) * 100)
+    let frac = str(units % 100)
+    `${v < 0 && units > 0 ? "-" : ""}${floor(units / 100)}.${repeat("0", 2 - len(frac))}${frac}`
+}
+
+// A value as a float, from a number or text such as "$1,200.50" or "12%"; null when it is not one.
+fn auto_insights_number(v) {
+    let kind = type_of(v)
+    if kind == "int" || kind == "float" {
+        let f = float(v)
+        return math.isfinite(f) && abs(f) < 1000000000000000 ? f : null
+    }
+    if kind == "dec" { return float(v) }
+    if kind != "str" { return null }
+    let t = re.replace(trim(v), "[$€£¥₱,\\s%]", "")
+    re.test(t, "^[-+]?\\d{1,15}(\\.\\d{1,12})?$") ? float(dec(t)) : null
+}
+
+// A date as "YYYY-MM-DD" from a date or a date-time, else null.
+fn auto_insights_day(v) {
+    if type_of(v) != "str" { return null }
+    let t = slice(trim(v), 0, 10)
+    re.test(t, "^\\d{4}-\\d{2}-\\d{2}$") && date.valid(t, "date") ? t : null
+}
+
+fn auto_insights_blank(v) -> bool = v == null || (type_of(v) == "str" && trim(v) == "")
+
+// "ad_spend" as a sentence would say it.
+fn auto_insights_words(key: str) -> str = trim(re.replace(replace(replace(key, "_", " "), "-", " "), "\\s+", " "))
+
+fn auto_insights_capital(s: str) -> str = len(s) == 0 ? s : upper(slice(s, 0, 1)) + slice(s, 1, len(s))
+
+// Which of tab, semicolon and comma a line of headings is split by.
+fn auto_insights_sep(line: str) -> str {
+    let tally = (s: str) => len(split(line, s)) - 1
+    let tabs = tally("\t")
+    let semis = tally(";")
+    let commas = tally(",")
+    tabs > 0 && tabs >= commas && tabs >= semis ? "\t" : (semis > commas ? ";" : ",")
+}
+
+// CSV's rows, each a list of fields, as RFC 4180 reads them. The characters are split
+// out first: a string indexed by character costs its length each time.
+fn auto_insights_csv(text: str, sep: str) -> list {
+    let chars = split(text, "")
+    let rows = []
+    let row = []
+    let field = []
+    let quoted = false
+    let i = 0
+    let n = len(chars)
+    while i < n {
+        let c = chars[i]
+        if quoted {
+            if c == "\"" {
+                if i + 1 < n && chars[i + 1] == "\"" { field = push(field, c); i += 1 } else { quoted = false }
+            } else { field = push(field, c) }
+        } else if c == "\"" {
+            quoted = true
+        } else if c == sep {
+            row = push(row, join(field))
+            field = []
+        } else if c == "\n" {
+            rows = push(rows, push(row, join(field)))
+            row = []
+            field = []
+        } else if c != "\r" {
+            field = push(field, c)
+        }
+        i += 1
+    }
+    if len(field) > 0 || len(row) > 0 { rows = push(rows, push(row, join(field))) }
+    rows | filter((r) => !(len(r) == 1 && trim(r[0]) == ""))
+}
+
+// What was pasted to { rows, problems }. Nothing here throws.
+fn auto_insights_read(text: str) -> map {
+    let long = len(text) > auto_insights_text_cap
+    let t = trim(long ? slice(text, 0, auto_insights_text_cap) : text)
+    let cut = long ? [`Only the first ${auto_insights_group(auto_insights_text_cap)} characters are read.`] : []
+    if t == "" { return { rows: [], problems: cut } }
+    let head = t[0]
+    if head == "[" || head == "{" {
+        let v = json.parse(t)
+        if is_err(v) { return { rows: [], problems: ["That is not valid JSON: look for a missing comma, bracket or quote."] } }
+        if type_of(v) != "list" { return { rows: [], problems: ["The JSON must be a list of rows, such as [{\"a\": 1}]."] } }
+        let good = v | filter((r) => type_of(r) == "map")
+        let some = len(v) - len(good)
+        return { rows: good, problems: cut + (some > 0 ? [`${some} ${some == 1 ? "item is" : "items are"} not a row, so left out.`] : []) }
+    }
+    let table = auto_insights_csv(t, auto_insights_sep(split(t, "\n")[0]))
+    let names = table[0] | map((h) => trim(h))
+    if len(table) < 2 { return { rows: [], problems: cut } }
+    let body = slice(table, 1, len(table))
+    let fits = body | filter((r) => len(r) == len(names))
+    let misfits = len(body) - len(fits)
+    let where_bad = find(range(len(body)), (i) => len(body[i]) != len(names))
+    let rows = fits | map((r) => reduce(range(len(names)), {}, (m, i) => set(m, filled(names[i]) ?? `column ${i + 1}`, r[i])))
+    { rows, problems: cut + (misfits > 0 ? [`${misfits} ${misfits == 1 ? "row does" : "rows do"} not have ${len(names)} fields, so left out (first at row ${where_bad == null ? 0 : where_bad + 2}).`] : []) }
+}
+
+// What a column is, from its values: { key, title, kind, numbers }.
+fn auto_insights_column(key: str, values: list) -> map {
+    let present = values | filter((v) => !auto_insights_blank(v))
+    let numbers = values | map(auto_insights_number)
+    let counted = numbers | filter((n) => n != null)
+    let title = auto_insights_words(key)
+    let lower_name = lower(key)
+    let is_number = len(present) >= 3 && len(counted) >= 0.9 * len(present)
+    let is_date = len(present) >= 2 && all(present, (v) => auto_insights_day(v) != null)
+    let count_up = len(counted) >= 5 && all(range(1, len(counted)), (i) => counted[i] - counted[i - 1] == 1)
+    let id_like = re.test(lower_name, "(^|[_ -])(id|no|number|code)$") || count_up
+    let is_year = is_number && re.test(lower_name, "year") && all(counted, (n) => n == floor(n) && n >= 1000 && n <= 3000)
+    let kind = is_date ? "date" : (is_year ? "year" : (is_number ? (id_like ? "id" : "number") : "text"))
+    let rate_like = re.test(lower_name, "rate|percent|pct|ratio|avg|average|mean|median|score|rating|margin|share|price|age|index")
+        || any(present, (v) => type_of(v) == "str" && contains(v, "%"))
+    { key, title, kind, numbers, additive: !rate_like, values }
+}
+
+// A value's spread from its median: robust deviations, or null when the column is flat.
+fn auto_insights_scale(xs: list) {
+    let centre = stats.median(xs)
+    let gaps = xs | map((x) => abs(x - centre))
+    let mad = stats.median(gaps)
+    let scale = mad > 0 ? mad * 1.4826 : stats.mean(gaps) * 1.253314
+    { centre, scale }
+}
+
+fn auto_insights_strength(z: num) -> int = min([100, round(abs(z) * 14)])
+
+// One (label, value) for each name: rows sharing a name are added or averaged.
+fn auto_insights_gather(names: list, numbers: list, additive: bool) -> list {
+    let pairs = range(len(names)) | filter((i) => numbers[i] != null && names[i] != null) | map((i) => ({ label: names[i], value: numbers[i] }))
+    let groups = group_by(pairs, (p) => p.label)
+    if len(groups) == len(pairs) { return pairs }
+    for [label, members] in groups {
+        let all_of = members | map((m) => m.value)
+        { label, value: additive ? float(sum(all_of | map((v) => dec(v)))) : sum(all_of) / len(all_of) }
+    }
+}
+
+fn auto_insights_highs(col: map, items: list) -> list {
+    if len(items) < 4 { return [] }
+    let xs = items | map((p) => p.value)
+    let s = auto_insights_scale(xs)
+    if s.scale <= 0 { return [] }
+    let top = last(sort_by(items, (p) => p.value))
+    let bottom = first(sort_by(items, (p) => p.value))
+    let times = s.centre > 0 && top.value > s.centre ? `, ${auto_insights_one(top.value / s.centre)} times the median of ${auto_insights_num(s.centre)}` : `, against a median of ${auto_insights_num(s.centre)}`
+    [
+        { kind: "highest", column: col.key, strength: auto_insights_strength((top.value - s.centre) / s.scale),
+          text: `${top.label} has the highest ${col.title} at ${auto_insights_num(top.value)}${times}.` },
+        { kind: "lowest", column: col.key, strength: auto_insights_strength((bottom.value - s.centre) / s.scale),
+          text: `${bottom.label} has the lowest ${col.title} at ${auto_insights_num(bottom.value)}, against a median of ${auto_insights_num(s.centre)}.` },
+    ]
+}
+
+// Share of the total and concentration, for columns where a total means something.
+fn auto_insights_shares(col: map, items: list) -> list {
+    let n = len(items)
+    if !col.additive || n < 3 || any(items, (p) => p.value < 0) { return [] }
+    // In decimals, so that the total shown is the exact sum of what went in.
+    let exact = sum(items | map((p) => dec(p.value)))
+    if exact <= 0 { return [] }
+    let total = float(exact)
+    let ranked = reverse(sort_by(items, (p) => p.value))
+    let top = ranked[0]
+    let share = top.value / total
+    let even = 1 / n
+    let one = [{ kind: "share", column: col.key, strength: round((share - even) / (1 - even) * 100),
+                 text: `${top.label} is ${auto_insights_pct(share)} of total ${col.title} (${auto_insights_num(top.value)} of ${auto_insights_num(total)}).` }]
+    let k = ceil(n * 0.2)
+    if n < 6 || k < 2 { return one }
+    let held = sum(slice(ranked, 0, k) | map((p) => p.value)) / total
+    let base = k / n
+    one + [{ kind: "concentration", column: col.key, strength: round((held - base) / (1 - base) * 100),
+             text: `The top ${k} of ${n} hold ${auto_insights_pct(held)} of ${col.title}.` }]
+}
+
+// The biggest step between dates, measured against the usual step.
+fn auto_insights_change(col: map, timed: list) -> list {
+    if len(timed) < 5 { return [] }
+    let steps = for i in range(1, len(timed)) => { from: timed[i - 1], to: timed[i], by: timed[i].value - timed[i - 1].value }
+    let s = auto_insights_scale(steps | map((p) => p.by))
+    if s.scale <= 0 { return [] }
+    let big = last(sort_by(steps, (p) => abs(p.by - s.centre)))
+    let way = big.by >= 0 ? "rose" : "fell"
+    let pct = big.from.value == 0 ? "" : ` ${auto_insights_pct(abs(big.by / big.from.value))}`
+    [{ kind: "change", column: col.key, strength: auto_insights_strength((big.by - s.centre) / s.scale),
+       text: `${auto_insights_capital(col.title)} ${way}${pct} from ${big.from.label} to ${big.to.label} (${auto_insights_num(big.from.value)} to ${auto_insights_num(big.to.value)}), its biggest move.` }]
+}
+
+// Pearson's r over the rows where both are there, or null when one does not vary.
+fn auto_insights_r(a: list, b: list) {
+    let both = range(len(a)) | filter((i) => a[i] != null && b[i] != null)
+    let n = len(both)
+    if n < 6 { return null }
+    let xs = both | map((i) => a[i])
+    let ys = both | map((i) => b[i])
+    let mx = sum(xs) / n
+    let my = sum(ys) / n
+    let dx = xs | map((x) => x - mx)
+    let dy = ys | map((y) => y - my)
+    let sxx = vec.dot(dx, dx)
+    let syy = vec.dot(dy, dy)
+    if sxx <= 0 || syy <= 0 { return null }
+    { r: vec.dot(dx, dy) / sqrt(sxx * syy), n }
+}
+
+fn auto_insights_pairs(numbers: list) -> list {
+    let found = []
+    for i in range(len(numbers)) {
+        for j in range(i + 1, len(numbers)) {
+            let c = auto_insights_r(numbers[i].numbers, numbers[j].numbers)
+            if c != null {
+                // The low end of r's 95% interval, by Fisher's z: few rows must show more.
+                let z = math.atanh(min([abs(c.r), 0.999999])) - 1.96 / sqrt(c.n - 3)
+                let low = z <= 0 ? 0 : math.tanh(z)
+                let how = c.r > 0 ? "move together" : "move in opposite directions"
+                found = push(found, { kind: "correlated", column: `${numbers[i].key}, ${numbers[j].key}`, strength: round(low * 100),
+                                      text: `${auto_insights_capital(numbers[i].title)} and ${numbers[j].title} ${how} (r = ${auto_insights_two(c.r)} across ${c.n} rows).` })
+            }
+        }
+    }
+    found
+}
+
+fn auto_insights_find(rows_in: list) -> map {
+    let rows = slice(rows_in | filter((r) => type_of(r) == "map"), 0, auto_insights_row_cap)
+    if len(rows) == 0 { return { insights: [], rows: 0, numbers: 0 } }
+    let names = unique(flatten(rows | map((r) => keys(r))))
+    let cols = names | map((k) => auto_insights_column(k, rows | map((r) => r[k])))
+    let numbers = slice(cols | filter((c) => c.kind == "number"), 0, auto_insights_number_cap)
+    let label_col = find(cols, (c) => c.kind == "text")
+    let time_col = find(cols, (c) => c.kind == "date" || c.kind == "year")
+    let time_key = (i: int) => time_col == null ? null : (time_col.kind == "date" ? auto_insights_day(time_col.values[i]) : str(time_col.numbers[i]))
+    let time_keys = range(len(rows)) | map(time_key)
+    let date_label = (k) => time_col != null && time_col.kind == "date" && k != null ? date.format(k, "D MMM YYYY") : k
+    let label_at = (i: int) => {
+        if label_col != null { return filled(trim(str(label_col.values[i] ?? ""))) }
+        time_col != null ? date_label(time_keys[i]) : `Row ${i + 1}`
+    }
+    let labels = range(len(rows)) | map(label_at)
+    let each = numbers | map((col) => {
+        let items = auto_insights_gather(labels, col.numbers, col.additive)
+        let timed = time_col == null ? [] : sort_by(auto_insights_gather(time_keys, col.numbers, col.additive), (p) => p.label)
+            | map((p) => ({ label: date_label(p.label), value: p.value }))
+        auto_insights_highs(col, items) + auto_insights_shares(col, items) + auto_insights_change(col, timed)
+    })
+    let all_found = flatten(each) + auto_insights_pairs(numbers)
+    { insights: reverse(sort_by(reverse(all_found), (f) => f.strength)), rows: len(rows), numbers: len(numbers), more_rows: len(rows_in) - len(rows) }
+}
+
+fn auto_insights_kind(kind: str) -> str = match kind {
+    "highest" => "Highest"
+    "lowest" => "Lowest"
+    "share" => "Share of total"
+    "concentration" => "Concentration"
+    "change" => "Biggest change"
+    _ => "Moves together"
+}
+
+component AutoInsights(rows: list = [], min_strength: int = 40, limit: int = 8, title: str = "What stands out", id: str = "auto-insights", name: str? = null, on_change = null, class: str? = null) {
+    style global auto_insights_css
+    state text = len(rows) == 0 ? "" : json.stringify(rows)
+    state bar = str(min_strength == 60 || min_strength == 25 ? min_strength : 40)
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let read = auto_insights_read(text)
+    let found = auto_insights_find(read.rows)
+    let enough = found.rows >= 3 && found.numbers >= 1
+    let shown = slice(found.insights | filter((f) => f.strength >= int(bar)), 0, limit)
+    let tell = () => {
+        if on_change != null {
+            on_change(slice(auto_insights_find(auto_insights_read(text).rows).insights | filter((f) => f.strength >= int(bar)), 0, limit))
+        }
+    }
+    <section class={ui_cls(["ui-auto-insights", class])} aria-labelledby={`${id}-title`}>
+        <div.ui-auto-insights-bar>
+            <h3.ui-auto-insights-title id={`${id}-title`}>{title}</h3>
+            <label.ui-auto-insights-field for={`${id}-strength`}>Say
+                <select id={`${id}-strength`} name={named("strength")} @change={(e) => { bar = e.value; tell() }}>
+                    {for b in auto_insights_bars => <option value={b.value} selected={str(b.value) == bar}>{b.label}</option>}
+                </select></label>
+        </div>
+        <div.ui-auto-insights-live aria-live="polite">
+            {len(read.problems) > 0 && <ul.ui-auto-insights-problems role="alert">{for p in read.problems => <li>{p}</li>}</ul>}
+            {found.rows == 0 && <p.ui-auto-insights-none>Nothing to read yet.</p>}
+            {found.rows > 0 && !enough && <p.ui-auto-insights-none>{found.rows < 3 ? "Too few rows to tell what stands out: at least 3 are needed." : "No columns of numbers to look at."}</p>}
+            {enough && <p.ui-auto-insights-seen>Read {found.rows} rows and {found.numbers == 1 ? "1 column" : `${found.numbers} columns`} of numbers{found.more_rows > 0 ? `, leaving out ${found.more_rows} more rows` : ""}.</p>}
+            {enough && len(shown) == 0 && <p.ui-auto-insights-none>Nothing stands out here, so nothing is said.</p>}
+            {len(shown) > 0 && enough && <ol.ui-auto-insights-list>
+                {for f in shown => <li.ui-auto-insights-item key={`${f.kind}-${f.column}`} data-kind={f.kind}>
+                    <span data-k="text">{f.text}</span>
+                    <span.ui-auto-insights-strength>
+                        <span data-k="strength">{auto_insights_kind(f.kind)}: {f.strength}</span>
+                        <span.ui-auto-insights-track aria-hidden="true"><span.ui-auto-insights-fill style={`width: ${f.strength}%`}></span></span>
+                    </span>
+                </li>}
+            </ol>}
+        </div>
+        <details.ui-auto-insights-data>
+            <summary>The data</summary>
+            <label.ui-sr for={`${id}-data`}>Rows, as JSON or CSV</label>
+            <textarea.ui-auto-insights-box id={`${id}-data`} name={named("data")} spellcheck="false" rows="8" @input={(e) => { text = e.value; tell() }}>{text}</textarea>
+        </details>
+    </section>
+}

@@ -1,0 +1,280 @@
+// UpdatePrompt: notices that a new version of the program is out, and offers a reload when the
+// person is not in the middle of something: not while a field has focus, nor just after typing,
+// nor in a dialog or during a press. What was typed comes back after the reload.
+//
+//   import ui/update_prompt.qwe use UpdatePrompt
+//
+//   // With nothing given it fetches its own page now and then, and compares the addresses
+//   // of the page's scripts, which change with the program.
+//   <UpdatePrompt/>
+//
+//   // Or say what the version is, and how to find the latest. It works from a phone app too.
+//   server fn latest_version() = http.get("https://example.com/version.json").json.version
+//   component Shell(version: str) {
+//       <UpdatePrompt version={version} check={() => latest_version()}/>
+//   }
+//
+// version: the version this page is. check(): gives the latest, and may wait; null, false or an
+// error value says nothing is known, and no one is told. Left out, it reads its own page: pass
+// `check` for a page whose components differ from one visit to the next, as that changes
+// the script's address too. every_ms: how often to look (300000), and it also looks on coming
+// back from the background or online. quiet_ms: how long after the last key it waits (2500).
+// later_ms: how long Later holds it back (1800000). title, text: what it says. on_store(): in
+// a phone app, the button to the store: the apps let only http and https out, so a store's
+// link will not open by itself; say how, or use quilloNative.share. place: "bottom",
+// "top" or "inline". id, class.
+//
+// In a phone app the program comes with the app, so a reload brings nothing new: it says to
+// update from the store, and has no Reload. It looks only with `check`.
+//
+// Reload writes each changed field to sessionStorage, which a reload keeps, even in a phone
+// app, then puts them back and goes back to the same scroll position. It leaves out passwords,
+// card numbers and one-time codes (by type and `autocomplete`), file fields, and anything
+// in `data-no-keep`. Fields are found again by id, then by name, then by place. Should the
+// new version not have one, what was typed in it is gone. If it cannot be written, it says so
+// and a second press reloads.
+//
+// update_prompt_moment(...) says whether now is a good time, and why not.
+
+import ui/theme.qwe use ui_cls
+
+let update_prompt_css = css`
+.ui-upgp-wrap { position: fixed; z-index: 50; left: 0; right: 0; bottom: 0; display: flex; justify-content: center; padding: 12px; padding-bottom: calc(12px + env(safe-area-inset-bottom)); padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); pointer-events: none; }
+.ui-upgp-wrap[data-place="top"] { top: 0; bottom: auto; padding-top: calc(12px + env(safe-area-inset-top)); padding-bottom: 12px; }
+.ui-upgp-wrap[data-place="inline"] { position: relative; padding: 0; }
+.ui-upgp { container-type: inline-size; box-sizing: border-box; width: 100%; max-width: 520px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 15px/1.4 var(--ui-font); pointer-events: auto; animation: ui-upgp-in .2s ease-out; }
+.ui-upgp-wrap[data-place="inline"] .ui-upgp { box-shadow: none; animation: none; }
+.ui-upgp-in { display: grid; gap: 10px; padding: 12px; }
+.ui-upgp-title { margin: 0; font-weight: 600; }
+.ui-upgp-text { margin: 2px 0 0; color: var(--ui-muted); font-size: 14px; }
+.ui-upgp-acts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.ui-upgp-btn { min-width: 84px; min-height: 46px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-upgp-go { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); font-weight: 600; }
+.ui-upgp-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-upgp-back { margin: 0; color: var(--ui-muted); font: 14px/1.4 var(--ui-font); }
+@keyframes ui-upgp-in { from { transform: translateY(12px); opacity: 0; } }
+@media (hover: hover) { .ui-upgp-btn:hover { border-color: var(--ui-strong); background: var(--ui-subtle); } .ui-upgp-go:hover { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); } }
+@media (prefers-reduced-motion: reduce) { .ui-upgp { animation: none; } }
+@container (min-width: 440px) {
+  .ui-upgp-in { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+}
+`
+
+let update_prompt_slot = "ui-update-prompt"
+
+// The scripts a page names: a program's change moves them. Found without a pattern, as the
+// text is a whole page.
+fn update_prompt_scripts(html) -> list {
+    if type_of(html) != "str" { return [] }
+    let parts = drop(split(html, "/_quillo/"), 1) | filter((p) => starts_with(p, "b/") || starts_with(p, "r/")) | map((p) => split(p, ".js")[0])
+    sort(unique(parts | filter((p) => len(p) < 80)))
+}
+
+// Whether a new version is out, from the two pages' scripts.
+fn update_prompt_page_moved(mine: list, theirs: list) -> bool = len(mine) > 0 && len(theirs) > 0 && mine != theirs
+
+// Whether what `check` gave is another version.
+fn update_prompt_differs(current, latest) -> bool {
+    if latest == null || latest == false || is_err(latest) || type_of(latest) == "map" || type_of(latest) == "list" { return false }
+    let l = trim(str(latest))
+    l != "" && l != trim(str(current ?? ""))
+}
+
+// Whether now is a good moment: null, or the reason it is not.
+fn update_prompt_moment(hidden: bool, field: bool, dialog: bool, pressing: bool, since_key: int, quiet_ms: int, held: bool) {
+    if hidden { return "hidden" }
+    if held { return "later" }
+    if field { return "field" }
+    if dialog { return "dialog" }
+    if pressing { return "pressing" }
+    since_key < quiet_ms ? "typing" : null
+}
+
+// Whether an element is one a person types in.
+fn update_prompt_types_in(tag: str, kind) -> bool =
+    tag == "textarea" || tag == "select" || (tag == "input" && !contains(["button", "submit", "reset", "checkbox", "radio", "range", "color", "file", "image"], str(kind ?? "text")))
+
+// Whether a field's value may be written down.
+fn update_prompt_keeps(kind: str, autocomplete) -> bool {
+    let auto = lower(str(autocomplete ?? ""))
+    !contains(["password", "hidden", "file", "submit", "button", "reset", "image"], kind)
+        && !starts_with(auto, "cc-") && !contains(["current-password", "new-password", "one-time-code"], auto)
+}
+
+// How a field is known after the reload.
+fn update_prompt_key(id, name, kind: str, value, place: int) -> str {
+    if type_of(id) == "str" && id != "" { return `#${id}${kind == "radio" ? `=${value}` : ""}` }
+    if type_of(name) == "str" && name != "" { return kind == "radio" || kind == "checkbox" ? `@${name}=${value}` : `@${name}` }
+    `%${place}`
+}
+
+// A snapshot still worth using: this page, within two minutes.
+fn update_prompt_fresh(snap, path: str, now_ms: int) -> bool =
+    type_of(snap) == "map" && snap.path == path && type_of(snap.at) == "int" && now_ms - snap.at < 120000 && type_of(snap.fields) == "map"
+
+component UpdatePrompt(version = null, check = null, every_ms: int = 300000, quiet_ms: int = 2500, later_ms: int = 1800000, title: str? = null, text: str? = null,
+                       on_store = null, place: str = "bottom", id: str? = null, class: str? = null) {
+    style global update_prompt_css
+    state started = false
+    state app = false
+    state doc = null
+    state mine = []
+    state latest = null
+    state reason = "waiting"
+    state looking = false
+    state typed_at = 0
+    state pressing = false
+    state later_until = 0
+    state warned = false
+    state back = 0
+    let heading = title ?? (app ? "A new version is out" : "A new version is ready")
+    let words = warned ? "What you typed here could not be kept. Send it first, or press Reload again to lose it."
+        : (text ?? (app ? "Update this app from its store to get it." : "Reload to get it. What you typed stays."))
+    let ask = () => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            // An answer that never comes must not stop it looking for good.
+            js("AbortSignal.timeout", 20000).addEventListener("abort", (_e) => { done(err("no answer")) })
+            js("Promise.resolve", check()).then(done, (_e = null) => { done(err("failed")) })
+        }))
+    }
+    let read_page = () => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            let failed = (_e = null) => { done(null) }
+            js("AbortSignal.timeout", 20000).addEventListener("abort", failed)
+            js("fetch", `${js("location.pathname")}${js("location.search")}`, { cache: "no-store", credentials: "same-origin" }).then((res) => {
+                if res.ok { res.text().then(done, failed) } else { done(null) }
+            }, failed)
+        }))
+    }
+    let look = () => {
+        if !looking && latest == null && doc != null && !doc.hidden && js("navigator.onLine") != false {
+            looking = true
+            if check != null {
+                let r = ask()
+                if update_prompt_differs(version, r) { latest = str(r) }
+            } else if !app {
+                let html = read_page()
+                if update_prompt_page_moved(mine, update_prompt_scripts(html)) { latest = "page" }
+            }
+            looking = false
+        }
+    }
+    let judge = () => {
+        let el = doc.activeElement
+        let tag = el != null ? lower(str(el.tagName)) : ""
+        let field = el != null && (el.isContentEditable == true || update_prompt_types_in(tag, el.type))
+        let dialog = doc.querySelector("dialog[open]") != null
+        reason = update_prompt_moment(doc.hidden, field, dialog, pressing, now() - typed_at, quiet_ms, now() < later_until)
+    }
+    if started { every(every_ms, look) }
+    if latest != null { every(300, judge) }
+    // Writes what changed. True, or an error value when it could not be written.
+    let snapshot = () => {
+        let list = js("Array.from", doc.querySelectorAll("input, textarea, select"))
+        let fields = {}
+        let i = 0
+        for el in list {
+            let kind = lower(str(el.type ?? "text"))
+            if update_prompt_keeps(kind, el.getAttribute("autocomplete")) && el.closest("[data-no-keep]") == null {
+                let k = update_prompt_key(el.id, el.name, kind, el.value, i)
+                if kind == "checkbox" || kind == "radio" {
+                    if el.checked != el.defaultChecked { fields = set(fields, k, el.checked) }
+                } else if kind == "select-one" || kind == "select-multiple" || el.value != el.defaultValue {
+                    fields = set(fields, k, el.value)
+                }
+            }
+            i += 1
+        }
+        let body = json.stringify({ at: now(), path: js("location.pathname"), y: js("window").scrollY, fields })
+        js("Promise.resolve", js_new("Promise", (done) => { done(js("sessionStorage.setItem", update_prompt_slot, body) ?? true) }))
+    }
+    let restore = () => {
+        let kept = js("Promise.resolve", js_new("Promise", (done) => {
+            let t = js("sessionStorage.getItem", update_prompt_slot)
+            js("sessionStorage.removeItem", update_prompt_slot)
+            done(t)
+        }))
+        if type_of(kept) == "str" {
+            let snap = json.parse(kept)
+            if update_prompt_fresh(snap, js("location.pathname"), now()) {
+                let list = js("Array.from", doc.querySelectorAll("input, textarea, select"))
+                let i = 0
+                let put = 0
+                for el in list {
+                    let kind = lower(str(el.type ?? "text"))
+                    let k = update_prompt_key(el.id, el.name, kind, el.value, i)
+                    if has(snap.fields, k) {
+                        let v = get(snap.fields, k)
+                        // A field in a component not started yet: this wakes it, so the events reach it.
+                        el.dispatchEvent(js_new("FocusEvent", "focusin", { bubbles: true }))
+                        if type_of(v) == "bool" { el.checked = v } else { el.value = v }
+                        el.dispatchEvent(js_new("Event", "input", { bubbles: true }))
+                        el.dispatchEvent(js_new("Event", "change", { bubbles: true }))
+                        put += 1
+                    }
+                    i += 1
+                }
+                js("window").scrollTo(0, type_of(snap.y) == "int" || type_of(snap.y) == "float" ? snap.y : 0)
+                back = put
+            }
+        }
+    }
+    <div.ui-upgp-wrap data-place={place} @mount={(_el) => {
+        let w = js("window")
+        let d = js("document")
+        let html = d.documentElement.outerHTML
+        doc = d
+        app = w.quilloNative != null
+        mine = update_prompt_scripts(html)
+        restore()
+        let turned = (_e = null) => { if !d.hidden { look() } }
+        let came = (_e = null) => { look() }
+        let keyed = (_e = null) => { typed_at = now() }
+        let down = (_e = null) => { pressing = true }
+        let up = (_e = null) => { pressing = false }
+        d.addEventListener("visibilitychange", turned)
+        w.addEventListener("online", came)
+        d.addEventListener("input", keyed, { passive: true, capture: true })
+        d.addEventListener("keydown", keyed, { passive: true, capture: true })
+        d.addEventListener("pointerdown", down, { passive: true, capture: true })
+        d.addEventListener("pointerup", up, { passive: true, capture: true })
+        d.addEventListener("pointercancel", up, { passive: true, capture: true })
+        started = true
+        look()
+        () => {
+            d.removeEventListener("visibilitychange", turned)
+            w.removeEventListener("online", came)
+            d.removeEventListener("input", keyed, { capture: true })
+            d.removeEventListener("keydown", keyed, { capture: true })
+            d.removeEventListener("pointerdown", down, { capture: true })
+            d.removeEventListener("pointerup", up, { capture: true })
+            d.removeEventListener("pointercancel", up, { capture: true })
+        }
+    }}>
+        <span.ui-sr role="status">{latest != null && reason == null ? heading : ""}</span>
+        {latest != null && reason == null && <div class={ui_cls(["ui-upgp", class])} id={id}>
+            <div.ui-upgp-in>
+                <div>
+                    <p.ui-upgp-title>{heading}</p>
+                    <p.ui-upgp-text>{words}</p>
+                </div>
+                <div.ui-upgp-acts>
+                    <button.ui-upgp-btn type="button" @click={() => {
+                        later_until = now() + later_ms
+                        warned = false
+                        reason = "later"
+                    }}>Later</button>
+                    {!app && <button.ui-upgp-btn.ui-upgp-go type="button" @click={() => {
+                        let wrote = snapshot()
+                        if is_err(wrote) && !warned {
+                            warned = true
+                        } else {
+                            js("location.reload")
+                        }
+                    }}>Reload</button>}
+                    {app && on_store != null && <button.ui-upgp-btn.ui-upgp-go type="button" @click={() => { on_store() }}>Open the store</button>}
+                </div>
+            </div>
+        </div>}
+    </div>
+}

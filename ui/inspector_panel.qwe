@@ -1,0 +1,388 @@
+// InspectorPanel: the panel down the right of a design or admin tool, showing the
+// properties of what is selected, in sections, live: a change in the panel goes straight
+// out, and a change to the thing shows straight in the panel. On a phone it is a sheet that
+// leaves the thing in view: a strip when closed, half the screen, or nearly all of it.
+//
+//   import ui/inspector_panel.qwe use InspectorPanel
+//
+//   <InspectorPanel title="Shape" selection={shape} sections={[
+//       { title: "Place", fields: [
+//           { key: "x", label: "X", type: "number", unit: "px" },
+//           { key: "width", label: "Width", type: "number", min: 1, max: 800, step: 10, unit: "px" },
+//       ] },
+//       { title: "Look", kinds: ["rect"], fields: [
+//           { key: "fill", label: "Fill", type: "color" },
+//           { key: "locked", label: "Locked", type: "toggle" },
+//           { key: "layer", label: "Layer", type: "select", options: ["Back", "Middle", "Front"] },
+//       ] },
+//   ]} on_change={(key, value) => { shape = set(shape, key, value) }}>
+//       <Canvas/>
+//   </InspectorPanel>
+//
+// selection: the selected thing, a map holding each field's key; null shows `empty`. Its
+// `id` tells one thing from another; `name` heads the panel; `kind` picks the sections.
+// sections: { title, fields, kinds?, closed? }: kinds keeps a section to those kinds, and a
+// field may say `kinds` too; closed starts it folded. A section stays folded or open as
+// the selection changes.
+// fields: { key, label, type, ... }. type: "text" (the default), "number", "select", "toggle",
+// "color" or "readonly". A number takes min, max, step (1) and unit. A select takes options,
+// each text or { value, label }.
+// on_change(key, value): inside one of your components, at each change. A number is given
+// as a number, and only when it is good: what cannot be a number, or is past min or max,
+// is said beside the field and sent nowhere, and leaving the field puts back the last good
+// value. The field a person is typing in is never overwritten from outside.
+// title: its heading ("Properties"). empty: what it says with nothing selected
+// ("Nothing selected"). children: the thing's own view, beside the panel or under the sheet.
+// height: as CSS ("100%" of the box around it).
+//
+// From 600 px wide, on its own box, it is the side panel, which Hide folds away and Show
+// brings back. Under that it is the sheet: drag its grip, tap it, or use the arrow keys on
+// it; selecting something raises it from the strip and selecting nothing lowers it. It
+// rises above the on-screen keyboard.
+
+import ui/theme.qwe use ui_cls
+
+let inspector_panel_css = css`
+.ui-inspector {
+  position: relative; display: flex; box-sizing: border-box; min-width: 0; height: var(--ui-inspector-height, 100%); overflow: hidden; container: ui-inspector / inline-size;
+  background: var(--ui-bg); color: var(--ui-fg); font: 14px/1.4 var(--ui-font);
+}
+.ui-inspector-frame { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; height: 100%; }
+.ui-inspector-stage { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: auto; }
+.ui-inspector-panel { display: flex; flex-direction: column; flex: none; box-sizing: border-box; width: 300px; min-height: 0; background: var(--ui-surface); border-left: 1px solid var(--ui-border); }
+.ui-inspector-closed .ui-inspector-panel { display: none; }
+.ui-inspector-show {
+  position: absolute; top: 8px; right: 8px; z-index: 2; display: none; align-items: center; min-height: 44px; box-sizing: border-box; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow); font: 500 14px/1.2 var(--ui-font); cursor: pointer;
+}
+.ui-inspector-closed .ui-inspector-show { display: inline-flex; }
+.ui-inspector-grip { display: none; flex: none; place-items: center; width: 100%; height: 44px; margin: 0; padding: 0; border: 0; background: transparent; cursor: grab; touch-action: none; -webkit-tap-highlight-color: transparent; }
+.ui-inspector-grip span { width: 40px; height: 5px; border-radius: 999px; background: var(--ui-strong); }
+.ui-inspector-grip:focus-visible { outline: none; }
+.ui-inspector-grip:focus-visible span { background: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-inspector-head { display: flex; align-items: center; gap: 6px; flex: none; min-height: 52px; box-sizing: border-box; padding: 4px 4px 4px 14px; border-bottom: 1px solid var(--ui-border); }
+.ui-inspector-heading { flex: 1; min-width: 0; }
+.ui-inspector-heading h2 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .04em; color: var(--ui-muted); text-transform: uppercase; }
+.ui-inspector-heading p { margin: 0; overflow: hidden; font-size: 15px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-inspector-hide { flex: none; min-width: 44px; min-height: 44px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-accent); font: 500 14px/1.2 var(--ui-font); cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.ui-inspector-hide:focus-visible, .ui-inspector-show:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-inspector-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding-bottom: env(safe-area-inset-bottom); }
+.ui-inspector-empty { margin: 0; padding: 28px 16px; color: var(--ui-muted); text-align: center; }
+.ui-inspector-section { border-bottom: 1px solid var(--ui-border); }
+.ui-inspector-section summary {
+  display: flex; align-items: center; justify-content: space-between; box-sizing: border-box; min-height: 44px; padding: 0 14px; font-weight: 600; list-style: none; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-inspector-section summary::-webkit-details-marker { display: none; }
+.ui-inspector-section summary::after { content: ""; width: 8px; height: 8px; border-right: 2px solid var(--ui-muted); border-bottom: 2px solid var(--ui-muted); transform: rotate(-45deg); transition: transform .15s; }
+.ui-inspector-section[open] summary::after { transform: rotate(45deg); }
+.ui-inspector-section summary:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-inspector-fields { display: grid; gap: 8px; padding: 2px 14px 14px; }
+.ui-inspector-field { display: grid; grid-template-columns: 84px minmax(0, 1fr); align-items: center; gap: 2px 8px; min-height: 44px; }
+.ui-inspector-field label, .ui-inspector-label { min-width: 0; overflow: hidden; color: var(--ui-muted); text-overflow: ellipsis; white-space: nowrap; }
+.ui-inspector-input {
+  box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px/1.2 var(--ui-font);
+}
+.ui-inspector-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-inspector-input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-inspector-number { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; gap: 2px; min-width: 0; }
+.ui-inspector-number .ui-inspector-input { text-align: center; padding: 0 2px; }
+.ui-inspector-step { width: 44px; height: 44px; padding: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); color: var(--ui-fg); font: 500 20px/1 var(--ui-font); cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.ui-inspector-step:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-inspector-unit { grid-column: 2; color: var(--ui-muted); font-size: 12px; text-align: center; }
+.ui-inspector-note { grid-column: 1 / -1; color: var(--ui-danger); font-size: 13px; }
+.ui-inspector-color { box-sizing: border-box; width: 100%; height: 44px; padding: 2px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-inspector-read { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-inspector-switch { justify-self: end; width: 26px; height: 26px; margin: 0; accent-color: var(--ui-accent); }
+@container ui-inspector (max-width: 599.98px) {
+  .ui-inspector-stage { padding-bottom: 100px; box-sizing: border-box; }
+  .ui-inspector-panel {
+    position: absolute; left: 0; right: 0; bottom: var(--ui-inspector-kb, 0px); z-index: 3; width: auto; height: 96px; max-height: calc(100% - var(--ui-inspector-kb, 0px) - 24px);
+    border-left: 0; border-top: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 8px) calc(var(--ui-radius) + 8px) 0 0; box-shadow: var(--ui-shadow-lg);
+    transition: height .24s cubic-bezier(.2, .8, .2, 1), bottom .2s;
+  }
+  .ui-inspector-panel[data-detent="half"] { height: 52%; }
+  .ui-inspector-panel[data-detent="full"] { height: calc(100% - 24px); }
+  .ui-inspector-dragging { transition: none; }
+  .ui-inspector-closed .ui-inspector-panel { display: flex; }
+  .ui-inspector-closed .ui-inspector-show { display: none; }
+  .ui-inspector-grip { display: grid; }
+  .ui-inspector-head { min-height: 48px; border-bottom: 0; }
+  .ui-inspector-hide { display: none; }
+  .ui-inspector-panel[data-detent="half"] .ui-inspector-head, .ui-inspector-panel[data-detent="full"] .ui-inspector-head { border-bottom: 1px solid var(--ui-border); }
+  .ui-inspector-panel[data-detent="peek"] .ui-inspector-body { visibility: hidden; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-inspector-panel { transition: none !important; } .ui-inspector-section summary::after { transition: none; } }
+`
+
+// Whether a field or section is for a kind: with no `kinds` it is for every kind.
+fn inspector_panel_for(part, kind) -> bool {
+    let kinds = get(part, "kinds")
+    kinds == null || contains(kinds, kind)
+}
+
+// The sections for a selection, each with only the fields for its kind, and none left empty.
+fn inspector_panel_shown(sections: list, selection) -> list {
+    if selection == null { return [] }
+    let kind = get(selection, "kind")
+    sections
+        | filter((s) => inspector_panel_for(s, kind))
+        | map((s) => { title: str(get(s, "title", "")), fields: get(s, "fields", []) | filter((f) => inspector_panel_for(f, kind)) })
+        | filter((s) => len(s.fields) > 0)
+}
+
+// Text for a number: whole numbers without a point, so 2.0 is 2 in both the server and the browser.
+fn inspector_panel_show(value) -> str {
+    if value == null { return "" }
+    let t = str(value)
+    ends_with(t, ".0") ? slice(t, 0, len(t) - 2) : t
+}
+
+// What a typed number comes to: { ok, value, note }. Up to 15 digits and six places, which
+// a float holds exactly enough; a comma as the point, as many keyboards give it.
+fn inspector_panel_number(text, field) {
+    let t = replace(trim(str(text ?? "")), ",", ".")
+    if !re.test(t, "^-?[0-9]{1,15}(\\.[0-9]{1,6})?$") { return { ok: false, value: null, note: "Must be a number" } }
+    let n = float(t)
+    let lo = get(field, "min")
+    let hi = get(field, "max")
+    if lo != null && n < lo { return { ok: false, value: null, note: `At least ${inspector_panel_show(lo)}` } }
+    if hi != null && n > hi { return { ok: false, value: null, note: `At most ${inspector_panel_show(hi)}` } }
+    { ok: true, value: n, note: "" }
+}
+
+// One press of a stepper, kept in range, and to six places, so 0.1 and 0.2 do not come to
+// 0.30000000000000004. Anything not a number starts from 0.
+fn inspector_panel_step(value, by: num, field) -> num {
+    let base = type_of(value) == "int" || type_of(value) == "float" ? value : 0
+    let next = round((base + by) * 1000000) / 1000000
+    let lo = get(field, "min")
+    let hi = get(field, "max")
+    lo != null && next < lo ? lo : hi != null && next > hi ? hi : next
+}
+
+// A colour an <input type=color> will take: seven characters, or black.
+fn inspector_panel_color(value) -> str {
+    let t = str(value ?? "")
+    re.test(t, "^#[0-9a-fA-F]{6}$") ? t : "#000000"
+}
+
+fn inspector_panel_option(o) = type_of(o) == "map" ? { value: str(get(o, "value", "")), label: str(get(o, "label", get(o, "value", ""))) }
+                                                   : { value: str(o), label: str(o) }
+
+// The height a sheet settles at when let go. now: where it was. tall: the height it was
+// let go at. room: the height it has. speed: px a millisecond, up being positive. A flick
+// goes one on in its direction, else the nearest wins.
+fn inspector_panel_detent(now: str, tall: num, room: num, speed: num) -> str {
+    let names = ["peek", "half", "full"]
+    let at = index_of(names, now) ?? 0
+    if speed > 0.5 { return names[at < 2 ? at + 1 : 2] }
+    if speed < -0.5 { return names[at > 0 ? at - 1 : 0] }
+    let heights = [96, room * 0.52, room - 24]
+    let gaps = heights | map((h) => abs(h - tall))
+    let least = min(gaps)
+    names[index_of(gaps, least) ?? at]
+}
+
+component InspectorPanelField(field, value, uid: str, on_change = null) {
+    let kind = get(field, "type", "text")
+    let key_name = str(get(field, "key", ""))
+    let inner = `${uid}-${key_name}`
+    let note_id = `${inner}-note`
+    state text = kind == "number" ? inspector_panel_show(value) : str(value ?? "")
+    state seen = value
+    state typing = false
+    state note = ""
+    // What came from outside shows, but never under someone's fingers.
+    if value != seen {
+        seen = value
+        if !typing {
+            text = kind == "number" ? inspector_panel_show(value) : str(value ?? "")
+            note = ""
+        }
+    }
+    let send = (v) => { on_change && on_change(key_name, v) }
+    let typed = (raw) => {
+        text = raw
+        if kind == "number" {
+            let n = inspector_panel_number(raw, field)
+            note = n.note
+            if n.ok { send(n.value) }
+        } else {
+            send(raw)
+        }
+    }
+    let step_by = (dir: int) => {
+        let by = get(field, "step", 1) * dir
+        let n = inspector_panel_number(text, field)
+        let next = inspector_panel_step(n.ok ? n.value : value, by, field)
+        text = inspector_panel_show(next)
+        note = ""
+        send(next)
+    }
+    <div.ui-inspector-field data-field={key_name}>
+        {kind == "toggle"
+            ? <label for={inner}>{str(get(field, "label", key_name))}</label>
+            : kind == "readonly" ? <span.ui-inspector-label>{str(get(field, "label", key_name))}</span>
+            : <label for={inner}>{str(get(field, "label", key_name))}</label>}
+        {kind == "number" && <div.ui-inspector-number>
+            <button.ui-inspector-step type="button" aria-label={`Less ${str(get(field, "label", key_name))}`} @click={() => { step_by(-1) }}>−</button>
+            <input.ui-inspector-input id={inner} type="text" inputmode="decimal" autocomplete="off" value={text}
+                   aria-invalid={note != "" ? "true" : null} aria-describedby={note != "" ? note_id : null}
+                   @focus={() => { typing = true }}
+                   @blur={() => {
+                       typing = false
+                       text = inspector_panel_show(value)
+                       note = ""
+                   }}
+                   @input={(e) => { typed(e.value) }}/>
+            <button.ui-inspector-step type="button" aria-label={`More ${str(get(field, "label", key_name))}`} @click={() => { step_by(1) }}>+</button>
+            {get(field, "unit") != null && <span.ui-inspector-unit>{str(get(field, "unit"))}</span>}
+        </div>}
+        {kind == "text" && <input.ui-inspector-input id={inner} type="text" autocomplete="off" value={text}
+                                  @focus={() => { typing = true }} @blur={() => { typing = false }} @input={(e) => { typed(e.value) }}/>}
+        {kind == "select" && <select.ui-inspector-input id={inner} @change={(e) => { send(e.value) }}>
+            {for o in get(field, "options", []) | map(inspector_panel_option) =>
+                <option key={o.value} value={o.value} selected={o.value == str(value ?? "")}>{o.label}</option>}
+        </select>}
+        {kind == "color" && <input.ui-inspector-color id={inner} type="color" value={inspector_panel_color(value)} @input={(e) => { send(e.value) }}/>}
+        {kind == "toggle" && <input.ui-inspector-switch id={inner} type="checkbox" role="switch" checked={value == true} data-small-target @change={(e) => { send(e.checked) }}/>}
+        {kind == "readonly" && <span.ui-inspector-read>{str(value ?? "")}</span>}
+        {note != "" && <span.ui-inspector-note id={note_id} role="alert">{note}</span>}
+    </div>
+}
+
+component InspectorPanel(selection = null, sections: list = [], title: str = "Properties", empty: str = "Nothing selected",
+                         on_change = null, id: str = "ui-inspector", height: str? = null, class: str? = null, children) {
+    style global inspector_panel_css
+    state closed = false
+    state detent = selection != null ? "half" : "peek"
+    state seen_id = selection != null ? str(get(selection, "id", "")) : ""
+    state root = null
+    state pull = null          // a finger on the grip: { y, tall, last_y, last_at, speed, on }
+    state folded = sections | filter((s) => get(s, "closed") == true) | map((s) => str(get(s, "title", "")))
+    let shown = inspector_panel_shown(sections, selection)
+    let now_id = selection != null ? str(get(selection, "id", "")) : ""
+    let heading = selection != null ? str(get(selection, "name", get(selection, "id", ""))) : empty
+    if now_id != seen_id {
+        let had = seen_id
+        seen_id = now_id
+        if now_id != "" && detent == "peek" { detent = "half" }
+        if now_id == "" && had != "" { detent = "peek" }
+    }
+    let panel = () => root.querySelector(".ui-inspector-panel")
+    <div class={ui_cls(["ui-inspector", closed && "ui-inspector-closed", class])}
+         style={height != null && !re.test(height, "[;{}<>\"]") ? `--ui-inspector-height: ${height}` : null}
+         @mount={(el) => {
+             let w = js("window")
+             let vv = w.visualViewport
+             let lift = (_e = null) => {
+                 if vv != null {
+                     // On the frame, not the root, whose style={...} is written whole when `height` changes.
+                     el.querySelector(".ui-inspector-frame").style.setProperty("--ui-inspector-kb", `${max([0, round(w.innerHeight - vv.height - vv.offsetTop)])}px`)
+                 }
+             }
+             if vv != null {
+                 vv.addEventListener("resize", lift, { passive: true })
+                 vv.addEventListener("scroll", lift, { passive: true })
+             }
+             root = el
+             () => {
+                 if vv != null {
+                     vv.removeEventListener("resize", lift)
+                     vv.removeEventListener("scroll", lift)
+                 }
+             }
+         }}>
+        <div.ui-inspector-frame>
+            <div.ui-inspector-stage>{children}</div>
+            <button.ui-inspector-show type="button" @click={() => { closed = false }}>Show {title}</button>
+            <aside.ui-inspector-panel aria-label={title} data-detent={detent}>
+                <button.ui-inspector-grip type="button" aria-label={detent == "peek" ? "Raise the panel" : detent == "half" ? "Make the panel taller" : "Make the panel shorter"}
+                        @pointerdown={(e) => {
+                            if e.button == 0 {
+                                e.target.setPointerCapture(e.pointerId)
+                                root.dataset.pulled = ""
+                                pull = { y: e.clientY, tall: panel().offsetHeight, last_y: e.clientY, last_at: e.timeStamp, speed: 0, on: false }
+                            }
+                        }}
+                        @pointermove={(e) => {
+                            if pull != null {
+                                let up = pull.y - e.clientY
+                                let on = pull.on || abs(up) > 8
+                                if on {
+                                    let p = panel()
+                                    if !pull.on { p.classList.add("ui-inspector-dragging") }
+                                    p.style.height = `${max([96, pull.tall + up])}px`
+                                }
+                                let dt = e.timeStamp - pull.last_at
+                                let step = dt > 0 ? (pull.last_y - e.clientY) / dt : pull.speed
+                                pull = { y: pull.y, tall: pull.tall, last_y: e.clientY, last_at: e.timeStamp, speed: pull.speed == 0 ? step : pull.speed * 0.4 + step * 0.6, on: on }
+                            }
+                        }}
+                        @pointerup={(e) => {
+                            if pull != null {
+                                let was = pull
+                                pull = null
+                                if was.on {
+                                    let p = panel()
+                                    let tall = p.offsetHeight
+                                    let run = e.timeStamp - was.last_at < 100 ? was.speed : 0
+                                    p.classList.remove("ui-inspector-dragging")
+                                    p.style.height = ""
+                                    detent = inspector_panel_detent(detent, tall, root.clientHeight, run)
+                                    root.dataset.pulled = "true"
+                                }
+                            }
+                        }}
+                        @pointercancel={() => {
+                            if pull != null {
+                                pull = null
+                                panel().classList.remove("ui-inspector-dragging")
+                                panel().style.height = ""
+                            }
+                        }}
+                        @click={() => {
+                            // A drag ends in a click too: only a press that stayed put counts.
+                            if root.dataset.pulled == "true" {
+                                root.dataset.pulled = ""
+                            } else {
+                                detent = detent == "peek" ? "half" : detent == "half" ? "full" : "half"
+                            }
+                        }}
+                        @keydown={(e) => {
+                            let names = ["peek", "half", "full"]
+                            let at = index_of(names, detent) ?? 0
+                            let next = e.key == "ArrowUp" ? (at < 2 ? at + 1 : 2) : e.key == "ArrowDown" ? (at > 0 ? at - 1 : 0) : null
+                            if next != null {
+                                e.preventDefault()
+                                detent = names[next]
+                            }
+                        }}><span aria-hidden="true"></span></button>
+                <div.ui-inspector-head>
+                    <div.ui-inspector-heading>
+                        <h2>{title}</h2>
+                        <p aria-live="polite">{heading}</p>
+                    </div>
+                    <button.ui-inspector-hide type="button" @click={() => { closed = true }}>Hide</button>
+                </div>
+                <div.ui-inspector-body>
+                    {selection == null && <p.ui-inspector-empty>{empty}</p>}
+                    {for s in shown =>
+                        <details.ui-inspector-section key={s.title} open={!contains(folded, s.title)}
+                                 @toggle={(e) => {
+                                     let open_now = e.target.open
+                                     let rest = folded | filter((t) => t != s.title)
+                                     folded = open_now ? rest : rest + [s.title]
+                                 }}>
+                            <summary>{s.title}</summary>
+                            <div.ui-inspector-fields>
+                                {for f in s.fields =>
+                                    <InspectorPanelField key={`${now_id}:${str(get(f, "key", ""))}`} field={f} value={get(selection, str(get(f, "key", "")))}
+                                                         uid={`${id}-${now_id}`} on_change={on_change}/>}
+                            </div>
+                        </details>}
+                </div>
+            </aside>
+        </div>
+    </div>
+}

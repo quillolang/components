@@ -1,0 +1,270 @@
+// SelectionMode: a list that turns into a picker, as in a phone's Photos, Mail or
+// Messages. A long press on a row starts selecting with that row; after that a tap adds
+// or removes a row, and a toolbar shows how many are chosen, with the actions. The
+// system's back (Android's button or gesture, the browser's) leaves the mode and stays on
+// the page, as does Cancel; Escape does on a keyboard. On a phone the actions stand along
+// the bottom, within thumb's reach; in a wide pane they join the top bar.
+//
+//   <SelectionMode label="Messages" items={mails | map((m) => { id: m.id, title: m.from, text: m.subject, meta: m.when })}
+//                  actions={[{ key: "archive", label: "Archive" }, { key: "delete", label: "Delete", danger: true }]}
+//                  on_action={(key, ids) => { act(key, ids) }} on_open={(id) => { navigate(`/mail/${id}`) }}/>
+//
+// items: a list of { id, title, text?, meta?, disabled? }; id any number or text, and
+// an item without one is left out. actions: a list of { key, label, danger? }.
+// title: the heading when not selecting (label when left out). hold: how long a press
+// lasts, in milliseconds (450). select_text: the words on the button that starts it
+// ("Select"): the way in for those who cannot long press, and for keys.
+// label: what screen readers call the list. empty: what shows with no items
+// ("Nothing here"). id, class: on the outer element.
+// on_open(id): a tap on a row when not selecting. on_change(ids): whenever the chosen
+// rows change. on_action(key, ids): an action pressed, with the ids chosen, in the
+// items' order, once the mode has ended and its history entry gone, so it may navigate.
+// on_mode(on): true when it starts, false when it ends.
+// All inside one of your components.
+//
+// Keys: Select (Tab, Enter) starts it, Enter or Space adds a row, Control or Command + A
+// takes all, Escape leaves, and the ContextMenu key or Shift + F10 on a row starts with it.
+// A press stops at 10 px of movement, and when the system takes it for a scroll, so the
+// list scrolls as any list does. Callouts and text selection stop only on the row pressed.
+// A haptic marks the start: the app's, else navigator.vibrate, which iOS's browser lacks.
+//
+// Leaving by back needs a history entry, so entering adds one for the same address;
+// leaving any other way takes it off again.
+
+import ui/theme.qwe use ui_cls
+
+let selection_mode_css = css`
+.ui-selmode { position: relative; container-type: inline-size; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; grid-template-columns: minmax(0, 1fr); grid-template-areas: "top" "list" "acts"; box-sizing: border-box; height: 100%; min-height: 280px; overflow: hidden; background: var(--ui-bg); color: var(--ui-fg); font: 16px/1.3 var(--ui-font); }
+.ui-selmode-grid { display: contents; }
+.ui-selmode-top { grid-area: top; display: flex; align-items: center; gap: 6px; min-height: 52px; padding: 4px 8px 4px 16px; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-selmode-head { flex: 1; min-width: 0; margin: 0; font: 600 17px/1.2 var(--ui-font); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ui-selmode-btn { flex: none; min-width: 44px; min-height: 44px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm); background: none; color: var(--ui-accent); font: 500 15px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-selmode-btn:disabled { color: var(--ui-muted); cursor: default; }
+.ui-selmode-btn:focus-visible, .ui-selmode-act:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-selmode-list { grid-area: list; margin: 0; padding: 0; overflow-y: auto; overscroll-behavior-y: contain; list-style: none; }
+.ui-selmode-row { display: flex; align-items: center; gap: 12px; box-sizing: border-box; width: 100%; min-height: 60px; padding: 8px 16px; border: 0; border-bottom: 1px solid var(--ui-border); background: transparent; color: inherit; font: inherit;
+  text-align: left; cursor: pointer; touch-action: pan-y; -webkit-tap-highlight-color: transparent; transition: background .12s, transform .12s; }
+.ui-selmode-press { background: color-mix(in srgb, var(--ui-fg) 8%, transparent); transform: scale(.985); -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+.ui-selmode-row:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-selmode-row:disabled { opacity: .5; cursor: default; }
+.ui-selmode-row[aria-pressed="true"] { background: var(--ui-accent-soft); }
+.ui-selmode-on .ui-selmode-row { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+.ui-selmode-box { display: grid; place-items: center; flex: none; box-sizing: border-box; width: 0; height: 24px; margin-right: -12px; overflow: hidden; border: 0 solid var(--ui-strong); border-radius: 50%; color: var(--ui-accent-fg); transition: width .16s, margin .16s; }
+.ui-selmode-on .ui-selmode-box { width: 24px; margin-right: 0; border-width: 2px; }
+[aria-pressed="true"] > .ui-selmode-box { border-color: var(--ui-accent); background: var(--ui-accent); }
+.ui-selmode-box svg { width: 14px; height: 14px; opacity: 0; }
+[aria-pressed="true"] > .ui-selmode-box svg { opacity: 1; }
+.ui-selmode-text { flex: 1; min-width: 0; }
+.ui-selmode-title, .ui-selmode-sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-selmode-title { font-weight: 500; }
+.ui-selmode-sub { color: var(--ui-muted); font-size: 14px; }
+.ui-selmode-meta { flex: none; color: var(--ui-muted); font-size: 13px; }
+.ui-selmode-acts { grid-area: acts; display: flex; gap: 8px; padding: 6px 12px calc(6px + env(safe-area-inset-bottom)); border-top: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-selmode-act { flex: 1; min-width: 0; min-height: 46px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 15px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-selmode-act:disabled { opacity: .45; cursor: default; }
+.ui-selmode-danger { color: var(--ui-danger); }
+.ui-selmode-empty { margin: 0; padding: 40px 16px; color: var(--ui-muted); text-align: center; }
+@container (min-width: 640px) {
+  .ui-selmode-grid { display: grid; grid-area: top; grid-template-columns: minmax(0, 1fr) auto; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+  .ui-selmode-top { grid-area: auto; border-bottom: 0; }
+  .ui-selmode-acts { grid-area: auto; align-items: center; padding: 4px 12px; border-top: 0; }
+  .ui-selmode-act { flex: none; min-width: 96px; }
+}
+@media (hover: hover) { .ui-selmode-row:not(:disabled):hover { background: color-mix(in srgb, var(--ui-fg) 4%, transparent); } }
+@media (prefers-reduced-motion: reduce) { .ui-selmode-row, .ui-selmode-box { transition: none; } .ui-selmode-press { transform: none; } }
+`
+
+// The items that can be shown: maps with an id, and no id twice.
+fn selection_mode_items(items) -> list {
+    let given = type_of(items) == "list" ? items | filter((x) => type_of(x) == "map" && get(x, "id") != null) : []
+    // By place, not by value: two maps equal in every field are still the same id twice.
+    let parts = group_by(enumerate(given), (p) => str(p[1].id))
+    enumerate(given) | filter((p) => get(parts, str(p[1].id), [])[0][0] == p[0]) | map((p) => p[1])
+}
+
+// The chosen after a tap on one.
+fn selection_mode_toggle(chosen: list, id) -> list = contains(chosen, id) ? remove(chosen, id) : chosen + [id]
+
+// All that can be chosen.
+fn selection_mode_all(rows: list) -> list = rows | filter((x) => get(x, "disabled", false) != true) | map((x) => x.id)
+
+// The chosen in the list's order, whatever order they were tapped in, and only those still there.
+fn selection_mode_order(rows: list, chosen: list) -> list {
+    let have = group_by(chosen, (x) => str(x))
+    rows | filter((x) => has(have, str(x.id))) | map((x) => x.id)
+}
+
+fn selection_mode_head(n: int) -> str = n == 0 ? "Select items" : `${n} selected`
+
+// Whether a finger has gone too far for a long press.
+fn selection_mode_far(dx: num, dy: num, limit: num = 10) -> bool = dx * dx + dy * dy > limit * limit
+
+fn selection_mode_haptic() {
+    let felt = js("quilloNative.haptic", "medium")
+    // Chrome logs a refusal if nothing was tapped yet, and a long press does not count until it ends.
+    if is_err(felt) && js("navigator.userActivation.hasBeenActive") == true { js("navigator.vibrate", 12) }
+}
+
+component SelectionMode(items = [], actions = [], title: str? = null, hold: int = 450, select_text: str = "Select", label: str = "Items", empty: str = "Nothing here",
+                        on_open = null, on_change = null, on_action = null, on_mode = null, id: str? = null, class: str? = null) {
+    style global selection_mode_css
+    let rows = selection_mode_items(items)
+    let can_take = selection_mode_all(rows)
+    state picking = false
+    state chosen = []
+    state pushed = false
+    state press_id = null
+    state press_el = null
+    state press_x = 0
+    state press_y = 0
+    state skip = false
+    state after_back = null   // an action, waiting for its history entry to go
+    let have = group_by(chosen, (x) => str(x))
+    let chosen_now = selection_mode_order(rows, chosen)
+    let all_in = len(can_take) > 0 && len(chosen_now) == len(can_take)
+    let unpress = () => {
+        if press_el != null { press_el.classList.remove("ui-selmode-press") }
+        press_el = null
+        press_id = null
+    }
+    let enter = (first_id) => {
+        picking = true
+        chosen = first_id != null ? [first_id] : []
+        if !pushed {
+            pushed = true
+            js("history.pushState", { ui_selmode: true }, "")
+        }
+        on_mode && on_mode(true)
+        on_change && on_change(chosen)
+    }
+    let leave = (by_back: bool) => {
+        if picking {
+            picking = false
+            chosen = []
+            on_mode && on_mode(false)
+            on_change && on_change([])
+        }
+        if pushed {
+            pushed = false
+            if !by_back { js("history.back") }
+        }
+    }
+    let pick = (the_id) => {
+        chosen = selection_mode_toggle(chosen, the_id)
+        on_change && on_change(selection_mode_order(rows, chosen))
+    }
+    // `every` is the only clock: it starts with the press and ends with it, or fires once.
+    if press_id != null {
+        every(hold, () => {
+            let the_id = press_id
+            unpress()
+            if the_id != null && !picking {
+                skip = true
+                enter(the_id)
+                selection_mode_haptic()
+            }
+        })
+    }
+    <div class={ui_cls(["ui-selmode", picking && "ui-selmode-on", class])} id={id}
+         @mount={(el) => {
+             let w = js("window")
+             let back = () => {
+                 leave(true)
+                 let f = after_back
+                 after_back = null
+                 f && f()
+             }
+             w.addEventListener("popstate", back)
+             () => w.removeEventListener("popstate", back)
+         }}
+         @pointerdown={() => { skip = false }}
+         @keydown={(e) => {
+             if e.key == "Escape" && picking {
+                 e.preventDefault()
+                 leave(false)
+             }
+             if picking && lower(e.key) == "a" && (e.ctrlKey || e.metaKey) {
+                 e.preventDefault()
+                 chosen = can_take
+                 on_change && on_change(selection_mode_order(rows, chosen))
+             }
+             if !picking && (e.key == "ContextMenu" || (e.key == "F10" && e.shiftKey)) {
+                 let row = e.target.closest("[data-id]")
+                 if row != null {
+                     e.preventDefault()
+                     let found = rows | find((x) => str(x.id) == row.dataset.id)
+                     if found != null { enter(found.id) }
+                 }
+             }
+         }}>
+        <div.ui-selmode-grid>
+            <div.ui-selmode-top>
+                <h3.ui-selmode-head>{picking ? selection_mode_head(len(chosen_now)) : (title ?? label)}</h3>
+                {picking && <button.ui-selmode-btn type="button" @click={() => {
+                    chosen = all_in ? [] : can_take
+                    on_change && on_change(selection_mode_order(rows, chosen))
+                }}>{all_in ? "Select none" : "Select all"}</button>}
+                <button.ui-selmode-btn.ui-selmode-mode type="button" disabled={len(rows) == 0}
+                        @click={() => { if picking { leave(false) } else { enter(null) } }}>{picking ? "Cancel" : select_text}</button>
+            </div>
+            {picking && <div.ui-selmode-acts role="toolbar" aria-label="Actions on the items selected">
+                {for a in actions => <button key={str(a.key)} type="button" class={ui_cls(["ui-selmode-act", get(a, "danger", false) == true && "ui-selmode-danger"])}
+                        disabled={len(chosen_now) == 0}
+                        @click={() => {
+                            // The bar comes up as a long press fires, maybe under the finger:
+                            // lifting it there is no press. skip goes at the next pointerdown.
+                            if skip {
+                                skip = false
+                            } else {
+                                let ids = chosen_now
+                                // history.back is not done until popstate: an on_action that
+                                // navigates at once would be undone by it, so it waits.
+                                if pushed {
+                                    after_back = () => { on_action && on_action(a.key, ids) }
+                                    leave(false)
+                                } else {
+                                    leave(false)
+                                    on_action && on_action(a.key, ids)
+                                }
+                            }
+                        }}>{a.label}</button>}
+            </div>}
+        </div>
+        <span.ui-sr role="status">{picking ? selection_mode_head(len(chosen_now)) : ""}</span>
+        {len(rows) == 0
+            ? <p.ui-selmode-empty style="grid-area: list">{empty}</p>
+            : <ul.ui-selmode-list aria-label={label}
+                  @pointerdown={(e) => {
+                      let row = e.target.closest("[data-id]")
+                      if row != null && !picking && !row.disabled && e.button == 0 {
+                          let found = rows | find((x) => str(x.id) == row.dataset.id)
+                          if found != null {
+                              press_x = e.clientX
+                              press_y = e.clientY
+                              press_el = row
+                              row.classList.add("ui-selmode-press")
+                              press_id = found.id
+                          }
+                      }
+                  }}
+                  @pointermove={(e) => { if press_id != null && selection_mode_far(e.clientX - press_x, e.clientY - press_y) { unpress() } }}
+                  @pointerup={() => { unpress() }}
+                  @pointercancel={() => { unpress() }}
+                  @contextmenu={(e) => { if press_id != null || (picking && e.target.closest("[data-id]") != null) { e.preventDefault() } }}>
+                {for it in rows => <li key={str(it.id)}>
+                    <button.ui-selmode-row type="button" data-id={str(it.id)} disabled={get(it, "disabled", false) == true}
+                            aria-pressed={picking ? (has(have, str(it.id)) ? "true" : "false") : null}
+                            @click={() => {
+                                if skip { skip = false } else if picking { pick(it.id) } else { on_open && on_open(it.id) }
+                            }}>
+                        <span.ui-selmode-box aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></span>
+                        <span.ui-selmode-text>
+                            <span.ui-selmode-title>{get(it, "title") ?? ""}</span>
+                            {get(it, "text") != null && <span.ui-selmode-sub>{it.text}</span>}
+                        </span>
+                        {get(it, "meta") != null && <span.ui-selmode-meta>{it.meta}</span>}
+                    </button>
+                </li>}
+              </ul>}
+    </div>
+}

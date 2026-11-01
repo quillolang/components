@@ -1,0 +1,75 @@
+const title = $("#slug-demo-title"), link = $("#slug-demo");
+const wrap = link.closest(".ui-sluginput");
+const out = (w = wrap) => w.querySelector(".ui-sluginput-out");
+const use = (w = wrap) => w.querySelector(".ui-sluginput-use");
+const follow = (w = wrap) => w.querySelector(".ui-sluginput-follow");
+if (link.value !== "creme-brulee-a-la-carte") return `start: ${link.value}`;
+if (link.name !== "slug" || title.name !== "title") return "real named fields";
+if (wrap.querySelector(".ui-sluginput-url").textContent !== "https://example.com/blog/creme-brulee-a-la-carte") return "the preview";
+if (out().textContent.trim() !== "creme-brulee-a-la-carte is free.") return `free: ${out().textContent}`;
+for (const [text, want] of [
+    ["Straße & Co.", "strasse-and-co"], ["  --Hello---World--  ", "hello-world"], ["Don't stop", "dont-stop"], ["Łódź Żółć", "lodz-zolc"],
+    ["Ærøskøbing", "aeroskobing"], ["Москва", "moskva"], ["Щука и ёж", "shchuka-i-ezh"], ["Ελλάδα", "ellada"], ["école", "ecole"], ["İstanbul", "istanbul"], ["Ça va, Œuvre?", "ca-va-oeuvre"],
+    ["日本語 test", "test"], ["100% Pure", "100-pure"], ["a_b.c/d", "a-b-c-d"], ["ÉCOLE", "ecole"], ["Crème", "creme"],
+]) {
+    type(title, text); await wait(20);
+    if (link.value !== want) return `"${text}" makes ${link.value}, not ${want}`;
+}
+type(title, "日本語"); await wait(30);
+if (link.value !== "" || !out().textContent.includes("no letters or digits")) return `a title with nothing to use: ${link.value} ${out().textContent}`;
+type(title, "😀 😀"); await wait(30);
+if (link.value !== "" || !out().textContent.includes("no letters or digits")) return "emoji";
+type(title, "   "); await wait(30);
+if (link.value !== "" || out().textContent.trim() !== "") return `blank: ${out().textContent}`;
+const words = "word ".repeat(40);
+type(title, words); await wait(30);
+if (link.value !== Array(12).fill("word").join("-")) return `cut at a word: ${link.value} (${link.value.length})`;
+const t0 = performance.now();
+type(title, "é".repeat(100000)); await wait(30);
+if (performance.now() - t0 > 500) return `a huge title took ${performance.now() - t0} ms`;
+if (link.value !== "e".repeat(60)) return `a huge title: ${link.value.length}`;
+type(title, "Hello, World!"); await wait(30);
+if (link.value !== "hello-world" || out().textContent.trim() !== "hello-world is taken.Use hello-world-2") return `taken: ${out().textContent}`;
+if (link.getAttribute("aria-invalid") !== "true") return "taken is marked";
+type(title, "My First Post"); await wait(30);
+if (use().textContent !== "Use my-first-post-4") return `the next free past 2 and 3: ${use().textContent}`;
+type(title, "launch notes"); await wait(30);
+if (!out().textContent.includes("launch-notes is taken.")) return "taken in any case";
+type(title, "Admin"); await wait(30);
+if (out().textContent.trim() !== "admin is reserved for the site.Use admin-2") return `reserved: ${out().textContent}`;
+use().click(); await wait(40);
+if (link.value !== "admin-2" || !out().textContent.includes("admin-2 is free.")) return `using it: ${link.value}`;
+type(title, "Something else"); await wait(30);
+if (link.value !== "admin-2") return "after a hand choice the title no longer leads";
+follow().click(); await wait(40);
+if (link.value !== "something-else" || follow()) return `following again: ${link.value}`;
+type(title, "Fresh title"); await wait(30);
+if (link.value !== "fresh-title") return "and it follows";
+type(link, "My Custom Link"); await wait(30);
+if (link.value !== "my-custom-link") return `tidied as typed: ${link.value}`;
+type(title, "Fresh title 2"); await wait(30);
+if (link.value !== "my-custom-link") return "stops following once edited by hand";
+type(link, "two-"); await wait(30);
+if (link.value !== "two-") return `a hyphen stays while typing: ${link.value}`;
+link.dispatchEvent(new FocusEvent("blur")); await wait(40);
+if (link.value !== "two") return `and goes on leaving: ${link.value}`;
+type(link, "--Ñandú--x"); await wait(30);
+if (link.value !== "nandu-x") return `what is typed by hand gets the same letters: ${link.value}`;
+type(link, "my-first-post-3"); await wait(30);
+if (use().textContent !== "Use my-first-post-4") return `a number counts on: ${use().textContent}`;
+const lv = $("#slug-demo-live"), lw = lv.closest(".ui-sluginput"), heading = $("#slug-demo-heading"), note = () => lv.closest(".demo-stack").querySelector(".demo-note").textContent;
+if (lw.querySelector("input[name=title]")) return "show_title false leaves its own title out";
+if (lv.value !== "pricing-for-teams") return `follows a parent's title: ${lv.value}`;
+type(heading, "Résumé tips for everyone"); await wait(40);
+if (lv.value !== "resume-tips-for-everyone") return `the title prop is followed live: ${lv.value}`;
+type(heading, "Résumé tips for all of the people"); await wait(40);
+if (lv.value !== "resume-tips-for-all-of") return `limit 24 cuts at a word: ${lv.value}`;
+type(lv, "hello-world"); await wait(40);
+if (note() !== "on_change: taken hello-world") return `on_change: ${note()}`;
+if (use(lw).textContent !== "Use hello-world-2") return "suggests within the limit";
+type(lv, "pricing-for-teams-in-eur"); await wait(40);
+if (use(lw).textContent !== "Use pricing-for-teams-in-e-2") return `a suggestion stays within the limit: ${use(lw).textContent}`;
+type(lv, "a-very-long-link-of-24-ch"); await wait(40);
+if (lv.value.length !== 24) return `the limit holds by hand: ${lv.value}`;
+follow(lw).click(); await wait(40);
+if (lv.value !== "resume-tips-for-all-of" || note() !== "on_change: free resume-tips-for-all-of") return `following: ${note()}`;

@@ -1,0 +1,191 @@
+// RotationLayout: one set of children in two arrangements, one for upright and one for
+// turned. Nothing is moved or made again: the same elements are placed by a CSS grid,
+// so the right arrangement is on the first paint, a video keeps playing, and what is
+// focused stays focused, keyboard and all. A person's place is kept as well: a list
+// shows the same row at its top after a turn, though everything has been laid out anew.
+//
+//   import ui/rotation_layout.qwe use RotationLayout, RotationLayoutArea
+//
+//   <RotationLayout portrait={["photo", "details", "stops"]} portrait_rows="240px auto 1fr"
+//                   landscape={["photo stops", "details stops"]} landscape_columns="3fr 2fr"
+//                   on_turn={(o) => { facing = o }}>
+//       <RotationLayoutArea name="photo"><img src="/site.jpg" alt="The site"/></RotationLayoutArea>
+//       <RotationLayoutArea name="details"><Details/></RotationLayoutArea>
+//       <RotationLayoutArea name="stops" scroll={true}><Stops/></RotationLayoutArea>
+//   </RotationLayout>
+//
+// portrait, landscape: the arrangement, a list of rows, each row the areas' names with
+// spaces between, as CSS's grid-template-areas: an area may span rows or columns, as
+// long as it stays a rectangle. Left out, or not a rectangle, the areas stack in order.
+// Name every area in both, or mark it `only`: one left out shares a cell with another.
+// portrait_columns, portrait_rows, landscape_columns, landscape_rows: the sizes of the
+// grid's tracks, as CSS ("3fr 2fr", "240px auto 1fr"); left out, columns share the
+// width and rows take what they need.
+// fit: what "turned" means. "screen" (the default) looks at the window, which on an
+// iPad in Split View is the window's share. "box" looks at the shape of this component's
+// own box, for one sitting in a pane: it then needs a height.
+// height: its height, as CSS ("100%", the default, of the box around it).
+// gap: the space between areas in px (12).
+// on_turn(orientation): inside one of your components, called with "portrait" or
+// "landscape" once it has measured and at each turn.
+// class: added to its root. data-orientation on the root says which, for your CSS.
+//
+// RotationLayoutArea(name): one area, named as in the arrangements. scroll: it scrolls
+// by itself. only: "portrait" or "landscape" keeps it to that arrangement: it stays on
+// the page the rest of the time, out of sight, with its state and its scroll.
+
+import ui/theme.qwe use ui_cls
+
+let rotation_layout_css = css`
+.ui-rotation { position: relative; min-width: 0; height: var(--ui-rotation-h, 100%); }
+.ui-rotation-box { container: ui-rotation / size; }
+.ui-rotation-grid {
+  display: grid; box-sizing: border-box; width: 100%; height: 100%; min-height: 0; gap: var(--ui-rotation-gap, 12px);
+  grid-template-areas: var(--ui-rotation-p-areas, none); grid-template-columns: var(--ui-rotation-p-cols, none); grid-template-rows: var(--ui-rotation-p-rows, none);
+  grid-auto-columns: minmax(0, 1fr); --ui-rotation-place: var(--ui-rotation-p-place);
+}
+/* The arrangement is CSS alone, so it changes in the same frame as the turn: no script runs first, so nothing flashes. */
+@media (orientation: landscape) {
+  .ui-rotation-screen > .ui-rotation-grid {
+    grid-template-areas: var(--ui-rotation-l-areas, none); grid-template-columns: var(--ui-rotation-l-cols, none); grid-template-rows: var(--ui-rotation-l-rows, none);
+    --ui-rotation-place: var(--ui-rotation-l-place);
+  }
+}
+@container ui-rotation (orientation: landscape) {
+  .ui-rotation-grid {
+    grid-template-areas: var(--ui-rotation-l-areas, none); grid-template-columns: var(--ui-rotation-l-cols, none); grid-template-rows: var(--ui-rotation-l-rows, none);
+    --ui-rotation-place: var(--ui-rotation-l-place);
+  }
+}
+.ui-rotation-area { min-width: 0; min-height: 0; }
+/* Not Chrome's own scroll anchoring: Safari has none, so both go by the one below. */
+.ui-rotation-area-scroll { overflow: auto; overflow-anchor: none; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+/* Out of sight by visibility, not display: what is not laid out forgets its scroll. */
+.ui-rotation-area[data-only="landscape"] { position: absolute; width: 0; height: 0; overflow: hidden; visibility: hidden; }
+@media (orientation: portrait) {
+  .ui-rotation-screen .ui-rotation-area[data-only="portrait"] { position: static; width: auto; height: auto; visibility: visible; }
+}
+@media (orientation: landscape) {
+  .ui-rotation-screen .ui-rotation-area[data-only="landscape"] { position: static; width: auto; height: auto; visibility: visible; }
+  .ui-rotation-screen .ui-rotation-area[data-only="portrait"] { position: absolute; width: 0; height: 0; overflow: hidden; visibility: hidden; }
+}
+.ui-rotation-box .ui-rotation-area[data-only="portrait"] { position: static; width: auto; height: auto; visibility: visible; }
+@container ui-rotation (orientation: landscape) {
+  .ui-rotation-area[data-only="landscape"] { position: static; width: auto; height: auto; visibility: visible; }
+  .ui-rotation-area[data-only="portrait"] { position: absolute; width: 0; height: 0; overflow: hidden; visibility: hidden; }
+}
+`
+
+// CSS's grid-template-areas from a list of rows. Every row needs as many names as the
+// first and each name must fill a rectangle, or the browser drops the whole property
+// and every area lands where it was going to anyway: `none` says so plainly.
+fn rotation_layout_areas(rows) -> str {
+    if type_of(rows) != "list" || len(rows) == 0 { return "none" }
+    let cells = rows | map((r) => type_of(r) == "str" ? split(trim(r), " ") | filter((c) => c != "") : [])
+    let width = len(cells[0])
+    if width == 0 || any(cells, (r) => len(r) != width) { return "none" }
+    let names = flatten(cells) | unique() | filter((n) => n != ".")
+    if any(names, (n) => !re.test(n, "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$")) { return "none" }
+    let square = all(names, (n) => rotation_layout_square(cells, n))
+    if !square { return "none" }
+    rows | map((r) => `"${trim(r)}"`) | join(" ")
+}
+
+// Whether a name fills exactly the rectangle around it.
+fn rotation_layout_square(cells, name: str) -> bool {
+    let at = flatten(range(len(cells)) | map((y) => range(len(cells[y])) | filter((x) => cells[y][x] == name) | map((x) => { x: x, y: y })))
+    let xs = at | map((c) => c.x)
+    let ys = at | map((c) => c.y)
+    (max(xs) - min(xs) + 1) * (max(ys) - min(ys) + 1) == len(at)
+}
+
+// Tracks as written, with the two things that would break out of a style attribute kept out.
+fn rotation_layout_track(text) -> str? {
+    if type_of(text) != "str" || trim(text) == "" { return null }
+    re.test(text, "[;{}<>\"]") ? null : text
+}
+
+fn rotation_layout_style(portrait, landscape, pc, pr, lc, lr, height, gap) -> str {
+    // A name with no such area puts every child on one cell, so without an arrangement
+    // the areas go back to the grid's own order: --ui-rotation-*-place, read by each area.
+    let p = rotation_layout_areas(portrait)
+    let l = rotation_layout_areas(landscape)
+    let parts = [`--ui-rotation-p-areas: ${p}`, `--ui-rotation-l-areas: ${l}`]
+        + (p == "none" ? ["--ui-rotation-p-place: auto"] : [])
+        + (l == "none" ? ["--ui-rotation-l-place: auto"] : [])
+    let tracks = [["p-cols", pc], ["p-rows", pr], ["l-cols", lc], ["l-rows", lr]]
+        | filter((t) => rotation_layout_track(t[1]) != null)
+        | map((t) => `--ui-rotation-${t[0]}: ${t[1]}`)
+    let tall = rotation_layout_track(height) != null ? [`--ui-rotation-h: ${height}`] : []
+    join(parts + tracks + tall + [`--ui-rotation-gap: ${gap}px`], "; ")
+}
+
+view RotationLayoutArea(name: str = "", scroll: bool = false, only: str? = null, class: str? = null, children) {
+    style global rotation_layout_css
+    let safe = re.test(name, "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$")
+    <div class={ui_cls(["ui-rotation-area", scroll && "ui-rotation-area-scroll", class])} data-area={name}
+         data-only={only == "portrait" || only == "landscape" ? only : null}
+         style={safe ? `grid-area: var(--ui-rotation-place, ${name})` : null}>{children}</div>
+}
+
+component RotationLayout(portrait = null, landscape = null, portrait_columns: str? = null, portrait_rows: str? = null,
+                         landscape_columns: str? = null, landscape_rows: str? = null, fit: str = "screen", height: str? = null,
+                         gap: num = 12, on_turn = null, class: str? = null, children) {
+    style global rotation_layout_css
+    state facing = ""          // "" until measured: the CSS does not need to know
+    state marks = []           // each scroller in play: what is at its top, and how far above the edge it starts
+    let box = fit == "box"
+    <div class={ui_cls(["ui-rotation", box ? "ui-rotation-box" : "ui-rotation-screen", class])} data-orientation={facing == "" ? null : facing}
+         style={rotation_layout_style(portrait, landscape, portrait_columns, portrait_rows, landscape_columns, landscape_rows, height, gap)}
+         @mount={(el) => {
+             let win = js("window")
+             let doc = win.document
+             let wide = win.matchMedia("(orientation: landscape)")
+             let page = doc.scrollingElement
+             // Noted on every scroll, since by the time a turn is known the old layout has
+             // gone. Elements are told apart by isSameNode: == calls any two of them equal.
+             let note = (e) => {
+                 let t = doc.isSameNode(e.target) ? page : e.target
+                 if t.contains != null && (t.contains(el) || el.contains(t)) {
+                     let whole = t.isSameNode(page)
+                     let r = whole ? { left: 0, top: 0 } : t.getBoundingClientRect()
+                     let at = t.scrollTop > 0 ? doc.elementFromPoint(r.left + 12, r.top + 2) : null
+                     let rest = marks | filter((m) => !m.s.isSameNode(t))
+                     marks = at != null && t.contains(at) && !at.isSameNode(t)
+                         ? rest + [{ s: t, a: at, d: at.getBoundingClientRect().top - r.top }]
+                         : rest
+                 }
+             }
+             let back = () => {
+                 for m in marks {
+                     let top = m.s.isSameNode(page) ? 0 : m.s.getBoundingClientRect().top
+                     m.s.scrollTop = m.s.scrollTop + m.a.getBoundingClientRect().top - top - m.d
+                 }
+                 let held = doc.activeElement
+                 if held != null && el.contains(held) { held.scrollIntoView({ block: "nearest" }) }
+             }
+             let look = (_e = null) => {
+                 let next = box ? (el.clientWidth >= el.clientHeight ? "landscape" : "portrait")
+                                : (wide.matches ? "landscape" : "portrait")
+                 if next != facing {
+                     let first = facing == ""
+                     facing = next
+                     if !first { back() }
+                     on_turn && on_turn(next)
+                 }
+             }
+             let seen = js_new("ResizeObserver", look)
+             seen.observe(el)
+             // The window's resize comes before the frame's scroll events, which would
+             // otherwise tell of the clamped places a shorter page leaves behind.
+             win.addEventListener("resize", look, { passive: true })
+             win.addEventListener("scroll", note, { capture: true, passive: true })
+             () => {
+                 seen.disconnect()
+                 win.removeEventListener("resize", look)
+                 win.removeEventListener("scroll", note, { capture: true })
+             }
+         }}>
+        <div.ui-rotation-grid>{children}</div>
+    </div>
+}

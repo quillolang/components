@@ -1,0 +1,575 @@
+// DocumentCapture: photographs a document page by page through the phone's camera, and keeps
+// the pages as a list to reorder, drop and crop. A page is cropped by four corners moved by
+// finger, one to each corner of the paper, so a page shot at an angle comes out flat and
+// square, which a plain rectangle cannot do. All of it happens on the phone. The pages are
+// real files in a file field, in order, named page-1.jpg and on, so a plain multipart
+// <form> sends them.
+//
+//   <form method="post" action="/claim" enctype="multipart/form-data">
+//       <DocumentCapture name="pages" limit={10}/>
+//       <Button size="lg" type="submit">Send</Button>
+//   </form>
+//   <DocumentCapture on_change={(list) => { pages = list }}/>
+//
+// name: the file field's name ("pages"). label: what adds a page ("Add a page"). limit: the
+// most pages (20). max_side: the longest side of a page, in pixels (2000). quality: the JPEG's
+// quality, 0 to 1 (0.85). on_change(pages): inside one of your components, given [{ name,
+// size, width, height }] in order after each change.
+//
+// Each gesture has its equal. Pages move with Earlier and Later as well as by their grip.
+// A corner, once chosen by a tap, moves with the four arrow buttons, or the arrow keys
+// on it (Shift moves further). Corners that would twist the page are refused, and go back.
+// On a tablet the list stands beside the crop; on a phone the crop takes its place.
+//
+// Needs Button: `import ui/button.qwe use Button`.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let document_capture_css = css`
+.ui-document-capture { container-type: inline-size; width: 100%; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-document-capture-body { display: grid; gap: 12px; }
+.ui-document-capture-side { display: grid; gap: 10px; align-content: start; min-width: 0; }
+.ui-document-capture-add {
+  position: relative; display: flex; align-items: center; justify-content: center; min-height: 46px; padding: 0 22px; overflow: hidden;
+  border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg); font: 500 16px/1 var(--ui-font); cursor: pointer;
+}
+.ui-document-capture-add input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; font-size: 16px; cursor: pointer; }
+.ui-document-capture-add:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-document-capture-add:has(input:disabled) { opacity: .55; }
+.ui-document-capture-count { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-document-capture-why { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-document-capture-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-document-capture-page {
+  position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); transition: transform .18s ease-out;
+}
+/* An attribute, not a class: a row's class is rewritten when it reads something new, which would drop this in mid-drag. */
+.ui-document-capture-page[data-lifted] { z-index: 2; box-shadow: var(--ui-shadow-lg); transition: none; }
+.ui-document-capture-page-open { border-color: var(--ui-accent); }
+.ui-document-capture-page img { display: block; width: 48px; height: 64px; object-fit: contain; border-radius: 3px; background: var(--ui-subtle); -webkit-user-drag: none; }
+.ui-document-capture-page b { flex: 1 1 60px; min-width: 0; font-weight: 600; }
+.ui-document-capture-page button {
+  display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer;
+}
+.ui-document-capture-page button svg { width: 20px; height: 20px; }
+.ui-document-capture-page button:disabled { opacity: .35; cursor: default; }
+.ui-document-capture-page button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-document-capture-page .ui-document-capture-grip { touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+@media (hover: hover) { .ui-document-capture-page button:hover:not(:disabled) { background: var(--ui-subtle); } }
+.ui-document-capture-crop { display: grid; gap: 10px; min-width: 0; }
+.ui-document-capture-crop h3 { margin: 0; font: 600 15px/1.3 var(--ui-font); }
+/* Room around the picture, so a handle at its edge is whole and on the page. */
+.ui-document-capture-room { padding: 24px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); overscroll-behavior: contain; }
+.ui-document-capture-stage { --ui-dc-x0: 0; --ui-dc-y0: 0; --ui-dc-x1: 1; --ui-dc-y1: 0; --ui-dc-x2: 1; --ui-dc-y2: 1; --ui-dc-x3: 0; --ui-dc-y3: 1; position: relative; width: fit-content; max-width: 100%; margin: 0 auto; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-document-capture-stage img { display: block; max-width: 100%; max-height: 56dvh; -webkit-user-drag: none; pointer-events: none; }
+.ui-document-capture-stage svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.ui-document-capture-stage polygon { fill: color-mix(in srgb, var(--ui-accent) 14%, transparent); stroke: var(--ui-accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.ui-document-capture-corner {
+  position: absolute; width: 44px; height: 44px; margin: -22px 0 0 -22px; padding: 0; border: 0; border-radius: 50%; background: transparent; touch-action: none; cursor: move; outline: none;
+  -webkit-tap-highlight-color: transparent;
+}
+/* Set by hand on the stage: a bound style here would be rewritten, and jump a corner home in mid-drag. */
+.ui-document-capture-c0 { left: calc(var(--ui-dc-x0) * 100%); top: calc(var(--ui-dc-y0) * 100%); }
+.ui-document-capture-c1 { left: calc(var(--ui-dc-x1) * 100%); top: calc(var(--ui-dc-y1) * 100%); }
+.ui-document-capture-c2 { left: calc(var(--ui-dc-x2) * 100%); top: calc(var(--ui-dc-y2) * 100%); }
+.ui-document-capture-c3 { left: calc(var(--ui-dc-x3) * 100%); top: calc(var(--ui-dc-y3) * 100%); }
+.ui-document-capture-corner::after { content: ""; position: absolute; inset: 12px; border: 2px solid var(--ui-accent); border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, .4); }
+.ui-document-capture-corner-chosen::after { background: var(--ui-accent); border-color: #fff; }
+.ui-document-capture-corner:focus-visible { box-shadow: var(--ui-focus); }
+.ui-document-capture-nudge { display: grid; grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(2, 44px); gap: 4px; justify-content: center; }
+.ui-document-capture-nudge button {
+  display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); cursor: pointer;
+}
+.ui-document-capture-nudge button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-document-capture-nudge svg { width: 20px; height: 20px; }
+.ui-document-capture-up { grid-column: 2; }
+.ui-document-capture-left { grid-column: 1; grid-row: 2; }
+.ui-document-capture-down { grid-column: 2; grid-row: 2; }
+.ui-document-capture-right { grid-column: 3; grid-row: 2; }
+.ui-document-capture-note { margin: 0; color: var(--ui-muted); font-size: 13px; text-align: center; }
+.ui-document-capture-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-document-capture-bar > * { flex: 1 1 auto; }
+/* A tablet, or a wide pane: list beside crop. On a phone the crop takes the list's place. */
+.ui-document-capture-open .ui-document-capture-side { display: none; }
+@container (min-width: 440px) {
+  .ui-document-capture-open .ui-document-capture-body { grid-template-columns: minmax(170px, 36%) minmax(0, 1fr); align-items: start; }
+  .ui-document-capture-open .ui-document-capture-side { display: grid; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-document-capture-page { transition: none; } }
+`
+
+let document_capture_names = ["Top left", "Top right", "Bottom right", "Bottom left"]
+let document_capture_full = [[0, 0], [1, 0], [1, 1], [0, 1]]
+let document_capture_cells = 16           // squares each side of the page is drawn in
+
+// The size a picture of w by h takes with its longer side at most limit.
+fn document_capture_fit(w: num, h: num, limit: num) -> map {
+    if w <= 0 || h <= 0 || limit <= 0 { return { w: 0, h: 0 } }
+    let longest = w > h ? w : h
+    let k = longest > limit ? limit / longest : 1
+    { w: round(w * k), h: round(h * k) }
+}
+
+// A size in bytes as people read it.
+fn document_capture_bytes(n: num) -> str {
+    if n < 1024 * 1024 { return `${round(n / 1024)} KB` }
+    let tenths = round(n * 10 / (1024 * 1024))
+    `${floor(tenths / 10)}${tenths % 10 == 0 ? "" : `.${tenths % 10}`} MB`
+}
+
+// The list with the item at `from` moved to `to`.
+fn document_capture_move(xs: list, from: int, to: int) -> list {
+    let n = len(xs)
+    if from < 0 || from >= n || to < 0 || to >= n || from == to { return xs }
+    let rest = range(n) | filter((i) => i != from) | map((i) => xs[i])
+    [...slice(rest, 0, to), xs[from], ...slice(rest, to, len(rest))]
+}
+
+// The place a row lands in, dragged dy from `from`, rows being h apart. Half a row is the threshold.
+fn document_capture_slot(from: int, dy: num, h: num, n: int) -> int {
+    if h <= 0 || n < 1 { return from }
+    let to = from + round(dy / h)
+    to < 0 ? 0 : to >= n ? n - 1 : to
+}
+
+// Whether four corners, top left, top right, bottom right, bottom left, make a page: each
+// turn the same way, so it is neither twisted nor hollow, and it covers some area.
+fn document_capture_good(c: list) -> bool {
+    if len(c) != 4 { return false }
+    let turns = for i in range(4) => {
+        let a = c[i]
+        let b = c[(i + 1) % 4]
+        let d = c[(i + 2) % 4]
+        (b[0] - a[0]) * (d[1] - b[1]) - (b[1] - a[1]) * (d[0] - b[0])
+    }
+    if !all(turns, (t) => t > 0) { return false }
+    let area = abs(c[0][0] * c[1][1] - c[1][0] * c[0][1] + c[1][0] * c[2][1] - c[2][0] * c[1][1]
+                 + c[2][0] * c[3][1] - c[3][0] * c[2][1] + c[3][0] * c[0][1] - c[0][0] * c[3][1]) / 2
+    area > 0.01
+}
+
+fn document_capture_clamp(v: num) -> num = v < 0 ? 0 : v > 1 ? 1 : v
+
+// The corners with corner i put at x, y, kept on the picture.
+fn document_capture_place(c: list, i: int, x: num, y: num) -> list {
+    for [k, p] in enumerate(c) => k == i ? [document_capture_clamp(x), document_capture_clamp(y)] : p
+}
+
+fn document_capture_dist(a: list, b: list, w: num, h: num) -> num = math.sqrt(math.pow((a[0] - b[0]) * w, 2) + math.pow((a[1] - b[1]) * h, 2))
+
+// The flat page's size in pixels: the longer of each pair of opposite edges, on a picture of
+// w by h, with its longer side at most limit.
+fn document_capture_size(c: list, w: num, h: num, limit: num) -> map {
+    let top = document_capture_dist(c[0], c[1], w, h)
+    let bottom = document_capture_dist(c[3], c[2], w, h)
+    let left = document_capture_dist(c[0], c[3], w, h)
+    let right = document_capture_dist(c[1], c[2], w, h)
+    document_capture_fit(round(top > bottom ? top : bottom), round(left > right ? left : right), limit)
+}
+
+// The perspective map taking the unit square to the four corners: Heckbert's closed form,
+// so no system of equations is solved. Gives { a, b, c, d, e, f, g, h }.
+fn document_capture_map(q: list) -> map {
+    let x0 = q[0][0]
+    let y0 = q[0][1]
+    let x1 = q[1][0]
+    let y1 = q[1][1]
+    let x2 = q[2][0]
+    let y2 = q[2][1]
+    let x3 = q[3][0]
+    let y3 = q[3][1]
+    let sx = x0 - x1 + x2 - x3
+    let sy = y0 - y1 + y2 - y3
+    let dx1 = x1 - x2
+    let dx2 = x3 - x2
+    let dy1 = y1 - y2
+    let dy2 = y3 - y2
+    let den = dx1 * dy2 - dx2 * dy1
+    let g = den == 0 ? 0 : (sx * dy2 - dx2 * sy) / den
+    let h = den == 0 ? 0 : (dx1 * sy - sx * dy1) / den
+    { a: x1 - x0 + g * x1, b: x3 - x0 + h * x3, c: x0, d: y1 - y0 + g * y1, e: y3 - y0 + h * y3, f: y0, g, h }
+}
+
+// Where a place on the flat page, u and v from 0 to 1, is on the picture.
+fn document_capture_at(m: map, u: num, v: num) -> list {
+    let w = m.g * u + m.h * v + 1
+    [(m.a * u + m.b * v + m.c) / w, (m.d * u + m.e * v + m.f) / w]
+}
+
+// The canvas transform carrying triangle s to triangle d, each three [x, y].
+fn document_capture_affine(s: list, d: list) -> list? {
+    let ax = s[1][0] - s[0][0]
+    let ay = s[1][1] - s[0][1]
+    let bx = s[2][0] - s[0][0]
+    let by = s[2][1] - s[0][1]
+    let px = d[1][0] - d[0][0]
+    let py = d[1][1] - d[0][1]
+    let qx = d[2][0] - d[0][0]
+    let qy = d[2][1] - d[0][1]
+    let det = ax * by - bx * ay
+    if det == 0 { return null }
+    let a = (px * by - qx * ay) / det
+    let c = (qx * ax - px * bx) / det
+    let b = (py * by - qy * ay) / det
+    let e = (qy * ax - py * bx) / det
+    [a, b, c, e, d[0][0] - a * s[0][0] - c * s[0][1], d[0][1] - b * s[0][0] - e * s[0][1]]
+}
+
+// One triangle of the picture onto the page. It is clipped a little wide of its edges,
+// or the seams between triangles would show as hair-lines.
+fn document_capture_tri(ctx, img, s: list, d: list) {
+    let t = document_capture_affine(s, d)
+    if t != null {
+        let cx = (d[0][0] + d[1][0] + d[2][0]) / 3
+        let cy = (d[0][1] + d[1][1] + d[2][1]) / 3
+        let wide = d | map((p) => {
+            let dx = p[0] - cx
+            let dy = p[1] - cy
+            let far = math.sqrt(dx * dx + dy * dy)
+            let k = far > 0 ? (far + 1) / far : 1
+            [cx + dx * k, cy + dy * k]
+        })
+        ctx.save()
+        ctx.beginPath()
+        ctx.moveTo(wide[0][0], wide[0][1])
+        ctx.lineTo(wide[1][0], wide[1][1])
+        ctx.lineTo(wide[2][0], wide[2][1])
+        ctx.closePath()
+        ctx.clip()
+        ctx.transform(t[0], t[1], t[2], t[3], t[4], t[5])
+        ctx.drawImage(img, 0, 0)
+        ctx.restore()
+    }
+}
+
+// Draws the picture onto a page of ow by oh, flattened. A canvas has no perspective, so the
+// page is cut into small squares, each close enough to flat to be drawn with an ordinary
+// transform: 16 by 16, 512 triangles, is fast on a phone and shows no bend.
+fn document_capture_flatten(ctx, img, c: list, w: num, h: num, ow: num, oh: num) {
+    let n = document_capture_cells
+    let px = c | map((p) => [p[0] * w, p[1] * h])
+    let m = document_capture_map(px)
+    for row in range(n) {
+        for col in range(n) {
+            let u0 = col / n
+            let u1 = (col + 1) / n
+            let v0 = row / n
+            let v1 = (row + 1) / n
+            let a = document_capture_at(m, u0, v0)
+            let b = document_capture_at(m, u1, v0)
+            let e = document_capture_at(m, u1, v1)
+            let d = document_capture_at(m, u0, v1)
+            let pa = [u0 * ow, v0 * oh]
+            let pb = [u1 * ow, v0 * oh]
+            let pe = [u1 * ow, v1 * oh]
+            let pd = [u0 * ow, v1 * oh]
+            document_capture_tri(ctx, img, [a, b, e], [pa, pb, pe])
+            document_capture_tri(ctx, img, [a, e, d], [pa, pe, pd])
+        }
+    }
+}
+
+component DocumentCapture(name: str = "pages", label: str = "Add a page", limit: int = 20, max_side: int = 2000, quality: num = 0.85,
+                          on_change = null, class: str? = null) {
+    style global document_capture_css
+    state pages = []            // { id, photo, w, h, corners, blob, url, ow, oh }: the whole photo, and the page made from it
+    state next_id = 1
+    state working = false
+    state said = ""
+    state open_id = 0           // the page being cropped
+    state corners = document_capture_full   // where its corners are, until Apply
+    state chosen = 0            // the corner the arrow buttons move
+    state stage = null
+    state carry = null
+    state hold = null           // a corner's drag: { i, x, y, box, moved, at }
+    state grab = null           // a row's drag: { from, y, card, moved, to, h }
+    let editing = pages | find((p) => p.id == open_id)
+    let total = pages | map((p) => p.blob.size) | sum()
+    let room = len(pages) < limit
+    let commit = (next: list) => {
+        pages = next
+        let dt = js_new("DataTransfer")
+        let named = for [i, p] in enumerate(next) => {
+            let f = js_new("File", [p.blob], `page-${i + 1}.jpg`, { type: "image/jpeg" })
+            dt.items.add(f)
+            { name: f.name, size: f.size, width: p.ow, height: p.oh }
+        }
+        carry.files = dt.files
+        on_change && on_change(named)
+    }
+    let encode = (canvas) => js("Promise.resolve", js_new("Promise", (done) => { canvas.toBlob((b) => { done(b) }, "image/jpeg", quality) }))
+    let open_image = (url: str) => {
+        let img = js_new("Image")
+        img.src = url
+        let opened = js("Promise.resolve", img.decode())
+        is_err(opened) || img.naturalWidth == 0 ? null : img
+    }
+    let add = (e) => {
+        let file = e.target.files[0]
+        if file == null { return null }
+        e.value = ""
+        said = ""
+        if !starts_with(file.type ?? "image/", "image/") {
+            said = "That is not a picture. Take a photo of the page."
+            return null
+        }
+        working = true
+        let raw = js("URL.createObjectURL", file)
+        let img = open_image(raw)
+        if img == null {
+            js("URL.revokeObjectURL", raw)
+            working = false
+            said = "This picture could not be read. Take it again."
+            return null
+        }
+        // Made smaller once, here, and upright, as an <img> applies the EXIF orientation.
+        let box = document_capture_fit(img.naturalWidth, img.naturalHeight, max_side)
+        let canvas = js("document.createElement", "canvas")
+        canvas.width = box.w
+        canvas.height = box.h
+        let ctx = canvas.getContext("2d")
+        ctx.imageSmoothingQuality = "high"
+        ctx.fillStyle = "#fff"
+        ctx.fillRect(0, 0, box.w, box.h)
+        ctx.drawImage(img, 0, 0, box.w, box.h)
+        let blob = encode(canvas)
+        js("URL.revokeObjectURL", raw)
+        working = false
+        if blob == null || is_err(blob) {
+            said = "This phone could not keep that page. Try again."
+            return null
+        }
+        let url = js("URL.createObjectURL", blob)
+        commit(pages | push({ id: next_id, photo: url, w: box.w, h: box.h, corners: document_capture_full, blob, url, ow: box.w, oh: box.h }))
+        next_id += 1
+    }
+    let close = () => {
+        open_id = 0
+        hold = null
+        said = ""
+    }
+    let start_crop = (p) => {
+        said = ""
+        hold = null
+        corners = p.corners
+        chosen = 0
+        open_id = p.id
+    }
+    let drop = (p) => {
+        if grab != null { return null }     // a second finger, during a drag: `from` would be wrong
+        js("URL.revokeObjectURL", p.photo)
+        if p.url != p.photo { js("URL.revokeObjectURL", p.url) }
+        if open_id == p.id { close() }
+        commit(pages | filter((x) => x.id != p.id))
+    }
+    let shift = (from: int, to: int) => { if grab == null { commit(document_capture_move(pages, from, to)) } }
+    // Moves a handle and the outline straight on the page, not by state, so a drag stays smooth.
+    let show = (c: list) => {
+        if stage != null {
+            for [i, p] in enumerate(c) {
+                stage.style.setProperty(`--ui-dc-x${i}`, str(round(p[0], 5)))
+                stage.style.setProperty(`--ui-dc-y${i}`, str(round(p[1], 5)))
+            }
+            stage.querySelector("polygon").setAttribute("points", join(c | map((p) => `${round(p[0], 5)},${round(p[1], 5)}`), " "))
+        }
+    }
+    // Moved corners are kept only if they still make a page; if not, it goes back.
+    let settle = (next: list) => {
+        if document_capture_good(next) {
+            corners = next
+            said = ""
+            show(next)
+        } else {
+            said = "Those corners would twist the page, so they went back."
+            show(corners)
+        }
+    }
+    let nudge = (i: int, dx: num, dy: num) => {
+        if hold != null { return null }     // one thing at a time: a key would redraw under the finger
+        let p = corners[i]
+        settle(document_capture_place(corners, i, p[0] + dx, p[1] + dy))
+    }
+    let apply_crop = () => {
+        if editing == null { return null }
+        let p = editing
+        let c = corners
+        let img = open_image(p.photo)
+        if img == null {
+            said = "This page could not be read again. Take it again."
+            return null
+        }
+        let size = document_capture_size(c, p.w, p.h, max_side)
+        let canvas = js("document.createElement", "canvas")
+        canvas.width = size.w
+        canvas.height = size.h
+        let ctx = canvas.getContext("2d")
+        ctx.imageSmoothingQuality = "high"
+        ctx.fillStyle = "#fff"
+        ctx.fillRect(0, 0, size.w, size.h)
+        document_capture_flatten(ctx, img, c, p.w, p.h, size.w, size.h)
+        let blob = encode(canvas)
+        if blob == null || is_err(blob) {
+            said = "This phone could not make that page. Try again."
+            return null
+        }
+        if p.url != p.photo { js("URL.revokeObjectURL", p.url) }
+        let made = { ...p, corners: c, blob, url: js("URL.createObjectURL", blob), ow: size.w, oh: size.h }
+        commit(pages | map((x) => x.id == p.id ? made : x))
+        close()
+    }
+    let row_end = (keep: bool) => {
+        if grab != null {
+            let g = grab
+            g.card.removeAttribute("data-lifted")
+            g.card.style.transform = ""
+            grab = null
+            if keep && g.moved && g.to != g.from { shift(g.from, g.to) }
+        }
+    }
+    let corner_end = (keep: bool) => {
+        if hold != null {
+            let h = hold
+            hold = null
+            if keep && h.moved { settle(h.at) } else { show(corners) }
+        }
+    }
+    <div class={ui_cls(["ui-document-capture", editing != null && "ui-document-capture-open", class])} data-state={working ? "working" : "ready"}
+         @mount={(_el) => {
+             () => {
+                 for p in pages {
+                     js("URL.revokeObjectURL", p.photo)
+                     if p.url != p.photo { js("URL.revokeObjectURL", p.url) }
+                 }
+             }
+         }}>
+        <div.ui-document-capture-body>
+            <div.ui-document-capture-side>
+                <label.ui-document-capture-add>
+                    <span>{working ? "Keeping the page…" : label}</span>
+                    <input type="file" accept="image/*" capture="environment" disabled={!room || working} aria-label={label} @change={add}/>
+                </label>
+                <p.ui-document-capture-count role="status">
+                    {len(pages) == 0 ? "No pages yet." : `${len(pages)} ${len(pages) == 1 ? "page" : "pages"}, ${document_capture_bytes(total)}`}{!room ? `. That is the most, ${limit}.` : ""}
+                </p>
+                {said != "" && editing == null && <p.ui-document-capture-why role="alert">{said}</p>}
+                {len(pages) > 0 && <ol.ui-document-capture-list>
+                    {for [i, p] in enumerate(pages) => <li class={ui_cls(["ui-document-capture-page", p.id == open_id && "ui-document-capture-page-open"])} key={p.id} data-id={str(p.id)}>
+                        <img src={p.url} alt={`Page ${i + 1}`} draggable="false"/>
+                        <b>Page {i + 1}</b>
+                        <button.ui-document-capture-grip type="button" aria-label={`Move page ${i + 1}. Arrow keys move it.`}
+                                @contextmenu={(e) => { e.preventDefault() }}
+                                @pointerdown={(e) => {
+                                    if e.button == 0 {
+                                        let card = e.target.closest("li")
+                                        let r = card.getBoundingClientRect()
+                                        e.target.closest("button").setPointerCapture(e.pointerId)
+                                        grab = { from: i, y: e.clientY, card, moved: false, to: i, h: r.height + 8 }
+                                    }
+                                }}
+                                @pointermove={(e) => {
+                                    if grab != null {
+                                        let dy = e.clientY - grab.y
+                                        if grab.moved || abs(dy) > 6 {
+                                            grab.card.style.transform = `translateY(${round(dy)}px)`
+                                            grab.card.dataset.lifted = "1"
+                                            grab = { ...grab, moved: true, to: document_capture_slot(grab.from, dy, grab.h, len(pages)) }
+                                        }
+                                    }
+                                }}
+                                @pointerup={() => { row_end(true) }}
+                                @pointercancel={() => { row_end(false) }}
+                                @keydown={(e) => {
+                                    let to = e.key == "ArrowUp" ? i - 1 : e.key == "ArrowDown" ? i + 1 : -1
+                                    if to >= 0 && to < len(pages) {
+                                        e.preventDefault()
+                                        shift(i, to)
+                                    }
+                                }}>
+                            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>
+                        </button>
+                        <button type="button" aria-label={`Earlier: page ${i + 1}`} disabled={i == 0} @click={() => { shift(i, i - 1) }}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 15l6-6 6 6"/></svg>
+                        </button>
+                        <button type="button" aria-label={`Later: page ${i + 1}`} disabled={i == len(pages) - 1} @click={() => { shift(i, i + 1) }}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+                        </button>
+                        <button type="button" aria-label={`Crop page ${i + 1}`} @click={() => { start_crop(p) }}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2v16h16M2 6h16v16"/></svg>
+                        </button>
+                        <button type="button" aria-label={`Drop page ${i + 1}`} @click={() => { drop(p) }}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                        </button>
+                    </li>}
+                </ol>}
+            </div>
+            {editing != null && <div.ui-document-capture-crop role="group" aria-label="Crop by four corners">
+                <h3>Move each corner to the corner of the paper</h3>
+                <div.ui-document-capture-room>
+                    <div.ui-document-capture-stage @mount={(el) => { stage = el; show(corners) }}>
+                        <img src={editing.photo} alt="The page as it was taken" draggable="false"/>
+                        <svg viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true">
+                            <polygon/>
+                        </svg>
+                        {for [i, c] in enumerate(corners) => <button class={ui_cls(["ui-document-capture-corner", `ui-document-capture-c${i}`, i == chosen && "ui-document-capture-corner-chosen"])} key={i} type="button"
+                                aria-label={`${document_capture_names[i]} corner, ${round(c[0] * 100)} percent across, ${round(c[1] * 100)} percent down. Arrow keys move it.`}
+                                @click={() => { chosen = i }}
+                                @contextmenu={(e) => { e.preventDefault() }}
+                                @pointerdown={(e) => {
+                                    if e.button == 0 {
+                                        e.target.setPointerCapture(e.pointerId)
+                                        chosen = i
+                                        let r = stage.getBoundingClientRect()
+                                        hold = { i, x: e.clientX, y: e.clientY, sx: corners[i][0], sy: corners[i][1], w: r.width, h: r.height, moved: false, at: corners }
+                                    }
+                                }}
+                                @pointermove={(e) => {
+                                    if hold != null {
+                                        let dx = e.clientX - hold.x
+                                        let dy = e.clientY - hold.y
+                                        if hold.moved || abs(dx) > 3 || abs(dy) > 3 {
+                                            let at = document_capture_place(corners, hold.i, hold.sx + dx / hold.w, hold.sy + dy / hold.h)
+                                            hold = { ...hold, moved: true, at }
+                                            show(at)
+                                        }
+                                    }
+                                }}
+                                @pointerup={() => { corner_end(true) }}
+                                @pointercancel={() => { corner_end(false) }}
+                                @keydown={(e) => {
+                                    let by = e.shiftKey ? 0.05 : 0.01
+                                    let move = match e.key {
+                                        "ArrowLeft" => [-by, 0]
+                                        "ArrowRight" => [by, 0]
+                                        "ArrowUp" => [0, -by]
+                                        "ArrowDown" => [0, by]
+                                        _ => null
+                                    }
+                                    if move != null {
+                                        e.preventDefault()
+                                        if hold == null {
+                                            chosen = i
+                                            nudge(i, move[0], move[1])
+                                        }
+                                    }
+                                }}></button>}
+                    </div>
+                </div>
+                <p.ui-document-capture-note>Moving: {document_capture_names[chosen]}. Tap a corner to choose it.</p>
+                <div.ui-document-capture-nudge role="group" aria-label="Move the chosen corner">
+                    <button.ui-document-capture-up type="button" aria-label="Up" @click={() => { nudge(chosen, 0, -0.01) }}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 15l6-6 6 6"/></svg></button>
+                    <button.ui-document-capture-left type="button" aria-label="Left" @click={() => { nudge(chosen, -0.01, 0) }}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button>
+                    <button.ui-document-capture-down type="button" aria-label="Down" @click={() => { nudge(chosen, 0, 0.01) }}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
+                    <button.ui-document-capture-right type="button" aria-label="Right" @click={() => { nudge(chosen, 0.01, 0) }}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></button>
+                </div>
+                {said != "" && <p.ui-document-capture-why role="alert">{said}</p>}
+                <div.ui-document-capture-bar>
+                    <Button size="lg" on_click={apply_crop}>Apply</Button>
+                    <Button size="lg" variant="outline" tone="neutral" on_click={() => { hold = null; corners = document_capture_full; show(document_capture_full); said = "" }}>Whole photo</Button>
+                    <Button size="lg" variant="ghost" tone="neutral" on_click={close}>Cancel</Button>
+                </div>
+            </div>}
+        </div>
+        <input type="file" name={name} multiple={true} hidden={true} tabindex="-1" aria-hidden="true" @mount={(el) => { carry = el }}/>
+    </div>
+}

@@ -1,0 +1,892 @@
+// ScanCount: counting stock by scanning: each item's expected number beside what has been
+// counted, and what is over and short. Every scan can be taken back, a whole case can
+// count as twelve, and nothing in it needs a connection: a count finished with none
+// waits on the device and goes when one comes.
+//
+// It takes scans from the camera, a photo, the keyboard, and the hardware scanner of a
+// rugged device, which types the code and presses Enter. Where the browser has
+// BarcodeDetector the camera uses it, for every code it knows. iOS has none, so frames
+// are also read here, in Quillo: EAN-13, EAN-8, UPC-A and Code 128 along straight lines.
+//
+//   import ui/scan_count.qwe use ScanCount
+//
+//   <ScanCount title="Aisle 4" items={[{ code: "4006381333931", name: "Marker pen", expected: 24 }]}
+//              store="aisle-4" on_finish={(count) => send_count(count)}/>
+//
+// items: what should be there, each { code, name, expected }. A code not listed still
+// counts, under "Not listed". UPC-A and EAN-13 are one number, and case does not matter.
+// title ("Stock count"). blind: hides what is expected until the count is finished, so
+// a count is not steered by it (false). wedge: a hardware scanner is the main way in, so
+// the field keeps its focus and the on-screen keyboard stays down; Keyboard brings it up
+// (false). use_camera: offers the camera (true). gap: ms a code must leave the camera's
+// view before it counts again (1500). sound: starts on (true). id: a prefix for its ids,
+// unique on the page ("ui-scanct").
+//
+// What must last: in the phone apps localStorage comes back empty, so give back `saved`
+// (what on_change gave) from your own store. store: a key to keep the count under in this
+// browser's localStorage as well.
+//
+// on_change(saved): after each scan, undo or correction, with { scans, started, result,
+// sent }. on_finish(result): called when Send is pressed, and again when a connection
+// comes back if it could not go; answer false, an error, or a Promise of either to try
+// again later. result: { title, lines: [{ code, name, expected, counted, diff }],
+// unknown: [{ code, counted }], counted, short, over, matched, scans, started, finished }.
+//
+// ScanCountInput is the scanning field alone, for a screen of your own:
+//   <ScanCountInput id="tag" label="Asset tag" on_scan={(code, how) => found(code)}/>
+// on_scan(code, how): how is "camera", "photo" or "typed". Answer false (or a Promise of
+// false) for a low sound and a warning buzz, anything else for the good ones.
+// label ("Scan or type a code"), id, use_camera, wedge, gap, sound, disabled.
+//
+// scan_count_rows(items, scans), scan_count_totals(rows), scan_count_clean(text),
+// scan_count_key(code) and scan_count_read(luma), which reads a line of pixels'
+// brightness, are the plain logic.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let scan_count_css = css`
+.ui-scanct { display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-scanct h3 { margin: 0; font-size: 18px; }
+.ui-scanct-cols { display: grid; gap: 12px; min-width: 0; }
+.ui-scanct-col { display: grid; gap: 12px; min-width: 0; align-content: start; }
+.ui-scanin { display: grid; gap: 8px; min-width: 0; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-scanin-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; margin: 0; }
+.ui-scanin-form label { display: grid; gap: 2px; min-width: 0; color: var(--ui-muted); font-size: 13px; }
+/* 16 px: anything smaller and iOS zooms the page when the field is touched. */
+.ui-scanin-form input { box-sizing: border-box; width: 100%; height: 52px; padding: 0 12px; border: 2px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 17px var(--ui-mono); }
+.ui-scanin-form input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-scanin-view { position: relative; display: grid; place-items: center; overflow: hidden; border-radius: var(--ui-radius); background: #0f0e17; color: #fff; aspect-ratio: 16 / 9; }
+.ui-scanin-view[hidden] { display: none; }
+.ui-scanin-view video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.ui-scanin-aim { position: absolute; inset: 22% 8%; border: 2px solid rgba(255, 255, 255, .85); border-radius: 8px; pointer-events: none; }
+.ui-scanin-aim::after { content: ""; position: absolute; left: 6px; right: 6px; top: 50%; height: 2px; background: #ff5a5a; }
+.ui-scanin-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-scanin-acts > * { flex: 1 1 110px; }
+.ui-scanin-msg { margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-scanin-msg:empty { display: none; }
+.ui-scanct-said { display: grid; align-content: center; min-height: 64px; margin: 0; padding: 8px 12px; border-left: 6px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+.ui-scanct-said[data-kind="good"] { border-color: var(--ui-success); background: var(--ui-success-soft); }
+.ui-scanct-said[data-kind="over"] { border-color: var(--ui-warning); background: var(--ui-warning-soft); }
+.ui-scanct-said[data-kind="bad"] { border-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-scanct-bar { display: grid; grid-template-columns: auto 1fr; gap: 8px; align-items: center; }
+.ui-scanct-times { display: inline-flex; align-items: center; gap: 6px; color: var(--ui-muted); font-size: 14px; }
+.ui-scanct-times input { box-sizing: border-box; width: 72px; height: 46px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px var(--ui-mono); text-align: center; }
+.ui-scanct-times input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-scanct-sum { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin: 0; }
+.ui-scanct-sum div { min-width: 0; padding: 6px 4px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); text-align: center; }
+.ui-scanct-sum dt { color: var(--ui-muted); font-size: 12px; }
+.ui-scanct-sum dd { margin: 0; font: 700 18px/1.3 var(--ui-mono); }
+.ui-scanct-filter { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-scanct-chip { position: relative; display: inline-flex; align-items: center; min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); font-size: 14px; font-weight: 600; cursor: pointer; }
+.ui-scanct-chip input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.ui-scanct-chip:has(input:checked) { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-scanct-chip:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-scanct-rows { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; min-width: 0; }
+.ui-scanct-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 2px 8px; padding: 6px 4px 6px 12px; border-left: 4px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); content-visibility: auto; contain-intrinsic-size: auto 60px; }
+.ui-scanct-row[data-state="match"] { border-color: var(--ui-success); }
+.ui-scanct-row[data-state="over"], .ui-scanct-row[data-state="unknown"] { border-color: var(--ui-warning); }
+.ui-scanct-row[data-state="short"] { border-color: var(--ui-danger); }
+.ui-scanct-name { min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.ui-scanct-code { display: block; color: var(--ui-muted); font: 12px var(--ui-mono); overflow-wrap: anywhere; }
+.ui-scanct-note { display: block; font-size: 13px; font-weight: 500; }
+.ui-scanct-qty { display: inline-flex; align-items: center; }
+.ui-scanct-step { display: grid; place-items: center; min-width: 46px; height: 46px; padding: 0; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 500 22px var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-scanct-step:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-scanct-step:disabled { opacity: .35; cursor: default; }
+.ui-scanct-n { min-width: 48px; text-align: center; font: 700 16px var(--ui-mono); }
+.ui-scanct-empty { margin: 0; color: var(--ui-muted); }
+.ui-scanct-review { display: grid; gap: 8px; padding: 12px; border: 2px solid var(--ui-strong); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-scanct-review h4 { margin: 0; font-size: 16px; }
+.ui-scanct-review ul { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.ui-scanct-review p { margin: 0; }
+.ui-scanct-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-scanct-acts > * { flex: 1 1 140px; }
+.ui-scanct-line { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); font-size: 14px; }
+@container (min-width: 640px) {
+  .ui-scanct-cols { grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 20px; align-items: start; }
+}
+`
+
+// EAN's digits as the widths of their space, bar, space, bar, in modules. The left half's
+// other form (G) is the same read backwards, and the right half has these with the colours
+// turned round, which gives the same widths.
+let scan_count_ean = [[3, 2, 1, 1], [2, 2, 2, 1], [2, 1, 2, 2], [1, 4, 1, 1], [1, 1, 3, 2],
+                      [1, 2, 3, 1], [1, 1, 1, 4], [1, 3, 1, 2], [1, 2, 1, 3], [3, 1, 1, 2]]
+
+// Which forms the six left digits of an EAN-13 take gives its first digit.
+let scan_count_ean_first = ["LLLLLL", "LLGLGG", "LLGGLG", "LLGGGL", "LGLLGG", "LGGLLG", "LGGGLL", "LGLGLG", "LGLGGL", "LGGLGL"]
+
+// Code 128's symbols by value, each three bars and three spaces, 11 modules in all.
+// 103 to 105 start sets A, B and C; 106 is the first six widths of the stop.
+let scan_count_128 = ["212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312", "132212", "221213", "221312", "231212",
+    "112232", "122132", "122231", "113222", "123122", "123221", "223211", "221132", "221231", "213212", "223112", "312131", "311222", "321122",
+    "321221", "312212", "322112", "322211", "212123", "212321", "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
+    "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121", "313121", "211331", "231131", "213113", "213311", "213131",
+    "311123", "311321", "331121", "312113", "312311", "332111", "314111", "221411", "431111", "111224", "111422", "121124", "121421", "141122",
+    "141221", "112214", "112412", "122114", "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111", "111242", "121142",
+    "121241", "114212", "124112", "124211", "411212", "421112", "421211", "212141", "214121", "412121", "111143", "111341", "131141", "114113",
+    "114311", "411113", "411311", "113141", "114131", "311141", "411131", "211412", "211214", "211232", "233111"]
+
+// Printable ASCII from the space, which is what a Code 128 value of 0 means.
+let scan_count_ascii = split(" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~", "")
+
+let scan_count_128_widths = scan_count_128 | map((p) => split(p, "") | map((c) => int(c)))
+
+// The GS1 check digit of the digits before it.
+fn scan_count_check(body: list) -> int {
+    let n = len(body)
+    let total = enumerate(body) | reduce(0, (a, p) => a + p[1] * ((n - p[0]) % 2 == 1 ? 3 : 1))
+    (10 - total % 10) % 10
+}
+
+// Which digit four widths are, against a list of patterns: { d, off }, off being how far
+// they are from it. 7 modules to a digit, so the widths are scaled to that first.
+fn scan_count_digit(w: list, flip: bool) -> map {
+    let unit = 7 / max([1, sum(w)])
+    let scaled = w | map((x) => x * unit)
+    let tries = for [d, p] in enumerate(scan_count_ean) {
+        let pat = flip ? reverse(p) : p
+        { d: d, off: abs(scaled[0] - pat[0]) + abs(scaled[1] - pat[1]) + abs(scaled[2] - pat[2]) + abs(scaled[3] - pat[3]) }
+    }
+    sort_by(tries, (t) => t.off)[0]
+}
+
+// A run of a guard: each width near one module.
+fn scan_count_guard(runs: list, at: int, n: int, unit) -> bool =
+    range(at, at + n) | all((i) => runs[i] > unit * 0.4 && runs[i] < unit * 2)
+
+// Reads an EAN or UPC starting at a bar: `half` digits a side, EAN-13 with 6 and EAN-8 with 4.
+fn scan_count_ean_at(runs: list, start: int, half: int) {
+    let count = 3 + half * 4 + 5 + half * 4 + 3
+    if start + count > len(runs) { return null }
+    let span = slice(runs, start, start + count)
+    let unit = sum(span) / (half == 6 ? 95 : 67)
+    if !scan_count_guard(runs, start, 3, unit) { return null }
+    if start > 0 && runs[start - 1] < unit * 3 { return null }
+    let middle = start + 3 + half * 4
+    if !scan_count_guard(runs, middle, 5, unit) || !scan_count_guard(runs, middle + 5 + half * 4, 3, unit) { return null }
+    let left = for i in range(0, half) {
+        let w = slice(runs, start + 3 + i * 4, start + 7 + i * 4)
+        let plain = scan_count_digit(w, false)
+        let other = scan_count_digit(w, true)
+        half == 4 || plain.off <= other.off ? { d: plain.d, form: "L", off: plain.off } : { d: other.d, form: "G", off: other.off }
+    }
+    let right = for i in range(0, half) => scan_count_digit(slice(runs, middle + 5 + i * 4, middle + 9 + i * 4), false)
+    if (left + right) | any((x) => x.off > 1.5) { return null }
+    let digits = (left | map((x) => x.d)) + (right | map((x) => x.d))
+    let all_digits = if half == 4 { digits } else {
+        let first = scan_count_ean_first | index_of(left | map((x) => x.form) | join(""))
+        if first == null { return null }
+        [first] + digits
+    }
+    let body = slice(all_digits, 0, len(all_digits) - 1)
+    all_digits[len(all_digits) - 1] == scan_count_check(body) ? all_digits | join("") : null
+}
+
+// The Code 128 value six widths are, or null when none is near.
+fn scan_count_128_value(w: list) {
+    let unit = 11 / max([1, sum(w)])
+    let scaled = w | map((x) => x * unit)
+    let best = enumerate(scan_count_128_widths) | map((p) => {
+        let t = p[1]
+        { v: p[0], off: abs(scaled[0] - t[0]) + abs(scaled[1] - t[1]) + abs(scaled[2] - t[2]) + abs(scaled[3] - t[3]) + abs(scaled[4] - t[4]) + abs(scaled[5] - t[5]) }
+    }) | sort_by((t) => t.off)
+    best[0].off <= 2 ? best[0].v : null
+}
+
+// The text of Code 128's values: `start` is 103, 104 or 105, and each value after it means
+// a character by the set in force. The check value is already gone.
+fn scan_count_128_text(start: int, values: list) -> str {
+    let code = start - 103   // 0 is A, 1 is B, 2 is C
+    let shift = false
+    let parts = for v in values {
+        let now_set = shift ? (code == 0 ? 1 : 0) : code
+        shift = false
+        if now_set == 2 {
+            if v < 100 {
+                v < 10 ? `0${v}` : str(v)
+            } else {
+                if v == 100 { code = 1 }
+                if v == 101 { code = 0 }
+                ""
+            }
+        } else if v == 98 {
+            shift = true
+            ""
+        } else if v == 99 {
+            code = 2
+            ""
+        } else if v == 100 || v == 101 {
+            // In set A 101 is FNC4 and in B 100 is; the other is a change of set.
+            if now_set == 0 && v == 100 { code = 1 }
+            if now_set == 1 && v == 101 { code = 0 }
+            ""
+        } else if v >= 102 {
+            ""
+        } else if now_set == 1 || v < 64 {
+            v < len(scan_count_ascii) ? scan_count_ascii[v] : ""
+        } else {
+            // Set A's control characters have no place in a code kept as text.
+            ""
+        }
+    }
+    join(parts, "")
+}
+
+// Reads a Code 128 starting at a bar: start symbol, data, check, stop.
+fn scan_count_128_at(runs: list, start: int) {
+    if start + 6 * 3 + 7 > len(runs) { return null }
+    // Most places are not a start: the quiet space before it rules them out cheaply.
+    let unit = sum(slice(runs, start, start + 6)) / 11
+    if start > 0 && runs[start - 1] < unit * 5 { return null }
+    let first = scan_count_128_value(slice(runs, start, start + 6))
+    if first == null || first < 103 || first > 105 { return null }
+    let count = floor((len(runs) - start) / 6)
+    let symbols = for i in range(1, count) => scan_count_128_value(slice(runs, start + i * 6, start + i * 6 + 6))
+    let end = symbols | index_of(106)
+    if end == null || end < 2 { return null }
+    let found = slice(symbols, 0, end)
+    if found | any((v) => v == null) { return null }
+    let data = slice(found, 0, end - 1)
+    let total = enumerate(data) | reduce(first, (a, p) => a + (p[0] + 1) * p[1])
+    total % 103 == found[end - 1] ? scan_count_128_text(first, data) : null
+}
+
+// The widths of the light and dark runs along a line, the first being dark. Light falls
+// unevenly across a phone's picture, so each pixel is judged against the brightest and
+// darkest near it, by blocks of a twentieth of the line.
+fn scan_count_runs(luma: list) -> list {
+    let n = len(luma)
+    let block = max([8, floor(n / 20)])
+    let count = ceil(n / block)
+    let parts = for i in range(0, count) => slice(luma, i * block, (i + 1) * block)
+    let lows = parts | map((p) => min(p))
+    let highs = parts | map((p) => max(p))
+    let whole = (min(lows) + max(highs)) / 2
+    let cuts = for i in range(0, count) {
+        let a = max([0, i - 1])
+        let b = min([count, i + 2])
+        let lo = min(slice(lows, a, b))
+        let hi = max(slice(highs, a, b))
+        hi - lo < 40 ? whole : (lo + hi) / 2
+    }
+    // Start at the first dark pixel, then the widths by turns: dark, light, dark.
+    let pieces = []
+    let chunk = []
+    let width = 0
+    let dark = null
+    for [i, v] in enumerate(luma) {
+        let now_dark = v < cuts[floor(i / block)]
+        if dark == null {
+            if now_dark {
+                dark = true
+                width = 1
+            }
+        } else if now_dark == dark {
+            width += 1
+        } else {
+            chunk = chunk | push(width)
+            if len(chunk) >= 64 {
+                pieces = pieces | push(chunk)
+                chunk = []
+            }
+            width = 1
+            dark = now_dark
+        }
+    }
+    flatten(pieces + [chunk])
+}
+
+// The code along one line of pixels' brightness, read each way, or null.
+fn scan_count_read(luma: list) {
+    if len(luma) < 60 { return null }
+    let runs = scan_count_runs(luma)
+    for way in [runs, reverse(runs)] {
+        let tops = range(0, floor(max([0, len(way) - 24]) / 2) + 1) | map((i) => i * 2)
+        for start in tops {
+            let long = scan_count_ean_at(way, start, 6)
+            if long != null { return long }
+            let short = scan_count_ean_at(way, start, 4)
+            if short != null { return short }
+            let c128 = scan_count_128_at(way, start)
+            if c128 != null && c128 != "" { return c128 }
+        }
+    }
+    null
+}
+
+// A scanned text as it should be kept. Scanners can add control characters and a
+// symbology prefix such as ]C1, and a code is never very long.
+fn scan_count_clean(text) -> str {
+    let plain = re.replace(slice(str(text ?? ""), 0, 120), "[\\x00-\\x1f\\x7f]", "")
+    slice(trim(re.replace(plain, "^\\][A-Za-z][0-9]", "")), 0, 80)
+}
+
+// What a code is compared by. UPC-A is an EAN-13 with a 0 in front: the same product,
+// however it was read. Letters are compared in one case.
+fn scan_count_key(code) -> str {
+    let c = upper(scan_count_clean(code))
+    len(c) == 12 && re.test(c, "^[0-9]{12}$") ? "0" + c : c
+}
+
+// Whether a code seen by the camera counts: not the same one again before it has left
+// the view. The time of the last sighting moves with each sighting, so one held still
+// counts once.
+fn scan_count_fresh(last, code: str, t, gap: int) -> bool = last == null || last.code != code || t - last.at >= gap
+
+// How many a scan counts for, from what is in its box: bad input is one.
+fn scan_count_times(text) -> int {
+    let t = trim(str(text ?? ""))
+    if !re.test(t, "^[0-9]{1,5}$") { return 1 }
+    max([1, int(t)])
+}
+
+// The items, each once and with sensible fields.
+fn scan_count_listed(items: list) -> list {
+    let good = items | filter((i) => type_of(i) == "map" && get(i, "code") != null && scan_count_clean(get(i, "code")) != "")
+    let rows = good | map((i) => {
+        let raw = get(i, "expected")
+        let expected = (type_of(raw) == "int" || type_of(raw) == "float") && raw >= 0 ? floor(raw) : 0
+        { key: scan_count_key(i.code), code: scan_count_clean(i.code), name: str(get(i, "name") ?? i.code), expected: expected }
+    })
+    let groups = group_by(enumerate(rows), (p) => p[1].key)
+    enumerate(rows) | filter((p) => get(groups, p[1].key)[0][0] == p[0]) | map((p) => p[1])
+}
+
+fn scan_count_sum(scans: list) -> int = scans | reduce(0, (a, s) => a + s.qty)
+
+// A row for each item, then one for each code not listed, first seen first:
+// { key, code, name, expected, counted, diff, state, listed }. state is "none", "short",
+// "match", "over" or "unknown". group_by gives one pass over the scans, and get() finds
+// a code that is also the name of a JavaScript object's field.
+fn scan_count_rows(items: list, scans: list) -> list {
+    let listed = scan_count_listed(items)
+    let groups = group_by(scans, (s) => s.key)
+    let known = group_by(listed, (r) => r.key)
+    let rows = for r in listed {
+        let counted = scan_count_sum(get(groups, r.key, []))
+        let diff = counted - r.expected
+        { key: r.key, code: r.code, name: r.name, expected: r.expected, counted: counted, diff: diff, listed: true,
+          state: counted == 0 && r.expected > 0 ? "none" : (diff < 0 ? "short" : (diff > 0 ? "over" : "match")) }
+    }
+    let others = scans | filter((s) => get(known, s.key) == null) | map((s) => s.key) | unique()
+    let extra = for k in others {
+        let these = get(groups, k, [])
+        { key: k, code: these[0].code, name: these[0].code, expected: 0, counted: scan_count_sum(these), diff: scan_count_sum(these), listed: false, state: "unknown" }
+    }
+    rows + (extra | filter((r) => r.counted > 0))
+}
+
+// { expected, counted, short, over, matched, unknown }: short and over in units.
+fn scan_count_totals(rows: list) -> map {
+    let listed = rows | filter((r) => r.listed)
+    { expected: listed | reduce(0, (a, r) => a + r.expected), counted: rows | reduce(0, (a, r) => a + r.counted),
+      short: listed | reduce(0, (a, r) => a + max([0, 0 - r.diff])), over: listed | reduce(0, (a, r) => a + max([0, r.diff])),
+      matched: listed | filter((r) => r.diff == 0) | len(), unknown: rows | filter((r) => !r.listed) | reduce(0, (a, r) => a + r.counted) }
+}
+
+// The rows a filter shows.
+fn scan_count_shown(rows: list, chosen: str) -> list = match chosen {
+    "short" => rows | filter((r) => r.state == "short" || r.state == "none")
+    "over" => rows | filter((r) => r.state == "over")
+    "unknown" => rows | filter((r) => r.state == "unknown")
+    _ => rows
+}
+
+// What goes to on_finish.
+fn scan_count_result(title: str, rows: list, scans: list, started, finished) -> map {
+    let t = scan_count_totals(rows)
+    { title: title, lines: rows | filter((r) => r.listed) | map((r) => ({ code: r.code, name: r.name, expected: r.expected, counted: r.counted, diff: r.diff })),
+      unknown: rows | filter((r) => !r.listed) | map((r) => ({ code: r.code, counted: r.counted })),
+      counted: t.counted, short: t.short, over: t.over, matched: t.matched, scans: len(scans), started: started, finished: finished }
+}
+
+// What saved or a store gave back, keeping only scans that make sense.
+fn scan_count_restore(s) -> map {
+    let raw = type_of(s) == "map" && type_of(get(s, "scans")) == "list" ? s.scans : []
+    let scans = raw | filter((x) => type_of(x) == "map" && type_of(get(x, "key")) == "str" && type_of(get(x, "qty")) == "int")
+    { scans: scans, started: type_of(s) == "map" ? get(s, "started") : null, result: type_of(s) == "map" ? get(s, "result") : null,
+      sent: type_of(s) == "map" && get(s, "sent") == true }
+}
+
+// A line for a row in the review.
+fn scan_count_diff_text(r) -> str = r.diff < 0 ? `${r.name}: ${0 - r.diff} short` : `${r.name}: ${r.diff} over`
+
+// Keeps text in localStorage, or says it could not: a full store or a private window
+// throws. A top-level fn does not wait for js(), so these give Promises, which the caller
+// waits for with js("Promise.resolve", ...).
+fn scan_count_keep(name: str, text: str) {
+    js_new("Promise", (done) => {
+        js("localStorage.setItem", name, text)
+        done(true)
+    }).then((_ok = null) => true, (_e = null) => false)
+}
+
+fn scan_count_kept(name: str) {
+    js_new("Promise", (done) => {
+        let text = js("localStorage.getItem", name)
+        let v = text == null ? null : json.parse(text)
+        done(is_err(v) ? null : v)
+    }).then((v = null) => v, (_e = null) => null)
+}
+
+// The field every scanning screen starts from: a hardware scanner, the keyboard, the
+// camera, a photo. It sounds and buzzes by what on_scan answers.
+component ScanCountInput(label: str = "Scan or type a code", id: str = "ui-scanin", use_camera: bool = true, gap: int = 1500, sound: bool = true,
+                         wedge: bool = false, disabled: bool = false, on_scan = null, class: str? = null) {
+    style global scan_count_css
+    state text = ""
+    state camera = "off"     // off, starting, live, none (there is none), refused, paused (the app left the screen)
+    state stream = null
+    state video = null
+    state picker = null
+    state field = null
+    state canvas = null
+    state detector = null    // the browser's BarcodeDetector, where there is one
+    state busy = false       // a frame is being read
+    state last = null        // the last code seen: { code, at }
+    state beeps = sound
+    state audio = null
+    state native = false     // in a phone app, which can open Settings
+    state typing = !wedge      // the on-screen keyboard may come up
+    state ready = false      // the field has the focus, so a hardware scanner reaches it
+    state said = ""
+    let stop = () => {
+        if stream != null {
+            for t in js("Array.from", stream.getTracks()) { t.stop() }
+            stream = null
+        }
+    }
+    let feel = (good) => {
+        let w = js("window")
+        if w.quilloNative != null {
+            js("quilloNative.haptic", good ? "success" : "warning")
+        } else if js("navigator").vibrate != null {
+            js("navigator").vibrate(good ? 30 : [40, 60, 40])
+        }
+    }
+    let beep = (good) => {
+        if beeps && audio != null {
+            let o = audio.createOscillator()
+            let g = audio.createGain()
+            o.frequency.value = good ? 1480 : 330
+            g.gain.value = 0.08
+            o.connect(g)
+            g.connect(audio.destination)
+            o.start()
+            o.stop(audio.currentTime + (good ? 0.09 : 0.22))
+        }
+    }
+    // A page may sound only after a tap: each way in makes it here, from one. A hardware
+    // scanner's key press counts as one too.
+    let wake_sound = () => {
+        if audio == null {
+            let w = js("window")
+            let make = w.AudioContext != null ? js_new("AudioContext") : (w.webkitAudioContext != null ? js_new("webkitAudioContext") : null)
+            if make != null && !is_err(make) { audio = make }
+        }
+        if audio != null && audio.state == "suspended" { audio.resume() }
+    }
+    let seen = (raw, how) => {
+        let code = scan_count_clean(raw)
+        if code != "" {
+            let t = now()
+            let fresh = how != "camera" || scan_count_fresh(last, code, t, gap)
+            last = { code: code, at: t }
+            if fresh {
+                let answer = on_scan != null ? js("Promise.resolve", on_scan(code, how)) : true
+                let good = answer != false && !is_err(answer)
+                beep(good)
+                feel(good)
+            }
+        }
+    }
+    let read_frame = (source, wide, high) => {
+        let d = js("document")
+        if canvas == null { canvas = d.createElement("canvas") }
+        let w = min([wide, 1024])
+        let h = round(high * w / wide)
+        canvas.width = w
+        canvas.height = h
+        let c = canvas.getContext("2d", { willReadFrequently: true })
+        c.drawImage(source, 0, 0, w, h)
+        let found = null
+        for part in [0.5, 0.42, 0.58, 0.34, 0.66] {
+            if found == null {
+                let px = js("Array.from", c.getImageData(0, floor(h * part), w, 1).data)
+                found = scan_count_read(for i in range(0, w) => px[i * 4] * 0.3 + px[i * 4 + 1] * 0.59 + px[i * 4 + 2] * 0.11)
+            }
+        }
+        // A phone held across the code: the same again, down the middle.
+        if found == null {
+            let px = js("Array.from", c.getImageData(floor(w / 2), 0, 1, h).data)
+            found = scan_count_read(for i in range(0, h) => px[i * 4] * 0.3 + px[i * 4 + 1] * 0.59 + px[i * 4 + 2] * 0.11)
+        }
+        found
+    }
+    let tick = () => {
+        if camera == "live" && !busy && video != null && video.readyState >= 2 && video.videoWidth > 0 {
+            if detector != null {
+                busy = true
+                detector.detect(video).then(
+                    (found) => {
+                        busy = false
+                        if len(found) > 0 { seen(found[0].rawValue, "camera") }
+                    },
+                    (_e = null) => { busy = false })
+            } else {
+                let code = read_frame(video, video.videoWidth, video.videoHeight)
+                if code != null { seen(code, "camera") }
+            }
+        }
+    }
+    if camera == "live" { every(240, tick) }
+    let start = () => {
+        wake_sound()
+        said = ""
+        let md = js("navigator").mediaDevices
+        if md == null || md.getUserMedia == null {
+            camera = "none"
+        } else {
+            camera = "starting"
+            let w = js("window")
+            detector = null
+            if w.BarcodeDetector != null {
+                // With no list of formats it reads all it can, which differs by phone. A constructor
+                // that throws would stop this handler, so it is made inside a Promise (Q-318).
+                let made = js("Promise.resolve", js_new("Promise", (done) => { done(js_new("BarcodeDetector")) }))
+                if !is_err(made) { detector = made }
+            }
+            md.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1280 } }, audio: false }).then(
+                (s) => {
+                    stream = s
+                    camera = "live"
+                    video.srcObject = s
+                    video.play().catch((_ = null) => { busy = false })
+                },
+                (e) => {
+                    native = w.quilloNative != null
+                    camera = e.name == "NotAllowedError" || e.name == "SecurityError" ? "refused" : "none"
+                })
+        }
+    }
+    let quit = () => {
+        stop()
+        camera = "off"
+    }
+    let photo = (file) => {
+        wake_sound()
+        said = ""
+        js("createImageBitmap", file).then(
+            (b) => {
+                let code = read_frame(b, b.width, b.height)
+                b.close()
+                if code != null {
+                    seen(code, "photo")
+                } else {
+                    said = "No code found in that photo. Try closer, with the code straight."
+                    beep(false)
+                    feel(false)
+                }
+            },
+            (_e = null) => { said = "That photo could not be read." })
+    }
+    let enter = () => {
+        wake_sound()
+        let was = text
+        text = ""
+        said = ""
+        seen(was, "typed")
+        if wedge && field != null { field.focus() }
+    }
+    let message = match camera {
+        "starting" => "Asking for the camera…"
+        "none" => "This device has no camera this page can use. Take a photo, or type the code."
+        "refused" => native ? "The camera was refused. Turn it on in Settings, or type the code." : "The camera was refused. Allow it in your browser's settings, or type the code."
+        "paused" => "The camera stopped when you left."
+        _ => wedge ? (ready ? "Ready for the scanner." : "Tap the field, then scan.") : ""
+    }
+    <div class={ui_cls(["ui-scanin", class])}
+         @mount={(_el) => {
+             let d = js("document")
+             // iOS stops the camera when the app leaves the screen, and it does not come back alone.
+             let away = (_e = null) => {
+                 if d.visibilityState == "hidden" {
+                     if camera == "live" {
+                         stop()
+                         camera = "paused"
+                     }
+                 } else if camera == "paused" {
+                     start()
+                 }
+             }
+             d.addEventListener("visibilitychange", away)
+             () => {
+                 d.removeEventListener("visibilitychange", away)
+                 stop()
+             }
+         }}>
+        <form.ui-scanin-form @submit={(e) => {
+            e.preventDefault()
+            enter()
+        }}>
+            <label for={`${id}-code`}>{label}
+                <input id={`${id}-code`} autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="go" disabled={disabled}
+                       inputmode={typing ? "text" : "none"} value={text}
+                       @mount={(el) => { field = el }}
+                       @focus={() => { ready = true }}
+                       @blur={() => { ready = false }}
+                       @input={(e) => { text = e.value }}
+                       @keydown={(e) => {
+                           // Some scanners end a code with Tab, which would take the focus away.
+                           if wedge && e.key == "Tab" && trim(text) != "" {
+                               e.preventDefault()
+                               enter()
+                           }
+                       }}/>
+            </label>
+            <Button type="submit" size="lg" disabled={disabled}>Add</Button>
+        </form>
+        <div.ui-scanin-view hidden={camera != "live"}>
+            <video muted={true} playsinline={true} autoplay={true} aria-label="The camera's picture" @mount={(el) => { video = el }}></video>
+            {camera == "live" && <div.ui-scanin-aim aria-hidden="true"></div>}
+        </div>
+        <div.ui-scanin-acts>
+            {use_camera && (camera == "live"
+                ? <Button variant="outline" size="lg" on_click={quit}>Stop camera</Button>
+                : <Button variant="outline" size="lg" disabled={disabled} on_click={start}>Camera</Button>)}
+            {use_camera && <Button variant="outline" size="lg" disabled={disabled} on_click={() => { picker.click() }}>Photo</Button>}
+            {wedge && <Button variant="outline" size="lg" on_click={() => {
+                typing = !typing
+                field.focus()
+            }}>{typing ? "Hide keyboard" : "Keyboard"}</Button>}
+            <Button variant="ghost" size="lg" on_click={() => { beeps = !beeps; wake_sound() }}>{beeps ? "Sound on" : "Sound off"}</Button>
+        </div>
+        {camera == "refused" && native && <Button variant="outline" size="lg" on_click={() => { js("quilloNative.openSettings") }}>Open Settings</Button>}
+        <input type="file" accept="image/*" capture="environment" hidden={true} aria-label="Photo of a code"
+               @mount={(el) => { picker = el }}
+               @change={(e) => {
+                   let f = e.target.files[0]
+                   if f != null { photo(f) }
+                   e.value = ""
+               }}/>
+        <p.ui-scanin-msg role="status">{said != "" ? said : message}</p>
+    </div>
+}
+
+component ScanCount(items: list = [], title: str = "Stock count", blind: bool = false, wedge: bool = false, use_camera: bool = true, gap: int = 1500, sound: bool = true,
+                    saved: map? = null, store: str? = null, id: str = "ui-scanct", on_change = null, on_finish = null, class: str? = null) {
+    style global scan_count_css
+    state scans = scan_count_restore(saved).scans
+    state started = scan_count_restore(saved).started
+    state result = scan_count_restore(saved).result     // the count, once finished
+    state sent = scan_count_restore(saved).sent
+    state sending = false
+    state reviewing = false
+    state online = true
+    state chosen = "all"
+    state times = "1"
+    state said = len(scan_count_restore(saved).scans) > 0 ? "Count picked up where it was left." : "Ready to count."
+    state kind = "idle"
+    state full = false       // the browser's store would not take it
+    let rows = scan_count_rows(items, scans)
+    let totals = scan_count_totals(rows)
+    let shown = scan_count_shown(rows, chosen)
+    let name_of = (key) => {
+        let r = rows | find((x) => x.key == key)
+        r != null ? r.name : key
+    }
+    let told = () => {
+        let s = { scans: scans, started: started, result: result, sent: sent }
+        on_change && on_change(s)
+        if store != null {
+            let ok = js("Promise.resolve", scan_count_keep(`ui-scanct-${store}`, json.stringify(s)))
+            full = !ok
+        }
+    }
+    let add = (key, code, qty, how) => {
+        let t = now()
+        if started == null { started = t }
+        scans = scans + [{ id: `${t}-${len(scans)}`, key: key, code: code, qty: qty, at: t, how: how }]
+    }
+    let counted = (code, how) => {
+        if result != null { return false }
+        let key = scan_count_key(code)
+        let qty = scan_count_times(times)
+        add(key, code, qty, how)
+        times = "1"
+        let r = scan_count_rows(items, scans) | find((x) => x.key == key)
+        if !r.listed {
+            said = `Not on the list: ${code}, ${r.counted} counted`
+            kind = "bad"
+        } else if blind {
+            said = `${r.name}: ${r.counted} counted`
+            kind = "good"
+        } else if r.diff > 0 {
+            said = `${r.name}: ${r.counted} of ${r.expected}, ${r.diff} over`
+            kind = "over"
+        } else {
+            said = `${r.name}: ${r.counted} of ${r.expected}`
+            kind = "good"
+        }
+        reviewing = false
+        told()
+        r.listed
+    }
+    let correct = (r, change) => {
+        add(r.key, r.code, change, "hand")
+        said = `${r.name}: ${r.counted + change} counted, by hand`
+        kind = "idle"
+        told()
+    }
+    let undo = () => {
+        if len(scans) > 0 {
+            let s = scans[len(scans) - 1]
+            scans = slice(scans, 0, len(scans) - 1)
+            said = `Undone: ${name_of(s.key)} ${s.qty > 0 ? "+" : ""}${s.qty}`
+            kind = "idle"
+            reviewing = false
+            told()
+        }
+    }
+    let flush = () => {
+        if result != null && !sent && !sending && online && on_finish != null {
+            sending = true
+            let r = js("Promise.resolve", on_finish(result))
+            sending = false
+            if r == false || is_err(r) {
+                said = "It could not be sent yet. It is kept here and will be tried again."
+                kind = "over"
+            } else {
+                sent = true
+                said = "Count sent."
+                kind = "good"
+            }
+            told()
+        }
+    }
+    let finish = () => {
+        result = scan_count_result(title, rows, scans, started, now())
+        reviewing = false
+        if on_finish == null {
+            said = "Count finished."
+            kind = "good"
+        } else if !online {
+            said = "No connection. The count is kept here and goes when there is one."
+            kind = "over"
+        }
+        told()
+        flush()
+    }
+    let again = () => {
+        scans = []
+        started = null
+        result = null
+        sent = false
+        reviewing = false
+        chosen = "all"
+        said = "Ready to count."
+        kind = "idle"
+        told()
+    }
+    <section class={ui_cls(["ui-scanct", class])}
+             @mount={(_el) => {
+                 let w = js("window")
+                 online = js("navigator").onLine != false
+                 if saved == null && store != null {
+                     let back = js("Promise.resolve", scan_count_kept(`ui-scanct-${store}`))
+                     if back != null {
+                         let s = scan_count_restore(back)
+                         if len(s.scans) > 0 {
+                             scans = s.scans
+                             started = s.started
+                             result = s.result
+                             sent = s.sent
+                             said = "Count picked up where it was left."
+                         }
+                     }
+                 }
+                 let up = (_e = null) => {
+                     online = true
+                     flush()
+                 }
+                 let down = (_e = null) => { online = false }
+                 w.addEventListener("online", up)
+                 w.addEventListener("offline", down)
+                 flush()
+                 () => {
+                     w.removeEventListener("online", up)
+                     w.removeEventListener("offline", down)
+                 }
+             }}>
+        <h3>{title}</h3>
+        <div.ui-scanct-cols>
+            <div.ui-scanct-col>
+                <p.ui-scanct-said data-kind={kind} role="status">{said}</p>
+                <ScanCountInput id={`${id}-in`} use_camera={use_camera} wedge={wedge} gap={gap} sound={sound} disabled={result != null} on_scan={counted}/>
+                <div.ui-scanct-bar>
+                    <label class="ui-scanct-times" for={`${id}-times`}>Next scan counts
+                        <input id={`${id}-times`} type="text" inputmode="numeric" autocomplete="off" value={times} @input={(e) => { times = e.value }}/>
+                    </label>
+                    <Button variant="outline" size="lg" disabled={len(scans) == 0 || result != null} on_click={undo}>Undo</Button>
+                </div>
+                {!online && <p.ui-scanct-line>No connection. Counting goes on; nothing is lost.</p>}
+                {full && <p.ui-scanct-line>This browser's store is full: keep this page open until the count is sent.</p>}
+                {!blind && <dl.ui-scanct-sum>
+                    <div><dt>Expected</dt><dd>{totals.expected}</dd></div>
+                    <div><dt>Counted</dt><dd>{totals.counted}</dd></div>
+                    <div><dt>Short</dt><dd>{totals.short}</dd></div>
+                    <div><dt>Over</dt><dd>{totals.over + totals.unknown}</dd></div>
+                </dl>}
+                {reviewing && <div.ui-scanct-review>
+                    <h4>Send this count?</h4>
+                    {(rows | filter((r) => r.diff != 0) | len()) == 0
+                        ? <p>Everything matches: {totals.counted} counted.</p>
+                        : <ul>{for r in rows | filter((r) => r.diff != 0) => <li key={r.key}>{r.listed ? scan_count_diff_text(r) : `${r.code}: ${r.counted}, not listed`}</li>}</ul>}
+                    <div.ui-scanct-acts>
+                        <Button size="lg" on_click={finish}>Send count</Button>
+                        <Button size="lg" variant="outline" on_click={() => { reviewing = false }}>Keep counting</Button>
+                    </div>
+                </div>}
+                {result == null && !reviewing && <Button size="lg" full={true} disabled={len(scans) == 0} on_click={() => { reviewing = true }}>Finish count</Button>}
+                {result != null && <div.ui-scanct-review>
+                    <h4>{sent ? "Count sent" : (on_finish != null ? "Waiting to send" : "Count finished")}</h4>
+                    <p>{result.counted} counted, {result.short} short, {result.over} over, {len(result.unknown)} not listed.</p>
+                    <div.ui-scanct-acts>
+                        {on_finish != null && !sent && online && <Button size="lg" variant="outline" loading={sending} on_click={flush}>Try again</Button>}
+                        <Button size="lg" variant="outline" on_click={again}>Start a new count</Button>
+                    </div>
+                </div>}
+            </div>
+            <div.ui-scanct-col>
+                {!blind && <fieldset.ui-scanct-filter aria-label="Show">
+                    {for f in [["all", "All"], ["short", "Short"], ["over", "Over"], ["unknown", "Not listed"]] {
+                        <label class="ui-scanct-chip" key={f[0]}>
+                            <input type="radio" name={`${id}-show`} value={f[0]} checked={chosen == f[0]} @change={() => { chosen = f[0] }}/>
+                            {f[1]} ({len(scan_count_shown(rows, f[0]))})
+                        </label>
+                    }}
+                </fieldset>}
+                {len(shown) == 0
+                    ? <p.ui-scanct-empty>Nothing here.</p>
+                    : <ul.ui-scanct-rows>
+                        {for r in shown => <li.ui-scanct-row key={r.key} data-state={blind ? null : r.state}>
+                            <div.ui-scanct-name>
+                                {r.name}
+                                <span.ui-scanct-code>{r.code}</span>
+                                {!blind && <span.ui-scanct-note>{!r.listed ? "Not listed" : `Expected ${r.expected}${r.diff > 0 ? `, ${r.diff} over` : (r.diff < 0 ? `, ${0 - r.diff} short` : "")}`}</span>}
+                            </div>
+                            <div.ui-scanct-qty role="group" aria-label={`How many of ${r.name}`}>
+                                <button.ui-scanct-step type="button" aria-label={`One fewer ${r.name}`} disabled={r.counted <= 0 || result != null}
+                                        @click={() => { correct(r, -1) }}>−</button>
+                                <span.ui-scanct-n aria-label={`${r.counted} counted`}>{r.counted}</span>
+                                <button.ui-scanct-step type="button" aria-label={`One more ${r.name}`} disabled={result != null}
+                                        @click={() => { correct(r, 1) }}>+</button>
+                            </div>
+                        </li>}
+                    </ul>}
+            </div>
+        </div>
+    </section>
+}

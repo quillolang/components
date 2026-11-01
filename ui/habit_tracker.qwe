@@ -1,0 +1,301 @@
+// HabitTracker: a row of days for each habit, to tick off. It works out the current and
+// longest streak, the completion rate and every streak there has been, and keeps them
+// apart properly: a day the habit is not scheduled neither counts nor breaks a streak, a
+// missed scheduled day ends one, today is not missed until it is over, and grace days
+// forgive a slip without adding to the count. Ticks on rest days are kept as extras.
+//
+//   <HabitTracker today="2026-11-11" habits={[
+//       { name: "Read", done: ["2026-11-09", "2026-11-10"] },
+//       { name: "Run", weekdays: [1, 3, 5], start: "2026-10-26", grace: 1, done: ["2026-11-09"] }]}/>
+//
+// habits: a list of { id?, name, weekdays?, start?, grace?, done }. weekdays: the days it
+// is scheduled, 1 for Monday to 7 for Sunday (every day when left out). start: the first
+// day it counts from (the earliest tick when left out; a tick before it moves it back).
+// grace: how many scheduled days in a row a streak survives missing (the `grace` prop
+// when left out). done: the dates ticked ("YYYY-MM-DD"). today: the last day shown;
+// pass it so the page is the same on the server and in the browser (the server's today,
+// in UTC, when left out). days: how many days the grid shows (28, from 7 to 366).
+// grace: the default for habits that do not say (0). title: the heading. id: a prefix
+// for its ids, unique on the page. name: the field a form gets the habits in, as JSON
+// ("habits"). on_change(habits): inside one of your components, after each tick, with
+// the habits as they stand.
+//
+// Arrow keys move between cells, Home and End along a row, and Space or Enter ticks.
+//
+// habit_tracker_stats(habit, today) is the logic, for a program's own use, on a habit
+// from habit_tracker_read: { current, longest, scheduled, done, missed, extras, rate,
+// runs, breaks, marks, pending, on_grace, cut }. rate is a whole percent, or null with
+// nothing yet due; a run is { from, to, length, graced }; breaks are the days a streak
+// ended; marks gives each date "done", "extra", "grace", "missed", "off", "pending" or
+// "before". It looks back at most 3,660 days, and `cut` says when it stopped short.
+
+import ui/theme.qwe use ui_cls
+
+let habit_tracker_css = css`
+.ui-habit-tracker { display: grid; gap: 12px; min-width: 0; padding: 18px 20px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-habit-tracker .ui-habit-tracker-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-habit-tracker-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-habit-tracker-wrap { overflow-x: auto; }
+.ui-habit-tracker-wrap:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-habit-tracker-grid { border-collapse: separate; border-spacing: 2px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-habit-tracker-grid th { font-weight: 500; color: var(--ui-muted); text-align: center; padding: 0 0 2px; }
+.ui-habit-tracker-grid th span { display: block; font-size: 10px; }
+.ui-habit-tracker-grid .ui-habit-tracker-name { position: sticky; left: 0; z-index: 1; min-width: 96px; max-width: 160px; padding-right: 10px; background: var(--ui-surface);
+  color: var(--ui-fg); font-size: 13px; font-weight: 600; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ui-habit-tracker-grid td { padding: 0; }
+.ui-habit-tracker-cell { display: block; width: 22px; height: 22px; padding: 0; border: 1px solid var(--ui-border); border-radius: 4px; background: var(--ui-surface); color: var(--ui-accent-fg); font: 700 11px/1 var(--ui-font); cursor: pointer; }
+.ui-habit-tracker-cell:hover { border-color: var(--ui-accent); }
+.ui-habit-tracker-cell:focus-visible { outline: none; box-shadow: var(--ui-focus); position: relative; z-index: 2; }
+.ui-habit-tracker-done { border-color: var(--ui-accent); background: var(--ui-accent); }
+.ui-habit-tracker-extra { border-color: var(--ui-accent); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-habit-tracker-grace { border-color: var(--ui-warning); background: var(--ui-warning-soft); color: var(--ui-warning); }
+.ui-habit-tracker-missed { border-color: var(--ui-danger); background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-habit-tracker-off, .ui-habit-tracker-before { border-style: dashed; background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-habit-tracker-pending { border: 2px solid var(--ui-accent); }
+.ui-habit-tracker-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; margin: 0; padding: 0; list-style: none; }
+.ui-habit-tracker-card { display: grid; gap: 3px; min-width: 0; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-size: 13px; }
+.ui-habit-tracker-card b { overflow-wrap: anywhere; }
+.ui-habit-tracker-figures { display: flex; flex-wrap: wrap; gap: 2px 12px; font-variant-numeric: tabular-nums; }
+.ui-habit-tracker-current, .ui-habit-tracker-longest, .ui-habit-tracker-rate { font-weight: 500; }
+.ui-habit-tracker-note { color: var(--ui-muted); font-size: 12px; overflow-wrap: anywhere; }
+.ui-habit-tracker-said { min-height: 1.4em; margin: 0; color: var(--ui-muted); font-size: 13px; }
+`
+
+let habit_tracker_look_back = 3660
+
+// A habit made safe to use: { id, name, weekdays, grace, start, done, problems }, with
+// what could not be used left out and said.
+fn habit_tracker_read(h, i: int, grace: int, today: str) -> map {
+    let m = type_of(h) == "map" ? h : { name: str(h ?? "") }
+    let label = filled(trim(str(m.name ?? ""))) ?? `Habit ${i + 1}`
+    let problems = []
+    let given = type_of(m.done) == "list" ? m.done : []
+    let good = given | filter((d) => type_of(d) == "str" && date.valid(d, "date") && d >= "1000-01-01" && d <= today)
+    for d in given {
+        if type_of(d) != "str" || !date.valid(d, "date") {
+            problems = problems | push(`${label}: "${slice(str(d), 0, 30)}" is not a date.`)
+        } else if d > today {
+            problems = problems | push(`${label}: ${d} is in the future, so it is left out.`)
+        }
+    }
+    let wanted = type_of(m.weekdays) == "list" ? m.weekdays : [1, 2, 3, 4, 5, 6, 7]
+    let weekdays = wanted | filter((w) => type_of(w) == "int" && w >= 1 && w <= 7) | unique | sort
+    for w in wanted {
+        if !contains(weekdays, w) { problems = problems | push(`${label}: weekday ${slice(str(w), 0, 12)} is not from 1 to 7.`) }
+    }
+    if len(weekdays) == 0 { problems = problems | push(`${label}: it is not scheduled on any day.`) }
+    let own = type_of(m.grace) == "int" && m.grace >= 0 ? m.grace : grace
+    if m.grace != null && own != m.grace { problems = problems | push(`${label}: grace must be a whole number of 0 or more.`) }
+    let done = sort(unique(good))
+    let wrote = type_of(m.start) == "str" && date.valid(m.start, "date") && m.start >= "1000-01-01" ? m.start : null
+    if m.start != null && wrote == null { problems = problems | push(`${label}: "${slice(str(m.start), 0, 30)}" is not a start date.`) }
+    let first_tick = first(done)
+    let start = wrote == null ? first_tick ?? today : (first_tick != null && first_tick < wrote ? first_tick : wrote)
+    { id: str(m.id ?? label), name: label, weekdays, grace: own, start, done, problems }
+}
+
+// Every habit, with no two sharing an id, as each row is keyed by it.
+fn habit_tracker_read_all(habits, grace: int, today: str) -> list {
+    let seen = {}
+    let out = []
+    for [i, h] in enumerate(type_of(habits) == "list" ? habits : []) {
+        let r = habit_tracker_read(h, i, grace, today)
+        let n = (get(seen, r.id) ?? 0) + 1
+        seen = set(seen, r.id, n)
+        out = out | push(n > 1 ? set(r, "id", `${r.id}-${n}`) : r)
+    }
+    out
+}
+
+// Whole percent, half up, in ints so nothing is lost: 13 of 16 is 81.
+fn habit_tracker_percent(part: int, whole: int) = whole == 0 ? null : floor((part * 200 + whole) / (whole * 2))
+
+// See the top of the file. Walking the days in order, misses wait in `gap`: they are
+// forgiven only if a tick follows while the streak is alive, or if there are still few
+// enough of them when the walk reaches today.
+fn habit_tracker_stats(h: map, today: str) -> map {
+    let ticked = {}
+    for d in h.done { ticked = set(ticked, d, true) }
+    let span = date.days_between(h.start, today)
+    let skip = max([0, span - habit_tracker_look_back + 1])
+    let marks = {}
+    let runs = []
+    let breaks = []
+    let run = null
+    let gap = []
+    let scheduled = 0
+    let done = 0
+    let extras = 0
+    let pending = false
+    let i = skip
+    let wd = date.weekday(date.add_days(h.start, skip))
+    while i <= span {
+        let d = date.add_days(h.start, i)
+        let due = contains(h.weekdays, wd)
+        let hit = has(ticked, d)
+        if !due {
+            marks = set(marks, d, hit ? "extra" : "off")
+            extras += hit ? 1 : 0
+        } else if hit {
+            scheduled += 1
+            done += 1
+            marks = set(marks, d, "done")
+            if run == null {
+                run = { from: d, to: d, length: 1, graced: 0 }
+            } else {
+                for g in gap { marks = set(marks, g, "grace") }
+                run = { from: run.from, to: d, length: run.length + 1, graced: run.graced + len(gap) }
+            }
+            gap = []
+        } else if d == today {
+            pending = true
+            marks = set(marks, d, "pending")
+        } else {
+            scheduled += 1
+            marks = set(marks, d, "missed")
+            gap = gap | push(d)
+            if run != null && len(gap) > h.grace {
+                runs = runs | push(run)
+                breaks = breaks | push(gap[0])
+                run = null
+            }
+        }
+        i += 1
+        wd = wd == 7 ? 1 : wd + 1
+    }
+    // Misses at the very end are forgiven for now, while few enough: the streak is alive.
+    let on_grace = run != null && len(gap) > 0
+    if on_grace {
+        for g in gap { marks = set(marks, g, "grace") }
+    }
+    let all_runs = run != null ? runs | push(run) : runs
+    { current: run != null ? run.length : 0, longest: all_runs | map((r) => r.length) | max ?? 0, scheduled, done, missed: scheduled - done, extras,
+      rate: habit_tracker_percent(done, scheduled), runs: all_runs, breaks, marks, pending, on_grace, cut: skip > 0, grace_left: on_grace ? h.grace - len(gap) : h.grace }
+}
+
+// The `count` days ending at `today`, oldest first.
+fn habit_tracker_days(today: str, count: int) -> list = range(count) | map((i) => date.add_days(today, i - count + 1))
+
+fn habit_tracker_show(d: str) -> str = date.format(d, "ddd D MMM")
+
+// What a cell says to a screen reader, and shows.
+fn habit_tracker_word(mark) -> str = match mark {
+    "done" => "done"
+    "extra" => "done on a rest day"
+    "grace" => "missed, forgiven by a grace day"
+    "missed" => "missed"
+    "pending" => "due today"
+    "before" => "before this habit started"
+    _ => "rest day"
+}
+
+fn habit_tracker_glyph(mark) -> str = match mark {
+    "done" => "✓"
+    "extra" => "+"
+    "grace" => "~"
+    "missed" => "×"
+    _ => ""
+}
+
+// A streak as it reads: "26 Oct to 28 Oct (3)".
+fn habit_tracker_run(r: map) -> str {
+    let d = (s: str) => date.format(s, "D MMM")
+    `${r.from == r.to ? d(r.from) : `${d(r.from)} to ${d(r.to)}`} (${r.length})`
+}
+
+fn habit_tracker_days_word(n: int) -> str = `${n} ${n == 1 ? "day" : "days"}`
+
+component HabitTracker(habits: list = [], today: str? = null, days: int = 28, grace: int = 0, title: str = "Habits", id: str = "habit-tracker",
+                       name: str = "habits", on_change = null, class: str? = null) {
+    style global habit_tracker_css
+    state day = today ?? date.today()
+    let good_day = date.valid(day, "date") && day >= "1000-02-01"
+    state items = good_day ? habit_tracker_read_all(habits, grace, day) : []
+    state at_row = 0
+    state at_col = 0
+    state moved = false
+    state said = ""
+    let count = min([max([days, 7]), 366])
+    let dates = good_day ? habit_tracker_days(day, count) : []
+    let stats = items | map((h) => habit_tracker_stats(h, day))
+    let col = moved ? at_col : count - 1
+    let data = () => items | map((h) => ({ id: h.id, name: h.name, weekdays: h.weekdays, grace: h.grace, start: h.start, done: h.done }))
+    let flip = (r: int, d: str) => {
+        let h = items[r]
+        let on = contains(h.done, d)
+        let done = on ? remove(h.done, d) : sort(h.done | push(d))
+        let start = !on && d < h.start ? d : h.start
+        items = set(items, r, merge(h, { done, start }))
+        let s = habit_tracker_stats(items[r], day)
+        said = `${h.name}, ${habit_tracker_show(d)} ${on ? "cleared" : "done"}. Current streak ${habit_tracker_days_word(s.current)}.`
+        on_change && on_change(data())
+    }
+    let go = (e, r: int, c: int) => {
+        e.preventDefault()
+        at_row = r
+        at_col = c
+        moved = true
+        let t = e.target.closest("table").querySelector(`[data-cell="${r}-${c}"]`)
+        t && t.focus()
+    }
+    let keys = (e, r: int, c: int) => {
+        let last_row = len(items) - 1
+        match e.key {
+            "ArrowRight" => go(e, r, min([c + 1, count - 1]))
+            "ArrowLeft" => go(e, r, max([c - 1, 0]))
+            "ArrowDown" => go(e, min([r + 1, last_row]), c)
+            "ArrowUp" => go(e, max([r - 1, 0]), c)
+            "Home" => go(e, r, 0)
+            "End" => go(e, r, count - 1)
+            _ => null
+        }
+    }
+    let problems = (good_day ? [] : [`"${slice(str(day), 0, 30)}" is not a date for today.`]) + (items | map((h) => h.problems) | flatten())
+    <section class={ui_cls(["ui-habit-tracker", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-habit-tracker-title id={`${id}-title`}>{title}</h3>
+        <input type="hidden" name={name} value={json.stringify(data())}/>
+        {len(problems) > 0 && <ul.ui-habit-tracker-problems role="alert">{for p in take(problems, 6) => <li key={p}>{p}</li>}</ul>}
+        {len(items) == 0
+            ? <p.ui-habit-tracker-said>No habits yet.</p>
+            : <div.ui-habit-tracker-wrap tabindex="0" role="region" aria-label={`${title}, last ${count} days`}>
+                <table.ui-habit-tracker-grid>
+                    <thead><tr>
+                        <th scope="col"><span.ui-sr>Habit</span></th>
+                        {for d in dates => <th key={d} scope="col" title={habit_tracker_show(d)}>{date.format(d, "ddd")[0]}<span>{date.format(d, "D")}</span></th>}
+                    </tr></thead>
+                    <tbody>
+                        {for [r, h] in enumerate(items) => <tr key={h.id}>
+                            <th.ui-habit-tracker-name scope="row">{h.name}</th>
+                            {for [c, d] in enumerate(dates) => {
+                                let mark = get(stats[r].marks, d) ?? "before"
+                                <td key={d}><button type="button" class={`ui-habit-tracker-cell ui-habit-tracker-${mark}`} data-cell={`${r}-${c}`} data-date={d}
+                                    tabindex={r == at_row && c == col ? 0 : -1} aria-pressed={mark == "done" || mark == "extra" ? "true" : "false"}
+                                    aria-label={`${h.name}, ${habit_tracker_show(d)}, ${habit_tracker_word(mark)}`}
+                                    @click={() => { flip(r, d) }} @keydown={(e) => { keys(e, r, c) }}>{habit_tracker_glyph(mark)}</button></td>
+                            }}
+                        </tr>}
+                    </tbody>
+                </table>
+              </div>}
+        {len(items) > 0 && <ul.ui-habit-tracker-list>
+            {for [r, h] in enumerate(items) => {
+                let s = stats[r]
+                <li.ui-habit-tracker-card key={h.id}>
+                    <b>{h.name}</b>
+                    <span.ui-habit-tracker-figures>
+                        <span.ui-habit-tracker-current>Current {habit_tracker_days_word(s.current)}</span>
+                        <span.ui-habit-tracker-longest>Longest {habit_tracker_days_word(s.longest)}</span>
+                        <span.ui-habit-tracker-rate>{s.rate != null ? `${s.rate}%` : "–"} of {s.scheduled} due</span>
+                    </span>
+                    {s.on_grace && <span.ui-habit-tracker-note>On grace: the streak ends if the next scheduled {s.grace_left == 0 ? "day is" : `${s.grace_left + 1} days are`} missed.</span>}
+                    {len(s.breaks) > 0 && <span.ui-habit-tracker-note>Broken on {habit_tracker_show(last(s.breaks))}{len(s.breaks) > 1 ? `, ${len(s.breaks)} times in all` : ""}.</span>}
+                    {len(s.runs) > 1 && <span.ui-habit-tracker-note>Streaks: {slice(s.runs, -4, len(s.runs)) | map(habit_tracker_run) | join(", ")}</span>}
+                    {s.extras > 0 && <span.ui-habit-tracker-note>{s.extras} extra on rest {s.extras == 1 ? "day" : "days"}, not in the streak.</span>}
+                    {s.cut && <span.ui-habit-tracker-note>Only the last {habit_tracker_look_back} days are counted.</span>}
+                </li>
+            }}
+        </ul>}
+        <p.ui-habit-tracker-said aria-live="polite">{said}</p>
+    </section>
+}

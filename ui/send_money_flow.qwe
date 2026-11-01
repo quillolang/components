@@ -1,0 +1,469 @@
+// SendMoneyFlow: sending money, a screen at a time: who to, how much, a note, a last look, and a
+// receipt. Going back keeps everything typed, by the Back button or the phone's own, and from
+// the last look each line can be changed and returns there. Every limit is written out beside
+// the amount, not only the one that was broken. On a tablet what has been chosen stays in a
+// panel beside the step.
+//
+//   import ui/send_money_flow.qwe use SendMoneyFlow
+//
+//   component Send() {
+//       <SendMoneyFlow balance={2481.07m} fee={1.50m} now_at="2026-11-01T09:42:00Z"
+//                      payees={[{ id: "ana", name: "Ana Reyes", account: "•• 4021" }]}
+//                      limits={{ minimum: 1m, per_transfer: 1000m, daily_left: 750m, monthly_left: 4000m }}
+//                      on_send={(p) => send_payment(p)} on_done={() => { navigate("/") }}/>
+//   }
+//
+// payees: each { id, name, account }, the people already saved. balance: what can be spent. fee:
+// what a transfer costs, a decimal, added to the amount (none). limits: { minimum, per_transfer,
+// daily_left, monthly_left }, each left out if there is none. currency ("USD"), locale. now_at:
+// the time for the receipt, when on_send gives none. note_max: most characters in a note (140).
+// id: tells two flows on one page apart ("ui-sendflow"). new_payees: false for only those saved.
+// on_send(payment): { key, payee: { id, name, account }, amount, fee, total, currency, note },
+// the amounts decimals. It may wait for a server fn, and gives { ref, at }, or true. An error
+// value or false says it failed, or { ok: false, message }, and the person stays on the last
+// look with everything kept. `key` stays the same for each try of one payment, so a server can
+// use it with `idempotent`. on_done(): the person left the receipt.
+//
+// Steps are entries in the browser's history, so Android's back and a browser's go back a step;
+// the receipt cannot be gone back from, as there is nothing left to send.
+//
+// send_money_flow_parse(text, currency), send_money_flow_limits(...) and
+// send_money_flow_payee_problem(name, account) are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/price.qwe use price_text
+import ui/button.qwe use Button
+
+let send_money_flow_css = css`
+.ui-sendflow {
+  box-sizing: border-box; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: 100%; min-height: min(560px, 100%); min-width: 0; container-type: inline-size; padding-bottom: var(--ui-sendflow-kb, 0px); color: var(--ui-fg); background: var(--ui-bg);
+  font: 15px/1.45 var(--ui-font);
+}
+.ui-sendflow-head { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; padding: max(6px, env(safe-area-inset-top)) 8px 6px; border-bottom: 1px solid var(--ui-border); }
+.ui-sendflow-head p { display: grid; place-items: center; min-height: 44px; margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-sendflow-back { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ui-fg); font: 24px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-sendflow-back:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-sendflow-bar { height: 3px; background: var(--ui-subtle); grid-column: 1 / -1; margin-top: 6px; }
+.ui-sendflow-bar span { display: block; height: 100%; background: var(--ui-accent); transition: width .2s; }
+.ui-sendflow-mid { display: grid; min-height: 0; min-width: 0; }
+.ui-sendflow-scroll { min-height: 0; min-width: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 14px 16px; }
+.ui-sendflow-step { display: grid; gap: 12px; min-width: 0; }
+.ui-sendflow-step[hidden] { display: none; }
+.ui-sendflow-step h2 { margin: 0; font-size: 21px; line-height: 1.25; outline: none; }
+.ui-sendflow-field { display: grid; gap: 4px; min-width: 0; }
+.ui-sendflow-field label { color: var(--ui-muted); font-size: 13px; font-weight: 600; }
+/* 16 px and up, or iOS zooms the page when one is focused. */
+.ui-sendflow-input { box-sizing: border-box; width: 100%; min-height: 48px; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px/1.3 var(--ui-font); }
+.ui-sendflow-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-sendflow-input[aria-invalid="true"] { border-color: var(--ui-danger); }
+textarea.ui-sendflow-input { min-height: 96px; resize: vertical; }
+.ui-sendflow-big { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ui-sendflow-hint { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-sendflow-err { margin: 0; color: var(--ui-danger); font-size: 14px; }
+.ui-sendflow-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-sendflow-payee { box-sizing: border-box; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; width: 100%; min-height: 56px; padding: 6px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: inherit; font: inherit; text-align: left; cursor: pointer; touch-action: manipulation; }
+.ui-sendflow-payee[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-sendflow-payee:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-sendflow-payee small { color: var(--ui-muted); font-size: 13px; }
+.ui-sendflow-payee b { font-weight: 600; overflow-wrap: anywhere; }
+.ui-sendflow-mark { color: var(--ui-accent); font-weight: 700; }
+.ui-sendflow-new { display: grid; gap: 10px; padding-top: 4px; }
+.ui-sendflow-new h3 { margin: 0; font-size: 15px; }
+.ui-sendflow-limits { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); }
+.ui-sendflow-limits li { display: flex; justify-content: space-between; gap: 12px; padding: 8px 12px; border-top: 1px solid var(--ui-border); font-size: 14px; font-variant-numeric: tabular-nums; }
+.ui-sendflow-limits li:first-child { border-top: 0; }
+.ui-sendflow-limits span { color: var(--ui-muted); }
+.ui-sendflow-over { background: var(--ui-danger-soft); }
+.ui-sendflow-over span, .ui-sendflow-over b { color: var(--ui-danger); }
+.ui-sendflow-sum { display: grid; gap: 0; margin: 0; }
+.ui-sendflow-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 0 8px; min-height: 52px; padding: 4px 0; border-top: 1px solid var(--ui-border); }
+.ui-sendflow-row:first-child { border-top: 0; }
+.ui-sendflow-row dt { color: var(--ui-muted); font-size: 13px; }
+.ui-sendflow-row dd { grid-column: 1; margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; white-space: pre-wrap; }
+.ui-sendflow-change { grid-column: 2; grid-row: 1 / span 2; min-width: 64px; min-height: 44px; padding: 0 8px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-accent); font: 600 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-sendflow-change:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-sendflow-total dd { font-size: 20px; }
+.ui-sendflow-done h2 { color: var(--ui-success); }
+.ui-sendflow-foot { padding: 8px 16px calc(8px + env(safe-area-inset-bottom)); border-top: 1px solid var(--ui-border); background: var(--ui-bg); }
+.ui-sendflow-foot .ui-btn { width: 100%; }
+.ui-sendflow-side { display: none; }
+@container (min-width: 640px) {
+  .ui-sendflow-mid { grid-template-columns: minmax(0, 1fr) minmax(240px, 300px); }
+  .ui-sendflow-scroll { padding: 22px 28px; }
+  .ui-sendflow-side { display: block; min-height: 0; overflow-y: auto; padding: 22px 20px; border-left: 1px solid var(--ui-border); background: var(--ui-subtle); }
+  .ui-sendflow-side h3 { margin: 0 0 8px; font-size: 13px; color: var(--ui-muted); }
+  .ui-sendflow-foot { display: flex; justify-content: flex-end; padding-inline: 28px; }
+  .ui-sendflow-foot .ui-btn { width: auto; min-width: 220px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-sendflow-bar span { transition: none; } }
+`
+
+// A number as a decimal, or null for one that is not.
+fn send_money_flow_dec(v) {
+    let kind = type_of(v)
+    if kind != "dec" && kind != "int" && kind != "float" && kind != "str" { return null }
+    let d = dec(v)
+    is_err(d) ? null : d
+}
+
+// The fee as a decimal, none being zero.
+fn send_money_flow_fee(fee) -> dec = send_money_flow_dec(fee) ?? 0m
+
+// What is wrong with a new payee, or "".
+fn send_money_flow_payee_problem(name: str, account: str) -> str {
+    let a = trim(account)
+    if len(trim(name)) < 2 { return "Enter the payee's name" }
+    if len(a) < 4 { return "Enter the payee's account" }
+    if len(a) > 34 || !re.test(a, "^[A-Za-z0-9@._ +-]+$") { return "An account has letters, digits and . _ @ + - only, 34 at most" }
+    ""
+}
+
+// Decimal places a currency has, and 2 for a code that is not one.
+fn send_money_flow_places(currency: str) -> int {
+    let p = money.minor_units(currency)
+    is_err(p) ? 2 : p
+}
+
+// An amount as a person writes one: "12.50", "12,50", "1,234.50", "1.234,50" or "1,234". Gives
+// { amount } or { problem }. What cannot be told apart is refused and not guessed at, as a
+// wrong guess here moves a thousand times the money: "1.234" is three decimals, which USD does
+// not have, and it says so. A lone comma with three digits after it is thousands, unless the
+// currency has three decimals.
+fn send_money_flow_parse(text: str, currency: str) -> map {
+    let t = re.replace(trim(text), "[\\s\\u00a0]", "")
+    if t == "" { return { problem: "Enter an amount" } }
+    if len(t) > 16 || !re.test(t, "^[0-9]{1,3}([.,][0-9]{3})*([.,][0-9]{1,3})?$") && !re.test(t, "^[0-9]{1,12}([.,][0-9]{1,3})?$") { return { problem: "That is not an amount" } }
+    let places = send_money_flow_places(currency)
+    let seps = re.find_all(t, "[.,]") | map((m) => m.text)
+    let hit = re.find(t, "[.,][0-9]{1,3}$")
+    let tail = hit == null ? "" : hit.text
+    let tail_digits = max([0, len(tail) - 1])
+    let same = len(unique(seps)) == 1
+    let grouped = same && tail_digits == 3 && (len(seps) > 1 || (seps[0] == "," && places != 3))
+    let whole = grouped ? t : slice(t, 0, len(t) - len(tail))
+    let cents = grouped || tail == "" ? "" : slice(tail, 1, len(tail))
+    if len(cents) > places { return { problem: places == 0 ? `${currency} has no decimals` : `${currency} has ${places} decimals at most` } }
+    let digits = re.replace(whole, "[.,]", "")
+    let d = dec(cents == "" ? digits : `${digits}.${cents}`)
+    if is_err(d) { return { problem: "That is not an amount" } }
+    if d <= 0m { return { problem: "Enter an amount above zero" } }
+    { amount: d }
+}
+
+// Every limit that applies, each as { key_of, label, text, over }. `over` says by how much the amount
+// and fee go past it, which is how it is put when it is broken.
+fn send_money_flow_limits(amount, balance, fee, limits, currency: str, locale: str?) -> list {
+    let cash = (v) => price_text(v, currency, locale)
+    let lim = limits ?? {}
+    let cost = send_money_flow_fee(fee)
+    let total = amount == null ? null : amount + cost
+    let rows = [
+        { key_of: "balance", label: "Your balance", top: send_money_flow_dec(balance), used: total },
+        { key_of: "minimum", label: "Smallest transfer", bottom: send_money_flow_dec(lim.minimum), used: amount },
+        { key_of: "per_transfer", label: "Most in one transfer", top: send_money_flow_dec(lim.per_transfer), used: amount },
+        { key_of: "daily_left", label: "Left of today's limit", top: send_money_flow_dec(lim.daily_left), used: amount },
+        { key_of: "monthly_left", label: "Left of this month's limit", top: send_money_flow_dec(lim.monthly_left), used: amount },
+    ]
+    let limited = rows | filter((r) => r.top != null || r.bottom != null) | map((r) => {
+        let over = r.used == null ? null : r.top != null && r.used > r.top ? r.used - r.top : r.bottom != null && r.used < r.bottom ? r.bottom - r.used : null
+        { key_of: r.key_of, label: r.label, text: cash(r.top != null ? r.top : r.bottom), over: over, short: r.bottom != null }
+    })
+    cost > 0m ? limited + [{ key_of: "fee", label: "Fee for this transfer", text: cash(cost), over: null, short: false }] : limited
+}
+
+// What a broken limit says, the first one first: "" when none is.
+fn send_money_flow_broken(rows: list, currency: str, locale: str?) -> str {
+    let bad = rows | filter((r) => r.over != null)
+    if len(bad) == 0 { return "" }
+    let r = bad[0]
+    let by = price_text(r.over, currency, locale)
+    if r.short { return `That is ${by} below the smallest transfer of ${r.text}` }
+    if r.key_of == "balance" { return `With the fee that is ${by} more than your balance of ${r.text}` }
+    `That is ${by} over: ${lower(r.label)} is ${r.text}`
+}
+
+// A note's trouble, or "": `len` counts characters as a person does, emoji as one.
+fn send_money_flow_note_problem(note: str, note_max: int) -> str = len(note) > note_max ? `A note can be ${note_max} characters: this is ${len(note) - note_max} too long` : ""
+
+// The answer to on_send: { ok, ref, at, message }.
+fn send_money_flow_answer(r) -> map {
+    let no = "The money was not sent. Try again, nothing has left your account."
+    if r == false || r == null || is_err(r) { return { ok: false, message: no } }
+    if type_of(r) == "map" && get(r, "ok", true) == false { return { ok: false, message: str(get(r, "message", no)) } }
+    if type_of(r) == "map" { return { ok: true, ref: str(get(r, "ref", "")), at: str(get(r, "at", "")) } }
+    { ok: true, ref: "", at: "" }
+}
+
+// Two lines of a summary, with a way back to the step that set them.
+view SendMoneyFlowLine(label: str, text: str, step_of: int = -1, on_change = null, class: str? = null) =
+    <div class={ui_cls(["ui-sendflow-row", class])}>
+        <dt>{label}</dt>
+        <dd>{text}</dd>
+        {step_of >= 0 && <button.ui-sendflow-change type="button" aria-label={`Change ${lower(label)}`} @click={() => { on_change(step_of) }}>Change</button>}
+    </div>
+
+component SendMoneyFlow(payees: list = [], balance = null, fee = null, limits = null, currency: str = "USD", locale: str? = null, now_at: str? = null,
+                        note_max: int = 140, new_payees: bool = true, id: str = "ui-sendflow", on_send = null, on_done = null) {
+    style global send_money_flow_css
+    state step = 0           // 0 who, 1 how much, 2 note, 3 last look, 4 receipt
+    state back_to = -1       // the last look, when a line was changed from there
+    state pushed = 0         // history entries this flow has added
+    state pops = 0           // goings back the Back button has asked for and already shown
+    state query = ""
+    state payee_id = null
+    state new_name = ""
+    state new_account = ""
+    state amount_text = ""
+    state note = ""
+    state tried = false      // Continue was pressed on this step, so its trouble may show
+    state busy = false
+    state failed = ""
+    state key_of = ""        // one payment's key, whatever number of tries
+    state done_ref = ""
+    state done_at = ""
+    state root_el = null
+    state scroll_el = null
+    let saved = payees | find((p) => p.id == payee_id)
+    let typed_payee = new_payees && payee_id == null && (trim(new_name) != "" || trim(new_account) != "")
+    let payee = saved != null ? saved : typed_payee ? { id: null, name: trim(new_name), account: trim(new_account) } : null
+    let payee_problem = saved != null ? "" : typed_payee ? send_money_flow_payee_problem(new_name, new_account) : "Choose who to send to"
+    let parsed = send_money_flow_parse(amount_text, currency)
+    let amount = parsed.amount
+    let cost = send_money_flow_fee(fee)
+    let total = amount == null ? null : amount + cost
+    let rows = send_money_flow_limits(amount, balance, fee, limits, currency, locale)
+    let broken = send_money_flow_broken(rows, currency, locale)
+    // A limit shows as it is typed; text that is not an amount yet waits for Continue, as it may be half typed.
+    let amount_problem = amount == null ? (tried ? parsed.problem : "") : broken
+    let note_problem = send_money_flow_note_problem(note, note_max)
+    let found = payees | filter((p) => query == "" || contains(lower(`${p.name} ${p.account}`), lower(trim(query))))
+    let cash = (v) => v == null ? "" : price_text(v, currency, locale)
+    let show_step = (n: int) => {
+        step = n
+        tried = false
+        js("Promise.resolve", 1)
+        if scroll_el != null { scroll_el.scrollTop = 0 }
+        if root_el != null {
+            let h = root_el.querySelector(`[data-step="${n}"] h2`)
+            if h != null { h.focus() }
+        }
+    }
+    let forward = (n: int) => {
+        js("history.pushState", { ui_sendflow: id, step: n }, "")
+        pushed = pushed + 1
+        show_step(n)
+    }
+    let next = () => {
+        let problem = match step {
+            0 => payee_problem
+            1 => amount == null ? parsed.problem : broken
+            2 => note_problem
+            _ => ""
+        }
+        if problem != "" {
+            tried = true
+        } else if back_to >= 0 {
+            back_to = -1
+            forward(3)
+        } else {
+            forward(step + 1)
+        }
+    }
+    let back = () => {
+        if step > 0 && step < 4 {
+            failed = ""
+            back_to = -1
+            // The step changes at once: the browser's own going back can take a moment on a slow phone.
+            let going = pushed > 0
+            if going { pops = pops + 1 }
+            show_step(step - 1)
+            if going { js("history.back") }
+        }
+    }
+    let change = (n: int) => {
+        back_to = n
+        forward(n)
+    }
+    let send = () => {
+        if !busy && step == 3 {
+            busy = true
+            failed = ""
+            if key_of == "" { key_of = uuid() }
+            let r = on_send == null ? true : js("Promise.resolve", on_send({
+                key: key_of, payee: { id: payee.id, name: payee.name, account: payee.account }, amount: amount, fee: cost, total: total, currency: currency, note: trim(note) }))
+            let a = send_money_flow_answer(r)
+            busy = false
+            if a.ok {
+                done_ref = a.ref
+                done_at = a.at != "" ? a.at : now_at != null ? now_at : ""
+                show_step(4)
+            } else {
+                failed = a.message
+            }
+        }
+    }
+    let finish = () => {
+        step = 0
+        query = ""
+        payee_id = null
+        new_name = ""
+        new_account = ""
+        amount_text = ""
+        note = ""
+        key_of = ""
+        done_ref = ""
+        done_at = ""
+        on_done && on_done()
+    }
+    let side_lines = [
+        payee != null && payee_problem == "" ? { label: "To", text: `${payee.name}\n${payee.account}` } : null,
+        amount != null ? { label: "Amount", text: cash(amount) } : null,
+        amount != null && cost > 0m ? { label: "Fee", text: cash(cost) } : null,
+        trim(note) != "" ? { label: "Note", text: trim(note) } : null,
+    ] | filter((x) => x != null)
+    <section.ui-sendflow id={id} aria-label="Send money"
+             @mount={(el) => {
+                 let w = js("window")
+                 let vv = w.visualViewport
+                 // On iOS the keyboard covers the page without changing its height, so the part it
+                 // takes is worked out; on Android the page may shrink, which makes this nothing.
+                 let fit_keyboard = (_e = null) => {
+                     if vv != null {
+                         let covered = w.innerHeight - vv.height - vv.offsetTop
+                         el.style.setProperty("--ui-sendflow-kb", `${max([0, round(covered)])}px`)
+                     }
+                 }
+                 let popped = (e) => {
+                     let s = e.state
+                     pushed = max([0, pushed - 1])
+                     if pops > 0 {
+                         pops = pops - 1
+                     } else if step < 4 {
+                         failed = ""
+                         back_to = -1
+                         show_step(s != null && s.ui_sendflow == id ? s.step : 0)
+                     }
+                 }
+                 w.addEventListener("popstate", popped)
+                 if vv != null {
+                     vv.addEventListener("resize", fit_keyboard)
+                     vv.addEventListener("scroll", fit_keyboard)
+                 }
+                 root_el = el
+                 () => {
+                     w.removeEventListener("popstate", popped)
+                     if vv != null {
+                         vv.removeEventListener("resize", fit_keyboard)
+                         vv.removeEventListener("scroll", fit_keyboard)
+                     }
+                 }
+             }}>
+        <div.ui-sendflow-head>
+            {step > 0 && step < 4 ? <button.ui-sendflow-back type="button" aria-label="Back" @click={back}>‹</button> : <span></span>}
+            <p>{step < 4 ? `Step ${step + 1} of 4` : "Receipt"}</p>
+            <span></span>
+            <div.ui-sendflow-bar aria-hidden="true"><span style={`width: ${(step + 1) * 20}%`}></span></div>
+        </div>
+        <div.ui-sendflow-mid>
+            <div.ui-sendflow-scroll @mount={(el) => { scroll_el = el }}>
+                <div.ui-sendflow-step data-step="0" hidden={step != 0}>
+                    <h2 tabindex="-1">Who are you sending to?</h2>
+                    {len(payees) > 3 && <div.ui-sendflow-field>
+                        <label for={`${id}-query`}>Find someone saved</label>
+                        <input.ui-sendflow-input id={`${id}-query`} type="search" autocomplete="off" enterkeyhint="search" bind:value={query}/>
+                    </div>}
+                    {len(payees) > 0 && <ul.ui-sendflow-list>
+                        {for p in found => <li key={p.id}>
+                            <button.ui-sendflow-payee type="button" aria-pressed={payee_id == p.id ? "true" : "false"}
+                                    @click={() => {
+                                        payee_id = payee_id == p.id ? null : p.id
+                                        tried = false
+                                    }}>
+                                <span><b>{p.name}</b><br/><small>{p.account}</small></span>
+                                <span.ui-sendflow-mark aria-hidden="true">{payee_id == p.id ? "✓" : ""}</span>
+                            </button>
+                        </li>}
+                        {len(found) == 0 && <li.ui-sendflow-hint>No one saved goes by that.</li>}
+                    </ul>}
+                    {new_payees && <div.ui-sendflow-new>
+                        <h3>{len(payees) > 0 ? "Or someone new" : "Someone new"}</h3>
+                        <div.ui-sendflow-field>
+                            <label for={`${id}-name`}>Name</label>
+                            <input.ui-sendflow-input id={`${id}-name`} type="text" autocomplete="off" autocapitalize="words" enterkeyhint="next" bind:value={new_name}
+                                   @input={() => { payee_id = null }}/>
+                        </div>
+                        <div.ui-sendflow-field>
+                            <label for={`${id}-account`}>Account</label>
+                            <input.ui-sendflow-input id={`${id}-account`} type="text" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="next" bind:value={new_account}
+                                   @input={() => { payee_id = null }}/>
+                        </div>
+                    </div>}
+                    {tried && step == 0 && payee_problem != "" && <p.ui-sendflow-err role="alert">{payee_problem}</p>}
+                </div>
+                <div.ui-sendflow-step data-step="1" hidden={step != 1}>
+                    <h2 tabindex="-1">How much?</h2>
+                    <div.ui-sendflow-field>
+                        <label for={`${id}-amount`}>Amount in {currency}{payee != null ? ` to ${payee.name}` : ""}</label>
+                        <input class="ui-sendflow-input ui-sendflow-big" id={`${id}-amount`} type="text" inputmode="decimal" autocomplete="off" enterkeyhint="next"
+                               aria-invalid={amount_problem != "" ? "true" : "false"} aria-describedby={`${id}-amount-says`} bind:value={amount_text}
+                               @keydown={(e) => {
+                                   if e.key == "Enter" {
+                                       e.preventDefault()
+                                       next()
+                                   }
+                               }}/>
+                    </div>
+                    <p class={ui_cls(["ui-sendflow-hint", amount_problem != "" && "ui-sendflow-err"])} id={`${id}-amount-says`} role={amount_problem != "" ? "alert" : null}>
+                        {amount_problem != "" ? amount_problem : total != null && cost > 0m ? `${cash(total)} will leave your account, with the fee` : ""}
+                    </p>
+                    {len(rows) > 0 && <ul.ui-sendflow-limits aria-label="Limits">
+                        {for r in rows => <li key={r.key_of} class={r.over != null ? "ui-sendflow-over" : null}><span>{r.label}</span><b>{r.text}</b></li>}
+                    </ul>}
+                </div>
+                <div.ui-sendflow-step data-step="2" hidden={step != 2}>
+                    <h2 tabindex="-1">Add a note?</h2>
+                    <div.ui-sendflow-field>
+                        <label for={`${id}-note`}>A note for {payee != null ? payee.name : "them"} (you can leave this empty)</label>
+                        <textarea.ui-sendflow-input id={`${id}-note`} rows="3" enterkeyhint="done" aria-invalid={note_problem != "" ? "true" : "false"} bind:value={note}></textarea>
+                    </div>
+                    <p class={ui_cls(["ui-sendflow-hint", note_problem != "" && "ui-sendflow-err"])} role={note_problem != "" ? "alert" : null}>{note_problem != "" ? note_problem : `${len(note)} of ${note_max} characters`}</p>
+                </div>
+                <div.ui-sendflow-step data-step="3" hidden={step != 3}>
+                    <h2 tabindex="-1">Check it, then send</h2>
+                    <dl.ui-sendflow-sum>
+                        <SendMoneyFlowLine label="To" text={payee != null ? `${payee.name}\n${payee.account}` : ""} step_of={0} on_change={change}/>
+                        <SendMoneyFlowLine label="Amount" text={cash(amount)} step_of={1} on_change={change}/>
+                        {cost > 0m && <SendMoneyFlowLine label="Fee" text={cash(cost)}/>}
+                        <SendMoneyFlowLine label="Note" text={trim(note) != "" ? trim(note) : "None"} step_of={2} on_change={change}/>
+                        <SendMoneyFlowLine label="Total leaving your account" text={cash(total)} class="ui-sendflow-total"/>
+                    </dl>
+                    {failed != "" && <p.ui-sendflow-err role="alert">{failed}</p>}
+                </div>
+                <div class="ui-sendflow-step ui-sendflow-done" data-step="4" hidden={step != 4}>
+                    <h2 tabindex="-1">Sent</h2>
+                    <dl.ui-sendflow-sum>
+                        <SendMoneyFlowLine label="To" text={payee != null ? `${payee.name}\n${payee.account}` : ""}/>
+                        <SendMoneyFlowLine label="Amount" text={cash(amount)}/>
+                        {cost > 0m && <SendMoneyFlowLine label="Fee" text={cash(cost)}/>}
+                        <SendMoneyFlowLine label="Total" text={cash(total)} class="ui-sendflow-total"/>
+                        {trim(note) != "" && <SendMoneyFlowLine label="Note" text={trim(note)}/>}
+                        {done_ref != "" && <SendMoneyFlowLine label="Reference" text={done_ref}/>}
+                        {done_at != "" && date.valid(done_at) && <SendMoneyFlowLine label="When" text={date.format(done_at, date.valid(done_at, "date-time") ? "MMM D, YYYY HH:mm" : "MMM D, YYYY")}/>}
+                    </dl>
+                </div>
+            </div>
+            <aside.ui-sendflow-side aria-label="So far">
+                <h3>So far</h3>
+                {len(side_lines) == 0 && <p.ui-sendflow-hint>Nothing chosen yet.</p>}
+                <dl.ui-sendflow-sum>
+                    {for s in side_lines => <SendMoneyFlowLine key={s.label} label={s.label} text={s.text}/>}
+                </dl>
+            </aside>
+        </div>
+        <div.ui-sendflow-foot>
+            {step < 3 && <Button size="lg" on_click={next}>{back_to >= 0 ? "Back to the last look" : "Continue"}</Button>}
+            {step == 3 && <Button size="lg" loading={busy} on_click={send}>{`Send ${cash(total)}`}</Button>}
+            {step == 4 && <Button size="lg" on_click={finish}>Done</Button>}
+        </div>
+    </section>
+}

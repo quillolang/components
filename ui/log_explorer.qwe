@@ -1,0 +1,520 @@
+// LogExplorer: raw log text made searchable, in the browser. Paste JSON lines, logfmt or
+// plain lines, mixed if need be, and each is read into a time, a level, a message and
+// fields. A stack trace stays with the line it belongs to: indented lines, `Caused by`,
+// `Traceback`, an `ExceptionName:` line, and, where most lines start with a time, any
+// line that does not. Search as you would in a log tool:
+//
+//   level:error status:5xx "timeout"      all of these, in any order
+//   -path:/health                         not this
+//   status:>=500  duration_ms:100..250    numbers: > >= < <= and a..b
+//   level:>=warn  host:web-*              level by rank; * stands for any text
+//   user:                                 has the field, with any value
+//
+// A plain word or a "quoted phrase" is looked for anywhere in the entry, its trace
+// too, in any case. The level buttons count what the rest of the query finds, and
+// turn that level on and off. Open an entry for its fields (a field's value adds it to
+// the query), its trace and its raw text; Context shows the entries around it, however
+// the search would hide them.
+//
+//   <LogExplorer text={log}/>
+//   <LogExplorer text={log} query="level:error" on_change={(r) => { found = r.matched }}/>
+//
+// text: the log. query: the search it starts with. limit: the most entries listed (200;
+// the counts cover them all). context: entries each side in Context (5). lines: the most
+// lines read (5,000), past which it says how many it left. title: its heading. id: a
+// prefix for its ids, unique on the page. The fields are named log and query. on_change(
+// result): inside one of your components, given { query, matched, total } after a
+// change. class: more classes for its outer element. Up and Down move between the
+// entries, Enter opens one, Escape closes it or leaves Context.
+//
+// log_explorer_parse(text, lines), log_explorer_query(text) and
+// log_explorer_search(entries, terms) work in a program, on the server too.
+
+import ui/theme.qwe use ui_cls
+
+let log_explorer_css = css`
+.ui-log-explorer { display: grid; gap: 12px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-log-explorer .ui-log-explorer-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-log-explorer-field { display: grid; gap: 5px; min-width: 0; }
+.ui-log-explorer-field label, .ui-log-explorer-source summary { font-size: 13px; font-weight: 500; }
+.ui-log-explorer-source summary { cursor: pointer; }
+.ui-log-explorer-source summary:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 4px; }
+.ui-log-explorer-field input, .ui-log-explorer-source textarea { box-sizing: border-box; width: 100%; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.45 var(--ui-mono); }
+.ui-log-explorer-source textarea { margin-top: 6px; resize: vertical; }
+.ui-log-explorer-field input:focus-visible, .ui-log-explorer-source textarea:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-log-explorer-levels { display: flex; flex-wrap: wrap; gap: 6px; }
+.ui-log-explorer-level { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: 999px;
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-log-explorer-level:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-log-explorer-level[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-log-explorer-level b { font-variant-numeric: tabular-nums; }
+.ui-log-explorer-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-log-explorer-problem { margin: 0; color: var(--ui-warning); font-size: 13px; }
+.ui-log-explorer-list { display: grid; gap: 0; margin: 0; padding: 0; overflow: hidden; list-style: none; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-log-explorer-entry + .ui-log-explorer-entry { border-top: 1px solid var(--ui-border); }
+.ui-log-explorer-anchor { background: var(--ui-accent-soft); }
+.ui-log-explorer-row { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 2px 10px; width: 100%; padding: 6px 10px; border: 0; background: none; color: inherit;
+  font: 13px/1.45 var(--ui-font); text-align: left; cursor: pointer; }
+.ui-log-explorer-row:hover { background: var(--ui-subtle); }
+.ui-log-explorer-row:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-log-explorer-time { color: var(--ui-muted); font: 12px/1.6 var(--ui-mono); white-space: nowrap; }
+.ui-log-explorer-tag { min-width: 44px; font: 600 11px/1.7 var(--ui-font); text-transform: uppercase; color: var(--ui-muted); }
+.ui-log-explorer-tag-error, .ui-log-explorer-tag-fatal { color: var(--ui-danger); }
+.ui-log-explorer-tag-warn { color: var(--ui-warning); }
+.ui-log-explorer-tag-info { color: var(--ui-info); }
+.ui-log-explorer-msg { min-width: 0; overflow-wrap: anywhere; font-family: var(--ui-mono); font-size: 12px; line-height: 1.6; }
+.ui-log-explorer-msg mark { border-radius: 2px; background: var(--ui-warning-soft); color: inherit; }
+.ui-log-explorer-more { color: var(--ui-muted); }
+.ui-log-explorer-body { display: grid; gap: 8px; padding: 6px 10px 10px; border-top: 1px dashed var(--ui-border); font-size: 13px; }
+.ui-log-explorer-fields { display: flex; flex-wrap: wrap; gap: 4px 8px; margin: 0; padding: 0; list-style: none; }
+.ui-log-explorer-chip { padding: 1px 6px; border: 1px solid var(--ui-border); border-radius: 4px; background: var(--ui-surface); color: var(--ui-fg); font: 12px/1.5 var(--ui-mono); overflow-wrap: anywhere; text-align: left; cursor: pointer; }
+.ui-log-explorer-chip:hover { border-color: var(--ui-accent); }
+.ui-log-explorer-chip:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-log-explorer-trace { margin: 0; max-height: 240px; padding: 8px 10px; overflow: auto; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font: 12px/1.5 var(--ui-mono); white-space: pre; }
+.ui-log-explorer-trace:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-log-explorer-btn { justify-self: start; height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-log-explorer-btn:hover { background: var(--ui-subtle); }
+.ui-log-explorer-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-log-explorer-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+@media (max-width: 520px) { .ui-log-explorer-row { grid-template-columns: auto minmax(0, 1fr); } .ui-log-explorer-msg { grid-column: 1 / -1; } }
+`
+
+let log_explorer_levels = ["fatal", "error", "warn", "info", "debug", "trace", "other"]
+let log_explorer_time_re = "^\\[?(\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}(?:[.,]\\d+)?(?:Z|[+-]\\d{2}(?::?\\d{2})?)?)\\]?[\\s:]*"
+let log_explorer_clf_re = "\\[(\\d{2})/([A-Z][a-z]{2})/(\\d{4}):(\\d{2}:\\d{2}:\\d{2}) ([+-]\\d{2})(\\d{2})\\]"
+let log_explorer_level_re = "^\\[?(TRACE|DEBUG|DBG|INFO|INF|NOTICE|WARNING|WARN|WRN|ERROR|ERR|FATAL|CRITICAL|CRIT|PANIC|SEVERE)\\]?(?::|\\s+|$)\\s*"
+let log_explorer_pair_re = "([A-Za-z_][\\w.-]*)=(\"(?:[^\"\\\\]|\\\\.)*\"|[^\\s]*)"
+let log_explorer_request_re = "\"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) (\\S+) HTTP/[\\d.]+\" (\\d{3}) (\\d+|-)"
+let log_explorer_time_keys = ["time", "timestamp", "ts", "@timestamp", "date", "datetime"]
+let log_explorer_level_keys = ["level", "lvl", "severity", "loglevel", "log.level"]
+let log_explorer_msg_keys = ["msg", "message", "event", "text"]
+let log_explorer_trace_keys = ["stack", "stacktrace", "stack_trace", "trace", "exception", "traceback"]
+let log_explorer_months = { Jan: "01", Feb: "02", Mar: "03", Apr: "04", May: "05", Jun: "06", Jul: "07", Aug: "08", Sep: "09", Oct: "10", Nov: "11", Dec: "12" }
+
+// Whatever a log calls a level, as one of log_explorer_levels.
+fn log_explorer_level(x) -> str {
+    if x == null { return "other" }
+    if type_of(x) == "int" || type_of(x) == "float" {
+        return x >= 60 ? "fatal" : (x >= 50 ? "error" : (x >= 40 ? "warn" : (x >= 30 ? "info" : (x >= 20 ? "debug" : "trace"))))
+    }
+    match lower(trim(str(x))) {
+        "fatal" | "critical" | "crit" | "panic" | "emerg" | "alert" | "severe" => "fatal"
+        "error" | "err" => "error"
+        "warn" | "warning" | "wrn" => "warn"
+        "info" | "inf" | "information" | "notice" => "info"
+        "debug" | "dbg" | "verbose" => "debug"
+        "trace" | "trc" => "trace"
+        _ => "other"
+    }
+}
+
+// A date-time as the `date` module takes it, and when it was: { text, ms }, ms null
+// when it does not read. Logs write "2026-11-01 12:00:03,123", without an offset; UTC.
+fn log_explorer_time(raw: str) -> map {
+    let t = replace(replace(trim(raw), ",", "."), " ", "T")
+    let full = re.test(t, "(Z|[+-]\\d{2}(:?\\d{2})?)$") ? t : `${t}Z`
+    let d = date.parse(full)
+    { text: raw, ms: is_err(d) ? null : date.ms(d) }
+}
+
+// A field's value as text. A whole float is written as an int, as the server would
+// write `1.0` and the browser `1`.
+fn log_explorer_value(v) -> str = match type_of(v) {
+    "str" => v
+    "null" => "null"
+    "float" => v == floor(v) && abs(v) < 1000000000000000 ? str(int(v)) : str(v)
+    "map" | "list" => json.stringify(v)
+    _ => str(v)
+}
+
+// A JSON value's fields, nested maps named with dots: { http: { status: 500 } } is
+// "http.status". Lower-case keys, so a search need not know the case.
+fn log_explorer_flatten(m: map, prefix: str, depth: int = 0) -> map {
+    let out = {}
+    for [k, v] in m {
+        let key = prefix + lower(k)
+        if type_of(v) == "map" && depth < 4 {
+            out = merge(out, log_explorer_flatten(v, `${key}.`, depth + 1))
+        } else {
+            out = set(out, key, log_explorer_value(v))
+        }
+    }
+    out
+}
+
+// The first of `names` the fields have.
+fn log_explorer_first(fields: map, names: list) = find(names, (n) => has(fields, n))
+
+fn log_explorer_entry(n: int, raw: str, time, ms, level: str, msg: str, fields: map, format: str, trace: list) -> map =
+    { n, line: n, time, ms, level, msg, fields, format, raw, trace, hay: lower(raw) }
+
+fn log_explorer_from_json(j: map, raw: str, n: int) -> map {
+    let all_fields = log_explorer_flatten(j, "")
+    let tk = log_explorer_first(all_fields, log_explorer_time_keys)
+    let lk = log_explorer_first(all_fields, log_explorer_level_keys)
+    let mk = log_explorer_first(all_fields, log_explorer_msg_keys)
+    let trk = log_explorer_first(all_fields, log_explorer_trace_keys)
+    let tv = tk == null ? null : get(j, tk) ?? get(all_fields, tk)
+    let numeric = type_of(tv) == "int" || type_of(tv) == "float"
+    let ms = numeric ? int(tv > 100000000000 ? tv : tv * 1000) : null
+    let t = tk == null ? { text: null, ms: null } : (numeric ? { text: date.from_ms(ms, "UTC"), ms } : log_explorer_time(str(tv)))
+    let raw_level = lk == null ? null : (has(j, lk) ? get(j, lk) : get(all_fields, lk))
+    let trace = trk == null ? [] : split(replace(get(all_fields, trk), "\r", ""), "\n")
+    let rest = reduce([tk, lk, mk, trk], all_fields, (m, k) => k == null ? m : remove(m, k))
+    log_explorer_entry(n, raw, t.text, t.ms, log_explorer_level(raw_level), mk == null ? raw : get(all_fields, mk), rest, "json", trace)
+}
+
+// `key=value` pairs in text, unquoted, lower-case keys.
+fn log_explorer_pairs(text: str) -> map {
+    let out = {}
+    for m in re.find_all(text, log_explorer_pair_re) {
+        let v = m.groups[1]
+        let plain = starts_with(v, "\"") ? replace(replace(slice(v, 1, len(v) - 1), "\\\"", "\""), "\\\\", "\\") : v
+        out = set(out, lower(m.groups[0]), plain)
+    }
+    out
+}
+
+fn log_explorer_from_text(line: str, n: int) -> map {
+    let t = trim(line)
+    let tm = re.find(t, log_explorer_time_re)
+    let after = tm != null ? slice(t, tm.end, len(t)) : t
+    let lm = re.find(after, log_explorer_level_re, "i")
+    let rest = lm != null ? slice(after, lm.end, len(after)) : after
+    let clf = tm == null ? re.find(t, log_explorer_clf_re) : null
+    let req = re.find(rest, log_explorer_request_re)
+    let pairs = re.find_all(rest, log_explorer_pair_re)
+    let covered = sum(pairs | map((p) => p.end - p.start))
+    let logfmt = len(pairs) >= 2 && pairs[0].start == 0 && covered * 10 >= len(rest) * 7
+    let found = log_explorer_pairs(rest)
+    let fields = req == null ? found : merge(found, { method: req.groups[0], path: req.groups[1], status: req.groups[2], bytes: req.groups[3] })
+    let tk = log_explorer_first(fields, log_explorer_time_keys)
+    let lk = log_explorer_first(fields, log_explorer_level_keys)
+    let mk = logfmt ? log_explorer_first(fields, log_explorer_msg_keys) : null
+    let time_text = tm != null ? tm.groups[0]
+        : (clf != null ? `${clf.groups[2]}-${get(log_explorer_months, clf.groups[1]) ?? "01"}-${clf.groups[0]}T${clf.groups[3]}${clf.groups[4]}:${clf.groups[5]}`
+        : (tk != null ? get(fields, tk) : null))
+    let tp = time_text == null ? { text: null, ms: null } : log_explorer_time(time_text)
+    let status = int(fields.status ?? "") ?? 0
+    let level = lm != null ? log_explorer_level(lm.groups[0])
+        : (lk != null ? log_explorer_level(get(fields, lk)) : (status >= 500 ? "error" : (status >= 400 ? "warn" : "other")))
+    let msg = mk != null ? get(fields, mk) : (req != null ? `${req.groups[0]} ${req.groups[1]} ${req.groups[2]}` : rest)
+    let shown = reduce([tk, lk, mk], fields, (m, k) => k == null ? m : remove(m, k))
+    log_explorer_entry(n, line, tp.text, tp.ms, level, msg, shown, logfmt ? "logfmt" : "plain", [])
+}
+
+fn log_explorer_line(line: str, n: int) -> map {
+    let t = trim(line)
+    if starts_with(t, "{") {
+        let j = json.parse(t)
+        if type_of(j) == "map" { return log_explorer_from_json(j, line, n) }
+    }
+    log_explorer_from_text(line, n)
+}
+
+// Whether a line starts an entry whatever else is around it.
+fn log_explorer_starts(line: str) -> bool {
+    let t = trim(line)
+    !re.test(line, "^\\s") && (starts_with(t, "{") || re.test(t, log_explorer_time_re) || re.test(t, log_explorer_level_re, "i")
+        || re.test(t, "^[A-Za-z_][\\w.-]*=") || re.test(t, log_explorer_clf_re))
+}
+
+// Whether a line goes with the one before: a stack frame or a trace's own lines.
+fn log_explorer_continues(line: str) -> bool =
+    re.test(line, "^\\s+\\S") || re.test(line, "^(Caused by:|Traceback \\(|\\.\\.\\. \\d+ more|[A-Za-z_][\\w.$]*(Error|Exception)(:|$))")
+
+// Reads a log: { entries, read (lines), more (lines left out), kept (lines kept in
+// traces), json, logfmt, plain (entries of each) }. Where most lines start an entry
+// plainly, a line that does not belongs to the one before.
+fn log_explorer_parse(text: str, lines: int = 5000) -> map {
+    let all_lines = split(replace(text, "\r\n", "\n"), "\n")
+    let last_blank = len(all_lines) > 0 && trim(all_lines[-1]) == ""
+    let whole = last_blank ? slice(all_lines, 0, len(all_lines) - 1) : all_lines
+    let list_of = take(whole, lines)
+    let sample = take(list_of, 200) | filter((l) => trim(l) != "")
+    let timed = count(sample, log_explorer_starts)
+    let strict = len(sample) > 0 && timed * 2 >= len(sample)
+    let entries = []
+    let open_entry = null
+    let kept = 0
+    let n = 0
+    for l in list_of {
+        n += 1
+        if trim(l) != "" {
+            let goes_on = open_entry != null && !log_explorer_starts(l) && (strict || log_explorer_continues(l))
+            if goes_on {
+                open_entry = { ...open_entry, trace: push(open_entry.trace, l), hay: `${open_entry.hay}\n${lower(l)}` }
+                kept += 1
+            } else {
+                if open_entry != null { entries = push(entries, open_entry) }
+                open_entry = log_explorer_line(l, n)
+            }
+        }
+    }
+    if open_entry != null { entries = push(entries, open_entry) }
+    let done = enumerate(entries) | map((p) => {
+        let e = p[1]
+        { ...e, n: p[0], level: e.level == "other" && len(e.trace) > 0 ? "error" : e.level }
+    })
+    { entries: done, read: len(list_of), more: len(whole) - len(list_of), kept,
+      json: count(done, (e) => e.format == "json"), logfmt: count(done, (e) => e.format == "logfmt"), plain: count(done, (e) => e.format == "plain") }
+}
+
+// One value of a `key:value` term as a test: { kind, ... }.
+fn log_explorer_test(value: str) -> map {
+    let v = lower(value)
+    if v == "" || v == "*" { return { kind: "any" } }
+    let cmp = re.find(v, "^(>=|<=|>|<)(-?\\d+(?:\\.\\d+)?)$")
+    if cmp != null { return { kind: "cmp", op: cmp.groups[0], n: float(cmp.groups[1]) } }
+    let span = re.find(v, "^(-?\\d+(?:\\.\\d+)?)\\.\\.(-?\\d+(?:\\.\\d+)?)$")
+    if span != null { return { kind: "span", lo: float(span.groups[0]), hi: float(span.groups[1]) } }
+    let rank = re.find(v, "^(>=|<=|>|<)([a-z]+)$")
+    if rank != null { return { kind: "rank", op: rank.groups[0], level: rank.groups[1] } }
+    if re.test(v, "^\\d+x+$") { return { kind: "class", head: replace(v, "x", ""), size: len(v) } }
+    if contains(v, "*") { return { kind: "glob", parts: split(v, "*") } }
+    { kind: "is", text: v }
+}
+
+// A query as terms: { terms: [{ neg, kind: "word", text } or { neg, kind: "field",
+// key, test }], problem: text or null }.
+fn log_explorer_query(text: str) -> map {
+    let problem = null
+    let tokens = re.find_all(text, "-?[^\\s:\"]+:\"[^\"]*\"?|-?\"[^\"]*\"?|\\S+")
+    let terms = tokens | map((m) => {
+        let t = m.text
+        let neg = len(t) > 1 && starts_with(t, "-")
+        let body = neg ? slice(t, 1, len(t)) : t
+        let quotes = count(split(body, ""), (c) => c == "\"")
+        if quotes % 2 == 1 { problem = `The quote at character ${m.start + 1} is not closed, so the search runs to the end of the text.` }
+        let colon = index_of(body, ":")
+        let quoted_first = starts_with(body, "\"")
+        if colon != null && colon > 0 && !quoted_first {
+            let key = lower(slice(body, 0, colon))
+            let value = replace(slice(body, colon + 1, len(body)), "\"", "")
+            { neg, kind: "field", key, test: log_explorer_test(value) }
+        } else {
+            { neg, kind: "word", text: lower(replace(body, "\"", "")) }
+        }
+    }) | filter((t) => t.kind == "field" || t.text != "")
+    { terms, problem }
+}
+
+fn log_explorer_rank(level: str) -> int = index_of(log_explorer_levels, level) ?? 6
+
+fn log_explorer_glob(parts: list, value: str) -> bool {
+    if !starts_with(value, parts[0]) || !ends_with(value, parts[-1]) || len(value) < len(parts[0]) + len(parts[-1]) { return false }
+    let rest = slice(value, len(parts[0]), len(value))
+    let ok = true
+    for p in slice(parts, 1, len(parts) - 1) {
+        let at = index_of(rest, p)
+        if at == null { ok = false } else { rest = slice(rest, at + len(p), len(rest)) }
+    }
+    ok
+}
+
+// Whether a field's text passes a test. Numbers are read only when a test wants one.
+fn log_explorer_passes(test: map, text: str) -> bool {
+    let value = lower(text)
+    match test.kind {
+        "any" => true
+        "is" => value == test.text
+        "glob" => log_explorer_glob(test.parts, value)
+        "class" => len(value) == test.size && re.test(value, "^\\d+$") && starts_with(value, test.head)
+        "cmp" | "span" => {
+            if !re.test(value, "^-?\\d{1,15}(\\.\\d{1,12})?$") { return false }
+            let n = float(value)
+            test.kind == "span" ? n >= test.lo && n <= test.hi
+                : (match test.op { ">" => n > test.n, ">=" => n >= test.n, "<" => n < test.n, _ => n <= test.n })
+        }
+        _ => false
+    }
+}
+
+// The fields a key names: its own, or one ending in it ("status" finds "http.status").
+fn log_explorer_lookup(fields: map, key: str) -> list {
+    if has(fields, key) { return [get(fields, key)] }
+    let tail = `.${key}`
+    keys(fields) | filter((k) => ends_with(k, tail)) | map((k) => get(fields, k))
+}
+
+fn log_explorer_level_test(test: map, level: str) -> bool {
+    if test.kind == "any" { return true }
+    if test.kind == "rank" {
+        let want = log_explorer_rank(log_explorer_level(test.level))
+        let here = log_explorer_rank(level)
+        // A lower place in the list is more severe; "other" has no rank.
+        return here < 6 && match test.op { ">=" => here <= want, ">" => here < want, "<=" => here >= want, _ => here > want }
+    }
+    if test.kind == "is" { return level == log_explorer_level(test.text) }
+    log_explorer_passes(test, level)
+}
+
+fn log_explorer_term(e: map, t: map) -> bool {
+    if t.kind == "word" { return contains(e.hay, t.text) }
+    let hit = match t.key {
+        "level" | "lvl" | "severity" => log_explorer_level_test(t.test, e.level)
+        "msg" | "message" => t.test.kind == "is" ? contains(lower(e.msg), t.test.text) : log_explorer_passes(t.test, e.msg)
+        "time" => t.test.kind == "is" ? starts_with(lower(e.time ?? ""), t.test.text) : (e.time != null && log_explorer_passes(t.test, e.time))
+        _ => any(log_explorer_lookup(e.fields, t.key), (v) => log_explorer_passes(t.test, v))
+    }
+    hit
+}
+
+// The entries every term takes; a `-` term must not hold.
+fn log_explorer_search(entries: list, terms: list) -> list =
+    len(terms) == 0 ? entries : entries | filter((e) => all(terms, (t) => log_explorer_term(e, t) != t.neg))
+
+// How many of each level, of the entries that pass all but the level terms.
+fn log_explorer_counts(entries: list, terms: list) -> list {
+    let rest = terms | filter((t) => !(t.kind == "field" && (t.key == "level" || t.key == "lvl" || t.key == "severity")))
+    let found = log_explorer_search(entries, rest)
+    log_explorer_levels | map((l) => { level: l, count: count(found, (e) => e.level == l) }) | filter((c) => c.count > 0)
+}
+
+// The query with `level:x` turned on or off, the rest as typed.
+fn log_explorer_toggle(query: str, term: str) -> str {
+    let words = re.find_all(query, "-?[^\\s:\"]+:\"[^\"]*\"?|-?\"[^\"]*\"?|\\S+") | map((m) => m.text)
+    let there = contains(words, term)
+    join(there ? remove(words, term) : push(words, term), " ")
+}
+
+fn log_explorer_quote(key: str, value: str) -> str {
+    let v = replace(value, "\"", "")
+    re.test(v, "\\s") || v == "" ? `${key}:"${v}"` : `${key}:${v}`
+}
+
+// A message cut into [{ t, hit }] pieces around what the words find. When lower case
+// changes a text's length, as it can outside ASCII, the places would be wrong: no marks.
+fn log_explorer_marks(text: str, terms: list) -> list {
+    let words = terms | filter((t) => t.kind == "word" && !t.neg && t.text != "") | map((t) => t.text)
+    let low = lower(text)
+    if len(words) == 0 || len(low) != len(text) || len(text) > 2000 { return [{ t: text, hit: false }] }
+    let spans = []
+    for w in words {
+        let from = 0
+        let going = true
+        while going {
+            let at = index_of(slice(low, from, len(low)), w)
+            if at == null { going = false } else {
+                spans = push(spans, [from + at, from + at + len(w)])
+                from = from + at + len(w)
+            }
+        }
+    }
+    let out = []
+    let pos = 0
+    for s in sort_by(spans, (x) => x[0]) {
+        if s[0] >= pos {
+            if s[0] > pos { out = push(out, { t: slice(text, pos, s[0]), hit: false }) }
+            out = push(out, { t: slice(text, s[0], s[1]), hit: true })
+            pos = s[1]
+        }
+    }
+    if pos < len(text) { out = push(out, { t: slice(text, pos, len(text)), hit: false }) }
+    out
+}
+
+fn log_explorer_clip(s: str) -> str = len(s) > 400 ? `${slice(s, 0, 400)}…` : s
+
+component LogExplorer(text: str = "", query: str = "", limit: int = 200, context: int = 5, lines: int = 5000, title: str = "Log explorer",
+                      id: str = "log-explorer", on_change = null, class: str? = null) {
+    style global log_explorer_css
+    state raw = text
+    state q = query
+    state open_at = null
+    state anchor = null
+    state span = context
+    state list_el = null
+    let log = log_explorer_parse(raw, lines)
+    let parsed = log_explorer_query(q)
+    let found = log_explorer_search(log.entries, parsed.terms)
+    let counts = log_explorer_counts(log.entries, parsed.terms)
+    let in_context = anchor != null && anchor < len(log.entries)
+    let shown = in_context ? slice(log.entries, max([0, anchor - span]), anchor + span + 1) : take(found, limit)
+    let tell = () => {
+        if on_change != null {
+            let l = log_explorer_parse(raw, lines)
+            let p = log_explorer_query(q)
+            on_change({ query: q, matched: len(log_explorer_search(l.entries, p.terms)), total: len(l.entries) })
+        }
+    }
+    // The row keeps its element as the list goes back (its key stays), so focus can
+    // go to it now, ahead of the update that takes the Back button away.
+    let leave = () => {
+        let row = list_el == null ? null : list_el.querySelector(`[data-line="${log.entries[anchor].line}"]`)
+        anchor = null
+        if row != null { row.focus() }
+    }
+    let go = (text_now: str) => { q = text_now; open_at = null; anchor = null; tell() }
+    let move = (e) => {
+        let goes = e.key == "ArrowDown" ? 1 : (e.key == "ArrowUp" ? -1 : 0)
+        if goes != 0 && list_el != null {
+            e.preventDefault()
+            let rows = list_el.querySelectorAll(".ui-log-explorer-row")
+            let here = -1
+            let i = 0
+            while i < rows.length {
+                if rows[i].isSameNode(e.target) { here = i }
+                i += 1
+            }
+            let next = here + goes
+            if next >= 0 && next < rows.length { rows[next].focus() }
+        }
+        if e.key == "Escape" {
+            if open_at != null { open_at = null } else if in_context { leave() }
+        }
+    }
+    <section class={ui_cls(["ui-log-explorer", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-log-explorer-title id={`${id}-title`}>{title}</h3>
+        <details.ui-log-explorer-source open={raw == ""}>
+            <summary>Log text</summary>
+            <label.ui-sr for={`${id}-log`}>Log text</label>
+            <textarea id={`${id}-log`} name="log" rows="8" spellcheck="false" placeholder="Paste JSON lines, logfmt or plain log lines"
+                      @input={(e) => { raw = e.value; open_at = null; anchor = null; tell() }}>{raw}</textarea>
+        </details>
+        <div.ui-log-explorer-field>
+            <label for={`${id}-query`}>Search</label>
+            <input type="search" id={`${id}-query`} name="query" value={q} autocomplete="off" spellcheck="false" placeholder={`level:error status:5xx "timeout"`}
+                   @input={(e) => { go(e.value) }}/>
+        </div>
+        {parsed.problem != null && <p.ui-log-explorer-problem>{parsed.problem}</p>}
+        {len(counts) > 0 && <div.ui-log-explorer-levels role="group" aria-label="Counts by level">
+            {for c in counts => <button.ui-log-explorer-level key={c.level} type="button" data-level={c.level} aria-pressed={contains(q, `level:${c.level}`) ? "true" : "false"}
+                                        @click={() => { go(log_explorer_toggle(q, `level:${c.level}`)) }}>{c.level} <b>{c.count}</b></button>}
+        </div>}
+        <p.ui-log-explorer-note data-count aria-live="polite">{len(log.entries) == 0 ? "Nothing to search yet."
+            : (in_context ? `Context around line ${log.entries[anchor].line}` : `${len(found)} of ${len(log.entries)} entries match`)}</p>
+        {len(log.entries) > 0 && !in_context && <p.ui-log-explorer-note data-read>{`Read ${log.read} lines: ${log.json} JSON, ${log.logfmt} logfmt, ${log.plain} plain${log.kept > 0 ? `, and ${log.kept} kept with a trace` : ""}.`}</p>}
+        {log.more > 0 && <p.ui-log-explorer-problem>{`Only the first ${log.read} lines are read; ${log.more} more are left out.`}</p>}
+        {!in_context && len(found) > limit && <p.ui-log-explorer-note>{`Showing the first ${limit} of ${len(found)}.`}</p>}
+        {in_context && <div.ui-log-explorer-bar>
+            <button.ui-log-explorer-btn type="button" data-back @mount={(el) => { el.focus() }} @click={leave}>Back to results</button>
+            <button.ui-log-explorer-btn type="button" data-more @click={() => { span = span + context }}>Show more around it</button>
+        </div>}
+        {len(log.entries) > 0 && !in_context && len(found) == 0 && <p.ui-log-explorer-note data-none>Nothing matches. Take a term out of the search to widen it.</p>}
+        {len(shown) > 0 && <ul.ui-log-explorer-list @mount={(el) => { list_el = el }} @keydown={move}>
+            {for e in shown => <li key={str(e.n)} class={ui_cls(["ui-log-explorer-entry", in_context && e.n == anchor && "ui-log-explorer-anchor"])}>
+                <button.ui-log-explorer-row type="button" aria-expanded={open_at == e.n ? "true" : "false"} data-line={e.line}
+                        @click={() => { open_at = open_at == e.n ? null : e.n }}>
+                    <span.ui-log-explorer-time>{e.time ?? "no time"}</span>
+                    <span class={`ui-log-explorer-tag ui-log-explorer-tag-${e.level}`}>{e.level}</span>
+                    <span.ui-log-explorer-msg>
+                        {for pair in enumerate(log_explorer_marks(log_explorer_clip(e.msg), parsed.terms)) => pair[1].hit ? <mark key={str(pair[0])}>{pair[1].t}</mark> : <span key={str(pair[0])}>{pair[1].t}</span>}
+                        {len(e.trace) > 0 && <span.ui-log-explorer-more>{` (+${len(e.trace)} trace lines)`}</span>}
+                    </span>
+                </button>
+                {open_at == e.n && <div.ui-log-explorer-body>
+                    {len(keys(e.fields)) > 0 && <ul.ui-log-explorer-fields aria-label="Fields: pick one to add it to the search">
+                        {for [k, v] in e.fields => <li key={k}><button.ui-log-explorer-chip type="button" @click={() => { go(log_explorer_toggle(q, log_explorer_quote(k, v))) }}>{`${k}=${log_explorer_clip(v)}`}</button></li>}
+                    </ul>}
+                    {len(e.trace) > 0 && <pre.ui-log-explorer-trace tabindex="0" aria-label="Trace">{join(e.trace, "\n")}</pre>}
+                    <p.ui-log-explorer-note>{`Line ${e.line}, ${e.format}: ${log_explorer_clip(e.raw)}`}</p>
+                    {!in_context && <button.ui-log-explorer-btn type="button" data-context @click={() => { anchor = e.n; span = context; open_at = null }}>Context</button>}
+                </div>}
+            </li>}
+        </ul>}
+    </section>
+}

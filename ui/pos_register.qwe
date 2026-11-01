@@ -1,0 +1,482 @@
+// PosRegister: a till for a tablet on a counter. A product grid beside a ticket, quantity and
+// discount by steppers and a number pad, tax, then cash with change or card. All the
+// sums are decimals in the currency's own units, so a sale adds up to the cent, and an
+// unfinished sale survives a reload.
+//
+//   import ui/pos_register.qwe use PosRegister
+//
+//   component Till(products: list) {
+//       state held = load_open_sale()
+//       <div style="height: 100dvh">
+//           <PosRegister products={products} tax_rate="0.0825" saved={held} on_change={(sale) => { keep_open_sale(sale) }}
+//                        on_card={(amount, ref) => { charge(amount, ref) }} on_sale={(done) => { record_sale(done) }}/>
+//       </div>
+//   }
+//
+// products: each { id, name, price, category? }. price is text or a decimal ("3.50", 3.50m); a
+// float works but is a float. One with no name or no usable price is left out, as is an id
+// already seen. currency: ISO code ("USD"). locale: how amounts are written ("en-US").
+// tax_rate: a share of the price, as text ("0.0825" is 8.25%; 0 for none). tax_included: true
+// when prices already hold the tax, so it is worked out of them, and the total is the
+// sum. label: its name for screen readers. class.
+// saved: an unfinished sale to carry on with, as on_change gave it; it wins over the browser's
+// own copy. storage_key: where that copy is kept ("quillo-pos-sale"; null for none).
+// on_change(sale): inside one of your components, called with { ref, lines, off_kind, off } after
+// each change. In a phone app the browser's copy lasts one launch, so an app keeps this
+// through a server fn and passes it back as saved.
+// on_card(amount, ref): what charges a card, given the total as money and the sale's own
+// reference, kept through a reload, so a retry can be told from a new charge. It may wait,
+// and answers true, or { ok: true }; anything else is a refusal, which keeps the sale. Without
+// it the till asks whether the terminal beside it approved. on_sale(done): called once with
+// { ref, lines, subtotal, discount, tax, total, paid_by, tendered, change, at }, in money.
+//
+// Tax is worked on the whole sale after discounts, half up, a discount in percent likewise,
+// each to the currency's smallest unit. An amount off never takes a line or a sale below zero.
+// Keys on the pad: digits, the point, Backspace, Enter and Escape.
+
+import ui/theme.qwe use ui_cls
+
+let pos_register_css = css`
+.ui-pos-register { position: relative; box-sizing: border-box; display: flex; width: 100%; height: 100%; min-height: 420px; container-type: inline-size; color: var(--ui-fg); background: var(--ui-subtle); font: 15px/1.3 var(--ui-font); }
+.ui-pos-register-main { display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; }
+.ui-pos-register-shop { display: flex; flex-direction: column; flex: 1 1 44%; min-width: 0; min-height: 0; }
+.ui-pos-register-cats { display: flex; flex: none; gap: 4px; overflow-x: auto; overscroll-behavior-x: contain; padding: 8px max(8px, env(safe-area-inset-left)); scrollbar-width: none; }
+.ui-pos-register-cat { flex: none; min-width: 44px; min-height: 44px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font: 500 14px var(--ui-font); cursor: pointer; }
+.ui-pos-register-cat[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-pos-register-cat:focus-visible, .ui-pos-register-item:focus-visible, .ui-pos-register-key:focus-visible, .ui-pos-register-btn:focus-visible, .ui-pos-register-line-pick:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-pos-register-grid { flex: 1; display: grid; grid-template-columns: repeat(auto-fill, minmax(124px, 1fr)); grid-auto-rows: 84px; gap: 8px; align-content: start; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 8px 8px max(8px, env(safe-area-inset-left)); }
+.ui-pos-register-item { display: flex; flex-direction: column; justify-content: space-between; min-width: 0; padding: 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: inherit; text-align: left; cursor: pointer; touch-action: manipulation; }
+.ui-pos-register-item:active { background: var(--ui-accent-soft); }
+.ui-pos-register-item b { display: block; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-pos-register-item span { color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-pos-register-ticket { display: flex; flex-direction: column; flex: 1 1 56%; min-width: 0; min-height: 0; border-top: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-pos-register-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: none; min-height: 48px; padding: 2px 12px; border-bottom: 1px solid var(--ui-border); }
+.ui-pos-register-head h3 { margin: 0; font-size: 16px; }
+.ui-pos-register-split { display: flex; flex: 1; min-height: 0; }
+.ui-pos-register-lines { flex: 1; min-width: 0; margin: 0; padding: 4px; overflow-y: auto; overscroll-behavior: contain; list-style: none; }
+.ui-pos-register-empty { padding: 24px 12px; color: var(--ui-muted); text-align: center; }
+.ui-pos-register-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 2px 4px; border-radius: var(--ui-radius-sm); }
+.ui-pos-register-line-on { background: var(--ui-accent-soft); }
+.ui-pos-register-line-pick { flex: 1 1 120px; min-width: 0; min-height: 44px; padding: 2px 4px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.ui-pos-register-line-pick b { display: block; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-pos-register-line-pick small { color: var(--ui-muted); font-size: 12px; }
+.ui-pos-register-qty { min-width: 28px; text-align: center; font-variant-numeric: tabular-nums; }
+.ui-pos-register-net { min-width: 72px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+.ui-pos-register-btn { min-width: 44px; min-height: 44px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-pos-register-btn:disabled { opacity: .5; cursor: default; }
+.ui-pos-register-btn[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-pos-register-primary { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-pos-register-side { display: flex; flex-direction: column; flex: 0 0 min(300px, 44%); min-height: 0; overflow-y: auto; border-left: 1px solid var(--ui-border); }
+.ui-pos-register-sums { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; margin: 0; padding: 8px 12px; font-variant-numeric: tabular-nums; }
+.ui-pos-register-sums dt { color: var(--ui-muted); }
+.ui-pos-register-sums dd { margin: 0; text-align: right; }
+.ui-pos-register-total { padding-top: 4px; color: var(--ui-fg) !important; font-size: 20px; font-weight: 700; }
+.ui-pos-register-acts { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 6px 12px calc(10px + env(safe-area-inset-bottom)); }
+.ui-pos-register-wide { grid-column: 1 / -1; }
+.ui-pos-register-panel { display: grid; gap: 8px; padding: 8px 12px calc(10px + env(safe-area-inset-bottom)); outline: none; }
+.ui-pos-register-panel h4 { margin: 0; font-size: 15px; }
+.ui-pos-register-entry { min-height: 44px; padding: 6px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font: 600 22px/1.4 var(--ui-font); font-variant-numeric: tabular-nums; text-align: right; }
+.ui-pos-register-keys { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.ui-pos-register-key { min-height: 52px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); color: var(--ui-fg); font: 600 19px var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-pos-register-row { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 6px; }
+.ui-pos-register-msg { margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-pos-register-bad { color: var(--ui-danger); }
+.ui-pos-register-change { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; text-align: center; }
+/* With the width of a turned tablet the ticket stands beside the grid and the sums under the lines. */
+@container (min-width: 960px) {
+  .ui-pos-register-main { flex-direction: row; }
+  .ui-pos-register-shop { flex: 1 1 56%; }
+  .ui-pos-register-ticket { flex: 0 0 440px; border-top: 0; border-left: 1px solid var(--ui-border); }
+  .ui-pos-register-split { flex-direction: column; }
+  .ui-pos-register-side { flex: 0 1 auto; max-height: 72%; border-top: 1px solid var(--ui-border); border-left: 0; }
+}
+`
+
+// A currency this till can count in, or USD: an unknown code stops every money call.
+fn pos_register_currency(code) -> str {
+    if type_of(code) != "str" { return "USD" }
+    type_of(money.of(0, code)) == "error" ? "USD" : code
+}
+
+// Text, a decimal, an int or a float as a decimal at most 12 digits long, or null. A text like
+// "1e3" or "abc" is not a price.
+fn pos_register_dec(v) {
+    let t = type_of(v)
+    if t == "dec" { return abs(v) < 1000000000m ? v : null }
+    if t == "int" || t == "float" { return pos_register_dec(str(v)) }
+    if t != "str" { return null }
+    let text = trim(v)
+    if len(text) == 0 || len(text) > 13 || !re.test(text, "^-?[0-9]{1,12}(\\.[0-9]{1,6})?$") { return null }
+    pos_register_dec(dec(text))
+}
+
+// The products that can be sold, ids as text, prices decimals rounded to the currency.
+fn pos_register_products(products, cur: str) -> list {
+    if type_of(products) != "list" { return [] }
+    let usable = products | filter((p) => type_of(p) == "map" && type_of(get(p, "name")) == "str" && pos_register_dec(get(p, "price")) != null && pos_register_dec(get(p, "price")) >= 0m)
+    let all = enumerate(usable) | map((p) => {
+        let x = p[1]
+        { id: get(x, "id") != null ? str(x.id) : `_${p[0]}`, name: x.name, category: type_of(get(x, "category")) == "str" ? x.category : "Other",
+          price: money.of(pos_register_dec(x.price), cur, "half_up") }
+    })
+    let ids = all | map((x) => x.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// The rate as a decimal share between 0 and 1.
+fn pos_register_rate(rate) {
+    let d = pos_register_dec(rate)
+    if d == null || d < 0m { return 0m }
+    d > 1m ? 1m : d
+}
+
+// An empty sale.
+fn pos_register_blank() {
+    { ref: "", lines: [], off_kind: "pct", off: "0" }
+}
+
+// A sale from outside or from storage: lines that make sense, the rest left out. Prices stay as
+// rung up, even if the product list has changed since.
+fn pos_register_clean(sale) {
+    if type_of(sale) != "map" { return pos_register_blank() }
+    let lines = get(sale, "lines")
+    let shaped = type_of(lines) != "list" ? [] : lines | filter((l) => {
+        if type_of(l) != "map" || type_of(get(l, "name")) != "str" { return false }
+        let q = get(l, "qty")
+        let price = pos_register_dec(get(l, "price"))
+        type_of(q) == "int" && q >= 1 && q <= 9999 && price != null && price >= 0m && get(l, "id") != null
+    })
+    let kept = shaped | map((l) => {
+        { id: str(l.id), name: l.name, price: str(pos_register_dec(l.price)), qty: l.qty,
+          off_kind: get(l, "off_kind") == "amt" ? "amt" : "pct", off: str(pos_register_dec(get(l, "off")) ?? 0m) }
+    })
+    { ref: type_of(get(sale, "ref")) == "str" ? sale.ref : "", lines: kept, off_kind: get(sale, "off_kind") == "amt" ? "amt" : "pct", off: str(pos_register_dec(get(sale, "off")) ?? 0m) }
+}
+
+// What a discount takes off an amount: a percentage, half up, or an amount; never more than it.
+fn pos_register_off(gross, kind: str, off: str, cur: str) {
+    let d = pos_register_dec(off) ?? 0m
+    if d <= 0m { return money.zero(cur) }
+    if kind == "pct" {
+        let share = (d > 100m ? 100m : d) / 100
+        return money.mul(gross, share, "half_up")
+    }
+    let amount = money.of(d, cur, "half_up")
+    money.compare(amount, gross) > 0 ? gross : amount
+}
+
+// A line's sums: { gross, off, net }.
+fn pos_register_line(l, cur: str) {
+    let price = money.of(pos_register_dec(l.price) ?? 0m, cur, "half_up")
+    let gross = money.mul(price, l.qty)
+    let off = pos_register_off(gross, l.off_kind, l.off, cur)
+    { gross, off, net: money.sub(gross, off) }
+}
+
+// The whole sale: { count, subtotal, discount, tax, total }. subtotal is before the sale's
+// discount and after the lines'. Tax is on what is left, out of it when prices include it.
+fn pos_register_totals(sale, rate, included: bool, cur: str) {
+    let nets = sale.lines | map((l) => pos_register_line(l, cur).net)
+    let subtotal = reduce(nets, money.zero(cur), (a, b) => money.add(a, b))
+    let discount = pos_register_off(subtotal, sale.off_kind, sale.off, cur)
+    let taxable = money.sub(subtotal, discount)
+    let count = sum(sale.lines | map((l) => l.qty))
+    if included {
+        let net = dec(1) + rate
+        let before = money.of(taxable.amount / net, cur, "half_up")
+        return { count, subtotal, discount, tax: money.sub(taxable, before), total: taxable }
+    }
+    let tax = money.mul(taxable, rate, "half_up")
+    { count, subtotal, discount, tax, total: money.add(taxable, tax) }
+}
+
+// The sale with one more of a product: a line it has, else a new one at the end.
+fn pos_register_add(sale, p) {
+    let has = find(sale.lines, (l) => l.id == p.id) != null
+    let lines = has ? (sale.lines | map((l) => l.id == p.id ? { ...l, qty: min([l.qty + 1, 9999]) } : l))
+        : sale.lines | push({ id: p.id, name: p.name, price: str(p.price.amount), qty: 1, off_kind: "pct", off: "0" })
+    { ...sale, lines }
+}
+
+// The sale with a line's quantity set; none takes the line off.
+fn pos_register_set_qty(sale, id: str, qty: int) {
+    if qty <= 0 { return { ...sale, lines: sale.lines | filter((l) => l.id != id) } }
+    { ...sale, lines: sale.lines | map((l) => l.id == id ? { ...l, qty: min([qty, 9999]) } : l) }
+}
+
+// A key on the pad applied to what has been typed. places: decimals allowed; a point is
+// refused at none. Nine characters are as many as a till needs.
+fn pos_register_type(entry: str, key: str, places: int) -> str {
+    if key == "C" { return "" }
+    if key == "del" { return slice(entry, 0, max([0, len(entry) - 1])) }
+    if key == "." {
+        if places == 0 || contains(entry, ".") { return entry }
+        return entry == "" ? "0." : entry + "."
+    }
+    if len(entry) >= 9 { return entry }
+    let parts = split(entry, ".")
+    if len(parts) == 2 && len(parts[1]) >= places { return entry }
+    entry == "0" ? key : entry + key
+}
+
+// Notes a customer is likely to hand over for a total: the next round amounts.
+fn pos_register_notes(total, places: int) -> list {
+    let scale = places == 0 ? 100 : 1
+    let steps = [5, 10, 20, 50, 100] | map((s) => dec(s * scale))
+    let ups = steps | map((s) => ceil(total / s) * s)
+    slice(unique(ups), 0, 4)
+}
+
+component PosRegister(products = [], currency: str = "USD", locale: str = "en-US", tax_rate = "0", tax_included: bool = false, label: str = "Till", saved = null,
+                      storage_key: str? = "quillo-pos-sale", on_change = null, on_card = null, on_sale = null, class: str? = null) {
+    style global pos_register_css
+    let cur = pos_register_currency(currency)
+    let places = money.minor_units(cur)
+    let rate = pos_register_rate(tax_rate)
+    let stock = pos_register_products(products, cur)
+    let cats = ["All"] + unique(stock | map((p) => p.category))
+    state cat = "All"
+    state sale = pos_register_clean(saved)
+    state picked = ""          // the line picked
+    state pad = null           // { what, title } while the number pad is out
+    state entry = ""
+    state pay = ""             // "cash" or "card" while paying
+    state busy = false
+    state msg = ""
+    state done = null          // the sale just finished, for the screen after it
+    state unkept = false       // the browser would not keep the sale
+    state said = ""
+    let shown = cat == "All" ? stock : (stock | filter((p) => p.category == cat))
+    let totals = pos_register_totals(sale, rate, tax_included, cur)
+    let line_sums = sale.lines | map((l) => pos_register_line(l, cur))
+    let fmt = (m) => money.format(m, locale)
+    let total_due = totals.total
+    let tendered = pos_register_dec(entry) ?? 0m
+    let is_short = tendered < total_due.amount
+    // Kept here as well as told, so a reload finds the sale. Storage may refuse, or not be there.
+    let keep = () => {
+        on_change && on_change(sale)
+        if storage_key != null {
+            let key = storage_key
+            let text = json.stringify(sale)
+            let r = js("Promise.resolve", js_new("Promise", (ok) => { ok(js("localStorage.setItem", key, text)) }))
+            unkept = is_err(r)
+        }
+    }
+    let change = (next) => {
+        sale = len(next.lines) > 0 && next.ref == "" ? { ...next, ref: uuid() } : next
+        keep()
+    }
+    let open_pad = (what: str, title: str, start: str) => {
+        pad = { what, title }
+        entry = start
+        msg = ""
+    }
+    let picked_line = () => find(sale.lines, (l) => l.id == picked)
+    let apply_pad = () => {
+        let p = pad
+        let d = pos_register_dec(entry) ?? 0m
+        if p.what == "qty" { change(pos_register_set_qty(sale, picked, int(d))) }
+        if p.what == "line_pct" || p.what == "line_amt" {
+            let kind = p.what == "line_pct" ? "pct" : "amt"
+            let off = str(d)
+            change({ ...sale, lines: sale.lines | map((l) => l.id == picked ? { ...l, off_kind: kind, off } : l) })
+        }
+        if p.what == "sale_pct" || p.what == "sale_amt" {
+            change({ ...sale, off_kind: p.what == "sale_pct" ? "pct" : "amt", off: str(d) })
+        }
+        pad = null
+        entry = ""
+        said = `Total ${fmt(pos_register_totals(sale, rate, tax_included, cur).total)}.`
+    }
+    let press = (k: str) => {
+        let allowed = pad != null && pad.what == "qty" ? 0 : places
+        entry = pos_register_type(entry, k, allowed == 0 && pad != null && (pad.what == "line_pct" || pad.what == "sale_pct") ? 2 : allowed)
+    }
+    let finish = (paid_by: str, given, back) => {
+        let t = totals
+        let record = { ref: sale.ref, lines: sale.lines, subtotal: t.subtotal, discount: t.discount, tax: t.tax, total: t.total, paid_by, tendered: given, change: back,
+                       at: js("Date.now") }
+        done = record
+        pay = ""
+        pad = null
+        entry = ""
+        picked = ""
+        msg = ""
+        sale = pos_register_blank()
+        keep()
+        said = `Paid. ${back != null ? `Change ${fmt(back)}.` : ""}`
+        on_sale && on_sale(record)
+    }
+    let pay_cash = (amount) => {
+        let given = money.of(amount, cur, "half_up")
+        if !busy && money.compare(given, total_due) >= 0 {
+            finish("cash", given, money.sub(given, total_due))
+        }
+    }
+    let pay_card = () => {
+        if !busy {
+            busy = true
+            msg = ""
+            let amount = total_due
+            let ref = sale.ref
+            let got = js("Promise.resolve", on_card(amount, ref))
+            busy = false
+            if got == true || (type_of(got) == "map" && get(got, "ok") == true) {
+                finish("card", amount, null)
+            } else {
+                msg = "The card was not accepted. The sale is kept."
+            }
+        }
+    }
+    let on_pad_key = (e) => {
+        if len(e.key) == 1 && e.key >= "0" && e.key <= "9" {
+            e.preventDefault()
+            press(e.key)
+        } else if e.key == "." {
+            e.preventDefault()
+            press(".")
+        } else if e.key == "Backspace" {
+            e.preventDefault()
+            press("del")
+        } else if e.key == "Enter" {
+            e.preventDefault()
+            if pad != null { apply_pad() } else if pay == "cash" { pay_cash(tendered) }
+        } else if e.key == "Escape" {
+            e.preventDefault()
+            pad = null
+            pay = ""
+            entry = ""
+        }
+    }
+    <div class={ui_cls(["ui-pos-register", class])} role="group" aria-label={label}
+         @mount={(_me) => {
+             if saved == null && storage_key != null {
+                 let key = storage_key
+                 let text = js("Promise.resolve", js_new("Promise", (ok) => { ok(js("localStorage.getItem", key)) }))
+                 if type_of(text) == "str" {
+                     let was = json.parse(text)
+                     if !is_err(was) { sale = pos_register_clean(was) }
+                 }
+             }
+         }}>
+        <div.ui-pos-register-main>
+            <div.ui-pos-register-shop>
+                <div.ui-pos-register-cats role="group" aria-label="Categories">
+                    {for c in cats => <button.ui-pos-register-cat key={c} type="button" aria-pressed={cat == c ? "true" : "false"} @click={() => { cat = c }}>{c}</button>}
+                </div>
+                <div.ui-pos-register-grid>
+                    {for p in shown => <button.ui-pos-register-item key={p.id} type="button" disabled={done != null} @click={() => {
+                        change(pos_register_add(sale, p))
+                        picked = p.id
+                        said = `${p.name} added.`
+                    }}><b>{p.name}</b><span>{fmt(p.price)}</span></button>}
+                    {len(shown) == 0 && <p.ui-pos-register-empty>No products to show.</p>}
+                </div>
+            </div>
+            <section.ui-pos-register-ticket aria-label="Ticket">
+                <div.ui-pos-register-head>
+                    <h3>Ticket</h3>
+                    <span>{totals.count} items</span>
+                    <button.ui-pos-register-btn type="button" disabled={len(sale.lines) == 0 || pay != ""} @click={() => {
+                        change(pos_register_blank())
+                        picked = ""
+                        pad = null
+                        said = "Sale voided."
+                    }}>Void</button>
+                </div>
+                <div.ui-pos-register-split>
+                    <ul.ui-pos-register-lines>
+                        {for p in enumerate(sale.lines) => <li key={p[1].id} class={ui_cls(["ui-pos-register-line", picked == p[1].id && "ui-pos-register-line-on"])} data-id={p[1].id}>
+                            <button.ui-pos-register-line-pick type="button" aria-pressed={picked == p[1].id ? "true" : "false"} @click={() => { picked = picked == p[1].id ? "" : p[1].id }}>
+                                <b>{p[1].name}</b>
+                                <small>{fmt(money.of(pos_register_dec(p[1].price) ?? 0m, cur, "half_up"))}{!money.is_zero(line_sums[p[0]].off) ? ` less ${fmt(line_sums[p[0]].off)}` : ""}</small>
+                            </button>
+                            <button.ui-pos-register-btn type="button" aria-label={`One fewer ${p[1].name}`} @click={() => { change(pos_register_set_qty(sale, p[1].id, p[1].qty - 1)) }}>-</button>
+                            <span.ui-pos-register-qty>{p[1].qty}</span>
+                            <button.ui-pos-register-btn type="button" aria-label={`One more ${p[1].name}`} @click={() => { change(pos_register_set_qty(sale, p[1].id, p[1].qty + 1)) }}>+</button>
+                            <span.ui-pos-register-net>{fmt(line_sums[p[0]].net)}</span>
+                        </li>}
+                        {len(sale.lines) == 0 && done == null && <li.ui-pos-register-empty>Tap a product to start a sale.</li>}
+                    </ul>
+                    <div.ui-pos-register-side>
+                        <dl.ui-pos-register-sums>
+                            <dt>Subtotal</dt><dd data-sum="subtotal">{fmt(totals.subtotal)}</dd>
+                            <dt>Discount</dt><dd data-sum="discount">{fmt(totals.discount)}</dd>
+                            <dt>{tax_included ? "Tax included" : "Tax"}</dt><dd data-sum="tax">{fmt(totals.tax)}</dd>
+                            <dt class="ui-pos-register-total">Total</dt><dd class="ui-pos-register-total" data-sum="total">{fmt(totals.total)}</dd>
+                        </dl>
+                        {done != null && <div.ui-pos-register-panel>
+                            <h4>Paid by {done.paid_by}</h4>
+                            <p.ui-pos-register-msg>{fmt(done.total)} taken{done.tendered != null ? `, ${fmt(done.tendered)} given` : ""}</p>
+                            {done.change != null && <div.ui-pos-register-change>Change {fmt(done.change)}</div>}
+                            <button.ui-pos-register-btn.ui-pos-register-primary type="button" @click={() => { done = null }}>New sale</button>
+                        </div>}
+                        {done == null && pad != null && <div.ui-pos-register-panel tabindex="-1" @mount={(me) => { me.focus({ preventScroll: true }) }} @keydown={on_pad_key}>
+                            <h4>{pad.title}</h4>
+                            <div.ui-pos-register-entry aria-live="polite">{entry == "" ? "0" : entry}</div>
+                            <div.ui-pos-register-keys>
+                                {for k in ["7", "8", "9", "4", "5", "6", "1", "2", "3", ".", "0", "del"] => <button.ui-pos-register-key key={k} type="button" aria-label={k == "del" ? "Delete" : k} @click={() => { press(k) }}>{k == "del" ? "Del" : k}</button>}
+                            </div>
+                            <div.ui-pos-register-row>
+                                <button.ui-pos-register-btn type="button" @click={() => {
+                                    pad = null
+                                    entry = ""
+                                }}>Cancel</button>
+                                <button.ui-pos-register-btn.ui-pos-register-primary type="button" @click={apply_pad}>Apply</button>
+                            </div>
+                        </div>}
+                        {done == null && pad == null && pay == "cash" && <div.ui-pos-register-panel tabindex="-1" @mount={(me) => { me.focus({ preventScroll: true }) }} @keydown={on_pad_key}>
+                            <h4>Cash given</h4>
+                            <div.ui-pos-register-row>
+                                <button.ui-pos-register-btn type="button" @click={() => { pay_cash(total_due.amount) }}>Exact</button>
+                                {for n in pos_register_notes(total_due.amount, places) => <button.ui-pos-register-btn key={str(n)} type="button" @click={() => { pay_cash(n) }}>{format_number(n, locale, 0)}</button>}
+                            </div>
+                            <div.ui-pos-register-entry aria-live="polite">{entry == "" ? "0" : entry}</div>
+                            <div.ui-pos-register-keys>
+                                {for k in ["7", "8", "9", "4", "5", "6", "1", "2", "3", ".", "0", "del"] => <button.ui-pos-register-key key={k} type="button" aria-label={k == "del" ? "Delete" : k} @click={() => { press(k) }}>{k == "del" ? "Del" : k}</button>}
+                            </div>
+                            <p class={ui_cls(["ui-pos-register-msg", is_short && entry != "" && "ui-pos-register-bad"])} data-part="short">{is_short && entry != "" ? `Short by ${fmt(money.of(total_due.amount - tendered, cur, "half_up"))}` : " "}</p>
+                            <div.ui-pos-register-row>
+                                <button.ui-pos-register-btn type="button" @click={() => {
+                                    pay = ""
+                                    entry = ""
+                                }}>Back</button>
+                                <button.ui-pos-register-btn.ui-pos-register-primary type="button" disabled={is_short} @click={() => { pay_cash(tendered) }}>Take cash</button>
+                            </div>
+                        </div>}
+                        {done == null && pad == null && pay == "card" && <div.ui-pos-register-panel>
+                            <h4>Card</h4>
+                            <p class={ui_cls(["ui-pos-register-msg", msg != "" && "ui-pos-register-bad"])} data-part="card">{busy ? "Waiting for the card reader..." : (msg != "" ? msg : (on_card != null ? `Charge ${fmt(total_due)}.` : `Take ${fmt(total_due)} on the terminal, then confirm.`))}</p>
+                            <div.ui-pos-register-row>
+                                <button.ui-pos-register-btn type="button" disabled={busy} @click={() => {
+                                    pay = ""
+                                    msg = ""
+                                }}>Back</button>
+                                {on_card != null ? <button.ui-pos-register-btn.ui-pos-register-primary type="button" disabled={busy} @click={pay_card}>Charge</button>
+                                    : <button.ui-pos-register-btn.ui-pos-register-primary type="button" @click={() => { finish("card", total_due, null) }}>Approved</button>}
+                            </div>
+                        </div>}
+                        {done == null && pad == null && pay == "" && <div.ui-pos-register-acts>
+                            {picked_line() != null && <button.ui-pos-register-btn type="button" @click={() => { open_pad("qty", `Quantity of ${picked_line().name}`, "") }}>Quantity</button>}
+                            {picked_line() != null && <button.ui-pos-register-btn type="button" @click={() => { open_pad("line_pct", `Percent off ${picked_line().name}`, "") }}>Line % off</button>}
+                            {picked_line() != null && <button.ui-pos-register-btn type="button" @click={() => { open_pad("line_amt", `Amount off ${picked_line().name}`, "") }}>Line amount off</button>}
+                            <button.ui-pos-register-btn type="button" disabled={len(sale.lines) == 0} @click={() => { open_pad("sale_pct", "Percent off the sale", "") }}>Sale % off</button>
+                            <button.ui-pos-register-btn type="button" disabled={len(sale.lines) == 0} @click={() => { open_pad("sale_amt", "Amount off the sale", "") }}>Sale amount off</button>
+                            <button.ui-pos-register-btn.ui-pos-register-primary type="button" disabled={len(sale.lines) == 0} @click={() => {
+                                pay = "cash"
+                                entry = ""
+                            }}>Cash</button>
+                            <button.ui-pos-register-btn.ui-pos-register-primary type="button" disabled={len(sale.lines) == 0} @click={() => {
+                                pay = "card"
+                                msg = ""
+                            }}>Card</button>
+                            {unkept && <p.ui-pos-register-msg.ui-pos-register-wide>This browser will not keep the sale through a reload.</p>}
+                        </div>}
+                    </div>
+                </div>
+            </section>
+        </div>
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

@@ -1,0 +1,307 @@
+// VoiceRecorder: records from the microphone with a level that shows it is hearing you,
+// pause and resume, a limit, and playback before it goes. The recording is a real file in
+// a file field, so a plain multipart <form> sends it. When the microphone is refused it
+// says so and points to Settings in the app; where this browser cannot record, it says that.
+//
+//   <form method="post" action="/note" enctype="multipart/form-data">
+//       <VoiceRecorder name="note" limit={60}/>
+//       <Button size="lg" type="submit">Send</Button>
+//   </form>
+//   <VoiceRecorder on_change={(n) => { note = n }}/>
+//
+// name: the file field's name ("voice"). label: what starts it ("Record a voice note").
+// limit: the most seconds, paused time not counted (120; at least 1, at most 3600). hint,
+// field (the input's id) and class as for every field. on_change(note): inside one of your
+// components, given { name, size, type, seconds } when a recording is ready, or null when
+// it is deleted.
+//
+// A recording under way pauses when the app leaves the screen, as iOS would cut it off,
+// and the microphone is let go when it is finished and when the component leaves the page.
+//
+// Needs Button: `import ui/button.qwe use Button`.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let voice_recorder_css = css`
+.ui-voice-recorder { container-type: inline-size; width: 100%; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-voice-recorder-body { display: grid; gap: 12px; padding: 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-voice-recorder-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.ui-voice-recorder-clock { font: 600 28px/1.1 var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-voice-recorder-limit { color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-voice-recorder-meter { position: relative; height: 10px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-voice-recorder-fill { position: absolute; inset: 0; transform: scaleX(0); transform-origin: left; border-radius: inherit; background: var(--ui-accent); will-change: transform; }
+.ui-voice-recorder-paused .ui-voice-recorder-fill { background: var(--ui-muted); }
+.ui-voice-recorder audio { display: block; width: 100%; height: 48px; }
+.ui-voice-recorder-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-voice-recorder-bar > * { flex: 1 1 auto; }
+.ui-voice-recorder-dot { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 50%; background: var(--ui-danger); }
+.ui-voice-recorder-paused .ui-voice-recorder-dot { background: var(--ui-muted); }
+.ui-voice-recorder-state { color: var(--ui-muted); font-size: 13px; }
+.ui-voice-recorder-hint { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-voice-recorder-why { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-voice-recorder input[type=file] { display: none; }
+/* A tablet: the buttons in one row beside the clock's width, not stretched across it. */
+@container (min-width: 440px) {
+  .ui-voice-recorder-bar > * { flex: 0 1 auto; }
+}
+`
+
+// The limit a prop gives, kept to what can be recorded: a bad one is the default's 120.
+fn voice_recorder_limit(s: num) -> num = s <= 0 ? 120 : s < 1 ? 1 : s > 3600 ? 3600 : s
+
+// How loud a stretch is, 0 to 1, from an analyser's bytes, where 128 is silence. It is the
+// root of the mean square, doubled since speech sits low, and held to 1.
+fn voice_recorder_level(bytes: list) -> num {
+    let n = len(bytes)
+    if n == 0 { return 0 }
+    let total = bytes | map((b) => { let d = (b - 128) / 128; d * d }) | sum()
+    let level = math.sqrt(total / n) * 2
+    level > 1 ? 1 : level
+}
+
+// Seconds as m:ss, rounded down.
+fn voice_recorder_clock(s: num) -> str {
+    let t = s < 0 ? 0 : floor(s)
+    let sec = t % 60
+    `${floor(t / 60)}:${sec < 10 ? "0" : ""}${sec}`
+}
+
+// A file's end from its type, with any `;codecs=` cut off.
+fn voice_recorder_ext(mime: str) -> str {
+    match split(mime, ";")[0] {
+        "audio/mp4" => "m4a"
+        "audio/webm" => "webm"
+        "audio/ogg" => "ogg"
+        _ => "audio"
+    }
+}
+
+// What a refusal of the microphone means.
+fn voice_recorder_why(name) -> str = name == "NotAllowedError" || name == "SecurityError" ? "refused" : "none"
+
+component VoiceRecorder(name: str = "voice", label: str = "Record a voice note", limit: num = 120, hint: str? = null,
+                        field: str? = null, on_change = null, class: str? = null) {
+    style global voice_recorder_css
+    state status = "idle"       // idle, starting, recording, paused, finishing, done, refused, none
+    state stream = null
+    state recorder = null
+    state parts = []
+    state counted = 0           // seconds recorded before the last resume
+    state since = 0
+    state spent = 0
+    state note = null           // the recording: { url, name, size, type, seconds }
+    state input = null
+    state fill = null
+    state audio = null          // { ctx, node, bytes } for the level
+    state said = ""
+    state settings = false
+    let most = voice_recorder_limit(limit)
+    let id = field ?? `voice-recorder-${name}`
+    let cut_off = status == "refused" || status == "none"
+    let release = () => {
+        if stream != null {
+            for t in js("Array.from", stream.getTracks()) { t.stop() }
+            stream = null
+        }
+        if audio != null {
+            audio.ctx.close()
+            audio = null
+        }
+        if fill != null { fill.style.transform = "scaleX(0)" }
+    }
+    let free = () => {
+        if note != null {
+            js("URL.revokeObjectURL", note.url)
+            note = null
+        }
+    }
+    let stop_recording = () => {
+        if recorder != null && recorder.state != "inactive" {
+            status = "finishing"
+            recorder.stop()
+        }
+    }
+    // The level goes straight to the bar's transform, twelve times a second: no state, no redraw.
+    if status == "recording" {
+        every(80, () => {
+            spent = counted + (now() - since) / 1000
+            if spent >= most { stop_recording() }
+            if audio != null && fill != null {
+                audio.node.getByteTimeDomainData(audio.bytes)
+                let level = voice_recorder_level(js("Array.from", audio.bytes))
+                fill.style.transform = `scaleX(${round(level, 3)})`
+                fill.dataset.level = str(round(level, 3))
+            }
+        })
+    }
+    let pause = () => {
+        if recorder != null && recorder.state == "recording" {
+            recorder.pause()
+            counted += (now() - since) / 1000
+            spent = counted
+            status = "paused"
+            if fill != null { fill.style.transform = "scaleX(0)" }
+        }
+    }
+    let resume = () => {
+        if recorder != null && recorder.state == "paused" {
+            recorder.resume()
+            since = now()
+            status = "recording"
+        }
+    }
+    let cannot = (kind: str, words: str) => {
+        release()
+        settings = kind == "refused" && js("window").quilloNative != null
+        said = words
+        status = kind
+    }
+    let finished = (mime: str) => {
+        let kept = parts
+        let seconds = spent > most ? most : spent
+        recorder = null
+        parts = []
+        release()
+        let blob = js_new("Blob", js("Array.from", kept), { type: mime })
+        if blob.size == 0 {
+            cannot("none", "Nothing was recorded. Try again.")
+            return null
+        }
+        let kind = split(mime, ";")[0]
+        let file = js_new("File", [blob], `voice.${voice_recorder_ext(mime)}`, { type: kind })
+        let dt = js_new("DataTransfer")
+        dt.items.add(file)
+        input.files = dt.files
+        note = { url: js("URL.createObjectURL", blob), name: file.name, size: file.size, type: kind, seconds }
+        status = "done"
+        on_change && on_change({ name: note.name, size: note.size, type: note.type, seconds })
+    }
+    let start = () => {
+        if status == "starting" { return null }
+        said = ""
+        let w = js("window")
+        if js("navigator").mediaDevices == null {
+            cannot("none", "This page cannot reach a microphone.")
+            return null
+        }
+        if w.MediaRecorder == null {
+            cannot("none", "This browser cannot record sound here.")
+            return null
+        }
+        status = "starting"
+        let got = js("Promise.resolve", js_new("Promise", (done) => {
+            done(js("navigator.mediaDevices.getUserMedia", { audio: { echoCancellation: true, noiseSuppression: true } }).then(
+                (s) => { stream: s, why: null }, (e) => { stream: null, why: e.name }))
+        }))
+        if got.stream == null {
+            let kind = voice_recorder_why(got.why)
+            cannot(kind, kind == "refused"
+                ? "The microphone was not allowed. Allow it in Settings to record."
+                : "No microphone could be opened here.")
+            return null
+        }
+        let s = got.stream
+        stream = s
+        let track = js("Array.from", s.getAudioTracks())[0]
+        track.addEventListener("ended", (_e = null) => {
+            if status == "recording" || status == "paused" {
+                said = "The microphone stopped, so the recording ended there."
+                stop_recording()
+            }
+        })
+        let kinds = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"] | filter((t) => js("MediaRecorder.isTypeSupported", t))
+        let mime = len(kinds) > 0 ? kinds[0] : ""
+        // In a Promise, here and at the start: both throw, which would stop the handler, not give an error value.
+        let r = js("Promise.resolve", js_new("Promise", (done) => { done(js_new("MediaRecorder", s, mime != "" ? { mimeType: mime } : {})) }))
+        if is_err(r) {
+            cannot("none", "This browser cannot record sound here.")
+            return null
+        }
+        parts = []
+        r.addEventListener("dataavailable", (e) => { if e.data.size > 0 { parts = parts | push(e.data) } })
+        r.addEventListener("stop", (_e = null) => { finished(r.mimeType != "" ? r.mimeType : mime != "" ? mime : "audio/webm") })
+        r.addEventListener("error", (_e = null) => {
+            recorder = null
+            parts = []
+            cannot("none", "Recording stopped with an error.")
+        })
+        // The level is a nicety: without a working AudioContext the note is still recorded.
+        if w.AudioContext != null {
+            let meter = js("Promise.resolve", js_new("Promise", (done) => {
+                let ctx = js_new("AudioContext")
+                if ctx.state == "suspended" { ctx.resume().catch((_ = null) => { said = "" }) }
+                let node = ctx.createAnalyser()
+                node.fftSize = 512
+                ctx.createMediaStreamSource(s).connect(node)
+                done({ ctx, node, bytes: js_new("Uint8Array", node.fftSize) })
+            }))
+            if !is_err(meter) { audio = meter }
+        }
+        let going = js("Promise.resolve", js_new("Promise", (done) => {
+            r.start(500)
+            done(true)
+        }))
+        if is_err(going) {
+            cannot("none", "This browser cannot record sound here.")
+            return null
+        }
+        recorder = r
+        counted = 0
+        spent = 0
+        since = now()
+        status = "recording"
+        if w.quilloNative != null { js("quilloNative.haptic", "medium") }
+    }
+    let wipe = () => {
+        let had = note != null
+        free()
+        input.value = ""
+        status = "idle"
+        spent = 0
+        said = ""
+        if had { on_change && on_change(null) }
+    }
+    <div class={ui_cls(["ui-voice-recorder", status == "paused" && "ui-voice-recorder-paused", class])} data-state={status}
+         @mount={(_el) => {
+             let d = js("document")
+             let seen = (_e = null) => {
+                 if d.hidden && status == "recording" {
+                     pause()
+                     said = "Paused while the app was away. Resume to go on."
+                 }
+             }
+             d.addEventListener("visibilitychange", seen)
+             () => {
+                 d.removeEventListener("visibilitychange", seen)
+                 if recorder != null && recorder.state != "inactive" { recorder.stop() }
+                 release()
+                 free()
+             }
+         }}>
+        <div.ui-voice-recorder-body role="group" aria-label="Voice recorder">
+            <div.ui-voice-recorder-head>
+                <span.ui-voice-recorder-clock role="timer" aria-label="Time recorded">{voice_recorder_clock(status == "done" && note != null ? note.seconds : spent)}</span>
+                <span.ui-voice-recorder-limit>up to {voice_recorder_clock(most)}</span>
+            </div>
+            <div.ui-voice-recorder-meter aria-hidden="true"><div.ui-voice-recorder-fill @mount={(el) => { fill = el }}></div></div>
+            {(status == "recording" || status == "paused") && <span.ui-voice-recorder-state role="status">
+                <span.ui-voice-recorder-dot aria-hidden="true"></span>{status == "paused" ? "Paused" : "Recording"}
+            </span>}
+            {status == "done" && note != null && <audio src={note.url} controls={true} preload="metadata" aria-label="The recording"></audio>}
+            <div.ui-voice-recorder-bar>
+                {(status == "idle" || status == "starting") && <Button size="lg" disabled={status == "starting"} on_click={start}>{status == "starting" ? "Asking for the microphone…" : label}</Button>}
+                {status == "recording" && <Button size="lg" variant="outline" tone="neutral" on_click={pause}>Pause</Button>}
+                {status == "paused" && <Button size="lg" variant="outline" tone="neutral" on_click={resume}>Resume</Button>}
+                {(status == "recording" || status == "paused") && <Button size="lg" tone="danger" on_click={stop_recording}>Finish</Button>}
+                {status == "done" && <Button size="lg" variant="outline" tone="danger" on_click={wipe}>Delete</Button>}
+                {status == "done" && <Button size="lg" variant="outline" tone="neutral" on_click={() => { wipe(); start() }}>Record again</Button>}
+                {cut_off && <Button size="lg" on_click={start}>Try again</Button>}
+                {status == "refused" && settings && <Button size="lg" variant="outline" tone="neutral" on_click={() => { js("quilloNative.openSettings") }}>Open Settings</Button>}
+            </div>
+            {hint != null && <p.ui-voice-recorder-hint>{hint}</p>}
+            {said != "" && <p.ui-voice-recorder-why role="alert">{said}</p>}
+            <input type="file" id={id} name={name} tabindex="-1" aria-hidden="true" @mount={(el) => { input = el }}/>
+        </div>
+    </div>
+}

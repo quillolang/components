@@ -1,0 +1,231 @@
+// SpacedRepetition: flashcards scheduled by the SM-2 algorithm. It shows today's queue
+// (overdue reviews first, then new cards, each up to its daily limit), the answer on
+// request, and six grades, each saying when the card would come back. A grade below 3
+// starts the card over; below 4 it comes round again today until it is known, as SM-2
+// asks. Ease is a decimal and intervals are whole days, kept with each card as data.
+//
+//   <SpacedRepetition today="2026-11-02" new_limit={10} review_limit={50} cards={[
+//       { id: "fr-1", front: "la lune", back: "the moon" },
+//       { id: "fr-2", front: "le soleil", back: "the sun", ease: 2.36, interval: 6, reps: 2, due: "2026-11-02" }]}
+//       on_review={(card) => { save(card) }}/>
+//
+// cards: a list of { id, front, back, ease?, interval?, reps?, due?, lapses? }. ease:
+// SM-2's E-Factor (2.5 to start, never under 1.3), interval: days to the last due date,
+// reps: correct answers in a row, due: the date it is next due; a card with no due
+// date is new. today: the day it is ("YYYY-MM-DD"); pass it so the page is the same on
+// the server and in the browser (the server's, in UTC, when left out). new_limit,
+// review_limit: the most new cards and reviews a day (20 and 100). new_done, reviews_done:
+// how many of each were done earlier today, which count against the limits (0). title:
+// the heading. id: a prefix for its ids, unique on the page. name: the field a form gets
+// the cards in, as JSON ("cards"). on_review(card): inside one of your components, after
+// each grade, with the card as it now stands, plus `grade`, `last` (the date) and
+// `again`, true for a go at a card already scheduled today, which changes nothing.
+//
+// Space or Enter on the card shows the answer; keys 0 to 5 grade it.
+//
+// spaced_repetition_grade(card, grade, today) is the algorithm, for a program's own
+// use: it gives the card after one grade. spaced_repetition_read(cards, today) cleans
+// a list into { cards, problems }, and spaced_repetition_queue(cards, today, new_limit,
+// review_limit, new_done, reviews_done) gives { reviews, fresh, held_new, held_reviews, later }.
+// The interval is worked out from the new ease and rounded up, as SM-2 says, and held
+// to 36,500 days. The first two intervals are 1 and 6 days.
+
+import ui/theme.qwe use ui_cls
+
+let spaced_repetition_css = css`
+.ui-spaced-rep { display: grid; gap: 14px; min-width: 0; max-width: 620px; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-spaced-rep .ui-spaced-rep-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-spaced-rep-counts { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-spaced-rep-left, .ui-spaced-rep-reviews, .ui-spaced-rep-new { white-space: nowrap; }
+.ui-spaced-rep-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-spaced-rep-card { display: grid; gap: 10px; min-height: 120px; padding: 18px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); text-align: center; }
+.ui-spaced-rep-card:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-spaced-rep-face { display: grid; gap: 10px; min-width: 0; }
+.ui-spaced-rep-kind { color: var(--ui-muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+.ui-spaced-rep-front { margin: 0; font-size: 20px; font-weight: 650; overflow-wrap: anywhere; }
+.ui-spaced-rep-back { margin: 0; padding-top: 10px; border-top: 1px dashed var(--ui-strong); font-size: 17px; overflow-wrap: anywhere; }
+.ui-spaced-rep-show, .ui-spaced-rep-grade { padding: 8px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1.3 var(--ui-font); cursor: pointer; }
+.ui-spaced-rep-show { justify-self: center; border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-spaced-rep-show:focus-visible, .ui-spaced-rep-grade:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-spaced-rep-grades { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; }
+.ui-spaced-rep-grade { display: grid; gap: 1px; text-align: left; }
+.ui-spaced-rep-grade:hover { border-color: var(--ui-accent); }
+.ui-spaced-rep-grade small { color: var(--ui-muted); font-size: 12px; font-weight: 400; }
+.ui-spaced-rep-low { border-left: 3px solid var(--ui-danger); }
+.ui-spaced-rep-said { min-height: 1.4em; margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-spaced-rep-empty { margin: 0; font-size: 15px; font-weight: 600; }
+.ui-spaced-rep-data { font-size: 13px; }
+.ui-spaced-rep-data summary { cursor: pointer; color: var(--ui-muted); }
+.ui-spaced-rep-data summary:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 3px; }
+.ui-spaced-rep-wrap { overflow-x: auto; margin-top: 6px; }
+.ui-spaced-rep-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-spaced-rep-table th, .ui-spaced-rep-table td { padding: 4px 8px; border-bottom: 1px solid var(--ui-border); text-align: right; white-space: nowrap; }
+.ui-spaced-rep-table th:first-child, .ui-spaced-rep-table td:first-child { text-align: left; }
+`
+
+let spaced_repetition_grades = ["Blackout", "Wrong, but familiar", "Wrong, but it seemed easy", "Right, with difficulty", "Right, after a pause", "Right, at once"]
+let spaced_repetition_longest = 36500
+
+// A value that may be a dec, a number or text as a dec, or null.
+fn spaced_repetition_dec(v) {
+    if v == null { return null }
+    let kind = type_of(v)
+    if kind != "dec" && kind != "int" && kind != "float" && kind != "str" { return null }
+    let d = dec(v)
+    is_err(d) ? null : d
+}
+
+// SM-2 for one answer of grade `q`, 0 to 5. From SuperMemo's own statement of it:
+// EF' = EF + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02)), never below 1.3; under 3 the
+// repetitions start again and the ease stays; a fraction of a day rounds up.
+fn spaced_repetition_grade(card: map, q: int, today: str) -> map {
+    let wrong = 5 - q
+    let moved = card.ease + (0.1m - wrong * (0.08m + wrong * 0.02m))
+    let ease = q < 3 ? card.ease : (moved < 1.3m ? 1.30m : moved)
+    let reps = q < 3 ? 0 : card.reps + 1
+    let grown = int(ceil(card.interval * ease))
+    let interval = reps <= 1 ? 1 : (reps == 2 ? 6 : min([grown, spaced_repetition_longest]))
+    merge(card, { ease, reps, interval, due: date.add_days(today, interval), last: today, grade: q, again: false,
+                  lapses: (card.lapses ?? 0) + (q < 3 && card.reps > 0 ? 1 : 0) })
+}
+
+// The cards made safe: bad ones are left out and said, by position.
+fn spaced_repetition_read(cards, today: str) -> map {
+    let good = []
+    let problems = []
+    let seen = {}
+    if type_of(cards) != "list" { problems = problems | push("The cards are not a list.") }
+    for [i, c] in enumerate(type_of(cards) == "list" ? cards : []) {
+        let at = `Card ${i + 1}`
+        let id = type_of(c) == "map" ? filled(trim(str(c.id ?? ""))) ?? `card-${i + 1}` : ""
+        let ease = type_of(c) == "map" ? spaced_repetition_dec(c.ease ?? 2.5m) : null
+        let n = (v) => type_of(v) == "int" && v >= 0
+        if type_of(c) != "map" {
+            problems = problems | push(`${at}: this is not a card.`)
+        } else if filled(trim(str(c.front ?? ""))) == null {
+            problems = problems | push(`${at}: it has no front.`)
+        } else if has(seen, id) {
+            problems = problems | push(`${at}: the id ${id} is used twice.`)
+        } else if ease == null {
+            problems = problems | push(`${at}: its ease "${slice(str(c.ease), 0, 20)}" is not a number.`)
+        } else if !n(c.interval ?? 0) || !n(c.reps ?? 0) {
+            problems = problems | push(`${at}: its interval and reps must be whole numbers of 0 or more.`)
+        } else if c.due != null && !(type_of(c.due) == "str" && date.valid(c.due, "date")) {
+            problems = problems | push(`${at}: its due date "${slice(str(c.due), 0, 20)}" is not a date.`)
+        } else {
+            seen = set(seen, id, true)
+            good = good | push({ id, front: str(c.front), back: str(c.back ?? ""), ease: ease < 1.3m ? 1.30m : ease, interval: min([c.interval ?? 0, spaced_repetition_longest]),
+                                 reps: c.reps ?? 0, due: c.due, lapses: c.lapses ?? 0 })
+        }
+    }
+    { cards: good, problems }
+}
+
+// Today's queue: overdue first, the longest overdue first; new cards in their order.
+fn spaced_repetition_queue(cards: list, today: str, new_limit: int = 20, review_limit: int = 100, new_done: int = 0, reviews_done: int = 0) -> map {
+    let due = cards | filter((c) => c.due != null && c.due <= today) | sort_by((c) => c.due)
+    let fresh = cards | filter((c) => c.due == null)
+    let room_new = max([new_limit - new_done, 0])
+    let room_due = max([review_limit - reviews_done, 0])
+    { reviews: take(due, room_due), fresh: take(fresh, room_new), held_reviews: max([len(due) - room_due, 0]), held_new: max([len(fresh) - room_new, 0]),
+      later: cards | filter((c) => c.due != null && c.due > today) | map((c) => c.due) | sort }
+}
+
+// "tomorrow", "in 6 days".
+fn spaced_repetition_when(days: int) -> str = days == 1 ? "tomorrow" : `in ${format_number(days, "en-US", 0)} days`
+
+// A card as data: what a program stores.
+fn spaced_repetition_data(cards: list) -> list = cards | map((c) => {
+    id: c.id, front: c.front, back: c.back, ease: str(c.ease), interval: c.interval, reps: c.reps, due: c.due, lapses: c.lapses })
+
+component SpacedRepetition(cards: list = [], today: str? = null, new_limit: int = 20, review_limit: int = 100, new_done: int = 0, reviews_done: int = 0,
+                           title: str = "Flashcards", id: str = "spaced-repetition", name: str = "cards", on_review = null, class: str? = null) {
+    style global spaced_repetition_css
+    state day = today ?? date.today()
+    let good_day = date.valid(day, "date") && day <= "9000-12-31"
+    let read = good_day ? spaced_repetition_read(cards, day) : { cards: [], problems: [`"${slice(str(day), 0, 30)}" is not a date for today.`] }
+    state deck = read.cards
+    state done_reviews = 0
+    state done_new = 0
+    let start = good_day ? spaced_repetition_queue(deck, day, new_limit, review_limit, new_done + done_new, reviews_done + done_reviews) : { reviews: [], fresh: [], held_reviews: 0, held_new: 0, later: [] }
+    state line = (start.reviews + start.fresh) | map((c) => ({ id: c.id, again: false }))
+    state open = false
+    state box = null
+    state said = ""
+    let now_at = len(line) > 0 ? line[0] : null
+    let card = now_at != null ? find(deck, (c) => c.id == now_at.id) : null
+    let previews = card != null && open ? range(6) | map((q) => spaced_repetition_grade(card, q, day)) : []
+    let held = [start.held_reviews > 0 && `${start.held_reviews} ${start.held_reviews == 1 ? "review" : "reviews"}`, start.held_new > 0 && `${start.held_new} new`]
+        | filter((p) => p != false) | join(" and ")
+    let next_due = deck | filter((c) => c.due != null && c.due > day) | map((c) => c.due) | sort | first
+    let answer = (q: int) => {
+        let at = line[0]
+        let c = find(deck, (x) => x.id == at.id)
+        let rest = slice(line, 1, len(line))
+        if at.again {
+            line = q >= 4 ? rest : rest | push(at)
+            said = q >= 4 ? "Known now. Its date stays." : "Again, later today."
+            on_review && on_review(merge(c, { grade: q, last: day, again: true }))
+        } else {
+            let after = spaced_repetition_grade(c, q, day)
+            deck = deck | map((x) => x.id == c.id ? after : x)
+            if c.due == null { done_new += 1 } else { done_reviews += 1 }
+            line = q >= 4 ? rest : rest | push({ id: c.id, again: true })
+            said = `${q >= 4 ? "Next" : "Again today, then"} ${spaced_repetition_when(after.interval)}: ${after.due}, ease ${str(after.ease)}.`
+            on_review && on_review(after)
+        }
+        open = false
+        box && box.focus()
+    }
+    let keys = (e) => {
+        if card == null { return null }
+        if !open && (e.key == " " || e.key == "Enter") {
+            e.preventDefault()
+            open = true
+        } else if open && re.test(str(e.key), "^[0-5]$") {
+            e.preventDefault()
+            answer(int(e.key))
+        }
+    }
+    <section class={ui_cls(["ui-spaced-rep", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-spaced-rep-title id={`${id}-title`}>{title}</h3>
+        <input type="hidden" name={name} value={json.stringify(spaced_repetition_data(deck))}/>
+        <p.ui-spaced-rep-counts>
+            <span.ui-spaced-rep-left>{len(line)} to go</span>
+            <span.ui-spaced-rep-reviews>{reviews_done + done_reviews} of {review_limit} reviews</span>
+            <span.ui-spaced-rep-new>{new_done + done_new} of {new_limit} new</span>
+        </p>
+        {len(read.problems) > 0 && <ul.ui-spaced-rep-problems role="alert">{for p in take(read.problems, 6) => <li key={p}>{p}</li>}</ul>}
+        <div.ui-spaced-rep-card tabindex="0" role="group" aria-label="The card" @mount={(el) => { box = el }} @keydown={keys}>
+            {card != null
+                ? <div.ui-spaced-rep-face>
+                    <span.ui-spaced-rep-kind>{now_at.again ? "Again today" : (card.due == null ? "New" : (card.due < day ? `Overdue by ${date.days_between(card.due, day)}` : "Review"))}</span>
+                    <p.ui-spaced-rep-front>{card.front}</p>
+                    {open ? <p.ui-spaced-rep-back>{filled(card.back) ?? "(this card has no answer)"}</p> : <button.ui-spaced-rep-show type="button" @click={() => { open = true }}>Show answer</button>}
+                  </div>
+                : <div.ui-spaced-rep-face>
+                    <p.ui-spaced-rep-empty>{len(deck) == 0 ? "No cards to study." : "All done for today."}</p>
+                    {(start.held_new > 0 || start.held_reviews > 0) && <p.ui-spaced-rep-said>Held back by today's limits: {held}.</p>}
+                    {next_due != null && <p.ui-spaced-rep-said>Next due {next_due}.</p>}
+                  </div>}
+        </div>
+        {open && card != null && <div.ui-spaced-rep-grades role="group" aria-label="How well did you know it?">
+            {for [q, after] in enumerate(previews) => <button type="button" key={q} class={ui_cls(["ui-spaced-rep-grade", q < 3 && "ui-spaced-rep-low"])} @click={() => { answer(q) }}>
+                <span>{q}. {spaced_repetition_grades[q]}</span>
+                <small>{now_at.again ? (q >= 4 ? "done for today" : "again today") : `${q >= 4 ? "" : "again today, then "}${spaced_repetition_when(after.interval)}`}</small>
+            </button>}
+        </div>}
+        <p.ui-spaced-rep-said aria-live="polite">{said}</p>
+        <details.ui-spaced-rep-data>
+            <summary>The cards as data</summary>
+            <div.ui-spaced-rep-wrap tabindex="0" role="region" aria-label="The cards as data">
+                <table.ui-spaced-rep-table>
+                    <thead><tr><th scope="col">Card</th><th scope="col">Ease</th><th scope="col">Interval</th><th scope="col">Reps</th><th scope="col">Due</th></tr></thead>
+                    <tbody>{for c in take(deck, 200) => <tr key={c.id} data-card={c.id}><td>{c.id}</td><td>{str(c.ease)}</td><td>{c.interval}</td><td>{c.reps}</td><td>{c.due ?? "new"}</td></tr>}</tbody>
+                </table>
+                {len(deck) > 200 && <p.ui-spaced-rep-said>The first 200 of {len(deck)} are listed; the field has them all.</p>}
+            </div>
+        </details>
+    </section>
+}

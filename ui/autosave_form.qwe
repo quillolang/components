@@ -1,0 +1,231 @@
+// AutosaveForm: a form that keeps a draft in the browser as it is typed. Coming back
+// with a draft waiting, it offers to restore or discard it, and until the choice is
+// made nothing overwrites it. It says when a draft is saved and when saving failed
+// (storage full, or blocked by the browser), in which case the form works on and only
+// the draft is lost. Sending the form clears the draft. Password fields and those marked
+// `secret` are never written to storage.
+//
+//   import ui/autosave_form.qwe use AutosaveForm
+//
+//   <AutosaveForm id="story" store="story-draft" action="/stories" fields={[
+//       { name: "title", label: "Title", required: true },
+//       { name: "body", label: "Your story", type: "textarea" },
+//       { name: "public", label: "Show it to everyone", type: "checkbox" },
+//   ]}/>
+//   <AutosaveForm id="note" fields={fields} on_submit={(v) => { save_note(v) }} on_status={(s) => { status = s }}/>
+//
+// A field: name, label, type ("text", "email", "tel", "url", "number", "date",
+// "password", "textarea", "select", "checkbox"), options (for a select: strings or
+// { label, value }), required (true), placeholder, hint, value (where it starts), secret
+// (true: not stored).
+//
+// id: a prefix for its ids ("autosave-form"), unique on the page. store: the name of
+// the draft (the id): two forms with one store share a draft. fields: as above. initial:
+// a map of starting values, over each field's value. action, method ("post"): where
+// a plain form sends it. submit: the button's words ("Send"). every_ms: how often
+// changes are written while typing (500). class: more classes for its outer element.
+// on_submit(values): inside one of your components, called with the values once
+// the required fields are filled. on_status(status): called with "saved", "failed",
+// "blocked", "offered", "restored", "discarded" or "sent".
+//
+// Drafts are kept in localStorage under `ui-autosave:<store>`. A draft for fields that
+// have since gone loses those, and one that cannot be read is cleared and said so.
+// autosave_form_encode(fields, values, at) and autosave_form_decode(text, fields) are
+// the format, for a program's own use; decode gives { values, at } or { error }.
+
+import ui/theme.qwe use ui_cls
+
+let autosave_form_css = css`
+.ui-asave { display: grid; gap: 14px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-asave-offer { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-info-soft); color: var(--ui-fg); font-size: 13px; }
+.ui-asave-offer span { flex: 1 1 200px; }
+.ui-asave-field { display: grid; gap: 5px; min-width: 0; }
+.ui-asave-label { font-size: 13px; font-weight: 500; }
+.ui-asave-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-asave-input { box-sizing: border-box; width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); transition: border-color .15s, box-shadow .15s; }
+textarea.ui-asave-input { height: auto; min-height: 96px; padding: 8px 10px; resize: vertical; }
+.ui-asave-input:hover { border-color: var(--ui-strong); }
+.ui-asave-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-asave-input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-asave-check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.ui-asave-check input { margin: 0; accent-color: var(--ui-accent); }
+.ui-asave-check input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-asave-hint { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-asave-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-asave-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.ui-asave-status { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-asave-status[data-status="failed"], .ui-asave-status[data-status="blocked"] { color: var(--ui-warning); }
+.ui-asave-btn { height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-asave-btn:hover { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-asave-btn:focus-visible, .ui-asave-send:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-asave-send { height: 38px; padding: 0 16px; border: 1px solid var(--ui-accent); border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg);
+  font: 600 14px/1 var(--ui-font); cursor: pointer; }
+.ui-asave-send:hover { background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+@media (prefers-reduced-motion: reduce) { .ui-asave-input { transition: none; } }
+`
+
+// Whether a field may be written down.
+fn autosave_form_keeps(f: map) -> bool = f.type != "password" && f.secret != true
+
+fn autosave_form_clean(fields) -> list =
+    (type_of(fields) == "list" ? fields : []) | filter((f) => type_of(f) == "map" && type_of(f.name) == "str" && f.name != "")
+
+fn autosave_form_options(f: map) -> list =
+    (type_of(f.options) == "list" ? f.options : []) | map((o) => type_of(o) == "map" ? { label: str(o.label ?? o.value), value: str(o.value ?? o.label) } : { label: str(o), value: str(o) })
+
+// The values the fields start with.
+fn autosave_form_start(fields: list, initial: map) -> map =
+    reduce(fields, {}, (m, f) => set(m, f.name, get(initial, f.name) ?? f.value ?? (f.type == "checkbox" ? false : "")))
+
+// A draft as text.
+fn autosave_form_encode(fields: list, values: map, at: int) -> str {
+    let kept = reduce(fields | filter(autosave_form_keeps), {}, (m, f) => set(m, f.name, get(values, f.name)))
+    json.stringify({ v: 1, at, values: kept })
+}
+
+// A draft from text: { values, at } with only what fits the fields, or { error }.
+fn autosave_form_decode(text, fields: list) -> map {
+    let bad = { error: "A saved draft could not be read, so it was cleared." }
+    if type_of(text) != "str" { return bad }
+    let d = json.parse(text)
+    if is_err(d) || type_of(d) != "map" || d.v != 1 || type_of(d.values) != "map" { return bad }
+    let fit = (f: map, v) => f.type == "checkbox" ? type_of(v) == "bool" : type_of(v) == "str"
+    let values = reduce(fields | filter(autosave_form_keeps), {}, (m, f) => has(d.values, f.name) && fit(f, get(d.values, f.name)) ? set(m, f.name, get(d.values, f.name)) : m)
+    { values, at: type_of(d.at) == "int" ? d.at : null }
+}
+
+// Whether a draft says anything the form does not already say.
+fn autosave_form_differs(draft: map, values: map) -> bool = any(keys(draft), (k) => get(draft, k) != get(values, k))
+
+// The fields that are required and empty.
+fn autosave_form_missing(fields: list, values: map) -> list =
+    fields | filter((f) => {
+        let v = get(values, f.name)
+        f.required == true && (v == null || v == false || (type_of(v) == "str" && trim(v) == ""))
+    })
+
+// One field and its label, hint and error.
+view AutosaveFormField(id: str, f: map, value = null, error: bool = false, on_value = null) {
+    let t = f.type ?? "text"
+    let fid = `${id}-${f.name}`
+    let hint_id = f.hint != null ? `${fid}-hint` : null
+    let about = ui_cls([hint_id, error && `${fid}-error`])
+    let said = about != "" ? about : null
+    let bad = error ? "true" : null
+    let star = f.required == true && <span.ui-asave-req aria-hidden="true">*</span>
+    <div.ui-asave-field data-field={f.name}>
+        {t != "checkbox" && <label.ui-asave-label for={fid}>{f.label ?? f.name}{star}</label>}
+        {match t {
+            "textarea" => <textarea.ui-asave-input id={fid} name={f.name} placeholder={f.placeholder} value={str(value ?? "")} aria-invalid={bad} aria-describedby={said}
+                                    @input={(e) => { on_value(f.name, e.value) }}></textarea>
+            "select" => <select.ui-asave-input id={fid} name={f.name} aria-invalid={bad} aria-describedby={said} @change={(e) => { on_value(f.name, e.value) }}>
+                <option value="" selected={str(value ?? "") == ""}>{f.placeholder ?? "Choose one"}</option>
+                {for o in autosave_form_options(f) => <option key={o.value} value={o.value} selected={o.value == str(value ?? "")}>{o.label}</option>}
+            </select>
+            "checkbox" => <label.ui-asave-check>
+                <input type="checkbox" id={fid} name={f.name} value="on" checked={value == true} aria-invalid={bad} aria-describedby={said} @change={(e) => { on_value(f.name, e.checked) }}/>
+                <span>{f.label ?? f.name}{star}</span>
+            </label>
+            _ => <input.ui-asave-input type={t} id={fid} name={f.name} placeholder={f.placeholder} value={str(value ?? "")} aria-invalid={bad} aria-describedby={said}
+                                       autocomplete={t == "password" ? "off" : null} @input={(e) => { on_value(f.name, e.value) }}/>
+        }}
+        {f.hint != null && <p.ui-asave-hint id={hint_id}>{f.hint}</p>}
+        {error && <p.ui-asave-error id={`${fid}-error`}>{`${f.label ?? f.name} is required.`}</p>}
+    </div>
+}
+
+component AutosaveForm(id: str = "autosave-form", store: str? = null, fields = [], initial: map = {}, action: str? = null, method: str = "post", submit: str = "Send",
+                       every_ms: int = 500, on_submit = null, on_status = null, class: str? = null) {
+    style global autosave_form_css
+    let clean = autosave_form_clean(fields)
+    let slot = `ui-autosave:${store ?? id}`
+    state vals = autosave_form_start(autosave_form_clean(fields), initial)
+    state offer = null
+    state pending = false
+    state status = ""
+    state message = ""
+    state tried = false
+    let missing = autosave_form_missing(clean, vals) | map((f) => f.name)
+    let say = (s: str, words: str) => {
+        status = s
+        message = words
+        on_status && s != "" && on_status(s)
+    }
+    // What storage throws (blocked, full) ends a handler, and Quillo has no `try`. Inside
+    // a Promise it becomes an error value here instead, and no name goes on the page.
+    let flush = () => {
+        pending = false
+        if offer == null {
+            let text = autosave_form_encode(clean, vals, now())
+            let wrote = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.setItem", slot, text) ?? true) }))
+            if is_err(wrote) {
+                say("failed", "Could not save a draft: storage is full or blocked. Your typing is safe on this page until you leave it.")
+            } else {
+                say("saved", `Draft saved at ${js_new("Date").toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`)
+            }
+        }
+    }
+    if pending { every(every_ms, flush) }
+    let forget = () => {
+        let gone = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.removeItem", slot) ?? true) }))
+        !is_err(gone)
+    }
+    let change = (name: str, v) => {
+        vals = set(vals, name, v)
+        pending = true
+    }
+    let begin = (el) => {
+        let text = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.getItem", slot)) }))
+        if is_err(text) {
+            say("blocked", "Drafts are off: this browser is blocking storage. The form still works.")
+        } else if text != null {
+            let draft = autosave_form_decode(text, clean)
+            if draft.error != null {
+                forget()
+                say("failed", draft.error)
+            } else if autosave_form_differs(draft.values, vals) {
+                offer = draft
+                say("offered", "")
+            }
+        }
+    }
+    <form class={ui_cls(["ui-asave", class])} id={id} action={action} method={method} novalidate="true" @mount={begin}
+          @submit={(e) => {
+              e.preventDefault()
+              tried = true
+              let wanting = autosave_form_missing(clean, vals)
+              if len(wanting) > 0 {
+                  let el = e.target.querySelector(`[name="${wanting[0].name}"]`)
+                  el && el.focus()
+              } else {
+                  pending = false
+                  offer = null
+                  forget()
+                  say("sent", "Sent. The draft is cleared.")
+                  tried = false
+                  on_submit && on_submit(vals)
+                  if action != null { e.target.submit() }
+              }
+          }}>
+        {offer != null && <div.ui-asave-offer role="group" aria-label="A saved draft">
+            <span data-offer="true">{offer.at != null ? `A draft from ${js_new("Date", offer.at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })} is saved in this browser.` : "A draft is saved in this browser."}</span>
+            <button.ui-asave-btn type="button" data-restore="true" @click={() => {
+                vals = merge(vals, offer.values)
+                offer = null
+                say("restored", "Draft restored.")
+            }}>Restore</button>
+            <button.ui-asave-btn type="button" data-discard="true" @click={() => {
+                offer = null
+                forget()
+                say("discarded", "Draft discarded.")
+            }}>Discard</button>
+        </div>}
+        {for f in clean => <AutosaveFormField key={f.name} id={id} f={f} value={get(vals, f.name)} error={tried && contains(missing, f.name)} on_value={change}/>}
+        <div.ui-asave-foot>
+            <button.ui-asave-send type="submit">{submit}</button>
+            <p.ui-asave-status role="status" aria-live="polite" data-status={status}>{message}</p>
+        </div>
+    </form>
+}

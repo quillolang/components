@@ -1,0 +1,313 @@
+// KeyboardHud: hold a modifier on a tablet's attached keyboard and the screen's shortcuts
+// show, as iPadOS does for an app. They are found from data, not typed in twice: whatever on
+// the page carries data-shortcut or aria-keyshortcuts is listed while it can be seen, so a
+// screen that changes shows what it has now. Two things on one combination, and a combination
+// the system keeps for itself, are reported. It moves no focus and takes no key: the caret stays
+// in its field and a shortcut pressed while holding goes on to whatever handles it.
+//
+//   import ui/keyboard_hud.qwe use KeyboardHud
+//
+//   <button data-shortcut="Mod+S" data-shortcut-group="File" @click={save}>Save</button>
+//   <button aria-keyshortcuts="Meta+K">Search</button>
+//   <KeyboardHud shortcuts={[{ keys: "Mod+/", label: "Show help", group: "Help" }]}
+//                on_conflict={(found) => { report(found) }}/>
+//
+// On the page: data-shortcut, keys joined by +, where Mod is Cmd on Apple's systems and Ctrl
+// elsewhere; data-shortcut-label, what it does, else the element's aria-label or text;
+// data-shortcut-group, the heading it goes under. aria-keyshortcuts is read too, each
+// alternative in it. An element out of sight is left out, and a disabled one is
+// listed as not available.
+//
+// shortcuts: more to list, each { keys, label, group? }, for those no element stands for.
+// scope: a CSS selector for where to look ("body"); one that means nothing shows no
+// shortcuts and says so. modifier: the key to hold, "Meta", "Control" or "Alt", or
+// "auto" for Cmd on Apple's systems and Ctrl elsewhere. delay: how long to hold it, in
+// milliseconds (500). reserved: combinations the system keeps; by default, Cmd+Tab and the like, or
+// Alt+Tab and the like. trigger: a button that shows the same list, for a tablet with no
+// keyboard and for screen readers (true; text in trigger_label). title. class.
+// on_conflict(found): inside one of your components, called when the conflicts change, with
+// a list of { keys, labels, kind }, kind being "clash" or "system".
+//
+// Pressing a row presses what it stands for, and focus stays. Anything else lets go: the
+// modifier coming up, another key, or the app leaving the screen. Escape or a press outside
+// closes it when the button opened it.
+
+import ui/theme.qwe use ui_cls
+
+let keyboard_hud_css = css`
+.ui-keyboard-hud-open { display: inline-flex; align-items: center; min-height: 44px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-keyboard-hud-open:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-keyboard-hud-open:hover { background: var(--ui-subtle); } }
+.ui-keyboard-hud { box-sizing: border-box; position: fixed; inset: auto 0 calc(16px + env(safe-area-inset-bottom)) 0; width: min(880px, calc(100vw - 32px)); max-height: min(70dvh, 620px); margin: 0 auto; padding: 16px 18px; overflow-y: auto; overscroll-behavior: contain;
+  border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 6px); background: color-mix(in srgb, var(--ui-surface) 94%, transparent); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); box-shadow: var(--ui-shadow-lg); color: var(--ui-fg); font: 14px/1.35 var(--ui-font); container-type: inline-size; }
+.ui-keyboard-hud-on { display: block; animation: ui-keyboard-hud-in .14s ease-out; }
+@keyframes ui-keyboard-hud-in { from { opacity: 0; transform: translateY(6px); } }
+.ui-keyboard-hud-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.ui-keyboard-hud-head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.ui-keyboard-hud-head span { color: var(--ui-muted); font-size: 13px; }
+.ui-keyboard-hud-groups { display: grid; grid-template-columns: 1fr; gap: 14px 24px; }
+@container (min-width: 560px) { .ui-keyboard-hud-groups { grid-template-columns: 1fr 1fr; } }
+@container (min-width: 820px) { .ui-keyboard-hud-groups { grid-template-columns: 1fr 1fr 1fr; } }
+.ui-keyboard-hud-group h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; color: var(--ui-muted); }
+.ui-keyboard-hud-group ul { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.ui-keyboard-hud-row { box-sizing: border-box; display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 44px; padding: 4px 8px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: inherit; font: inherit; text-align: left; }
+button.ui-keyboard-hud-row { cursor: pointer; }
+button.ui-keyboard-hud-row:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { button.ui-keyboard-hud-row:hover { background: var(--ui-subtle); } }
+.ui-keyboard-hud-off { color: var(--ui-muted); }
+.ui-keyboard-hud-keys { display: inline-flex; flex: none; gap: 3px; }
+.ui-keyboard-hud-keys kbd { display: inline-grid; place-items: center; min-width: 22px; height: 24px; padding: 0 5px; box-sizing: border-box; border: 1px solid var(--ui-border); border-radius: 5px; background: var(--ui-subtle); font: 500 13px/1 var(--ui-font); }
+.ui-keyboard-hud-issues { display: grid; gap: 2px; margin: 12px 0 0; padding: 8px 10px; list-style: none; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+.ui-keyboard-hud-empty { margin: 0; color: var(--ui-muted); }
+@media (prefers-reduced-motion: reduce) { .ui-keyboard-hud-on { animation: none; } }
+`
+
+// Is this one of Apple's systems? iPadOS calls itself a Mac.
+fn keyboard_hud_is_apple(platform) -> bool {
+    let p = lower(str(platform ?? ""))
+    contains(p, "mac") || contains(p, "iphone") || contains(p, "ipad")
+}
+
+// A key's one spelling, whatever it was written as.
+fn keyboard_hud_key(k: str) -> str {
+    let low = lower(k)
+    match low {
+        "esc" => "Escape"
+        "return" => "Enter"
+        "del" => "Delete"
+        "spacebar" => "Space"
+        "up" => "ArrowUp"
+        "down" => "ArrowDown"
+        "left" => "ArrowLeft"
+        "right" => "ArrowRight"
+        _ => len(k) == 1 ? upper(k) : upper(slice(k, 0, 1)) + slice(k, 1, len(k))
+    }
+}
+
+// Keys as text in one order, so that Cmd+Shift+S, shift+meta+s and Mod+Shift+S (where Mod is
+// Meta) are one combination. mod: what Mod stands for. Null when no key is named.
+fn keyboard_hud_normal(text, mod_key: str) {
+    if type_of(text) != "str" { return null }
+    let plus = ends_with(text, "++")
+    let parts = split(plus ? slice(text, 0, len(text) - 2) : text, "+") | map((p) => trim(p)) | filter((p) => p != "")
+    let named = parts | map((p) => {
+        let low = lower(p)
+        if low == "mod" { return mod_key }
+        if low == "cmd" || low == "command" || low == "meta" { return "Meta" }
+        if low == "ctrl" || low == "control" { return "Control" }
+        if low == "alt" || low == "opt" || low == "option" { return "Alt" }
+        if low == "shift" { return "Shift" }
+        keyboard_hud_key(p)
+    })
+    let mods = ["Control", "Alt", "Shift", "Meta"] | filter((m) => contains(named, m))
+    let rest = named | filter((n) => !contains(mods, n))
+    let main = plus ? ["+"] : rest
+    if len(main) != 1 { return null }
+    join(mods + main, "+")
+}
+
+// The caps to show for a combination.
+fn keyboard_hud_caps(keys: str, apple: bool) -> list {
+    let parts = ends_with(keys, "++") ? (split(slice(keys, 0, len(keys) - 2), "+") | push("+")) : split(keys, "+")
+    parts | map((p) => {
+        match p {
+            "Meta" => apple ? "⌘" : "Meta"
+            "Control" => apple ? "⌃" : "Ctrl"
+            "Alt" => apple ? "⌥" : "Alt"
+            "Shift" => apple ? "⇧" : "Shift"
+            "Enter" => "↩"
+            "Escape" => "esc"
+            "ArrowUp" => "↑"
+            "ArrowDown" => "↓"
+            "ArrowLeft" => "←"
+            "ArrowRight" => "→"
+            "Backspace" => "⌫"
+            _ => p
+        }
+    })
+}
+
+// Combinations the system keeps for itself.
+fn keyboard_hud_reserved(apple: bool) -> list {
+    if apple { return ["Meta+Tab", "Meta+Space", "Meta+H", "Meta+Shift+3", "Meta+Shift+4"] }
+    ["Alt+Tab", "Control+W", "Control+T", "Control+N"]
+}
+
+// What the rows get wrong: one combination with two meanings, and those the system keeps.
+// The same label twice on a combination is one thing shown twice, and no conflict.
+fn keyboard_hud_conflicts(rows: list, reserved: list) -> list {
+    let seen = unique(rows | map((r) => r.keys))
+    let clashes = seen | map((k) => {
+        let labels = unique(rows | filter((r) => r.keys == k) | map((r) => r.label))
+        { keys: k, labels, kind: "clash" }
+    }) | filter((c) => len(c.labels) > 1)
+    let kept = reserved | map((k) => keyboard_hud_normal(k, "Meta"))
+    let system = seen | filter((k) => contains(kept, k)) | map((k) => {
+        { keys: k, labels: unique(rows | filter((r) => r.keys == k) | map((r) => r.label)), kind: "system" }
+    })
+    clashes + system
+}
+
+// The rows under their headings, in the order the headings first come.
+fn keyboard_hud_groups(rows: list) -> list {
+    let names = unique(rows | map((r) => r.group))
+    names | map((n) => { { name: n, rows: rows | filter((r) => r.group == n) } })
+}
+
+// Rows from the data given.
+fn keyboard_hud_given(shortcuts, mod_key: str) -> list {
+    if type_of(shortcuts) != "list" { return [] }
+    let shaped = shortcuts | filter((s) => type_of(s) == "map" && type_of(get(s, "label")) == "str" && keyboard_hud_normal(get(s, "keys"), mod_key) != null)
+    shaped | map((s) => {
+        { keys: keyboard_hud_normal(s.keys, mod_key), label: s.label, group: type_of(get(s, "group")) == "str" ? s.group : "This screen", el: null, off: false }
+    })
+}
+
+// Rows from an element of the page: one for each combination it names.
+fn keyboard_hud_read(el, mod_key: str) -> list {
+    let label = el.getAttribute("data-shortcut-label") ?? el.getAttribute("aria-label") ?? slice(trim(el.textContent ?? ""), 0, 60)
+    let group = el.getAttribute("data-shortcut-group") ?? "This screen"
+    let off = el.disabled == true || el.getAttribute("aria-disabled") == "true"
+    let own = el.getAttribute("data-shortcut")
+    let spoken = split(el.getAttribute("aria-keyshortcuts") ?? "", " ")
+    let names = unique(([own] + spoken) | map((k) => keyboard_hud_normal(k, mod_key)) | filter((k) => k != null))
+    names | map((k) => { { keys: k, label: label != "" ? label : "Unnamed", group, el, off } })
+}
+
+component KeyboardHud(shortcuts = [], scope: str = "body", modifier: str = "auto", delay: int = 500, reserved = null, trigger: bool = true,
+                      trigger_label: str = "Keyboard shortcuts", title: str = "Keyboard shortcuts", on_conflict = null, class: str? = null) {
+    style global keyboard_hud_css
+    state win = null
+    state doc = null
+    state hud = null
+    state apple = false
+    state mod_key = "Meta"
+    state hold_key = "Control"
+    state armed = false
+    state open = false
+    state pinned = false
+    state rows = []
+    state issues = []
+    state scope_bad = false
+    state g_sig = ""
+    state said = ""
+    let groups = keyboard_hud_groups(rows)
+    let scan = () => {
+        let valid = win.CSS.supports(`selector(${scope})`)
+        scope_bad = !valid
+        let root = valid ? doc.querySelector(scope) : null
+        let found = root != null ? root.querySelectorAll("[data-shortcut], [aria-keyshortcuts]") : null
+        let n = found != null ? found.length : 0
+        let els = range(0, n) | map((i) => found[i]) | filter((el) => el.closest(".ui-keyboard-hud") == null && el.getClientRects().length > 0)
+        let from_page = flatten(els | map((el) => keyboard_hud_read(el, mod_key)))
+        let all = from_page + keyboard_hud_given(shortcuts, mod_key)
+        rows = all
+        issues = keyboard_hud_conflicts(all, reserved ?? keyboard_hud_reserved(apple))
+        let sig = join(issues | map((c) => `${c.kind} ${c.keys} ${join(c.labels, ",")}`), ";")
+        if sig != g_sig {
+            g_sig = sig
+            on_conflict && on_conflict(issues)
+        }
+    }
+    let show = () => {
+        scan()
+        open = true
+        hud.classList.add("ui-keyboard-hud-on")
+        if hud.showPopover != null && !hud.matches(":popover-open") { hud.showPopover() }
+        said = `${len(rows)} shortcuts shown${len(issues) > 0 ? `, ${len(issues)} with a problem` : ""}.`
+    }
+    let hide = () => {
+        armed = false
+        pinned = false
+        if open {
+            open = false
+            hud.classList.remove("ui-keyboard-hud-on")
+            if hud.showPopover != null && hud.matches(":popover-open") { hud.hidePopover() }
+        }
+    }
+    if armed { every(delay, () => {
+        if armed {
+            armed = false
+            show()
+        }
+    }) }
+    <div.ui-keyboard-hud-host style="display: contents"
+         @mount={(me) => {
+             win = js("window")
+             doc = js("document")
+             hud = me.querySelector(".ui-keyboard-hud")
+             apple = keyboard_hud_is_apple(js("navigator").platform)
+             mod_key = apple ? "Meta" : "Control"
+             hold_key = modifier == "auto" ? mod_key : modifier
+             let press = (e) => {
+                 if e.key == hold_key {
+                     if !e.repeat && !open && !armed { armed = true }
+                 } else if pinned {
+                     if e.key == "Escape" { hide() }
+                 } else {
+                     // Another key with it down is a shortcut being used, not a look at the list.
+                     hide()
+                 }
+             }
+             let release = (e) => { if e.key == hold_key && !pinned { hide() } }
+             let leave = (_e) => { if !pinned { hide() } }
+             let away = (e) => { if pinned && !e.target.closest(".ui-keyboard-hud") && !e.target.closest(".ui-keyboard-hud-open") { hide() } }
+             // Capture, so a handler that stops a key does not leave this holding on. A modifier's
+             // keyup never comes once the app has lost the keyboard, as with Cmd+Tab.
+             doc.addEventListener("keydown", press, true)
+             doc.addEventListener("keyup", release, true)
+             doc.addEventListener("pointerdown", away, true)
+             doc.addEventListener("visibilitychange", leave)
+             win.addEventListener("blur", leave)
+             () => {
+                 doc.removeEventListener("keydown", press, true)
+                 doc.removeEventListener("keyup", release, true)
+                 doc.removeEventListener("pointerdown", away, true)
+                 doc.removeEventListener("visibilitychange", leave)
+                 win.removeEventListener("blur", leave)
+             }
+         }}>
+        {trigger && <button.ui-keyboard-hud-open type="button" aria-expanded={open ? "true" : "false"}
+                @mousedown={(e) => { e.preventDefault() }}
+                @click={() => {
+                    if open {
+                        hide()
+                    } else {
+                        pinned = true
+                        show()
+                    }
+                }}>{trigger_label}</button>}
+        <div class={ui_cls(["ui-keyboard-hud", class])} popover="manual" role="group" aria-label={title}>
+            <div.ui-keyboard-hud-head>
+                <h2>{title}</h2>
+                <span>{pinned ? "Press a row to use it" : "Hold to keep showing"}</span>
+            </div>
+            {len(rows) == 0 && <p.ui-keyboard-hud-empty>{scope_bad ? `Nothing to show: "${scope}" is not a selector.` : "This screen has no shortcuts."}</p>}
+            <div.ui-keyboard-hud-groups>
+                {for g in groups => <section.ui-keyboard-hud-group key={g.name}>
+                    <h3>{g.name}</h3>
+                    <ul>
+                        {for r in g.rows => <li key={`${r.keys} ${r.label}`}>
+                            {r.el != null && !r.off ? <button.ui-keyboard-hud-row type="button" tabindex={pinned ? "0" : "-1"}
+                                    @mousedown={(e) => { e.preventDefault() }}
+                                    @click={() => {
+                                        hide()
+                                        r.el.click()
+                                    }}>
+                                <span>{r.label}</span>
+                                <span.ui-keyboard-hud-keys aria-label={r.keys}>{for c in keyboard_hud_caps(r.keys, apple) => <kbd>{c}</kbd>}</span>
+                            </button> : <div class={ui_cls(["ui-keyboard-hud-row", r.off && "ui-keyboard-hud-off"])}>
+                                <span>{r.label}{r.off ? " (not available)" : ""}</span>
+                                <span.ui-keyboard-hud-keys aria-label={r.keys}>{for c in keyboard_hud_caps(r.keys, apple) => <kbd>{c}</kbd>}</span>
+                            </div>}
+                        </li>}
+                    </ul>
+                </section>}
+            </div>
+            {len(issues) > 0 && <ul.ui-keyboard-hud-issues>
+                {for c in issues => <li key={`${c.kind} ${c.keys}`}>{join(keyboard_hud_caps(c.keys, apple), " ")}: {c.kind == "clash" ? `used by ${join(c.labels, " and ")}` : `kept by the system, so ${join(c.labels, " and ")} may never get it`}</li>}
+            </ul>}
+        </div>
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

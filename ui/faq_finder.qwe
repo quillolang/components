@@ -1,0 +1,408 @@
+// FaqFinder: searches questions and answers as you type, and ranks what it finds by term
+// weighting: a word counts for more in a question than in an answer, for more
+// the rarer it is across the FAQ, and an entry with all the words beats one with a few.
+// It forgives word endings ("refunded" finds "refund"), typos ("shiping" finds
+// "shipping") and a word cut short while typing, and takes synonyms as data ("money
+// back" finds "refund"). Each result says why it is there. With no match it says what it
+// did look for, offers the nearest words, the common questions and a way to ask.
+//
+//   <FaqFinder items={[{ question: "How do I get a refund?", answer: "..." }]}
+//              synonyms={[["refund", "money back", "reimbursement"]]} contact_url="/contact"/>
+//   <FaqFinder items={faqs} on_no_match={(q) => { missed = missed | push(q) }}/>
+//
+// items: each { question, answer, category?, tags?, popular?, id? }: category shows beside
+// the question, tags are words that count like the answer's, popular puts it among the common questions (else the first few
+// are). An entry without a question or an answer is left out and reported. synonyms:
+// groups of words or phrases that mean the same, a list of lists, or a map from a
+// word to its others; searching for one finds the rest, for a little less. limit: the most
+// results (5). query: what the box starts with. contact_url, contact_label: where
+// to ask when nothing fits ("Contact us"); left out, no link. placeholder: the box's
+// hint. title: the heading ("Questions and answers"). id: a prefix for its ids ("faq-finder"),
+// unique on the page. The box is named q, so a form around it sends it; name: another
+// name for it. on_no_match(query): inside one of your components, given a search that
+// found nothing when the box is left or Enter is pressed, once for each: what people
+// asked and the FAQ lacks. on_change(r): given { query, count, top } after each change.
+//
+// Keys: Down goes from the box to the results, Up and Down move through them, Escape in
+// the box clears it.
+//
+// faq_finder_index(items) and faq_finder_search(index, query, synonyms, limit) are the
+// work, for a program's own use. It takes 500 entries and 200 characters of a search,
+// and says so.
+
+import ui/theme.qwe use ui_cls
+
+let faq_finder_css = css`
+.ui-faqf { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; min-width: 0; max-width: 680px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-faqf .ui-faqf-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-faqf-field { display: grid; gap: 5px; font-size: 13px; font-weight: 500; }
+.ui-faqf-field input { box-sizing: border-box; width: 100%; height: 40px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 15px var(--ui-font); }
+.ui-faqf-field input:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-faqf-count { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-faqf-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-warning); font-size: 13px; }
+.ui-faqf-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-faqf-item { min-width: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); overflow-wrap: anywhere; }
+.ui-faqf-item summary { display: grid; gap: 2px; padding: 9px 12px; font-weight: 600; cursor: pointer; border-radius: var(--ui-radius-sm); }
+.ui-faqf-item summary:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-faqf-why { color: var(--ui-muted); font-size: 12px; font-weight: 400; }
+.ui-faqf-answer { margin: 0; padding: 0 12px 10px; white-space: pre-line; }
+.ui-faqf-tag { color: var(--ui-muted); font-size: 12px; font-weight: 400; }
+.ui-faqf-none { display: grid; gap: 8px; padding: 12px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-faqf-none p { margin: 0; }
+.ui-faqf-offers { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ui-faqf-offer { height: 28px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); cursor: pointer; }
+.ui-faqf-offer:hover { border-color: var(--ui-accent); }
+.ui-faqf-offer:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-faqf-contact { color: var(--ui-accent); font-weight: 600; }
+.ui-faqf-contact:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 2px; }
+.ui-faqf .ui-faqf-heading { margin: 0; font-size: 13px; font-weight: 650; color: var(--ui-muted); }
+`
+
+let faq_finder_most = 500
+let faq_finder_longest = 200
+let faq_finder_stop = ["a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could", "do", "does", "for", "from", "get", "had", "has", "have", "how", "i", "if", "in", "into",
+    "is", "it", "its", "me", "my", "no", "not", "of", "on", "or", "our", "should", "so", "that", "the", "their", "them", "then", "there", "this", "to", "us", "was", "we", "what",
+    "when", "where", "which", "who", "why", "will", "with", "would", "you", "your"]
+
+fn faq_finder_fold(s: str) {
+    let plain = [["[àáâãäå]", "a"], ["ç", "c"], ["[èéêë]", "e"], ["[ìíîï]", "i"], ["ñ", "n"], ["[òóôõö]", "o"], ["[ùúûü]", "u"], ["[ýÿ]", "y"]]
+    reduce(plain, s, (t, p) => re.replace(t, p[0], p[1]))
+}
+
+// Words from text: small letters, no accents, no apostrophes (so "don't" is one word).
+fn faq_finder_words(text) {
+    let t = faq_finder_fold(lower(str(text ?? "")))
+    re.split(re.replace(t, "['’]", ""), "[^a-z0-9\u00c0-\uffff]+") | filter((w) => w != "")
+}
+
+fn faq_finder_undouble(w: str) = re.test(w, "(bb|dd|ff|gg|ll|mm|nn|pp|rr|tt)$") ? slice(w, 0, len(w) - 1) : w
+
+// A light stemmer: enough that the endings English adds to a word come to one form. It need not
+// give real words, only the same one each time.
+fn faq_finder_stem(word: str) {
+    let w = word
+    if len(w) <= 3 { return w }
+    let cut = (n: int) => slice(w, 0, len(w) - n)
+    if ends_with(w, "ies") && len(w) > 4 { w = cut(3) + "y" }
+    else if ends_with(w, "sses") { w = cut(2) }
+    else if re.test(w, "(ch|sh|x|z)es$") { w = cut(2) }
+    else if ends_with(w, "s") && !re.test(w, "(ss|us|is)$") { w = cut(1) }
+    if ends_with(w, "ation") && len(w) > 7 { w = faq_finder_undouble(cut(5)) }
+    else if ends_with(w, "ment") && len(w) > 6 { w = cut(4) }
+    else if ends_with(w, "ing") && len(w) > 5 { w = faq_finder_undouble(cut(3)) }
+    else if ends_with(w, "ed") && len(w) > 4 { w = faq_finder_undouble(cut(2)) }
+    else if ends_with(w, "ly") && len(w) > 5 { w = cut(2) }
+    if re.test(w, "[^aeiou]y$") && len(w) > 4 { w = cut(1) }
+    if ends_with(w, "e") && len(w) > 3 { w = cut(1) }
+    w
+}
+
+fn faq_finder_counts(words: list) = reduce(words, {}, (m, w) => set(m, w, get(m, w, 0) + 1))
+
+fn faq_finder_keep(words: list) = words | filter((w) => !contains(faq_finder_stop, w))
+
+// What a search needs, made once from the entries: for each, its words' counts by
+// where they stand; how many entries hold each word; and how each stem was written.
+fn faq_finder_index(items) {
+    let given = type_of(items) == "list" ? items : []
+    let entries = []
+    let problems = []
+    for i in 0..len(given) {
+        let x = given[i]
+        let q = type_of(x) == "map" ? trim(str(x.question ?? "")) : ""
+        let a = type_of(x) == "map" ? trim(str(x.answer ?? "")) : ""
+        if q == "" || a == "" {
+            problems = problems | push(`Entry ${i + 1} has no ${q == "" ? "question" : "answer"}, so it is left out.`)
+        } else if len(entries) < faq_finder_most {
+            entries = entries | push({ id: str(x.id ?? i), question: q, answer: a, category: x.category, popular: x.popular == true, tags: x.tags ?? [] })
+        }
+    }
+    if len(given) > faq_finder_most { problems = problems | push(`Only the first ${faq_finder_most} entries are searched.`) }
+    let shown = {}
+    let seen = {}
+    let docs = []
+    for e in entries {
+        let qw = faq_finder_keep(faq_finder_words(e.question))
+        let aw = faq_finder_keep(faq_finder_words(slice(e.answer, 0, 4000)))
+        let tw = faq_finder_keep(faq_finder_words(join(e.tags | map((t) => str(t)), " ")))
+        let stem_all = (ws: list) => ws | map(faq_finder_stem)
+        let doc = { q: faq_finder_counts(stem_all(qw)), a: faq_finder_counts(stem_all(aw)), t: faq_finder_counts(stem_all(tw)) }
+        for w in qw + aw + tw {
+            let s = faq_finder_stem(w)
+            if !has(shown, s) { shown = set(shown, s, w) }
+        }
+        for s in keys(doc.q) + keys(doc.a) + keys(doc.t) | unique() { seen = set(seen, s, get(seen, s, 0) + 1) }
+        docs = docs | push(doc)
+    }
+    { entries, docs, seen, shown, problems, stems: keys(shown) }
+}
+
+// The groups of synonyms, each a list of phrases, each phrase its stems.
+fn faq_finder_groups(synonyms) {
+    let phrase = (t) => ({ text: trim(str(t)), stems: faq_finder_words(t) | map(faq_finder_stem) })
+    if type_of(synonyms) == "map" {
+        return for [k, v] in synonyms => ([k] + (type_of(v) == "list" ? v : [v])) | map(phrase)
+    }
+    if type_of(synonyms) != "list" { return [] }
+    synonyms | filter((g) => type_of(g) == "list") | map((g) => g | map(phrase))
+}
+
+// Edits from a to b, counting a swap of neighbours as one, giving up past `most`.
+fn faq_finder_distance(a: str, b: str, most: int) {
+    let n = len(a)
+    let m = len(b)
+    if abs(n - m) > most { return most + 1 }
+    let before = []
+    let row = range(m + 1)
+    for i in 1..(n + 1) {
+        let next = [i]
+        let lowest = i
+        for j in 1..(m + 1) {
+            let cost = a[i - 1] == b[j - 1] ? 0 : 1
+            let v = min([row[j] + 1, next[j - 1] + 1, row[j - 1] + cost])
+            let swapped = i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] ? before[j - 2] + 1 : v
+            let best = min([v, swapped])
+            if best < lowest { lowest = best }
+            next = next | push(best)
+        }
+        if lowest > most { return most + 1 }
+        before = row
+        row = next
+    }
+    row[m]
+}
+
+fn faq_finder_allowed(w: str) = len(w) >= 8 ? 2 : len(w) >= 4 ? 1 : 0
+
+// The stem nearest a word not in the FAQ, with a typo's distance: { stem } or null.
+fn faq_finder_near(index, word: str, stem: str) {
+    let allow = faq_finder_allowed(word)
+    if allow == 0 { return null }
+    let best = null
+    let gap = allow + 1
+    for s in index.stems {
+        if abs(len(s) - len(stem)) <= allow && gap > 0 {
+            let d = min([faq_finder_distance(stem, s, allow), faq_finder_distance(word, index.shown[s], allow)])
+            if d < gap {
+                gap = d
+                best = s
+            }
+        }
+    }
+    best
+}
+
+// Is `phrase` in these stems, one after another?
+fn faq_finder_within(stems: list, phrase: list) {
+    let n = len(phrase)
+    if n == 0 { return false }
+    any(range(max([len(stems) - n + 1, 0])), (i) => slice(stems, i, i + n) == phrase)
+}
+
+// What to look for: { terms, unknown }, each term { stem, weight, says }, where
+// says explains how it came from the search.
+fn faq_finder_terms(index, query: str, synonyms) {
+    let all_words = faq_finder_words(slice(query, 0, faq_finder_longest))
+    let kept = faq_finder_keep(all_words)
+    let words = len(kept) > 0 ? kept : all_words
+    let stems = words | map(faq_finder_stem)
+    let terms = []
+    let covered = []
+    for group in faq_finder_groups(synonyms) {
+        for p in group {
+            if faq_finder_within(stems, p.stems) {
+                // The words of a phrase mean the phrase, not themselves: "back" alone is noise.
+                if len(p.stems) > 1 { covered = covered + p.stems }
+                for other in group {
+                    if other.text != p.text {
+                        for s in other.stems {
+                            if has(index.seen, s) { terms = terms | push({ stem: s, weight: 0.8, says: `"${p.text}" means "${other.text}"` }) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let unknown = []
+    let typing = re.test(query, "\\S$")
+    for i in 0..len(words) {
+        let w = words[i]
+        let s = stems[i]
+        if !contains(covered, s) && has(index.seen, s) {
+            terms = terms | push({ stem: s, weight: 1.0, says: `"${w}"` })
+        } else if !contains(covered, s) {
+            let near = faq_finder_near(index, w, s)
+            let starts = i == len(words) - 1 && typing && len(w) >= 3 ? index.stems | filter((x) => starts_with(x, s)) | take(4) : []
+            if near != null {
+                terms = terms | push({ stem: near, weight: 0.7, says: `"${w}" read as "${index.shown[near]}"` })
+            } else if len(starts) > 0 {
+                for x in starts { terms = terms | push({ stem: x, weight: 0.6, says: `"${w}" as the start of "${index.shown[x]}"` }) }
+            } else {
+                unknown = unknown | push(w)
+            }
+        }
+    }
+    { terms, unknown, asked: len(words) }
+}
+
+fn faq_finder_rarity(index, stem: str) {
+    let n = float(len(index.docs))
+    let df = float(get(index.seen, stem, 0))
+    math.log(1.0 + (n - df + 0.5) / (df + 0.5))
+}
+
+fn faq_finder_fill(n) = float(n) / (float(n) + 1.0)
+
+// { results, unknown, near }: each result { entry, score, why }.
+fn faq_finder_search(index, query, synonyms = null, limit: int = 5) {
+    let t = faq_finder_terms(index, str(query ?? ""), synonyms)
+    let terms = t.terms
+    let scored = []
+    for i in 0..len(index.docs) {
+        let d = index.docs[i]
+        let score = 0.0
+        let why = []
+        let hit = 0
+        for term in terms {
+            let s = term.stem
+            let q = get(d.q, s, 0)
+            let a = get(d.a, s, 0)
+            let g = get(d.t, s, 0)
+            if q + a + g > 0 {
+                hit += 1
+                score += term.weight * faq_finder_rarity(index, s) * (3.0 * faq_finder_fill(q) + faq_finder_fill(a) + faq_finder_fill(g))
+                why = why | push(`${term.says} in the ${q > 0 ? "question" : a > 0 ? "answer" : "tags"}`)
+            }
+        }
+        if hit > 0 {
+            let reach = float(hit) / float(max([len(terms), 1]))
+            scored = scored | push({ entry: index.entries[i], score: score * (0.5 + 0.5 * reach), why: why | unique() | take(3) })
+        }
+    }
+    let ranked = scored | sort_by((r) => -r.score)
+    let top = len(ranked) == 0 ? 0.0 : ranked[0].score
+    // Far below the best is noise: one common word that the best also has.
+    { results: ranked | filter((r) => r.score >= top * 0.2) | take(limit), unknown: t.unknown, near: faq_finder_nearest(index, t.unknown) }
+}
+
+// For a search that found nothing: the FAQ's words closest to what was typed, for
+// "did you mean", more generously than a typo, the closest first.
+fn faq_finder_nearest(index, words: list) {
+    let all_near = []
+    for w in words | take(4) {
+        let stem = faq_finder_stem(w)
+        let allow = max([2, int(floor(len(w) / 3))])
+        for s in index.stems {
+            let d = abs(len(s) - len(stem)) > allow ? allow + 1 : faq_finder_distance(stem, s, allow)
+            if d <= allow { all_near = all_near | push({ word: index.shown[s], d }) }
+        }
+    }
+    all_near | sort_by((x) => x.d) | map((x) => x.word) | unique() | take(4)
+}
+
+fn faq_finder_common(index, limit: int) {
+    let marked = index.entries | filter((e) => e.popular)
+    (len(marked) > 0 ? marked : index.entries) | take(limit)
+}
+
+fn faq_finder_found(n: int, q: str) = n == 1 ? `1 answer for "${q}".` : `${n} answers for "${q}".`
+
+component FaqFinder(items = [], synonyms = null, limit: int = 5, query: str = "", contact_url: str? = null, contact_label: str = "Contact us", placeholder: str = "Search the questions",
+                    title: str = "Questions and answers", id: str = "faq-finder", name: str = "q", on_no_match = null, on_change = null, class: str? = null) {
+    style global faq_finder_css
+    state text = query
+    state told = ""
+    state box = null
+    state field = null
+    let index = faq_finder_index(items)
+    let cleaned = trim(text)
+    let long = len(text) > faq_finder_longest
+    let found = cleaned == "" ? null : faq_finder_search(index, text, synonyms, limit)
+    let results = found == null ? [] : found.results
+    let nothing = found != null && len(results) == 0
+    let common = faq_finder_common(index, limit)
+    let short = len(cleaned) > 60 ? `${slice(cleaned, 0, 60)}...` : cleaned
+    let count_text = found == null ? `${len(index.entries)} questions to search.` : nothing ? `No answers for "${short}".` : faq_finder_found(len(results), short)
+    let report = (q: str) => {
+        if on_change != null {
+            let f = trim(q) == "" ? null : faq_finder_search(index, q, synonyms, limit)
+            on_change({ query: q, count: f == null ? 0 : len(f.results), top: f == null || len(f.results) == 0 ? null : f.results[0].entry.question })
+        }
+    }
+    let flag = () => {
+        let q = trim(text)
+        if on_no_match != null && q != "" && q != told && len(faq_finder_search(index, q, synonyms, limit).results) == 0 {
+            told = q
+            on_no_match(q)
+        }
+    }
+    let search_for = (word: str) => {
+        text = word
+        report(word)
+        if field != null { field.focus() }
+    }
+    let first_result = () => {
+        if box != null {
+            let s = box.querySelector("summary")
+            if s != null { s.focus() }
+        }
+    }
+    let walk = (e) => {
+        if e.key == "ArrowDown" || e.key == "ArrowUp" {
+            e.preventDefault()
+            let li = e.target.closest("li")
+            let other = e.key == "ArrowDown" ? li.nextElementSibling : li.previousElementSibling
+            if other != null { other.querySelector("summary").focus() } else if e.key == "ArrowUp" && field != null { field.focus() }
+        }
+    }
+    let row = (r, open_it: bool) => {
+        let e = r.entry
+        <details.ui-faqf-item open={open_it}>
+            <summary @keydown={walk}>
+                <span>{e.question}</span>
+                {e.category != null && <span.ui-faqf-tag>{e.category}</span>}
+                {len(r.why) > 0 && <span.ui-faqf-why>{`Found by ${join(r.why, "; ")}`}</span>}
+            </summary>
+            <p.ui-faqf-answer>{e.answer}</p>
+        </details>
+    }
+    <section class={ui_cls(["ui-faqf", class])} aria-labelledby={`${id}-title`} @mount={(el) => { box = el }}>
+        <h3.ui-faqf-title id={`${id}-title`}>{title}</h3>
+        <div.ui-faqf-field role="search">
+            <label for={`${id}-q`}>Search</label>
+            <input type="search" id={`${id}-q`} name={name} value={text} placeholder={placeholder} autocomplete="off" @mount={(el) => { field = el }}
+                   @input={(e) => { text = e.value; report(e.value) }} @change={flag}
+                   @keydown={(e) => {
+                       if e.key == "Enter" { e.preventDefault(); flag() }
+                       if e.key == "ArrowDown" { e.preventDefault(); first_result() }
+                       if e.key == "Escape" { text = ""; report("") }
+                   }}/>
+        </div>
+        {len(index.problems) > 0 && <ul.ui-faqf-problems>{for p in index.problems | take(5) => <li>{p}</li>}</ul>}
+        {long && <p.ui-faqf-count>{`Only the first ${faq_finder_longest} characters are searched.`}</p>}
+        <p.ui-faqf-count aria-live="polite">{count_text}</p>
+        {len(results) > 0 && <ol.ui-faqf-list>
+            {for i in 0..len(results) {
+                let r = results[i]
+                <li key={r.entry.id}>{row(r, i == 0)}</li>
+            }}
+        </ol>}
+        {nothing && <div.ui-faqf-none>
+            <p>{`Nothing here mentions ${join(found.unknown | take(4) | map((w) => `"${w}"`), " or ")}.`}</p>
+            {len(found.near) > 0 && <div.ui-faqf-offers>
+                <span>Did you mean</span>
+                {for w in found.near => <button.ui-faqf-offer key={w} type="button" @click={() => { search_for(w) }}>{w}</button>}
+            </div>}
+            {contact_url != null && <p><a.ui-faqf-contact href={contact_url}>{contact_label}</a></p>}
+        </div>}
+        {(found == null || nothing) && len(common) > 0 && <h4.ui-faqf-heading>Common questions</h4>}
+        {(found == null || nothing) && len(common) > 0 && <ul.ui-faqf-list>
+            {for e in common {
+                let eid = e.id
+                <li key={eid}>{row({ entry: e, why: [] }, false)}</li>
+            }}
+        </ul>}
+    </section>
+}

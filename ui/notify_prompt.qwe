@@ -1,0 +1,249 @@
+// NotifyPrompt: explains why, then asks for notifications. A browser or phone asks only
+// once, and a refusal is hard to undo, so this card says what they are for first, and the
+// system's question comes only after a person says yes to it. "Not now" asks nothing and
+// comes back after some days. Refused has a way to Settings in the app, and says where to
+// look in a browser. Already allowed, it says so; nothing here shows at all until it is
+// on the page, as only the browser knows.
+//
+//   <NotifyPrompt why="We'll tell you when your parcel is at the door, and nothing else."
+//                 reasons={["Delivery on the day", "Changes to an order"]}/>
+//   <NotifyPrompt on_result={(r) => { allowed = r == "granted" }}/>
+//
+// title ("Turn on notifications?"), why: what the card says. reasons: a list of what they
+// will be for, shown as a list. yes ("Turn on"), no ("Not now"): the buttons. again_days:
+// days before a "Not now" asks again (30). store: the localStorage key that remembers
+// that, and in the app what was answered ("ui-notify-prompt"); give each prompt on a page
+// its own. saved, on_save(text): in the app, localStorage is empty each launch, as the
+// program's port changes, and no call says what was answered, so without these it asks
+// again each launch. Keep the text on_save gives in the app's own database and pass it
+// back as saved. first_title ("Notifications are on"), first_body, first_seconds (2): the apps
+// ask the first time one is sent, with no other way to ask, so this first one is sent to
+// ask; a person who allows it sees it. on_result(status): inside one of your components,
+// called with "granted", "refused", "later", "dismissed" (the question closed
+// with no answer) or "none" (notifications cannot work here).
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let notify_prompt_css = css`
+.ui-notifyask { container-type: inline-size; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-notifyask-card { display: grid; gap: 10px; padding: 16px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-notifyask-words { display: grid; gap: 10px; min-width: 0; }
+.ui-notifyask-title { margin: 0; font-size: 16px; font-weight: 600; }
+.ui-notifyask-why { margin: 0; color: var(--ui-muted); }
+.ui-notifyask-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+.ui-notifyask-list li { position: relative; padding-left: 20px; }
+.ui-notifyask-list li::before { content: ""; position: absolute; left: 3px; top: .6em; width: 7px; height: 7px; border-radius: 50%; background: var(--ui-accent); }
+.ui-notifyask-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-notifyask-bar > .ui-btn { flex: 1 1 auto; }
+.ui-notifyask-say { margin: 0; color: var(--ui-muted); }
+.ui-notifyask-say[data-bad] { color: var(--ui-fg); }
+.ui-notifyask-quiet { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+/* A wide pane has room for the reasons in two columns and the buttons on one side. */
+@container (min-width: 420px) {
+  .ui-notifyask-list { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 16px; }
+  .ui-notifyask-bar { justify-content: flex-end; }
+  .ui-notifyask-bar > .ui-btn { flex: 0 0 auto; }
+}
+/* A whole tablet: the case on one side, the choice on the other, so the thumb need not cross it. */
+@container (min-width: 600px) {
+  .ui-notifyask-ask { grid-template-columns: minmax(0, 1fr) 180px; column-gap: 24px; align-items: center; padding: 24px; }
+  .ui-notifyask-ask .ui-notifyask-bar { flex-direction: column-reverse; }
+  .ui-notifyask-ask .ui-notifyask-bar > .ui-btn { flex: 0 0 auto; }
+}
+`
+
+// What the store holds: "later:<ms>", "on" or "refused"; anything else is nothing.
+fn notify_prompt_saved(text) {
+    let t = str(text ?? "")
+    if t == "on" || t == "refused" {
+        { kind: t, until: 0 }
+    } else if starts_with(t, "later:") {
+        let n = int(slice(t, 6, len(t)))
+        is_err(n) ? { kind: "", until: 0 } : { kind: "later", until: n }
+    } else {
+        { kind: "", until: 0 }
+    }
+}
+
+// What to show first. `permission` is the browser's own answer, which is the truth
+// where there is one; in the app, null, as an app has no call that says, and all there
+// is to go on is what this prompt was told last time.
+fn notify_prompt_start(in_app, permission, saved, now) {
+    if !in_app && permission == null {
+        "none"
+    } else if !in_app && permission == "granted" {
+        "granted"
+    } else if !in_app && permission == "denied" {
+        "refused"
+    } else if in_app && saved.kind == "on" {
+        "granted"
+    } else if in_app && saved.kind == "refused" {
+        "refused"
+    } else if saved.kind == "later" && now < saved.until {
+        "later"
+    } else {
+        "ask"
+    }
+}
+
+// iPhones and iPads hide the web's notifications until a site is on the Home Screen. An
+// iPad says it is a Mac, so it is told by its touch screen.
+fn notify_prompt_on_ios(agent, touch) {
+    let a = str(agent ?? "")
+    contains(a, "iPhone") || contains(a, "iPad") || contains(a, "iPod") || (contains(a, "Macintosh") && touch == true)
+}
+
+fn notify_prompt_none_text(ios, secure) {
+    if !secure {
+        "Notifications work only on pages served over https."
+    } else if ios {
+        "On iPhone and iPad, a site can send notifications once it is on the Home Screen. Use Share, then Add to Home Screen, and open it from there."
+    } else {
+        "This browser cannot show notifications."
+    }
+}
+
+fn notify_prompt_refused_text(in_app) = in_app
+    ? "Notifications are turned off for this app. You can turn them on in Settings."
+    : "Notifications are blocked for this page. Allow them in your browser's site settings, then come back."
+
+component NotifyPrompt(title: str = "Turn on notifications?", why: str = "We only send what you would want to hear about, and you can turn them off at any time.",
+                       reasons: list = [], yes: str = "Turn on", no: str = "Not now", again_days: num = 30, store: str = "ui-notify-prompt",
+                       saved: str? = null, first_title: str = "Notifications are on", first_body: str = "This is how they will look.",
+                       first_seconds: num = 2, on_result = null, on_save = null, class: str? = null) {
+    style global notify_prompt_css
+    state status = "wait"       // wait, ask, asking, granted, refused, later, none
+    state in_app = false
+    state note = ""             // a line for what just happened, such as a closed question
+    state none_text = ""
+    state to_settings = false
+
+    // Storage can throw (blocked, or full), which would stop the handler where it stands;
+    // inside a Promise it is an error value instead. Not remembered means asked again, no harm done.
+    let keep = (text) => {
+        js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.setItem", store, text) ?? true) }))
+        on_save && on_save(text)
+    }
+    let finish = (s) => {
+        status = s == "dismissed" ? "ask" : s
+        on_result && on_result(s)
+    }
+    let settle = () => {
+        let native = js("window").quilloNative
+        in_app = native != null
+        let p = js("Notification.permission")
+        let raw = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.getItem", store)) }))
+        let shown = status
+        // This launch's own answer first: `saved` may be a page's prop, and older.
+        let known = is_err(raw) ? saved : (raw ?? saved)
+        status = notify_prompt_start(in_app, is_err(p) ? null : p, notify_prompt_saved(known), js("Date.now"))
+        if status == "none" {
+            none_text = notify_prompt_none_text(notify_prompt_on_ios(js("navigator.userAgent"), js("navigator.maxTouchPoints") > 1), js("isSecureContext") == true)
+        }
+        if status != shown && shown != "wait" && (status == "granted" || status == "refused") { on_result && on_result(status) }
+    }
+    let ask = () => {
+        status = "asking"
+        note = ""
+        let native = js("quilloNative.notify", first_title, first_body, max([first_seconds, 1]))
+        if !is_err(native) {
+            in_app = true
+            keep("on")
+            finish("granted")
+        } else if !contains(native.error, "not defined") {
+            in_app = true
+            keep("refused")
+            finish("refused")
+        } else {
+            in_app = false
+            let a = js("Notification.requestPermission")
+            if is_err(a) {
+                settle()
+            } else if a == "granted" {
+                finish("granted")
+            } else if a == "denied" {
+                finish("refused")
+            } else {
+                note = "The question closed with no answer. You can ask again."
+                finish("dismissed")
+            }
+        }
+    }
+    let later = () => {
+        keep(`later:${js("Date.now") + round(max([again_days, 0]) * 86400000)}`)
+        note = ""
+        finish("later")
+    }
+    let test = () => {
+        note = ""
+        let n = js("quilloNative.notify", first_title, first_body, max([first_seconds, 1]))
+        if !is_err(n) {
+            note = `It will arrive in ${max([first_seconds, 1])} seconds.`
+        } else if !contains(n.error, "not defined") {
+            keep("refused")
+            finish("refused")
+        } else {
+            // Android's browsers make a notification only through a service worker.
+            let sw = js("navigator.serviceWorker.getRegistration")
+            let reg = is_err(sw) ? null : sw
+            // A method's Promise is not waited for by itself, so a refusal would read as sent.
+            // The constructor throws there too, which only a Promise turns into a value.
+            let sent = reg != null ? js("Promise.resolve", reg.showNotification(first_title, { body: first_body }))
+                                   : js("Promise.resolve", js_new("Promise", (done) => { done(js_new("Notification", first_title, { body: first_body })) }))
+            note = is_err(sent) ? "This browser sends notifications only through a service worker." : "Sent."
+        }
+    }
+    <div class={ui_cls(["ui-notifyask", class])} @mount={(_el) => {
+        let d = js("document")
+        let back = (_e = null) => {
+            if js("document.visibilityState") == "visible" && status != "asking" {
+                if to_settings {
+                    to_settings = false
+                    ask()
+                } else if status != "wait" {
+                    settle()
+                }
+            }
+        }
+        d.addEventListener("visibilitychange", back)
+        settle()
+        () => { d.removeEventListener("visibilitychange", back) }
+    }}>
+        {(status == "ask" || status == "asking") && <div.ui-notifyask-card.ui-notifyask-ask role="group" aria-label={title}>
+            <div.ui-notifyask-words>
+                <p.ui-notifyask-title>{title}</p>
+                <p.ui-notifyask-why>{why}</p>
+                {len(reasons) > 0 && <ul.ui-notifyask-list>{for r in reasons => <li>{r}</li>}</ul>}
+                {note != "" && <p.ui-notifyask-say role="status">{note}</p>}
+            </div>
+            <div.ui-notifyask-bar>
+                <Button size="lg" variant="ghost" class="ui-notifyask-no" disabled={status == "asking"} on_click={later}>{no}</Button>
+                <Button size="lg" class="ui-notifyask-yes" loading={status == "asking"} on_click={ask}>{yes}</Button>
+            </div>
+        </div>}
+        {status == "granted" && <div.ui-notifyask-card>
+            <div.ui-notifyask-quiet>
+                <p.ui-notifyask-say role="status">Notifications are on.</p>
+                <Button size="lg" variant="outline" class="ui-notifyask-test" on_click={test}>Send a test</Button>
+            </div>
+            {note != "" && <p.ui-notifyask-say role="status">{note}</p>}
+        </div>}
+        {status == "refused" && <div.ui-notifyask-card>
+            <p.ui-notifyask-say role="alert" data-bad="">{notify_prompt_refused_text(in_app)}</p>
+            {in_app && <div.ui-notifyask-bar>
+                <Button size="lg" variant="outline" class="ui-notifyask-settings" on_click={() => {
+                    to_settings = true
+                    js("quilloNative.openSettings")
+                }}>Open Settings</Button>
+            </div>}
+        </div>}
+        {status == "later" && <div.ui-notifyask-card>
+            <div.ui-notifyask-quiet>
+                <p.ui-notifyask-say>Notifications are off for now.</p>
+                <Button size="lg" variant="ghost" class="ui-notifyask-again" on_click={() => { status = "ask" }}>{yes}</Button>
+            </div>
+        </div>}
+        {status == "none" && <div.ui-notifyask-card><p.ui-notifyask-say role="status" data-bad="">{none_text}</p></div>}
+    </div>
+}

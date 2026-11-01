@@ -1,0 +1,304 @@
+// WheelPicker: a drum of options turned with a finger, as on a phone: it carries on with
+// the flick and settles on a row. It is the browser's own scrolling with scroll snap, so
+// the momentum is the system's own on either phone, and over it sits nothing: under it is a
+// real <select>, which a form sends, which a screen reader reads, and which the keyboard
+// moves (arrows, Page Up, Page Down, Home, End). A mouse drags it too, and a tap on a
+// row goes there.
+//
+//   <WheelPicker label="Size" name="size" value="M" options={["XS", "S", "M", "L", "XL"]}/>
+//   <WheelPicker label="Seat" options={[{ value: "1a", label: "1A window" }, { value: "1b", label: "1B", disabled: true }]}
+//                value={seat} on_change={(v) => { seat = v }}/>
+//
+// options: text or numbers, or { value, label, disabled }. value: the one to start on, and
+// the one to move to when it changes (the first that can be chosen when it is not there).
+// label: its name for screen readers. shown: whether label is also written above it (false).
+// name: the field's name in a form (none by default). rows: how many rows show, an
+// odd number from 3 to 9 (5). disabled, field (the select's id), class as for every field.
+// on_change(value): inside one of your components, given the value as text once the wheel
+// has come to rest, not at each row it passes.
+// A row a person passes gives a small tick through quilloNative.haptic in the apps.
+//
+// There is no endless wheel: a wheel that loops needs rows made and dropped as it turns,
+// which fights the system's momentum.
+//
+// wheel_picker_options(options), wheel_picker_find(opts, value) and
+// wheel_picker_near(opts, i) are the logic, for other components.
+
+import ui/theme.qwe use ui_cls
+
+let wheel_picker_row = 44
+
+let wheel_picker_css = css`
+.ui-wheel-picker { display: grid; gap: 6px; min-width: 0; font: 18px/1.2 var(--ui-font); color: var(--ui-fg); }
+.ui-wheel-picker-label { font-size: 13px; font-weight: 500; text-align: center; }
+.ui-wheel-picker-drum { position: relative; height: calc(var(--rows) * 44px); min-width: 0; }
+/* The band the chosen row rests in, behind the rows. */
+.ui-wheel-picker-band {
+  position: absolute; inset: calc((var(--rows) - 1) * 22px) 0 auto; height: 44px; border-radius: var(--ui-radius);
+  background: var(--ui-subtle); border-block: 1px solid var(--ui-border); pointer-events: none;
+}
+.ui-wheel-picker-drum:has(select:focus-visible) .ui-wheel-picker-band { box-shadow: var(--ui-focus); }
+.ui-wheel-picker-list {
+  position: relative; box-sizing: border-box; height: 100%; padding-block: calc((var(--rows) - 1) * 22px); overflow: hidden;
+  overscroll-behavior: contain; scrollbar-width: none; cursor: grab; outline: none;
+  perspective: 600px; -webkit-mask-image: linear-gradient(transparent, #000 34%, #000 66%, transparent);
+  mask-image: linear-gradient(transparent, #000 34%, #000 66%, transparent);
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: pan-y;
+}
+.ui-wheel-picker-list::-webkit-scrollbar { display: none; }
+/* Until the browser takes over, the server's page shows the right row all the same. */
+.ui-wheel-picker-list:not(.ui-wheel-picker-ready) > .ui-wheel-picker-item:first-child { margin-top: calc(var(--at) * -44px); }
+.ui-wheel-picker-on { overflow-y: auto; scroll-snap-type: y mandatory; scroll-behavior: smooth; }
+.ui-wheel-picker-grab { cursor: grabbing; }
+.ui-wheel-picker-off .ui-wheel-picker-list { overflow: hidden; cursor: not-allowed; opacity: .55; }
+.ui-wheel-picker-item {
+  box-sizing: border-box; height: 44px; padding-inline: 8px; display: flex; align-items: center; justify-content: center; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; scroll-snap-align: center; scroll-snap-stop: normal; font-variant-numeric: tabular-nums;
+}
+.ui-wheel-picker-item[data-off] { color: var(--ui-muted); text-decoration: line-through; }
+/* The select lies over the wheel and takes no finger: a screen reader finds it where the wheel is, and it is big enough to reach. */
+.ui-wheel-picker-native { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; pointer-events: none; font-size: 16px; }
+@supports (animation-timeline: view()) {
+  .ui-wheel-picker-on .ui-wheel-picker-item { animation: ui-wheel-picker-turn linear both; animation-timeline: view(); }
+  @keyframes ui-wheel-picker-turn {
+    from { transform: rotateX(62deg) scale(.9); }
+    50% { transform: none; }
+    to { transform: rotateX(-62deg) scale(.9); }
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-wheel-picker-on { scroll-behavior: auto; }
+  .ui-wheel-picker-on .ui-wheel-picker-item { animation: none; }
+}
+`
+
+// Each option as { value, label, off }, the value always text, whatever it was given as.
+fn wheel_picker_options(options) -> list {
+    if type_of(options) != "list" { return [] }
+    for o in options => type_of(o) == "map"
+        ? { value: str(get(o, "value", "")), label: str(get(o, "label", get(o, "value", ""))), off: get(o, "disabled", false) == true }
+        : { value: str(o), label: str(o), off: false }
+}
+
+// The row of a value, or else the first row that can be chosen.
+fn wheel_picker_find(opts: list, value) -> int {
+    let wanted = str(value)
+    let open = enumerate(opts) | filter((p) => !p[1].off)
+    let hits = open | filter((p) => p[1].value == wanted)
+    len(hits) > 0 ? hits[0][0] : len(open) > 0 ? open[0][0] : 0
+}
+
+// The row nearest to row i that can be chosen, going `way` (1 or -1) first on a tie.
+fn wheel_picker_near(opts: list, i: int, way: int = 1) -> int {
+    let n = len(opts)
+    if n == 0 { return 0 }
+    let at = max([0, min([i, n - 1])])
+    let open = enumerate(opts) | filter((p) => !p[1].off)
+    let ranked = sort_by(open, (p) => abs(p[0] - at) * 2 + ((p[0] - at) * way >= 0 ? 0 : 1))
+    len(ranked) == 0 ? at : ranked[0][0]
+}
+
+// How many rows show: odd, from 3 to 9.
+fn wheel_picker_shown(rows: int) -> int {
+    let r = max([3, min([rows, 9])])
+    r % 2 == 0 ? r + 1 : r
+}
+
+// The row the wheel stops on after a mouse lets go, `speed` in px a millisecond: as far on
+// as a flick would carry it in about a quarter of a second.
+fn wheel_picker_landing(top: num, speed: num, count: int) -> int =
+    max([0, min([round((top + speed * 250) / 44), count - 1])])
+
+// A tick on a phone, where there is one: `js` gives an error value elsewhere, which is
+// nothing to say, and a browser's vibrate is too coarse for rows going by.
+fn wheel_picker_tick() {
+    js("quilloNative.haptic", "selection")
+}
+
+component WheelPicker(options: list = [], value = null, label: str = "Choose", shown: bool = false, name: str? = null, rows: int = 5,
+                      disabled: bool = false, field: str? = null, on_change = null, class: str? = null) {
+    style global wheel_picker_css
+    let opts = wheel_picker_options(options)
+    let wanted = wheel_picker_find(opts, value)
+    state at = wanted               // the row in the middle now
+    state chosen = len(opts) > 0 ? opts[wanted].value : ""      // what the select and the caller have
+    let asked = `${wanted}:${len(opts) > 0 ? opts[wanted].value : ""}`
+    state seen = asked              // what `value` and `options` last asked for
+    state box = null
+    state moving = false
+    state last_top = -1
+    state grab = null               // a mouse's drag: { y, top, dragging, speed, t }
+    state grabbing = false          // apart from `grab`, which changes on each move: only this is in the markup
+    state dragged = false           // the click that ends a mouse's drag is no tap
+    state aim = null                // a row the wheel is being sent to from outside
+
+    // Rests on a row: says so once, moving off a row that cannot be chosen.
+    let rest = () => {
+        if len(opts) > 0 {
+            let i = wheel_picker_near(opts, at)
+            if i != at {
+                at = i
+                box.scrollTop = i * wheel_picker_row
+            } else {
+                let v = opts[i].value
+                if v != chosen {
+                    chosen = v
+                    on_change && on_change(v)
+                }
+            }
+        }
+    }
+    let go = (i: int) => {
+        at = i
+        moving = true
+        last_top = -1
+        box.scrollTop = i * wheel_picker_row
+    }
+    // Rest is seen by the wheel not moving between two ticks, on a row. `scrollend` is
+    // missing from older Safari, and no event says a finger has stopped but not lifted.
+    let settle = () => {
+        let top = box.scrollTop
+        // Sent to a row: new rows are not on the page when `options` changes, and a scroll
+        // set before they are stops at the old end, so it is set here until it holds.
+        if aim != null {
+            if box.clientHeight == 0 || abs(top - aim * wheel_picker_row) < 2 {
+                aim = null
+            } else {
+                box.scrollTop = aim * wheel_picker_row
+            }
+        }
+        if aim == null && top == last_top && abs(top - at * wheel_picker_row) < 2 {
+            moving = false
+            rest()
+        }
+        last_top = top
+    }
+    if moving { every(90, settle) }
+    if asked != seen {
+        seen = asked
+        if wanted != at || (len(opts) > 0 && opts[wanted].value != chosen) {
+            at = wanted
+            chosen = len(opts) > 0 ? opts[wanted].value : ""
+            aim = wanted
+            last_top = -1
+            moving = true
+        }
+    }
+    if box != null && len(opts) > 0 && at >= len(opts) {
+        at = len(opts) - 1
+        moving = true
+    }
+    let n = wheel_picker_shown(rows)
+    let row_of = (e) => (e.target.closest("[data-i]") ?? e.target).dataset.i
+    <div class={ui_cls(["ui-wheel-picker", disabled && "ui-wheel-picker-off", class])} style={`--rows: ${n}; --at: ${wanted}`}>
+        {shown && <span.ui-wheel-picker-label aria-hidden="true">{label}</span>}
+        <div.ui-wheel-picker-drum>
+            <div.ui-wheel-picker-band aria-hidden="true"></div>
+            <div class={ui_cls(["ui-wheel-picker-list", box != null && "ui-wheel-picker-ready", box != null && !disabled && "ui-wheel-picker-on", grabbing && "ui-wheel-picker-grab"])}
+                 aria-hidden="true" tabindex="-1"
+                 @mount={(el) => {
+                     // The server's margin must go before the wheel can scroll that far.
+                     el.classList.add("ui-wheel-picker-ready")
+                     el.scrollTop = wanted * wheel_picker_row
+                     box = el
+                     // A wheel in a closed <dialog> has no height, so no scroll position, until it opens.
+                     let watch = js_new("ResizeObserver", () => {
+                         if !moving && abs(el.scrollTop - at * wheel_picker_row) > 2 { el.scrollTop = at * wheel_picker_row }
+                     })
+                     watch.observe(el)
+                     () => { watch.disconnect() }
+                 }}
+                 @scroll={(e) => {
+                     let i = max([0, min([round(e.scrollTop / wheel_picker_row), len(opts) - 1])])
+                     moving = true
+                     if aim == null && i != at {
+                         at = i
+                         wheel_picker_tick()
+                     }
+                 }}
+                 @click={(e) => {
+                     let i = row_of(e)
+                     let was_drag = dragged
+                     dragged = false
+                     if i != null && !disabled && !was_drag {
+                         let k = wheel_picker_near(opts, int(i))
+                         if k != at { go(k) }
+                     }
+                 }}
+                 @pointerdown={(e) => {
+                     dragged = false
+                     aim = null
+                     if e.pointerType == "mouse" && e.button == 0 && !disabled {
+                         grab = { y: e.clientY, top: box.scrollTop, dragging: false, speed: 0, t: e.timeStamp, last: e.clientY }
+                     }
+                 }}
+                 @pointermove={(e) => {
+                     if grab != null {
+                         let dy = e.clientY - grab.y
+                         if !grab.dragging && abs(dy) > 5 {
+                             box.setPointerCapture(e.pointerId)
+                             box.style.scrollSnapType = "none"
+                             box.style.scrollBehavior = "auto"
+                             grab = { ...grab, dragging: true }
+                             grabbing = true
+                         }
+                         if grab.dragging {
+                             box.scrollTop = grab.top - dy
+                             let dt = max([1, e.timeStamp - grab.t])
+                             grab = { ...grab, speed: (grab.last - e.clientY) / dt, t: e.timeStamp, last: e.clientY }
+                         }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     if grab != null {
+                         let was = grab
+                         grab = null
+                         grabbing = false
+                         if was.dragging {
+                             dragged = true
+                             box.style.scrollSnapType = ""
+                             box.style.scrollBehavior = ""
+                             let still = e.timeStamp - was.t > 80
+                             go(wheel_picker_near(opts, wheel_picker_landing(box.scrollTop, still ? 0 : was.speed, len(opts))))
+                         }
+                     }
+                 }}
+                 @pointercancel={() => {
+                     if grab != null {
+                         let was = grab
+                         grab = null
+                         grabbing = false
+                         box.style.scrollSnapType = ""
+                         box.style.scrollBehavior = ""
+                         if was.dragging { go(at) }
+                     }
+                 }}>
+                {for [i, o] in enumerate(opts) =>
+                    <div.ui-wheel-picker-item key={o.value} data-i={i} data-off={o.off ? "" : null}>{o.label}</div>}
+            </div>
+            <select.ui-wheel-picker-native id={field} name={name} aria-label={label} disabled={disabled}
+                    @change={(e) => {
+                        let i = e.target.selectedIndex
+                        if i >= 0 { go(i) }
+                    }}
+                    @keydown={(e) => {
+                        let to = match e.key {
+                            "ArrowUp" => at - 1
+                            "ArrowDown" => at + 1
+                            "PageUp" => at - 5
+                            "PageDown" => at + 5
+                            "Home" => 0
+                            "End" => len(opts) - 1
+                            _ => null
+                        }
+                        if to != null {
+                            e.preventDefault()
+                            let k = wheel_picker_near(opts, to, to < at ? -1 : 1)
+                            if k != at { go(k) }
+                        }
+                    }}>
+                {for o in opts => <option key={o.value} value={o.value} selected={o.value == chosen} disabled={o.off}>{o.label}</option>}
+            </select>
+        </div>
+    </div>
+}

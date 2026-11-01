@@ -1,0 +1,387 @@
+// InspectionForm: a checklist to walk round something with: each line pass, fail or N/A,
+// with big targets. A fail asks for a note and a stamped photo before the form can go in.
+// It scores as it goes, a failed critical line failing the whole, and keeps a draft, so
+// a dead battery or a reload loses nothing. With no connection, it goes when one comes.
+//
+//   import ui/inspection_form.qwe use InspectionForm
+//
+//   <InspectionForm title="Daily truck check" job="Truck 14" pass_mark={85} store="truck-14"
+//       sections={[{ title: "Cab", items: [{ id: "brakes", text: "Brakes hold on a slope", critical: true, weight: 3 }] }]}
+//       on_submit={(r) => send(r)}/>
+//
+// sections: each { title, items }. An item: { id, text, weight (1), critical (false),
+// note (true: a fail needs a note), photo (true: a fail needs a photo) }. pass_mark: the
+// percentage to reach (80). N/A lines do not count either way. job: goes on each photo's
+// stamp. use_place: asks for a place for photos (true). title ("Inspection"). id: a prefix
+// for its ids, and every answer is a real named radio, `<id>-<item id>`, with its note
+// `<id>-<item id>-note`, so a plain <form> around it sends the answers.
+//
+// What must last: in the phone apps localStorage comes back empty, so give back `saved`
+// (what on_draft gave) from your own store. store: a key to keep the draft under in this
+// browser's localStorage as well. A browser too full for the photos keeps the answers
+// and notes, and says so.
+//
+// on_draft(draft): soon after each change, with { answers }. on_submit(result): when
+// nothing is missing, and again when a connection comes back if it could not go; answer
+// false, an error, or a Promise of either to try again later. result: { title, job, score,
+// outcome, answered, total, failed, lines: [{ id, text, section, answer, note, photos }], at }.
+//
+// inspection_form_items(sections), inspection_form_score(items, answers, pass_mark) and
+// inspection_form_missing(items, answers) are the plain logic. answers: a map of item id
+// to { answer, note, photos }; a score: { score, earned, possible, answered, total,
+// failed, critical, outcome }, outcome being "incomplete", "pass" or "fail".
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/photo_evidence.qwe use PhotoEvidenceAdd, PhotoEvidenceThumbs
+
+let inspection_form_css = css`
+.ui-inspect { display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-inspect h3 { margin: 0; font-size: 18px; }
+.ui-inspect-body { display: grid; gap: 16px; min-width: 0; }
+.ui-inspect-side { display: none; }
+.ui-inspect-main { display: grid; gap: 16px; min-width: 0; }
+.ui-inspect-sec { display: grid; gap: 8px; min-width: 0; scroll-margin-top: 8px; }
+.ui-inspect-sec h4 { margin: 0; font-size: 16px; }
+.ui-inspect-item { display: grid; gap: 8px; min-width: 0; padding: 10px; border: 1px solid var(--ui-border); border-left: 4px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); scroll-margin: 12px; }
+.ui-inspect-item[data-answer="pass"] { border-left-color: var(--ui-success); }
+.ui-inspect-item[data-answer="fail"] { border-left-color: var(--ui-danger); }
+.ui-inspect-item[data-short] { border-color: var(--ui-danger); }
+.ui-inspect-text { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+.ui-inspect-crit { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 4px; background: var(--ui-danger-soft); color: var(--ui-danger); font-size: 12px; font-weight: 700; }
+.ui-inspect-three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-inspect-opt { position: relative; display: grid; place-items: center; min-height: 56px; border: 2px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-bg); font-weight: 700; cursor: pointer; touch-action: manipulation; }
+.ui-inspect-opt input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.ui-inspect-opt:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-inspect-opt:has(input[value="pass"]:checked) { border-color: var(--ui-success); background: var(--ui-success-soft); }
+.ui-inspect-opt:has(input[value="fail"]:checked) { border-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-inspect-opt:has(input[value="na"]:checked) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-inspect-fail { display: grid; gap: 8px; min-width: 0; }
+.ui-inspect-fail label { display: grid; gap: 2px; min-width: 0; color: var(--ui-muted); font-size: 13px; }
+/* 16 px: anything smaller and iOS zooms the page when the field is touched. */
+.ui-inspect-fail textarea { box-sizing: border-box; width: 100%; min-height: 76px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-bg); color: var(--ui-fg); font: 16px/1.4 var(--ui-font); resize: vertical; }
+.ui-inspect-fail textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-inspect-need { margin: 0; color: var(--ui-danger); font-size: 14px; font-weight: 600; }
+.ui-inspect-need:empty { display: none; }
+.ui-inspect-bar { position: sticky; bottom: 0; z-index: 2; display: grid; gap: 8px; padding: 10px 0 max(10px, env(safe-area-inset-bottom)); border-top: 1px solid var(--ui-border); background: var(--ui-bg); }
+.ui-inspect-sum { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; margin: 0; font-size: 14px; font-weight: 600; }
+.ui-inspect-sum [data-outcome="fail"] { color: var(--ui-danger); }
+.ui-inspect-sum [data-outcome="pass"] { color: var(--ui-success); }
+.ui-inspect-prog { display: block; width: 100%; height: 8px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-inspect-prog span { display: block; height: 100%; background: var(--ui-accent); transition: width .2s; }
+.ui-inspect-acts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.ui-inspect-said { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-inspect-said:empty { display: none; }
+.ui-inspect-note { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); font-size: 14px; }
+.ui-inspect-jump { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; width: 100%; min-height: 48px; padding: 4px 10px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 600 14px var(--ui-font); text-align: left; cursor: pointer; }
+.ui-inspect-jump small { color: var(--ui-muted); font: 500 13px var(--ui-mono); }
+.ui-inspect-jump:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-inspect-done { display: grid; gap: 8px; padding: 12px; border: 2px solid var(--ui-strong); border-radius: var(--ui-radius); }
+.ui-inspect-done h4 { margin: 0; font-size: 17px; }
+.ui-inspect-done p { margin: 0; }
+@media (hover: hover) { .ui-inspect-jump:hover { background: var(--ui-subtle); } }
+@container (min-width: 700px) {
+  .ui-inspect-body { grid-template-columns: 220px minmax(0, 1fr); align-items: start; }
+  .ui-inspect-side { position: sticky; top: 8px; display: grid; gap: 2px; padding: 6px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-inspect-prog span { transition: none; } }
+`
+
+fn inspection_form_answer_label(a) -> str = match a {
+    "pass" => "Pass"
+    "fail" => "Fail"
+    "na" => "N/A"
+    _ => "Not answered"
+}
+
+// Every item, flat, with its section and its rules filled in. Items with no id are left
+// out, and an id used twice counts once: an answer could not tell them apart.
+fn inspection_form_items(sections: list) -> list {
+    let rows = sections | filter((s) => type_of(s) == "map" && type_of(get(s, "items")) == "list") | map((s) =>
+        s.items | filter((i) => type_of(i) == "map" && get(i, "id") != null) | map((i) => {
+            let w = get(i, "weight")
+            { id: str(i.id), text: str(get(i, "text") ?? i.id), section: str(get(s, "title") ?? ""),
+              weight: (type_of(w) == "int" || type_of(w) == "float") && w > 0 ? w : 1, critical: get(i, "critical") == true,
+              need_note: get(i, "note") != false, need_photo: get(i, "photo") != false }
+        }))
+    let all = flatten(rows)
+    let groups = group_by(enumerate(all), (p) => p[1].id)
+    enumerate(all) | filter((p) => get(groups, p[1].id)[0][0] == p[0]) | map((p) => p[1])
+}
+
+// One item's answer: { answer, note, photos }, whatever a saved draft held.
+fn inspection_form_answer(answers, id: str) -> map {
+    let a = type_of(answers) == "map" ? get(answers, id) : null
+    if type_of(a) != "map" { return { answer: null, note: "", photos: [] } }
+    let chosen = get(a, "answer")
+    { answer: chosen == "pass" || chosen == "fail" || chosen == "na" ? chosen : null, note: str(get(a, "note") ?? ""),
+      photos: type_of(get(a, "photos")) == "list" ? a.photos : [] }
+}
+
+// The score: N/A lines are out of it, whole percentages are enough to read in a yard, and
+// a percentage below the mark is not rounded up to it.
+fn inspection_form_score(items: list, answers, pass_mark: int) -> map {
+    let rows = items | map((i) => ({ item: i, a: inspection_form_answer(answers, i.id).answer }))
+    let weigh = (f) => rows | filter(f) | reduce(0, (n, r) => n + r.item.weight)
+    let earned = weigh((r) => r.a == "pass")
+    let possible = earned + weigh((r) => r.a == "fail")
+    let answered = rows | filter((r) => r.a != null) | len()
+    let failed = rows | filter((r) => r.a == "fail") | len()
+    let critical = rows | filter((r) => r.a == "fail" && r.item.critical) | len()
+    let exact = possible > 0 ? earned * 100 / possible : null
+    let below = exact != null && exact < pass_mark
+    let outcome = answered < len(rows) ? "incomplete" : (critical > 0 || below ? "fail" : "pass")
+    { score: exact == null ? null : (below ? min([round(exact), pass_mark - 1]) : round(exact)), earned: earned, possible: possible,
+      answered: answered, total: len(rows), failed: failed, critical: critical, outcome: outcome }
+}
+
+// What each item still needs, in order: [{ id, text, needs }], needs in words.
+fn inspection_form_missing(items: list, answers) -> list {
+    items | map((i) => {
+        let a = inspection_form_answer(answers, i.id)
+        let needs = a.answer == null ? ["an answer"] :
+            (a.answer != "fail" ? [] : [i.need_note && trim(a.note) == "" ? "a note" : null, i.need_photo && len(a.photos) == 0 ? "a photo" : null] | filter((x) => x != null))
+        { id: i.id, text: i.text, needs: needs }
+    }) | filter((m) => len(m.needs) > 0)
+}
+
+// What a draft is without its photos, for a browser with no room for them.
+fn inspection_form_light(answers: map) -> map {
+    let names = keys(answers)
+    let rows = for k in names => [k, set(inspection_form_answer(answers, k), "photos", [])]
+    rows | reduce({}, (m, p) => set(m, p[0], p[1]))
+}
+
+// What goes to on_submit.
+fn inspection_form_result(title: str, job, items: list, answers, pass_mark: int, at) -> map {
+    let s = inspection_form_score(items, answers, pass_mark)
+    { title: title, job: job, score: s.score, outcome: s.outcome, answered: s.answered, total: s.total, failed: s.failed, at: at,
+      lines: items | map((i) => {
+          let a = inspection_form_answer(answers, i.id)
+          { id: i.id, text: i.text, section: i.section, answer: a.answer, note: a.note, photos: a.photos }
+      }) }
+}
+
+fn inspection_form_keep(name: str, text: str) {
+    js_new("Promise", (done) => {
+        js("localStorage.setItem", name, text)
+        done(true)
+    }).then((_ok = null) => true, (_e = null) => false)
+}
+
+fn inspection_form_kept(name: str) {
+    js_new("Promise", (done) => {
+        let text = js("localStorage.getItem", name)
+        let v = text == null ? null : json.parse(text)
+        done(is_err(v) ? null : v)
+    }).then((v = null) => v, (_e = null) => null)
+}
+
+fn inspection_form_forget(name: str) {
+    js_new("Promise", (done) => { done(js("localStorage.removeItem", name) ?? true) }).then((_ok = null) => true, (_e = null) => false)
+}
+
+// One line of the form. A view, so its fields keep their focus as answers change.
+view InspectionFormItem(item, a, needs: list, shout: bool, id: str, job: str? = null, use_place: bool = true, locked: bool = false,
+                        on_answer = null, on_note = null, on_photo = null, on_drop = null) {
+    <div.ui-inspect-item data-item={item.id} data-answer={a.answer} data-short={shout && len(needs) > 0 ? "" : null}>
+        <p.ui-inspect-text id={`${id}-${item.id}-text`}>{item.text}{item.critical && <span.ui-inspect-crit>Critical</span>}</p>
+        <fieldset.ui-inspect-three aria-labelledby={`${id}-${item.id}-text`} disabled={locked}>
+            {for o in ["pass", "fail", "na"] => <label class="ui-inspect-opt" key={o}>
+                <input type="radio" name={`${id}-${item.id}`} value={o} checked={a.answer == o} @change={() => { on_answer(item.id, o) }}/>
+                {inspection_form_answer_label(o)}
+            </label>}
+        </fieldset>
+        {a.answer == "fail" && <div.ui-inspect-fail>
+            <label for={`${id}-${item.id}-note`}>What is wrong{item.need_note ? "" : " (if you like)"}
+                <textarea id={`${id}-${item.id}-note`} name={`${id}-${item.id}-note`} rows="2" disabled={locked} value={a.note}
+                          @input={(e) => { on_note(item.id, e.value) }}></textarea>
+            </label>
+            <PhotoEvidenceAdd label={len(a.photos) > 0 ? "Add another photo" : "Take photo"} tag={item.text} job={job} use_place={use_place} disabled={locked}
+                              on_add={(p) => { on_photo(item.id, p) }}/>
+            <PhotoEvidenceThumbs photos={a.photos} on_remove={(p) => { on_drop(item.id, p) }}/>
+        </div>}
+        <p.ui-inspect-need>{shout && len(needs) > 0 ? `Needs ${join(needs, " and ")}` : ""}</p>
+    </div>
+}
+
+component InspectionForm(sections: list = [], title: str = "Inspection", pass_mark: int = 80, job: str? = null, use_place: bool = true, saved: map? = null,
+                         store: str? = null, id: str = "ui-inspect", on_draft = null, on_submit = null, class: str? = null) {
+    style global inspection_form_css
+    state answers = type_of(get(saved, "answers")) == "map" ? saved.answers : {}
+    state tried = false      // Submit was pressed with things missing, so they are marked
+    state dirty = false      // something changed since the draft was kept
+    state said = ""
+    state note = ""          // about the draft
+    state full = false
+    state result = null      // the form, once submitted
+    state sent = false
+    state sending = false
+    state online = true
+    state root = null
+    state wiping = false     // Start over pressed once
+    let items = inspection_form_items(sections)
+    let score = inspection_form_score(items, answers, pass_mark)
+    let missing = inspection_form_missing(items, answers)
+    let needs_of = (item_id) => {
+        let m = missing | find((x) => x.id == item_id)
+        m != null ? m.needs : []
+    }
+    let keep = () => {
+        dirty = false
+        let draft = { answers: answers }
+        on_draft && on_draft(draft)
+        if store != null {
+            let ok = js("Promise.resolve", inspection_form_keep(`ui-inspect-${store}`, json.stringify(draft)))
+            full = !ok
+            if !ok { js("Promise.resolve", inspection_form_keep(`ui-inspect-${store}`, json.stringify({ answers: inspection_form_light(answers) }))) }
+        }
+    }
+    // Typing makes many changes in a second, and a draft holds photos, so it is kept when
+    // the typing stops, not on each key. A tick with dirty false stops itself.
+    if dirty { every(700, keep) }
+    let put = (item_id, f) => {
+        answers = set(answers, item_id, f(inspection_form_answer(answers, item_id)))
+        dirty = true
+        wiping = false
+        said = ""
+    }
+    let go_to = (item_id) => {
+        let w = js("window")
+        let box = js("Array.from", root.querySelectorAll("[data-item]")) | find((el) => el.dataset.item == item_id)
+        if box != null {
+            let calm = w.matchMedia("(prefers-reduced-motion: reduce)").matches
+            box.scrollIntoView({ block: "center", behavior: calm ? "auto" : "smooth" })
+            let first = box.querySelector("input:checked") ?? box.querySelector("input")
+            first.focus({ preventScroll: true })
+        }
+    }
+    let flush = () => {
+        if result != null && !sent && !sending && online && on_submit != null {
+            sending = true
+            let r = js("Promise.resolve", on_submit(result))
+            sending = false
+            if r == false || is_err(r) {
+                said = "It could not be sent yet. It is kept here and will be tried again."
+            } else {
+                sent = true
+                said = ""
+                if store != null { js("Promise.resolve", inspection_form_forget(`ui-inspect-${store}`)) }
+            }
+        }
+    }
+    let submit = () => {
+        if len(missing) > 0 {
+            tried = true
+            let n = len(missing)
+            said = `${n} ${n == 1 ? "line needs" : "lines need"} attention first.`
+            go_to(missing[0].id)
+        } else {
+            keep()
+            result = inspection_form_result(title, job, items, answers, pass_mark, now())
+            flush()
+        }
+    }
+    let wipe = () => {
+        if wiping {
+            answers = {}
+            wiping = false
+            tried = false
+            note = ""
+            full = false
+            result = null
+            sent = false
+            said = ""
+            if store != null { js("Promise.resolve", inspection_form_forget(`ui-inspect-${store}`)) }
+            on_draft && on_draft({ answers: {} })
+        } else {
+            wiping = true
+        }
+    }
+    <section class={ui_cls(["ui-inspect", class])}
+             @mount={(el) => {
+                 root = el
+                 let w = js("window")
+                 let d = js("document")
+                 online = js("navigator").onLine != false
+                 if saved == null && store != null {
+                     let back = js("Promise.resolve", inspection_form_kept(`ui-inspect-${store}`))
+                     if type_of(back) == "map" && type_of(get(back, "answers")) == "map" && len(keys(back.answers)) > 0 {
+                         answers = back.answers
+                         note = `Draft picked up: ${len(keys(back.answers))} answered.`
+                     }
+                 }
+                 let up = (_e = null) => {
+                     online = true
+                     flush()
+                 }
+                 let down = (_e = null) => { online = false }
+                 // The system may end a page it has hidden, so the draft does not wait.
+                 let away = (_e = null) => { if d.visibilityState == "hidden" && dirty { keep() } }
+                 w.addEventListener("online", up)
+                 w.addEventListener("offline", down)
+                 d.addEventListener("visibilitychange", away)
+                 () => {
+                     w.removeEventListener("online", up)
+                     w.removeEventListener("offline", down)
+                     d.removeEventListener("visibilitychange", away)
+                 }
+             }}>
+        <h3>{title}</h3>
+        {note != "" && <p.ui-inspect-note>
+            <span>{note}</span>
+            <Button size="lg" variant="ghost" on_click={wipe}>{wiping ? "Clear every answer?" : "Start over"}</Button>
+        </p>}
+        {full && <p.ui-inspect-note>This browser has no room for the photos. Answers and notes are kept, but photos last only while this page is open.</p>}
+        {!online && <p.ui-inspect-note>No connection. The form is kept on this device.</p>}
+        <div.ui-inspect-body>
+            <nav.ui-inspect-side aria-label="Sections">
+                {for s in sections | filter((x) => type_of(x) == "map") {
+                    let mine = items | filter((i) => i.section == str(get(s, "title") ?? ""))
+                    let open = missing | filter((m) => mine | any((i) => i.id == m.id)) | len()
+                    <button.ui-inspect-jump type="button" key={str(get(s, "title") ?? "")} @click={() => { if len(mine) > 0 { go_to(mine[0].id) } }}>
+                        <span>{str(get(s, "title") ?? "")}</span>
+                        <small>{len(mine) - open}/{len(mine)}</small>
+                    </button>
+                }}
+            </nav>
+            <div.ui-inspect-main>
+                {for s in sections | filter((x) => type_of(x) == "map") {
+                    let mine = items | filter((i) => i.section == str(get(s, "title") ?? ""))
+                    <div.ui-inspect-sec key={str(get(s, "title") ?? "")}>
+                        <h4>{str(get(s, "title") ?? "")}</h4>
+                        {for it in mine => <InspectionFormItem key={it.id} item={it} a={inspection_form_answer(answers, it.id)} needs={needs_of(it.id)} shout={tried} id={id}
+                            job={job} use_place={use_place} locked={result != null}
+                            on_answer={(k, v) => { put(k, (a) => set(a, "answer", v)) }}
+                            on_note={(k, v) => { put(k, (a) => set(a, "note", v)) }}
+                            on_photo={(k, p) => { put(k, (a) => set(a, "photos", a.photos + [p])) }}
+                            on_drop={(k, p) => { put(k, (a) => set(a, "photos", a.photos | filter((x) => x.id != p.id))) }}/>}
+                    </div>
+                }}
+            </div>
+        </div>
+        {result != null && <div.ui-inspect-done>
+            <h4>{sent ? "Sent" : (on_submit == null ? "Finished" : "Waiting to send")}: {result.outcome == "pass" ? "passed" : "failed"}{result.score != null ? `, ${result.score}%` : ""}</h4>
+            <p>{result.failed} failed of {result.total}.{sent ? "" : (online ? "" : " It goes when there is a connection.")}</p>
+            <div.ui-inspect-acts>
+                {on_submit != null && !sent && online && <Button size="lg" variant="outline" loading={sending} on_click={flush}>Try again</Button>}
+                <Button size="lg" variant="outline" on_click={() => {
+                    wiping = true
+                    wipe()
+                }}>Start a new one</Button>
+            </div>
+        </div>}
+        {result == null && <div.ui-inspect-bar>
+            <p.ui-inspect-sum>
+                <span>{score.answered} of {score.total} answered</span>
+                <span data-outcome={score.outcome}>{score.score != null ? `Score ${score.score}%` : "No score yet"}{score.critical > 0 ? ", critical failure" : ""}</span>
+            </p>
+            <span.ui-inspect-prog role="progressbar" aria-label="Answered" aria-valuemin="0" aria-valuemax={score.total} aria-valuenow={score.answered}><span style={`width: ${score.total > 0 ? floor(score.answered * 100 / score.total) : 0}%`}></span></span>
+            <p.ui-inspect-said role="status">{said}</p>
+            <div.ui-inspect-acts>
+                <Button size="lg" variant="outline" disabled={len(missing) == 0} on_click={() => { if len(missing) > 0 { go_to(missing[0].id) } }}>Next to do</Button>
+                <Button size="lg" on_click={submit}>Submit</Button>
+            </div>
+        </div>}
+    </section>
+}

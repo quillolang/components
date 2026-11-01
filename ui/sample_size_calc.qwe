@@ -1,0 +1,223 @@
+// SampleSizeCalc: how many visitors an A/B test needs before it starts: from the
+// baseline rate, the smallest effect worth finding, the power and the significance,
+// the visitors per variant, and the days that takes at a given traffic. It shows the
+// formula with the numbers in it, and refuses inputs that have no answer (a lift
+// that would take the rate past 100%, power below significance), saying why.
+//
+//   <SampleSizeCalc baseline={10} effect={20} daily={2000}/>
+//   <SampleSizeCalc baseline="3.5" effect="0.5" relative={false} power={90} variants={3}
+//                   on_change={(f) => { need = f.per_variant }}/>
+//
+// The formula is the usual one for two proportions (Fleiss, without continuity
+// correction, as R's power.prop.test gives it), rounded up. The rates are kept as
+// decimals, so 10% lifted by 20% is exactly 12%; the square roots and z values are
+// floats, as they must be.
+//
+// baseline: the rate today, in percent. effect: the smallest change to find, in
+// percent of the baseline (relative, the default) or in percentage points (relative
+// false); a negative one looks for a fall. significance: the false-positive rate, in
+// percent (5). power: the chance of finding a real effect, in percent (80). sides:
+// "two" (the default) or "one", for a test that looks one way only. daily: visitors a
+// day across the whole test; left out, no duration is worked out. variants: how many
+// variants share that traffic, the control included (2). title: the heading ("Sample
+// size"). id: a prefix for its fields' ids ("sample-size-calc"), unique on the page.
+// The fields are named baseline, effect, effect_type, significance, power, sides,
+// daily_visitors and variants, so a form around it sends them; name: a prefix for
+// those names. on_change(result): inside one of your components, given the map below
+// after each change, with `error` set when there is no answer.
+//
+// sample_size_calc_solve(baseline, effect, relative, significance, power, two_sided)
+// is the arithmetic, for a program's own use: its numbers are decimals, and it gives
+// { per_variant, exact, p1, p2, z_alpha, z_power, spread_null, spread_effect, baseline, target } or
+// { error, field }. sample_size_calc_days(per_variant, variants, daily) is the
+// days to run, rounded up.
+
+import ui/theme.qwe use ui_cls
+
+let sample_size_calc_css = css`
+.ui-sample-size-calc { display: grid; gap: 16px; min-width: 0; max-width: 620px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-sample-size-calc .ui-sample-size-calc-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-sample-size-calc-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; }
+.ui-sample-size-calc-field { display: grid; gap: 4px; min-width: 0; font-size: 13px; }
+.ui-sample-size-calc-field input, .ui-sample-size-calc-field select { box-sizing: border-box; width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-sample-size-calc-field input:hover, .ui-sample-size-calc-field select:hover { border-color: var(--ui-strong); }
+.ui-sample-size-calc-field input:focus, .ui-sample-size-calc-field select:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-sample-size-calc-field input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-sample-size-calc-kind { display: flex; flex-wrap: wrap; gap: 4px 14px; grid-column: 1 / -1; margin: 0; padding: 0; border: 0; font-size: 13px; }
+.ui-sample-size-calc-kind legend { float: left; margin-right: 8px; padding: 0; }
+.ui-sample-size-calc-kind label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ui-sample-size-calc-kind input { margin: 0; accent-color: var(--ui-accent); }
+.ui-sample-size-calc-live { display: grid; gap: 12px; min-width: 0; }
+.ui-sample-size-calc-out { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0; }
+.ui-sample-size-calc-out div { min-width: 0; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-sample-size-calc-out dt { color: var(--ui-muted); font-size: 12px; }
+.ui-sample-size-calc-out dd { margin: 2px 0 0; font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-sample-size-calc-how { display: grid; gap: 4px; margin: 0; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); color: var(--ui-muted); font-size: 12px; }
+.ui-sample-size-calc-how code { color: var(--ui-fg); font: 12px/1.5 var(--ui-mono); overflow-wrap: anywhere; }
+.ui-sample-size-calc-note { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+.ui-sample-size-calc-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+@media (max-width: 520px) { .ui-sample-size-calc-grid, .ui-sample-size-calc-out { grid-template-columns: minmax(0, 1fr); } }
+`
+
+// A percentage or count as typed, as a decimal: a plain number (commas and a trailing
+// % allowed), null when it is not one. Text so that nothing here passes through a float.
+fn sample_size_calc_read(text) {
+    let t = replace(replace(trim(str(text ?? "")), ",", ""), "%", "")
+    if !re.test(t, "^[-+]?\\d{1,12}(\\.\\d{1,12})?$") { return null }
+    dec(t)
+}
+
+// A number with commas and exactly `places` decimals, in whole numbers so that the
+// server and the browser write the same text.
+fn sample_size_calc_num(v: num, places: int) -> str {
+    let scale = pow(10, places)
+    let units = round(abs(v) * scale)
+    let whole = floor(units / scale)
+    let frac = str(units - whole * scale)
+    let tail = places == 0 ? "" : `.${repeat("0", places - len(frac))}${frac}`
+    `${v < 0 && units > 0 ? "-" : ""}${sample_size_calc_group(whole)}${tail}`
+}
+
+fn sample_size_calc_group(n: num) -> str {
+    if n < 1000 { return str(n) }
+    let rest = str(n % 1000)
+    `${sample_size_calc_group(floor(n / 1000))},${repeat("0", 3 - len(rest))}${rest}`
+}
+
+// A decimal percentage without the zeros it does not need: 12.000 is "12", 0.50 is "0.5".
+fn sample_size_calc_rate(d) -> str {
+    let s = str(round(d, 4, "half_up"))
+    contains(s, ".") ? re.replace(s, "\\.?0+$", "") : s
+}
+
+fn sample_size_calc_solve(baseline, effect, relative: bool, significance, power, two_sided: bool) -> map {
+    let wrong = (field: str, error: str) => { field, error }
+    if baseline <= 0 || baseline >= 100 { return wrong("baseline", "The baseline rate must be above 0% and below 100%.") }
+    if effect == 0 { return wrong("effect", "The effect cannot be 0: no sample finds a change of nothing.") }
+    let target = relative ? baseline * (100 + effect) / 100 : baseline + effect
+    let what = relative ? `A change of ${sample_size_calc_rate(effect)}%` : `A change of ${sample_size_calc_rate(effect)} points`
+    if target >= 100 { return wrong("effect", `${what} takes ${sample_size_calc_rate(baseline)}% to ${sample_size_calc_rate(target)}%, and a rate stops short of 100%.`) }
+    if target <= 0 { return wrong("effect", `${what} takes ${sample_size_calc_rate(baseline)}% to ${sample_size_calc_rate(target)}%, and a rate stays above 0%.`) }
+    if significance <= 0 || significance > 50 { return wrong("significance", "Significance must be above 0% and at most 50%.") }
+    if power <= 0 || power >= 100 { return wrong("power", "Power must be above 0% and below 100%.") }
+    let p1 = float(baseline / 100)
+    let p2 = float(target / 100)
+    let tail = float(significance / 100) / (two_sided ? 2 : 1)
+    let z_alpha = stats.normal_inv(1 - tail)
+    let z_power = stats.normal_inv(float(power / 100))
+    let mean = (p1 + p2) / 2
+    let spread_null = sqrt(2 * mean * (1 - mean))
+    let spread_effect = sqrt(p1 * (1 - p1) + p2 * (1 - p2))
+    let root = z_alpha * spread_null + z_power * spread_effect
+    if root <= 0 { return wrong("power", `Power of ${sample_size_calc_rate(power)}% is below what significance alone gives: no sample size has this answer. Raise the power or lower the significance.`) }
+    let exact = root * root / ((p2 - p1) * (p2 - p1))
+    if exact >= 100000000000000 { return wrong("effect", "That effect is too small to test: it would take over 100 trillion visitors.") }
+    { per_variant: ceil(exact), exact, p1, p2, z_alpha, z_power, spread_null, spread_effect, baseline, target, error: null }
+}
+
+fn sample_size_calc_days(per_variant: int, variants: int, daily) -> int = ceil(float(per_variant * variants) / float(daily))
+
+// All the fields as text to one result, each kind of input refused where it is wrong.
+fn sample_size_calc_check(baseline: str, effect: str, relative: bool, significance: str, power: str, two_sided: bool, daily: str, variants: str) -> map {
+    let wrong = (field: str, error: str) => { field, error }
+    let need = (t: str, field: str, label: str) => {
+        if trim(t) == "" { return wrong(field, `${label} is empty.`) }
+        sample_size_calc_read(t) == null ? wrong(field, `${label} must be a number, not "${trim(t)}".`) : null
+    }
+    let bad = need(baseline, "baseline", "The baseline rate") ?? need(effect, "effect", "The effect")
+        ?? need(significance, "significance", "Significance") ?? need(power, "power", "Power")
+        ?? need(variants, "variants", "The number of variants")
+    if bad != null { return bad }
+    let many = sample_size_calc_read(variants)
+    if many != floor(many) || many < 2 || many > 20 { return wrong("variants", "Variants must be a whole number from 2 to 20, the control included.") }
+    let per_day = trim(daily) == "" ? null : sample_size_calc_read(daily)
+    if trim(daily) != "" && per_day == null { return wrong("daily", `Daily visitors must be a number, not "${trim(daily)}".`) }
+    if per_day != null && per_day <= 0 { return wrong("daily", "Daily visitors must be above 0, or empty to skip the duration.") }
+    let r = sample_size_calc_solve(sample_size_calc_read(baseline), sample_size_calc_read(effect), relative, sample_size_calc_read(significance), sample_size_calc_read(power), two_sided)
+    if r.error != null { return r }
+    let total = r.per_variant * int(many)
+    { ...r, field: null, variants: int(many), total, days: per_day == null ? null : sample_size_calc_days(r.per_variant, int(many), per_day) }
+}
+
+fn sample_size_calc_duration(days: int) -> str =
+    days == 1 ? "1 day" : (days < 730 ? `${sample_size_calc_num(days, 0)} days` : `${sample_size_calc_num(days / 365, 0)} years`)
+
+fn sample_size_calc_note(days: int?) -> str? {
+    if days == null { return null }
+    if days < 7 { return "Under a week: run a full 7 days anyway, so that every day of the week is in the test." }
+    if days > 90 { return "Over three months: few tests stay clean that long. Look for a bigger effect or more traffic." }
+    null
+}
+
+component SampleSizeCalc(baseline = null, effect = null, relative: bool = true, significance = 5, power = 80, sides: str = "two", daily = null, variants = 2,
+                         title: str = "Sample size", id: str = "sample-size-calc", name: str? = null, on_change = null, class: str? = null) {
+    style global sample_size_calc_css
+    state base = baseline == null ? "" : str(baseline)
+    state eff = effect == null ? "" : str(effect)
+    state kind = relative ? "relative" : "absolute"
+    state sig = str(significance)
+    state pow_text = str(power)
+    state tails = sides == "one" ? "one" : "two"
+    state per_day = daily == null ? "" : str(daily)
+    state many = str(variants)
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let r = sample_size_calc_check(base, eff, kind == "relative", sig, pow_text, tails == "two", per_day, many)
+    let hint = trim(base) == "" && trim(eff) == ""
+    let good = r.error == null
+    let tell = () => {
+        if on_change != null { on_change(sample_size_calc_check(base, eff, kind == "relative", sig, pow_text, tails == "two", per_day, many)) }
+    }
+    let wrong = (field: str) => !hint && r.field == field ? "true" : null
+    let note = good ? sample_size_calc_note(r.days) : null
+    let z_name = tails == "two" ? "z(1 − α/2)" : "z(1 − α)"
+    <section class={ui_cls(["ui-sample-size-calc", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-sample-size-calc-title id={`${id}-title`}>{title}</h3>
+        <div.ui-sample-size-calc-grid>
+            <label.ui-sample-size-calc-field for={`${id}-baseline`}>Baseline rate (%)
+                <input type="text" inputmode="decimal" id={`${id}-baseline`} name={named("baseline")} value={base} autocomplete="off" aria-invalid={wrong("baseline")}
+                       @input={(e) => { base = e.value; tell() }}/></label>
+            <label.ui-sample-size-calc-field for={`${id}-effect`}>{kind == "relative" ? "Smallest effect (% of baseline)" : "Smallest effect (points)"}
+                <input type="text" inputmode="decimal" id={`${id}-effect`} name={named("effect")} value={eff} autocomplete="off" aria-invalid={wrong("effect")}
+                       @input={(e) => { eff = e.value; tell() }}/></label>
+            <fieldset.ui-sample-size-calc-kind>
+                <legend>Effect is</legend>
+                <label><input type="radio" name={named("effect_type")} value="relative" checked={kind == "relative"} @change={() => { kind = "relative"; tell() }}/> Relative</label>
+                <label><input type="radio" name={named("effect_type")} value="absolute" checked={kind == "absolute"} @change={() => { kind = "absolute"; tell() }}/> Percentage points</label>
+            </fieldset>
+            <label.ui-sample-size-calc-field for={`${id}-significance`}>Significance (%)
+                <input type="text" inputmode="decimal" id={`${id}-significance`} name={named("significance")} value={sig} autocomplete="off" aria-invalid={wrong("significance")}
+                       @input={(e) => { sig = e.value; tell() }}/></label>
+            <label.ui-sample-size-calc-field for={`${id}-power`}>Power (%)
+                <input type="text" inputmode="decimal" id={`${id}-power`} name={named("power")} value={pow_text} autocomplete="off" aria-invalid={wrong("power")}
+                       @input={(e) => { pow_text = e.value; tell() }}/></label>
+            <label.ui-sample-size-calc-field for={`${id}-sides`}>Test
+                <select id={`${id}-sides`} name={named("sides")} @change={(e) => { tails = e.value; tell() }}>
+                    <option value="two" selected={tails == "two"}>Two-sided</option>
+                    <option value="one" selected={tails == "one"}>One-sided</option>
+                </select></label>
+            <label.ui-sample-size-calc-field for={`${id}-variants`}>Variants, control included
+                <input type="text" inputmode="numeric" id={`${id}-variants`} name={named("variants")} value={many} autocomplete="off" aria-invalid={wrong("variants")}
+                       @input={(e) => { many = e.value; tell() }}/></label>
+            <label.ui-sample-size-calc-field for={`${id}-daily`}>Daily visitors, all variants
+                <input type="text" inputmode="numeric" id={`${id}-daily`} name={named("daily_visitors")} value={per_day} autocomplete="off" aria-invalid={wrong("daily")}
+                       @input={(e) => { per_day = e.value; tell() }}/></label>
+        </div>
+        <div.ui-sample-size-calc-live aria-live="polite">
+            {!good && (hint ? <p.ui-sample-size-calc-note>Enter the baseline rate and the smallest effect worth finding.</p>
+                            : <p.ui-sample-size-calc-error role="alert">{r.error}</p>)}
+            {good && <dl.ui-sample-size-calc-out>
+                <div data-k="per"><dt>Visitors per variant</dt><dd>{sample_size_calc_num(r.per_variant, 0)}</dd></div>
+                <div data-k="total"><dt>Visitors in all</dt><dd>{sample_size_calc_num(r.total, 0)}</dd></div>
+                <div data-k="days"><dt>Time to run</dt><dd>{r.days == null ? "Add traffic" : sample_size_calc_duration(r.days)}</dd></div>
+            </dl>}
+            {good && note != null && <p.ui-sample-size-calc-note>{note}</p>}
+            {good && <div.ui-sample-size-calc-how>
+                <span>Testing {sample_size_calc_rate(r.baseline)}% against {sample_size_calc_rate(r.target)}%, where {z_name} = {sample_size_calc_num(r.z_alpha, 3)} and z(1 − β) = {sample_size_calc_num(r.z_power, 3)}:</span>
+                <code>{"n = (z₁ √(2 p̄ (1 − p̄)) + z₂ √(p₁(1 − p₁) + p₂(1 − p₂)))² / (p₂ − p₁)²"}</code>
+                <code data-k="worked">n = ({sample_size_calc_num(r.z_alpha, 3)} × {sample_size_calc_num(r.spread_null, 4)} + {sample_size_calc_num(r.z_power, 3)} × {sample_size_calc_num(r.spread_effect, 4)})² / {sample_size_calc_num(abs(r.p2 - r.p1), 4)}² = {sample_size_calc_num(r.exact, 1)}, rounded up</code>
+            </div>}
+        </div>
+    </section>
+}

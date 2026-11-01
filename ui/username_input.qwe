@@ -1,0 +1,207 @@
+// UsernameInput: a username field that says what it wants before the form is sent. Each
+// rule ticks as it is met, a name is checked against those in use in any case, and also
+// for look-alikes: with "bill" taken, "bi11" and "biIl" are refused, since nobody could
+// tell them apart on a page and one could pass for the other. When a name will not do it
+// offers free ones made from the person's own name.
+//
+//   <UsernameInput id="user" name="username" label="Username" taken={names} reserved={["admin"]} person="Ana Sofía Núñez"/>
+//   <UsernameInput id="handle" taken={names} on_change={(r) => { ok = r.status == "free" }}/>
+//
+// id: a prefix for its ids, unique on the page. name: the field's name ("username"), a real
+// field. label: its label ("Username"). value: the name to start with. taken: the names in
+// use, any case. reserved: names kept for the site, refused the same way. person: the
+// person's own name, to make suggestions from; without it they come from what is typed.
+// min_length (3), max_length (20): how long a name may be. separators: which of _ . - may
+// join words ("_."). suggestions: how many to offer (4). hint, required, disabled as for
+// every field. class: more classes. on_change(result): inside one of your components, {
+// username, status } after each change; status as below. A leading @ is dropped as typed.
+//
+// username_input_check(text, taken, reserved, min_length, max_length, separators) is the
+// check, for a program's own use (the server must check again): { status, message, near,
+// rules }. status is "empty", "invalid", "reserved", "taken", "lookalike" or "free"; near
+// is the name it clashes with; rules are { id, label, ok }. username_input_skeleton(text)
+// is what a name looks like: two names with one skeleton look the same. It folds case,
+// 1 and l, 0 and O, rn and m, vv and w, and a capital I is compared as an l and as an i
+// (username_input_shapes). username_input_suggest(person, text,
+// taken, reserved, min_length, max_length, separators, count) gives free names.
+
+import ui/slug_input.qwe use slug_input_transliterate
+import ui/theme.qwe use ui_cls
+
+let username_input_css = css`
+.ui-userinput { display: grid; gap: 6px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-userinput-label { font-size: 13px; font-weight: 500; }
+.ui-userinput-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-userinput-control { box-sizing: border-box; width: 100%; height: 38px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1 var(--ui-mono);
+  transition: border-color .15s, box-shadow .15s; }
+.ui-userinput-control:hover { border-color: var(--ui-strong); }
+.ui-userinput-control:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-userinput-control[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-userinput-control:disabled { opacity: .55; cursor: not-allowed; }
+.ui-userinput-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-userinput-rules { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; font-size: 12px; color: var(--ui-muted); }
+.ui-userinput-rule { display: flex; align-items: center; gap: 6px; }
+.ui-userinput-rule svg { flex: none; width: 12px; height: 12px; opacity: .35; }
+.ui-userinput-rule[data-ok="true"] { color: var(--ui-success); }
+.ui-userinput-rule[data-ok="true"] svg { opacity: 1; }
+.ui-userinput-rule[data-ok="false"] { color: var(--ui-danger); }
+.ui-userinput-out { min-height: 20px; font-size: 13px; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-userinput-free { color: var(--ui-success); }
+.ui-userinput-bad { color: var(--ui-danger); }
+.ui-userinput-offers { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-userinput-offers-label { color: var(--ui-muted); font-size: 12px; }
+.ui-userinput-offer { min-height: 28px; padding: 3px 10px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg);
+  font: 13px/1.3 var(--ui-mono); cursor: pointer; }
+.ui-userinput-offer:hover { border-color: var(--ui-accent); color: var(--ui-accent); }
+.ui-userinput-offer:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) { .ui-userinput-control { transition: none; } }
+`
+
+// What a name looks like: names that come out the same cannot be told apart by eye.
+fn username_input_skeleton(text) {
+    let s = replace(replace(lower(str(text ?? "")), "1", "l"), "0", "o")
+    replace(replace(s, "rn", "m"), "vv", "w")
+}
+
+// The two ways a name can be seen. A capital I looks like an l in "biIl", and like the
+// i it is once case is ignored in "BIl1", so each name is looked up both ways.
+fn username_input_shapes(text) {
+    let s = str(text ?? "")
+    unique([username_input_skeleton(replace(s, "I", "l")), username_input_skeleton(s)])
+}
+
+// Only these three may join words; each goes in a pattern's [...], the hyphen last.
+fn username_input_marks(separators: str) = ["_", ".", "-"] | filter((c) => contains(separators, c))
+
+fn username_input_rules(text: str, min_length: int, max_length: int, separators: str) {
+    let marks = username_input_marks(separators)
+    let cls = join(marks, "")
+    let plain = cls == "" ? "digits" : `digits and ${join(marks, " ")}`
+    [
+        { id: "length", label: `${min_length} to ${max_length} characters`, ok: len(text) >= min_length && len(text) <= max_length },
+        { id: "start", label: "Starts with a letter", ok: re.test(text, "^[A-Za-z]") },
+        { id: "chars", label: `Only plain letters, ${plain}`, ok: text != "" && re.test(text, `^[A-Za-z0-9${cls}]*$`) },
+        { id: "joins", label: "No separator at the end, or two in a row", ok: text != "" && (cls == "" || !re.test(text, `[${cls}]$|[${cls}]{2}`)) },
+    ]
+}
+
+// Who a name clashes with: { same, like } maps from lower case and from skeletons.
+fn username_input_index(names: list) {
+    reduce(names, { same: {}, like: {} }, (m, x) => {
+        let n = str(x)
+        { same: set(m.same, lower(n), n), like: reduce(username_input_shapes(n), m.like, (acc, shape) => set(acc, shape, n)) }
+    })
+}
+
+fn username_input_judge(text: str, used, kept, rules: list) {
+    if text == "" { return { status: "empty", message: null, near: null, rules } }
+    let broken = find(rules, (r) => !r.ok)
+    if broken != null { return { status: "invalid", message: `Not yet: ${lower(slice(broken.label, 0, 1))}${slice(broken.label, 1, len(broken.label))}.`, near: null, rules } }
+    let low = lower(text)
+    let shapes = username_input_shapes(text)
+    let look = (found) => shapes | map((shape) => found[shape]) | filter((x) => x != null) | first
+    let hold = kept.same[low] ?? look(kept.like)
+    if hold != null { return { status: "reserved", message: `${text} is kept for the site.`, near: hold, rules } }
+    let same = used.same[low]
+    if same != null { return { status: "taken", message: `${text} is taken.`, near: same, rules } }
+    let like = look(used.like)
+    if like != null { return { status: "lookalike", message: `${text} looks too much like ${like}, which is taken.`, near: like, rules } }
+    { status: "free", message: `${text} is free.`, near: null, rules }
+}
+
+fn username_input_check(text, taken: list = [], reserved: list = [], min_length: int = 3, max_length: int = 20, separators: str = "_.") {
+    let s = str(text ?? "")
+    username_input_judge(s, username_input_index(taken), username_input_index(reserved), username_input_rules(s, min_length, max_length, separators))
+}
+
+// The words of a name in plain letters.
+fn username_input_words(text) =
+    re.split(lower(slug_input_transliterate(text)), "[^a-z0-9]+") | filter((w) => w != "")
+
+// Free names, from the person's name first, then from what was typed, then numbered.
+// Each must pass every rule, and no two may look alike.
+fn username_input_suggest(person, text, taken: list = [], reserved: list = [], min_length: int = 3, max_length: int = 20, separators: str = "_.", count: int = 4) {
+    let used = username_input_index(taken)
+    let kept = username_input_index(reserved)
+    let marks = username_input_marks(separators)
+    let typed = username_input_words(text)
+    let given = username_input_words(person)
+    let words = len(given) > 0 ? given : typed
+    let first_word = words[0] ?? ""
+    let last_word = len(words) > 1 ? words[-1] : ""
+    let initial = slice(first_word, 0, 1)
+    let joined = marks | map((m) => last_word != "" ? `${first_word}${m}${last_word}` : null) | filter((x) => x != null)
+    let bases = [...joined, first_word + last_word, initial + last_word, first_word + slice(last_word, 0, 1), last_word + initial, first_word, last_word, join(typed, marks[0] ?? "")]
+    let found = []
+    let shapes = {}
+    let consider = (name: str) => {
+        let cut = slice(name, 0, max_length)
+        let shape = username_input_skeleton(cut)
+        if len(found) < count && cut != "" && !has(shapes, shape) && username_input_judge(cut, used, kept, username_input_rules(cut, min_length, max_length, separators)).status == "free" {
+            found = push(found, cut)
+            shapes = set(shapes, shape, true)
+        }
+    }
+    for b in bases { consider(b) }
+    // Numbers come last: they are what is left when the name itself is gone.
+    let base = bases | find((b) => b != "" && len(b) >= 2) ?? ""
+    let n = 2
+    while len(found) < count && n < 200 && base != "" {
+        let tail = str(n)
+        consider(slice(base, 0, max_length - len(tail)) + tail)
+        n += 1
+    }
+    found
+}
+
+component UsernameInput(id: str, name: str = "username", label: str = "Username", value: str = "", taken: list = [], reserved: list = [], person: str? = null,
+                        min_length: int = 3, max_length: int = 20, separators: str = "_.", suggestions: int = 4, hint: str? = null, required: bool = false,
+                        disabled: bool = false, on_change = null, class: str? = null) {
+    style global username_input_css
+    state text = value
+    let used = username_input_index(taken)
+    let kept = username_input_index(reserved)
+    let read = username_input_judge(text, used, kept, username_input_rules(text, min_length, max_length, separators))
+    let blocked = read.status == "reserved" || read.status == "taken" || read.status == "lookalike"
+    let wrong = blocked || read.status == "invalid"
+    let offers = read.status == "free" ? [] : username_input_suggest(person, text, taken, reserved, min_length, max_length, separators, suggestions)
+    let described = ui_cls([hint != null && `${id}-hint`, `${id}-rules`, `${id}-out`])
+    let tell = (s: str) => {
+        on_change && on_change({ username: s, status: username_input_judge(s, used, kept, username_input_rules(s, min_length, max_length, separators)).status })
+    }
+    <div class={ui_cls(["ui-userinput", class])}>
+        <label.ui-userinput-label for={id}>
+            {label}{required && <span.ui-userinput-req aria-hidden="true">*</span>}
+        </label>
+        <input.ui-userinput-control type="text" id={id} name={name} value={text} required={required} disabled={disabled} autocomplete="username"
+               spellcheck="false" autocapitalize="none" aria-invalid={wrong ? "true" : null} aria-describedby={described}
+               @input={(e) => {
+                   let clean = re.replace(e.value, "^@+", "")
+                   text = clean
+                   tell(clean)
+               }}/>
+        {hint != null && <p.ui-userinput-hint id={`${id}-hint`}>{hint}</p>}
+        <ul.ui-userinput-rules id={`${id}-rules`}>
+            {for r in read.rules => <li.ui-userinput-rule key={r.id} data-rule={r.id} data-ok={text == "" ? null : r.ok ? "true" : "false"}>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8.5l3.5 3.5 6.5-8"/></svg>
+                <span>{r.label}</span>
+                <span.ui-sr>{text == "" ? "" : r.ok ? " (met)" : " (not met)"}</span>
+            </li>}
+        </ul>
+        <div.ui-userinput-out id={`${id}-out`} aria-live="polite">
+            {read.status == "free" ? <span.ui-userinput-free>{read.message}</span> : wrong ? <span.ui-userinput-bad>{read.message}</span> : null}
+        </div>
+        {len(offers) > 0 && <ul.ui-userinput-offers aria-label="Free names">
+            <li.ui-userinput-offers-label aria-hidden="true">Free:</li>
+            {for o in offers => <li key={o}>
+                <button.ui-userinput-offer type="button" @click={(e) => {
+                    let picked = o
+                    text = picked
+                    tell(picked)
+                    e.target.closest(".ui-userinput").querySelector("input").focus()
+                }}>{o}</button>
+            </li>}
+        </ul>}
+    </div>
+}

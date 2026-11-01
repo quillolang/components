@@ -1,0 +1,341 @@
+// ProfileSetup: the few steps after signing up: a photo, a name and whatever else an
+// app asks. Each step can be skipped, what was done is kept, so leaving part way and coming
+// back lands on the same step, and the end says what was left undone, with a way to do it.
+//
+//   <ProfileSetup remember="profile-1" on_finish={(r) => { save_profile(r.values); navigate("/") }} steps={[
+//       { id: "photo", kind: "photo", title: "Add a photo", text: "People you share with will see it." },
+//       { id: "name", kind: "text", title: "What should we call you?", label: "Your name", autocomplete: "name" },
+//       { id: "use", kind: "choice", title: "What brings you here?", options: ["Work", "School", "Myself"] }
+//   ]}/>
+//
+// steps: a list of { id, kind, title, text }. kind "photo" takes a picture, cropped square
+// and made small on the phone; "text" takes a line, with label, placeholder, autocomplete
+// and inputmode; "choice" takes one of its options. remember: the name progress is kept under
+// (null keeps none). saved: progress to start from, as on_progress gave it, for an app that keeps
+// it itself. fixed: it fills the screen (true); false sits where written, in a box with a height.
+// id: the start of its ids ("profile-setup").
+// title_text: what screen readers call it ("Set up your profile"). finish_label: the last
+// button ("Finish"). photo_size: the kept picture's side in pixels (320).
+// on_progress(progress): inside one of your components, given { at, values, skipped } after each
+// change: `at` the step, from 0, `values` a map from id to what was given (a photo is a data: address).
+// on_finish(result): given { values, done, left }, the ids filled in and those left undone.
+//
+// A phone app's localStorage is new at each launch (see welcome_carousel.qwe), and a
+// picture is too large for a cookie. So the words and the place survive a relaunch by
+// themselves, and a photo survives only in a browser: an app that must keep it across launches
+// keeps what on_progress gives and passes it back in `saved`. Then, or if the photo is gone,
+// its step simply counts as not done.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/welcome_carousel.qwe use welcome_carousel_keep, welcome_carousel_recall, welcome_carousel_forget
+
+let profile_setup_css = css`
+.ui-profile-setup {
+  position: relative; z-index: 50; display: flex; flex-direction: column; box-sizing: border-box; width: 100%; height: 100%; overflow: hidden;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) calc(env(safe-area-inset-bottom) + var(--ui-profile-setup-keyboard, 0px)) env(safe-area-inset-left);
+  background: var(--ui-bg); color: var(--ui-fg); font: 16px/1.45 var(--ui-font); container: ui-profile-setup / size;
+}
+.ui-profile-setup-fixed { position: fixed; inset: 0; width: auto; height: auto; }
+.ui-profile-setup-top { display: flex; align-items: center; justify-content: space-between; flex: none; min-height: 46px; padding: 8px 8px 0; }
+.ui-profile-setup-count { color: var(--ui-muted); font-size: 14px; }
+.ui-profile-setup-bar { flex: none; height: 4px; margin: 4px 20px 0; border-radius: 999px; background: var(--ui-subtle); overflow: hidden; }
+.ui-profile-setup-bar span { display: block; height: 100%; border-radius: inherit; background: var(--ui-accent); transition: width .25s; }
+.ui-profile-setup-panes { display: flex; flex: 1; min-height: 0; }
+.ui-profile-setup-list { display: none; }
+.ui-profile-setup-main { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+.ui-profile-setup-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 24px 20px 12px; }
+.ui-profile-setup-body h2 { margin: 0 0 6px; font-size: 24px; line-height: 1.25; outline: none; }
+.ui-profile-setup-text { margin: 0 0 18px; color: var(--ui-muted); }
+.ui-profile-setup-foot { display: grid; flex: none; gap: 8px; padding: 8px 20px 16px; }
+.ui-profile-setup-problem { margin: 10px 0 0; color: var(--ui-danger); font-size: 14px; }
+.ui-profile-setup-face { display: grid; place-items: center; width: 132px; height: 132px; margin: 8px auto 16px; overflow: hidden; border-radius: 50%; background: var(--ui-accent-soft); color: var(--ui-accent); font-size: 44px; font-weight: 600; }
+.ui-profile-setup-face img { display: block; width: 100%; height: 100%; object-fit: cover; -webkit-touch-callout: none; }
+.ui-profile-setup-picks { display: grid; gap: 8px; }
+.ui-profile-setup-field { display: grid; gap: 4px; }
+.ui-profile-setup-field label { font-size: 14px; font-weight: 500; }
+.ui-profile-setup-field input {
+  box-sizing: border-box; width: 100%; height: 50px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 17px var(--ui-font);
+}
+.ui-profile-setup-field input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-profile-setup-choice { display: flex; align-items: center; gap: 12px; min-height: 50px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); cursor: pointer; }
+.ui-profile-setup-choice + .ui-profile-setup-choice { margin-top: 8px; }
+.ui-profile-setup-choice:has(input:checked) { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-profile-setup-choice:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-profile-setup-choice input { width: 20px; height: 20px; margin: 0; accent-color: var(--ui-accent); }
+.ui-profile-setup-sum { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+.ui-profile-setup-sum li { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 46px; padding: 2px 0; border-bottom: 1px solid var(--ui-border); }
+.ui-profile-setup-sum span { min-width: 0; overflow-wrap: anywhere; }
+.ui-profile-setup-sum small { display: block; color: var(--ui-muted); font-size: 13px; }
+.ui-profile-setup-sum [data-done] small { color: var(--ui-success); }
+/* A tablet has room for the steps beside the one in hand, and they are places to go. */
+@container ui-profile-setup (min-width: 600px) {
+  .ui-profile-setup-bar { display: none; }
+  .ui-profile-setup-list { display: grid; align-content: start; flex: 0 0 240px; gap: 4px; margin: 0; padding: 20px 12px; list-style: none; border-inline-end: 1px solid var(--ui-border); }
+  .ui-profile-setup-list button {
+    display: flex; align-items: center; gap: 8px; width: 100%; min-height: 44px; padding: 0 12px; border: 0; border-radius: var(--ui-radius-sm); background: transparent;
+    color: var(--ui-fg); font: 15px var(--ui-font); text-align: start; cursor: pointer;
+  }
+  .ui-profile-setup-list button[aria-current="step"] { background: var(--ui-accent-soft); color: var(--ui-accent); }
+  .ui-profile-setup-list button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+  .ui-profile-setup-list small { margin-inline-start: auto; color: var(--ui-muted); font-size: 12px; }
+  .ui-profile-setup-body, .ui-profile-setup-foot { width: 100%; max-width: 520px; margin-inline: auto; box-sizing: border-box; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-profile-setup-bar span { transition: none; } }
+`
+
+// Whether a step's value counts as given.
+fn profile_setup_filled(step, value) -> bool {
+    if value == null || type_of(value) != "str" { return false }
+    let kind = get(step, "kind")
+    if kind == "photo" { return starts_with(value, "data:image/") }
+    if kind == "choice" { return (get(step, "options") ?? []) | any((o) => o == value) }
+    trim(value) != ""
+}
+
+// The ids of the steps done, and of those not.
+fn profile_setup_split(steps: list, values) {
+    let done = steps | filter((s) => profile_setup_filled(s, get(values, s.id)))
+    let left = steps | filter((s) => !profile_setup_filled(s, get(values, s.id)))
+    { done: done | map((s) => s.id), left: left | map((s) => s.id) }
+}
+
+// Progress as it was kept, with whatever does not fit today's steps dropped. Anything
+// unreadable is a fresh start, since this comes from storage a person can clear or a
+// new version of the app can outgrow.
+fn profile_setup_restore(text, steps: list) {
+    let blank = { at: 0, values: {}, skipped: [] }
+    if type_of(text) != "str" { return blank }
+    let got = json.parse(text)
+    if is_err(got) || type_of(got) != "map" { return blank }
+    let ids = steps | map((s) => s.id)
+    let old = get(got, "values")
+    let values = type_of(old) == "map"
+        ? (steps | reduce({}, (m, s) => profile_setup_filled(s, get(old, s.id)) ? set(m, s.id, get(old, s.id)) : m))
+        : {}
+    let gone = get(got, "skipped")
+    let skipped = type_of(gone) == "list" ? (gone | filter((x) => ids | any((i) => i == x))) : []
+    let at = get(got, "at")
+    { at: type_of(at) == "int" && at >= 0 && at <= len(steps) ? at : 0, values: values, skipped: skipped }
+}
+
+// The square to cut from a picture w by h, and the side to draw it at, no larger than `limit`.
+fn profile_setup_crop(w: num, h: num, limit: int) {
+    let side = min([w, h])
+    { x: floor((w - side) / 2), y: floor((h - side) / 2), side: side, out: min([side, limit]) }
+}
+
+// One or two letters for a name, in place of a photo.
+fn profile_setup_initials(name) -> str {
+    let words = split(trim(name ?? ""), " ") | filter((w) => w != "")
+    if len(words) == 0 { return "?" }
+    let letter = (w) => upper(split(w, "")[0])
+    len(words) == 1 ? letter(words[0]) : `${letter(words[0])}${letter(words[len(words) - 1])}`
+}
+
+// Why a picked file cannot be used, or "".
+fn profile_setup_refuse(kind: str?, size: num) -> str {
+    if !starts_with(kind ?? "", "image/") { return "That is not a picture. Pick a photo." }
+    if size > 40000000 { return "That picture is too large. Pick a smaller one." }
+    ""
+}
+
+component ProfileSetup(steps: list = [], remember: str? = null, saved = null, fixed: bool = true, title_text: str = "Set up your profile",
+                       finish_label: str = "Finish", photo_size: int = 320, id: str = "profile-setup",
+                       on_progress = null, on_finish = null, class: str? = null) {
+    style global profile_setup_css
+    let begun = profile_setup_restore(saved != null ? json.stringify(saved) : null, steps)
+    state at = begun.at
+    state values = begun.values
+    state skipped = begun.skipped
+    state problem = ""
+    state busy = false
+    state finished = false
+    state returning = false     // came from the end to fill one step: Next goes back there
+    state turn = 0              // counts moves, so the heading takes the focus on each, not on the first
+    state root = null
+    let n = len(steps)
+    let step = at < n ? steps[at] : null
+    let parts = profile_setup_split(steps, values)
+    let shown = step != null ? (get(values, step.id) ?? "") : ""
+    let name_step = find(steps, (s) => get(s, "autocomplete") == "name")
+    let word = (s) => {
+        if profile_setup_filled(s, get(values, s.id)) { return "Done" }
+        skipped | any((x) => x == s.id) ? "Skipped" : ""
+    }
+    let keep = () => {
+        let photos = steps | filter((s) => get(s, "kind") == "photo")
+        let small = photos | reduce(values, (m, s) => remove(m, s.id))
+        if remember != null {
+            welcome_carousel_keep(remember, json.stringify({ at: at, values: small, skipped: skipped }))
+            js_new("Promise", (done) => { done(js("localStorage.setItem", `${remember}-photos`, json.stringify({ values: values })) ?? true) }).catch((_e = null) => null)
+        }
+        on_progress && on_progress({ at: at, values: values, skipped: skipped })
+    }
+    let go = (i: int) => {
+        at = max([0, min([i, n])])
+        problem = ""
+        turn = turn + 1
+        keep()
+    }
+    let onward = () => {
+        if returning {
+            returning = false
+            go(n)
+        } else {
+            go(at + 1)
+        }
+    }
+    let next = () => {
+        if step != null && !profile_setup_filled(step, get(values, step.id)) {
+            problem = get(step, "kind") == "text" ? "Fill this in, or skip it for now." : "Pick one, or skip it for now."
+        } else {
+            skipped = skipped | filter((x) => x != step.id)
+            onward()
+        }
+    }
+    let skip = () => {
+        values = remove(values, step.id)
+        if !(skipped | any((x) => x == step.id)) { skipped = skipped + [step.id] }
+        onward()
+    }
+    let finish = () => {
+        finished = true
+        if remember != null {
+            welcome_carousel_forget(remember)
+            js_new("Promise", (done) => { done(js("localStorage.removeItem", `${remember}-photos`) ?? true) }).catch((_e = null) => null)
+        }
+        on_finish && on_finish({ values: values, done: parts.done, left: parts.left })
+    }
+    let picked = (e) => {
+        let input = e.target
+        let file = input.files[0]
+        let sid = step.id
+        problem = ""
+        if file != null {
+            let refused = profile_setup_refuse(file.type, file.size)
+            if refused != "" {
+                problem = refused
+            } else {
+                busy = true
+                // A camera's sideways photo comes upright from this, and a bad file as an error.
+                let bitmap = js("createImageBitmap", file)
+                if is_err(bitmap) {
+                    problem = "That picture could not be read. Pick another one."
+                } else {
+                    let cut = profile_setup_crop(bitmap.width, bitmap.height, photo_size)
+                    let canvas = js("document.createElement", "canvas")
+                    canvas.width = cut.out
+                    canvas.height = cut.out
+                    canvas.getContext("2d").drawImage(bitmap, cut.x, cut.y, cut.side, cut.side, 0, 0, cut.out, cut.out)
+                    bitmap.close()
+                    values = set(values, sid, canvas.toDataURL("image/jpeg", 0.82))
+                    skipped = skipped | filter((x) => x != sid)
+                    keep()
+                }
+                busy = false
+            }
+        }
+        input.value = ""
+    }
+    <div class={ui_cls(["ui-profile-setup", fixed && "ui-profile-setup-fixed", class])} role="group" aria-label={title_text}
+         @mount={(el) => {
+             root = el
+             if saved == null && remember != null {
+                 let text = js("Promise.resolve", welcome_carousel_recall(remember))
+                 if !is_err(text) && text != null {
+                     let back = profile_setup_restore(text, steps)
+                     let photos = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.getItem", `${remember}-photos`)) }))
+                     let more = profile_setup_restore(is_err(photos) ? null : photos, steps)
+                     at = back.at
+                     values = { ...back.values, ...more.values }
+                     skipped = back.skipped
+                 }
+             }
+             // Over the form on iOS, and only visualViewport says how much.
+             let vv = js("window").visualViewport
+             let shift = (_e) => {
+                 let hidden = max([0, round(js("innerHeight") - vv.height - vv.offsetTop)])
+                 el.style.setProperty("--ui-profile-setup-keyboard", `${hidden}px`)
+             }
+             if vv != null { vv.addEventListener("resize", shift) }
+             () => { if vv != null { vv.removeEventListener("resize", shift) } }
+         }}>
+        {!finished && <div.ui-profile-setup-top>
+            {at > 0
+                ? <Button variant="ghost" tone="neutral" size="lg" on_click={() => { returning = false; go(at - 1) }}>Back</Button>
+                : <span></span>}
+            <span.ui-profile-setup-count role="status">{at < n ? `Step ${at + 1} of ${n}` : "Last check"}</span>
+            {step != null
+                ? <Button variant="ghost" tone="neutral" size="lg" on_click={skip}>Skip</Button>
+                : <span></span>}
+        </div>}
+        {!finished && <div.ui-profile-setup-bar aria-hidden="true"><span style={`width: ${n > 0 ? round(at * 100 / n) : 0}%`}></span></div>}
+        {!finished && <div.ui-profile-setup-panes>
+            <ul.ui-profile-setup-list aria-label="Steps">
+                {for [i, s] in enumerate(steps) =>
+                    <li key={s.id}><button type="button" aria-current={i == at ? "step" : null} @click={() => { returning = false; go(i) }}>
+                        {s.title}<small>{word(s)}</small>
+                    </button></li>}
+            </ul>
+            <div.ui-profile-setup-main>
+                <div.ui-profile-setup-body>
+                    {step != null && <h2 key={turn} tabindex="-1" @mount={(el) => { if turn > 0 { el.focus() } }}>{step.title}</h2>}
+                    {step != null && get(step, "text") != null && <p.ui-profile-setup-text>{step.text}</p>}
+                    {step != null && get(step, "kind") == "photo" && <div.ui-profile-setup-picks>
+                        <div.ui-profile-setup-face>
+                            {shown != ""
+                                ? <img src={shown} alt="Your photo"/>
+                                : <span aria-hidden="true">{profile_setup_initials(name_step != null ? get(values, name_step.id) : null)}</span>}
+                        </div>
+                        <input id={`${id}-camera`} type="file" accept="image/*" capture="user" hidden="hidden" @change={picked}/>
+                        <input id={`${id}-album`} type="file" accept="image/*" hidden="hidden" @change={picked}/>
+                        <Button size="lg" variant="outline" full={true} loading={busy} on_click={() => { root.querySelector(`#${id}-camera`).click() }}>Take a photo</Button>
+                        <Button size="lg" variant="outline" full={true} loading={busy} on_click={() => { root.querySelector(`#${id}-album`).click() }}>Choose a photo</Button>
+                        {shown != "" && <Button size="lg" variant="ghost" tone="danger" full={true} on_click={() => { values = remove(values, step.id); keep() }}>Remove it</Button>}
+                    </div>}
+                    {step != null && get(step, "kind") == "text" && <div.ui-profile-setup-field>
+                        <label for={`${id}-${step.id}`}>{get(step, "label") ?? step.title}</label>
+                        <input id={`${id}-${step.id}`} type="text" value={shown} maxlength="80" enterkeyhint="next" placeholder={get(step, "placeholder")}
+                               autocomplete={get(step, "autocomplete") ?? "off"} inputmode={get(step, "inputmode") ?? "text"} autocapitalize="words"
+                               aria-invalid={problem != "" ? "true" : null}
+                               @input={(e) => {
+                                   let v = e.value
+                                   problem = ""
+                                   values = v == "" ? remove(values, step.id) : set(values, step.id, v)
+                                   keep()
+                               }}
+                               @keydown={(e) => { if e.key == "Enter" { e.preventDefault(); next() } }}/>
+                    </div>}
+                    {step != null && get(step, "kind") == "choice" && <div role="radiogroup" aria-label={step.title}>
+                        {for o in get(step, "options") ?? [] =>
+                            <label.ui-profile-setup-choice key={o}>
+                                <input type="radio" name={`${id}-${step.id}`} value={o} checked={shown == o}
+                                       @change={() => { problem = ""; values = set(values, step.id, o); keep() }}/>
+                                {o}
+                            </label>}
+                    </div>}
+                    {problem != "" && <p.ui-profile-setup-problem role="alert">{problem}</p>}
+                    {step == null && <div>
+                        <h2 key={turn} tabindex="-1" @mount={(el) => { if turn > 0 { el.focus() } }}>{len(parts.left) == 0 ? "All done" : "Nearly there"}</h2>
+                        <p.ui-profile-setup-text>{len(parts.left) == 0 ? "That is everything." : `You left ${len(parts.left)} for later. You can add ${len(parts.left) == 1 ? "it" : "them"} now, or finish.`}</p>
+                        <ul.ui-profile-setup-sum>
+                            {for s in steps {
+                                let filled = profile_setup_filled(s, get(values, s.id))
+                                <li key={s.id} data-done={filled ? "1" : null} data-left={filled ? null : "1"}>
+                                    <span>{s.title}<small>{filled ? "Done" : "Left undone"}</small></span>
+                                    {!filled && <Button size="lg" variant="soft" label={`Add now: ${s.title}`}
+                                                        on_click={() => { returning = true; go(index_of(steps, s)) }}>Add</Button>}
+                                </li>
+                            }}
+                        </ul>
+                    </div>}
+                </div>
+                <div.ui-profile-setup-foot>
+                    <Button size="lg" full={true} on_click={() => { if step != null { next() } else { finish() } }}>{step == null ? finish_label : returning ? "Save" : "Next"}</Button>
+                </div>
+            </div>
+        </div>}
+    </div>
+}

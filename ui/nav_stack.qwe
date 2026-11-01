@@ -1,0 +1,339 @@
+// NavStack: a phone app's stack of screens. A screen pushed slides in over the last,
+// which stays built underneath with its state, what was typed and its scroll position,
+// and is there as it was when the top one goes. Back is the real thing: each push is
+// a step of the browser's history, so the browser's Back and Forward, Android's Back,
+// and a reload all do what they should. A swipe from the left edge pops as well. In a
+// pane 700 px wide or more the first screen stands as a column beside the rest, as on a
+// tablet's mail or settings.
+//
+//   import ui/nav_stack.qwe use NavStack
+//
+//   component Mail() {
+//       <NavStack root={{ title: "Inbox", name: "inbox" }}
+//                 screen={(s, nav) => match s.name {
+//                     "inbox" => <Inbox on_open={(m) => { nav.push({ title: m.subject, name: "mail", id: m.id }) }}/>
+//                     _ => <Message id={s.id} on_done={() => { nav.pop() }}/>
+//                 }}/>
+//   }
+//
+// root: the first screen: a map with `title` and whatever your `screen` wants. screen(s,
+// nav): gives the screen for an entry, once, when it is pushed, so it goes inside one
+// of your components. An entry is the map you pushed, with `at`, its place in the
+// stack, `key` and `before`, the title of the one under it. nav.push(entry) adds a
+// screen, nav.pop() goes back one, nav.home() goes back to the first. An entry's
+// optional `path` is the address it shows (a hash, a query or a path of the site's own;
+// anything else is left out).
+// Entries are kept in the history, so they are plain data: no functions and no
+// decimals. on_change(entry, depth): called when the top screen changes. back: use the
+// history (true). swipe: a swipe from the edge pops (true). split: a column beside
+// the rest on a wide pane (true). empty_text: what shows beside the column with nothing
+// open ("Nothing selected"). id: what its steps in the history are kept under, unique
+// on the page. The box takes the size of its parent, which needs a height.
+//
+// On a phone each screen has a bar with a Back button and its title, and Alt + Left goes
+// back. Moving to a screen moves the focus to its title; going back returns it to what
+// opened the screen. In the column, opening another item replaces the one showing, and
+// the screen beside it has no Back. Swiping has the limits of SwipeBack: Safari on an
+// iPhone and Android's gesture navigation keep the edge for their own Back, which pops
+// the stack the same way.
+
+import ui/theme.qwe use ui_cls
+import ui/swipe_back.qwe use swipe_back_finishes, swipe_back_share, swipe_back_speed
+
+let nav_stack_css = css`
+.ui-navstack { display: block; width: 100%; height: 100%; min-height: 0; container-type: inline-size; background: var(--ui-subtle); color: var(--ui-fg); font: 15px/1.5 var(--ui-font); }
+.ui-navstack-in { position: relative; width: 100%; height: 100%; overflow: hidden; overscroll-behavior-x: contain; touch-action: pan-y pinch-zoom; }
+.ui-navstack-screen {
+  position: absolute; inset: 0; display: flex; flex-direction: column; background: var(--ui-bg); transition: transform .3s cubic-bezier(.2, .8, .2, 1);
+  animation: ui-navstack-in .3s cubic-bezier(.2, .8, .2, 1);
+}
+.ui-navstack-screen:dir(rtl) { animation-name: ui-navstack-in-rtl; }
+.ui-navstack-screen[data-at="0"], .ui-navstack-quiet .ui-navstack-screen { animation: none; }
+@keyframes ui-navstack-in { from { transform: translate3d(100%, 0, 0); } }
+@keyframes ui-navstack-in-rtl { from { transform: translate3d(-100%, 0, 0); } }
+.ui-navstack-under { visibility: hidden; transform: translate3d(-30%, 0, 0); transition: transform .3s cubic-bezier(.2, .8, .2, 1), visibility 0s .3s; }
+.ui-navstack-under:dir(rtl) { transform: translate3d(30%, 0, 0); }
+.ui-navstack-gone { transform: translate3d(100%, 0, 0); }
+.ui-navstack-gone:dir(rtl) { transform: translate3d(-100%, 0, 0); }
+.ui-navstack-moving .ui-navstack-screen { transition: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-navstack-moving .ui-navstack-top { box-shadow: var(--ui-shadow-lg); }
+.ui-navstack-bar {
+  display: flex; flex: none; align-items: center; gap: 2px; box-sizing: border-box; min-height: calc(48px + env(safe-area-inset-top));
+  padding: env(safe-area-inset-top) max(8px, env(safe-area-inset-right)) 0 max(4px, env(safe-area-inset-left)); border-bottom: 1px solid var(--ui-border); background: var(--ui-surface);
+}
+.ui-navstack-title { flex: 1; min-width: 0; margin: 0; padding-inline-start: 8px; overflow: hidden; font-size: 17px; font-weight: 600; outline: none; text-overflow: ellipsis; white-space: nowrap; }
+.ui-navstack-back {
+  display: inline-flex; flex: 0 1 auto; align-items: center; min-width: 44px; max-width: 45%; height: 44px; padding: 0 8px 0 2px; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-accent); font: inherit; cursor: pointer;
+}
+.ui-navstack-back span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-navstack-back svg { flex: none; width: 26px; height: 26px; }
+.ui-navstack-back:dir(rtl) svg { transform: scaleX(-1); }
+.ui-navstack-back:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-navstack-back:hover { background: var(--ui-subtle); } }
+/* touch-action on the scroller itself: it stops counting at a scroller. */
+.ui-navstack-body { flex: 1; min-height: 0; padding-bottom: env(safe-area-inset-bottom); overflow: auto; overscroll-behavior: contain; touch-action: pan-y pinch-zoom; }
+.ui-navstack-empty { display: none; }
+@container (min-width: 700px) {
+  .ui-navstack-split .ui-navstack-screen { inset-inline-start: 320px; }
+  .ui-navstack-split .ui-navstack-screen[data-at="0"] {
+    z-index: 1; inset-inline: 0 auto; width: 320px; border-inline-end: 1px solid var(--ui-border); transform: none; visibility: visible; transition: none;
+  }
+  .ui-navstack-split .ui-navstack-screen[data-at="1"] .ui-navstack-back { display: none; }
+  .ui-navstack-split .ui-navstack-empty { position: absolute; inset: 0 0 0 320px; display: grid; place-items: center; color: var(--ui-muted); }
+  .ui-navstack-split .ui-navstack-empty:dir(rtl) { inset: 0 320px 0 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-navstack-screen, .ui-navstack-under { transition: none; animation: none; }
+}
+`
+
+// An entry as the stack keeps it. Anything that is not a map is an empty screen.
+fn nav_stack_entry(x, at: int, key: int, before: str) {
+    let base = type_of(x) == "map" ? x : {}
+    { ...base, at: at, key: key, before: before }
+}
+
+fn nav_stack_title(e) -> str {
+    let t = get(e, "title", "")
+    type_of(t) == "str" ? t : str(t)
+}
+
+// What goes in the history's state: whatever was there, and this stack under its id.
+fn nav_stack_state(was, id: str, stack: list) {
+    let base = type_of(was) == "map" ? was : {}
+    let mine = get(base, "ui_nav_stack", {})
+    { ...base, ui_nav_stack: set(type_of(mine) == "map" ? mine : {}, id, stack) }
+}
+
+// The stack the history holds for this id, or null. Another script's state, or none,
+// counts as the first screen alone.
+fn nav_stack_saved(state, id: str) {
+    if type_of(state) != "map" { return null }
+    let mine = get(state, "ui_nav_stack")
+    if type_of(mine) != "map" { return null }
+    let got = get(mine, id)
+    type_of(got) == "list" && len(got) > 0 && all(got, (e) => type_of(e) == "map") ? got : null
+}
+
+// An address of the page's own, or none: the history refuses another site's by throwing,
+// which would stop the push. A backslash counts as a slash, and tabs and line ends are
+// dropped, so `/\\x` and a broken `//x` would get past the first look.
+fn nav_stack_path(e) {
+    let p = get(e, "path")
+    if type_of(p) != "str" { return null }
+    if contains(p, "\\") || contains(p, "\t") || contains(p, "\n") || contains(p, "\r") { return null }
+    starts_with(p, "#") || starts_with(p, "?") || (starts_with(p, "/") && !starts_with(p, "//")) ? p : null
+}
+
+fn nav_stack_paint(top, below, share: num, width: num, sign: num) {
+    top.style.transform = `translate3d(${share * width * sign}px, 0, 0)`
+    if below != null { below.style.transform = `translate3d(${-0.3 * width * (1 - share) * sign}px, 0, 0)` }
+}
+
+component NavStack(root = {}, screen = null, id: str = "ui-navstack", back: bool = true, swipe: bool = true, split: bool = true,
+                   empty_text: str = "Nothing selected", on_change = null, class: str? = null) {
+    style global nav_stack_css
+    state stack = [nav_stack_entry(root, 0, 0, "")]    // the screens built, those past `depth` on their way out
+    state depth = 1
+    state next = 1                 // the next entry's key
+    state wide = false
+    state win = null
+    state box = null
+    state quiet = false            // a stack brought back: no slide
+    state openers = []             // what opened each screen, to give the focus back to
+    state leaving = false          // the history was asked to go back and has not yet
+    state g = null                 // the finger: { sx, sy, fx, ft, x, t, on, sign, id, w, top, below }
+    state moving = false
+    let columns = wide && split
+    let section = (at: int) => box.querySelector(`[data-at="${at}"]`)
+    let focus_on = (el) => {
+        win.requestAnimationFrame(() => {
+            if el != null && el.isConnected { el.focus({ preventScroll: true }) }
+        })
+    }
+    let title_of = (at: int) => {
+        let s = section(at)
+        s != null ? s.querySelector(".ui-navstack-title") : null
+    }
+    let told = () => { on_change && on_change(stack[depth - 1], depth) }
+    let clear_drag = () => {
+        if g != null {
+            g.top.style.transform = ""
+            if g.below != null {
+                g.below.style.transform = ""
+                g.below.style.visibility = ""
+            }
+            g = null
+        }
+        moving = false
+    }
+    // Whatever way it came: a list of entries to show. Back shortens the stack, and
+    // Forward lengthens it from what the history kept.
+    let arrive = (list_of: list) => {
+        leaving = false
+        let n = len(list_of)
+        clear_drag()
+        if n < depth {
+            depth = n
+            let to = n - 1 < len(openers) ? openers[n - 1] : null
+            focus_on(to != null ? to : title_of(n - 1))
+            told()
+        } else if n > depth {
+            stack = take(stack, depth) + drop(list_of, depth)
+            depth = n
+            told()
+        }
+    }
+    // A step back that never arrives must not leave Back dead.
+    if leaving { every(800, () => { leaving = false }) }
+    // Those on their way out go when the slide is over; a clock, as a transition's end may never come.
+    if len(stack) > depth {
+        every(340, () => { stack = take(stack, depth) })
+    }
+    let push_entry = (x) => {
+        let e = nav_stack_entry(x, depth, next, nav_stack_title(stack[depth - 1]))
+        next += 1
+        openers = take(openers, depth - 1) + [win.document.activeElement]
+        stack = take(stack, depth) + [e]
+        depth += 1
+        if back { win.history.pushState(nav_stack_state(win.history.state, id, stack), "", nav_stack_path(e)) }
+        told()
+        win.requestAnimationFrame(() => { focus_on(title_of(depth - 1)) })
+    }
+    // In the column, a second item takes the place of the first: there is no stack to speak of.
+    let swap_entry = (x) => {
+        let e = nav_stack_entry(x, 1, next, nav_stack_title(stack[0]))
+        next += 1
+        stack = [stack[0], e]
+        depth = 2
+        if back { win.history.replaceState(nav_stack_state(win.history.state, id, stack), "", nav_stack_path(e)) }
+        told()
+        win.requestAnimationFrame(() => { focus_on(title_of(1)) })
+    }
+    let pop_to = (n: int) => {
+        if depth > n && !leaving {
+            if back {
+                leaving = true
+                win.history.go(n - depth)
+            } else {
+                arrive(take(stack, n))
+            }
+        }
+    }
+    let nav_of = (e) => {
+        {
+            push: (x) => { if columns && e.at == 0 && depth >= 2 { swap_entry(x) } else { push_entry(x) } },
+            pop: () => { pop_to(depth - 1) },
+            home: () => { pop_to(1) },
+        }
+    }
+    <div.ui-navstack @mount={(el) => {
+             win = js("window")
+             box = el
+             let ro = js_new("ResizeObserver", () => { wide = el.clientWidth >= 700 })
+             ro.observe(el)
+             if back {
+                 let saved = nav_stack_saved(win.history.state, id)
+                 if saved != null && len(saved) > 1 {
+                     quiet = true
+                     stack = saved
+                     depth = len(saved)
+                     next = reduce(saved, 1, (top, e) => get(e, "key", 0) >= top ? get(e, "key", 0) + 1 : top)
+                 } else {
+                     win.history.replaceState(nav_stack_state(win.history.state, id, stack), "")
+                 }
+             }
+             let popped = () => {
+                 if back {
+                     let saved = nav_stack_saved(win.history.state, id)
+                     quiet = false
+                     arrive(saved != null ? saved : take(stack, 1))
+                 }
+             }
+             win.addEventListener("popstate", popped)
+             () => {
+                 ro.disconnect()
+                 win.removeEventListener("popstate", popped)
+             }
+         }}>
+        <div class={ui_cls(["ui-navstack-in", split && "ui-navstack-split", quiet && "ui-navstack-quiet", moving && "ui-navstack-moving", class])}
+             @pointerdown={(e) => {
+                 // A second finger: a pinch or a mistake, not a swipe.
+                 if g != null && !e.isPrimary { clear_drag() }
+                 if swipe && depth > 1 && !(columns && depth == 2) && g == null && e.isPrimary && e.button == 0 && !leaving {
+                     let top = section(depth - 1)
+                     let sign = win.getComputedStyle(top).direction == "rtl" ? -1 : 1
+                     let r = top.getBoundingClientRect()
+                     let from_edge = sign > 0 ? e.clientX - r.left : r.right - e.clientX
+                     if from_edge >= 0 && from_edge <= 24 {
+                         g = { sx: e.clientX, sy: e.clientY, fx: e.clientX, ft: e.timeStamp, x: e.clientX, t: e.timeStamp, on: false, sign: sign,
+                               id: e.pointerId, w: r.width, top: top, below: section(depth - 2) }
+                     }
+                 }
+             }}
+             @pointermove={(e) => {
+                 if g != null && e.pointerId == g.id {
+                     let dx = (e.clientX - g.sx) * g.sign
+                     let dy = e.clientY - g.sy
+                     if !g.on && abs(dx) + abs(dy) >= 10 {
+                         if dx <= abs(dy) {
+                             g = null
+                         } else {
+                             g = { ...g, on: true }
+                             moving = true
+                             if g.below != null { g.below.style.visibility = "visible" }
+                             e.target.closest(".ui-navstack-in").setPointerCapture(e.pointerId)
+                         }
+                     }
+                     if g != null && g.on {
+                         let keep = e.timeStamp - g.t > 40
+                         g = { ...g, fx: keep ? g.x : g.fx, ft: keep ? g.t : g.ft, x: e.clientX, t: e.timeStamp }
+                         nav_stack_paint(g.top, columns && depth == 2 ? null : g.below, swipe_back_share(dx, g.w), g.w, g.sign)
+                     }
+                 }
+             }}
+             @pointerup={(e) => {
+                 if g != null && e.pointerId == g.id {
+                     if g.on {
+                         let dx = (e.clientX - g.sx) * g.sign
+                         let speed = swipe_back_speed(g.fx, g.ft, g.x, g.t, e.timeStamp) * g.sign
+                         if swipe_back_finishes(dx, g.w, speed) {
+                             // Slides the rest of the way from here; it is cleared on arrival.
+                             moving = false
+                             nav_stack_paint(g.top, g.below, 1, g.w, g.sign)
+                             pop_to(depth - 1)
+                         } else {
+                             clear_drag()
+                         }
+                     } else {
+                         g = null
+                     }
+                 }
+             }}
+             @pointercancel={(e) => {
+                 if g != null && e.pointerId == g.id { clear_drag() }
+             }}
+             @keydown={(e) => {
+                 if e.altKey && e.key == "ArrowLeft" && depth > 1 {
+                     e.preventDefault()
+                     pop_to(depth - 1)
+                 }
+             }}>
+            {depth == 1 && <div.ui-navstack-empty>{empty_text}</div>}
+            {for e in stack => <section key={e.key} data-at={e.at}
+                    class={ui_cls(["ui-navstack-screen", e.at == depth - 1 && "ui-navstack-top", e.at < depth - 1 && "ui-navstack-under", e.at >= depth && "ui-navstack-gone"])}
+                    inert={e.at == depth - 1 || (columns && e.at == 0) ? null : ""} aria-label={nav_stack_title(e)}>
+                <header.ui-navstack-bar>
+                    {e.at > 0 && <button.ui-navstack-back type="button" aria-label={`Back to ${e.before}`} @click={() => { pop_to(depth - 1) }}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"
+                             stroke-linejoin="round" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
+                        <span>{e.before}</span>
+                    </button>}
+                    <h2.ui-navstack-title tabindex="-1">{nav_stack_title(e)}</h2>
+                </header>
+                <div.ui-navstack-body>{screen != null ? screen(e, nav_of(e)) : null}</div>
+            </section>}
+        </div>
+    </div>
+}

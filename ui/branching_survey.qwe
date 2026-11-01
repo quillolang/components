@@ -1,0 +1,367 @@
+// BranchingSurvey: a survey that asks one question at a time, where the answer can
+// jump to another question or to the end. Back keeps what was answered, and changing an
+// answer can send the survey down another path, while the answers on the old path wait
+// in case it comes back. Progress is honest: it counts the questions answered against
+// the longest path still possible from here, so it says "at most 4 more" and can go up
+// or down as answers take a shorter way. The questions themselves are checked: those no
+// path reaches, jumps that go in a circle or to nothing are reported above the survey,
+// and a loop cannot trap anyone, as coming back to a question on the path ends it. It
+// finishes with a summary of the path taken, where any answer can be changed.
+//
+//   import ui/branching_survey.qwe use BranchingSurvey
+//
+//   <BranchingSurvey id="visit" questions={[
+//       { id: "came", text: "Did you stay with us?", options: ["Yes", "No"], jumps: [{ when: "No", to: "why" }] },
+//       { id: "score", text: "How was it?", type: "scale", min: 1, max: 5 },
+//       { id: "low", text: "What went wrong?", type: "text", required: false, next: "end" },
+//       { id: "why", text: "What stopped you?", type: "text" },
+//   ]} on_finish={(answers) => { saved = answers }}/>
+//
+// A question: id (unique; "end" is taken), text, help, type ("single", the default;
+// "multi", several of the options; "text"; "number"; "scale", from min to max, 1 to 5
+// by default), options (strings or { label, value }), required (true), min and max (for
+// a number too), next (the question that follows, or "end"; left out, the next in the
+// list), jumps (tried in order before next: { when: an answer, to } or, for a number or
+// a scale, { gte: n, to } or { lte: n, to }; a multi jumps when it holds `when`).
+//
+// id: a prefix for its ids ("branching-survey"), unique on the page. questions: the list. start: the
+// id to begin at (the first). action, method ("post"): where a plain form sends it at
+// the end, each answer under its question's id. finish: the last button's words
+// ("Send"). report: lists what is wrong with the questions (true). class: more classes
+// for its outer element. on_finish(answers): inside one of your components, called
+// with a map of the answers on the path taken, and only those.
+//
+// branching_survey_check(questions, start) is the graph's logic, for a program's own
+// use: { problems, unreachable, loops, longest }; branching_survey_next(question,
+// answer, questions) says where an answer leads.
+
+import ui/theme.qwe use ui_cls
+
+let branching_survey_css = css`
+.ui-bsurvey { display: grid; gap: 14px; min-width: 0; max-width: 620px; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-bsurvey-problems { margin: 0; padding: 10px 12px 10px 28px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; overflow-wrap: anywhere; }
+.ui-bsurvey-progress { display: grid; gap: 4px; font-size: 13px; color: var(--ui-muted); }
+.ui-bsurvey-track { height: 6px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-bsurvey-bar { height: 100%; border-radius: 999px; background: var(--ui-accent); transition: width .2s; }
+.ui-bsurvey .ui-bsurvey-question { margin: 0; font-size: 17px; font-weight: 650; overflow-wrap: anywhere; }
+.ui-bsurvey-question:focus { outline: none; }
+.ui-bsurvey-help { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-bsurvey-form { display: grid; gap: 12px; min-width: 0; }
+.ui-bsurvey-choices { display: grid; gap: 6px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-bsurvey-scale { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.ui-bsurvey-choice { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; overflow-wrap: anywhere; }
+.ui-bsurvey-choice input { margin: 0; accent-color: var(--ui-accent); }
+.ui-bsurvey-choice input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-bsurvey-input { box-sizing: border-box; width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); }
+.ui-bsurvey-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-bsurvey-input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-bsurvey-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-bsurvey-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-bsurvey-btn { height: 36px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-bsurvey-btn:hover { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-bsurvey-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-bsurvey-go { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-bsurvey-go:hover { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-bsurvey-summary { display: grid; gap: 0; margin: 0; }
+.ui-bsurvey-line { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 8px 0; border-bottom: 1px solid var(--ui-border); }
+.ui-bsurvey-line dt { font-size: 13px; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-bsurvey-line dd { grid-row: 2; margin: 0; font-weight: 500; overflow-wrap: anywhere; }
+.ui-bsurvey-line button { grid-row: 1 / span 2; grid-column: 2; align-self: center; height: 28px; padding: 0 10px; font-size: 12px; }
+.ui-bsurvey-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-bsurvey-done { margin: 0; color: var(--ui-success); font-weight: 600; }
+@media (prefers-reduced-motion: reduce) { .ui-bsurvey-bar { transition: none; } }
+`
+
+let branching_survey_most = 500
+
+// The questions that can run: maps with an id of their own.
+fn branching_survey_clean(questions) -> list {
+    let seen = []
+    let out = []
+    for q in type_of(questions) == "list" ? take(questions, branching_survey_most) : [] {
+        if type_of(q) == "map" && type_of(q.id) == "str" && q.id != "" && q.id != "end" && !contains(seen, q.id) {
+            seen = push(seen, q.id)
+            out = push(out, { ...q, type: q.type ?? "single" })
+        }
+    }
+    out
+}
+
+fn branching_survey_options(q: map) -> list =
+    (type_of(q.options) == "list" ? q.options : []) | map((o) => type_of(o) == "map" ? { label: str(o.label ?? o.value), value: str(o.value ?? o.label) } : { label: str(o), value: str(o) })
+
+fn branching_survey_range(q: map) -> map {
+    let lo = type_of(q.min) == "int" ? q.min : 1
+    let hi = type_of(q.max) == "int" ? q.max : 5
+    { lo, hi: hi < lo ? lo : (hi - lo > 20 ? lo + 20 : hi) }
+}
+
+// The id after q when no jump is taken.
+fn branching_survey_after(q: map, questions: list) -> str {
+    if type_of(q.next) == "str" { return q.next }
+    let ids = questions | map((x) => x.id)
+    let i = index_of(ids, q.id)
+    i != null && i + 1 < len(ids) ? ids[i + 1] : "end"
+}
+
+fn branching_survey_jumps(q: map) -> list = (type_of(q.jumps) == "list" ? q.jumps : []) | filter((j) => type_of(j) == "map")
+
+fn branching_survey_number(v) {
+    let s = trim(str(v ?? ""))
+    if !re.test(s, "^-?\\d+(\\.\\d+)?$") { return null }
+    let d = dec(s)
+    is_err(d) ? null : d
+}
+
+// Whether a jump is taken for an answer.
+fn branching_survey_taken(j: map, answer) -> bool {
+    if has(j, "when") {
+        return type_of(answer) == "list" ? contains(answer, str(j.when)) : str(answer ?? "") == str(j.when)
+    }
+    let n = branching_survey_number(answer)
+    let bound = (key: str) => branching_survey_number(get(j, key))
+    if has(j, "gte") { return n != null && bound("gte") != null && n >= bound("gte") }
+    if has(j, "lte") { return n != null && bound("lte") != null && n <= bound("lte") }
+    false
+}
+
+// Where an answer leads: an id, or "end".
+fn branching_survey_next(q: map, answer, questions: list) -> str {
+    let j = find(branching_survey_jumps(q), (x) => branching_survey_taken(x, answer))
+    j != null && type_of(j.to) == "str" ? j.to : branching_survey_after(q, questions)
+}
+
+// Every place q can lead: its jumps, and what follows it unless its jumps take every
+// option of a single choice, when no answer can fall through.
+fn branching_survey_targets(q: map, questions: list) -> list {
+    let jumps = branching_survey_jumps(q)
+    let to = jumps | filter((j) => type_of(j.to) == "str") | map((j) => j.to)
+    let whens = jumps | filter((j) => has(j, "when")) | map((j) => str(j.when))
+    let opts = branching_survey_options(q) | map((o) => o.value)
+    let covered = q.type == "single" && q.required != false && len(opts) > 0 && all(opts, (o) => contains(whens, o))
+    unique(covered ? to : push(to, branching_survey_after(q, questions)))
+}
+
+// A walk of the graph, depth first: st is { marks, path, loops, longest }. The longest
+// way from a question counts it; a jump back along the path is a loop, and counts nothing.
+fn branching_survey_walk(id: str, edges: map, st: map) -> map {
+    let out = { ...st, marks: set(st.marks, id, 1), path: push(st.path, id) }
+    let best = 0
+    for to in get(edges, id) ?? [] {
+        let mark = get(out.marks, to)
+        if mark == 1 {
+            out = { ...out, loops: push(out.loops, push(slice(out.path, index_of(out.path, to), len(out.path)), to)) }
+        } else {
+            if mark == null && has(edges, to) { out = branching_survey_walk(to, edges, out) }
+            best = max([best, get(out.longest, to) ?? 0])
+        }
+    }
+    { ...out, marks: set(out.marks, id, 2), path: take(out.path, len(out.path) - 1), longest: set(out.longest, id, best + 1) }
+}
+
+// What is wrong with the questions, and how long a path can be from each:
+// { problems (sentences), unreachable (ids), loops (lists of ids), longest (id to n) }.
+fn branching_survey_check(questions, start = null) -> map {
+    if type_of(questions) != "list" || len(questions) == 0 { return { problems: ["This survey has no questions."], unreachable: [], loops: [], longest: {} } }
+    let problems = []
+    let seen = []
+    if len(questions) > branching_survey_most { problems = push(problems, `Only the first ${branching_survey_most} questions are used.`) }
+    for [i, q] in enumerate(take(questions, branching_survey_most)) {
+        if type_of(q) != "map" || type_of(q.id) != "str" || q.id == "" {
+            problems = push(problems, `Question ${i + 1} has no id.`)
+        } else if q.id == "end" {
+            problems = push(problems, "A question cannot be called end: that word ends the survey.")
+        } else if contains(seen, q.id) {
+            problems = push(problems, `Two questions have the id ${q.id}: the second is left out.`)
+        } else {
+            seen = push(seen, q.id)
+        }
+    }
+    let qs = branching_survey_clean(questions)
+    if len(qs) == 0 { return { problems: push(problems, "This survey has no questions."), unreachable: [], loops: [], longest: {} } }
+    let ids = qs | map((q) => q.id)
+    let edges = reduce(qs, {}, (m, q) => set(m, q.id, branching_survey_targets(q, qs)))
+    for q in qs {
+        let kind = q.type
+        if !contains(["single", "multi", "text", "number", "scale"], kind) { problems = push(problems, `${q.id}: there is no type "${str(kind)}".`) }
+        if (kind == "single" || kind == "multi") && len(branching_survey_options(q)) == 0 { problems = push(problems, `${q.id} has no options.`) }
+        for to in get(edges, q.id) {
+            if to != "end" && !contains(ids, to) { problems = push(problems, `${q.id} jumps to ${to}, which is no question.`) }
+        }
+        let opts = branching_survey_options(q) | map((o) => o.value)
+        for j in branching_survey_jumps(q) {
+            if has(j, "when") && (kind == "single" || kind == "multi") && !contains(opts, str(j.when)) { problems = push(problems, `${q.id} jumps on "${str(j.when)}", which is no option.`) }
+        }
+    }
+    let first_id = start != null && contains(ids, start) ? start : ids[0]
+    if start != null && !contains(ids, start) { problems = push(problems, `The survey starts at ${str(start)}, which is no question.`) }
+    let st = branching_survey_walk(first_id, edges, { marks: {}, path: [], loops: [], longest: {} })
+    let unreachable = ids | filter((i) => !has(st.marks, i))
+    // Those no path reaches still count in their own right, for an honest count if the
+    // program starts there.
+    let whole = reduce(unreachable, st, (s, i) => has(s.marks, i) ? s : branching_survey_walk(i, edges, s))
+    problems = problems + (unreachable | map((i) => `No path reaches ${i}.`))
+    problems = problems + (whole.loops | map((l) => `A loop: ${join(l, " → ")}. Coming back to a question ends the survey there.`))
+    { problems, unreachable, loops: whole.loops, longest: whole.longest }
+}
+
+// What is wrong with an answer, or null.
+fn branching_survey_error(q: map, v) {
+    let blank = v == null || (type_of(v) == "str" && trim(v) == "") || (type_of(v) == "list" && len(v) == 0)
+    if blank { return q.required == false ? null : "This one needs an answer." }
+    if q.type == "number" || q.type == "scale" {
+        let n = branching_survey_number(v)
+        if n == null { return "This needs a number." }
+        if type_of(q.min) == "int" && n < q.min { return `The lowest is ${q.min}.` }
+        if type_of(q.max) == "int" && n > q.max { return `The highest is ${q.max}.` }
+    }
+    null
+}
+
+// An answer as words, for the summary.
+fn branching_survey_shown(q: map, v) -> str {
+    let opts = branching_survey_options(q)
+    let word = (x) => (find(opts, (o) => o.value == str(x)) ?? { label: str(x) }).label
+    if v == null || v == "" || v == [] { return "No answer" }
+    type_of(v) == "list" ? join(v | map(word), ", ") : word(v)
+}
+
+// The answers on a path, and only those.
+fn branching_survey_answers(path: list, answers: map) -> map =
+    reduce(path, {}, (m, id) => has(answers, id) && get(answers, id) != null ? set(m, id, get(answers, id)) : m)
+
+// A question's field; each question is made afresh, so nothing carries over.
+view BranchingSurveyField(id: str, q: map, value = null, error: str? = null, on_value = null) {
+    let fid = `${id}-${q.id}`
+    let bad = error != null ? "true" : null
+    let about = error != null ? `${id}-error` : (q.help != null ? `${id}-help` : null)
+    let keep = (x) => { on_value(x) }
+    let held = type_of(value) == "list" ? value : []
+    let span = branching_survey_range(q)
+    let steps = q.type == "scale" ? (span.lo..(span.hi + 1)) | map((n) => { label: str(n), value: str(n) }) : branching_survey_options(q)
+    q.type == "single" || q.type == "multi" || q.type == "scale"
+        ? <fieldset.ui-bsurvey-choices aria-labelledby={`${id}-question`} aria-describedby={about} aria-invalid={bad}>
+            <div class={q.type == "scale" ? "ui-bsurvey-scale" : "ui-bsurvey-choices"}>
+                {for o in steps => <label.ui-bsurvey-choice key={o.value}>
+                    {q.type == "multi"
+                        ? <input type="checkbox" name={q.id} value={o.value} checked={contains(held, o.value)}
+                                 @change={(e) => keep(e.checked ? push(held, o.value) : remove(held, o.value))}/>
+                        : <input type="radio" name={q.id} value={o.value} checked={o.value == str(value ?? "")} @change={(e) => keep(e.value)}/>}
+                    {o.label}
+                </label>}
+            </div>
+        </fieldset>
+        : <input.ui-bsurvey-input type="text" inputmode={q.type == "number" ? "decimal" : null} id={fid} name={q.id} value={str(value ?? "")} autocomplete="off"
+                 aria-labelledby={`${id}-question`} aria-describedby={about} aria-invalid={bad} @input={(e) => keep(e.value)}/>
+}
+
+component BranchingSurvey(questions = [], id: str = "branching-survey", start: str? = null, action: str? = null, method: str = "post",
+                          finish: str = "Send", report: bool = true, on_finish = null, class: str? = null) {
+    style global branching_survey_css
+    let qs = branching_survey_clean(questions)
+    let graph = branching_survey_check(questions, start)
+    let begin = start != null && any(qs, (q) => q.id == start) ? start : (len(qs) > 0 ? qs[0].id : null)
+    state path = begin != null ? [begin] : []
+    state answers = {}
+    state done = false
+    state sent = false
+    state stopped = null
+    state problem = null
+    state moved = false
+    let question = (i) => find(qs, (q) => q.id == i)
+    let here = len(path) > 0 ? path[-1] : null
+    let q = here != null ? question(here) : null
+    let before = len(path) - 1
+    let left = here != null ? get(graph.longest, here) ?? 1 : 0
+    let percent = done ? 100 : (before + left > 0 ? floor(100 * before / (before + left)) : 0)
+    let final = branching_survey_answers(path, answers)
+    let lines = path | map((i) => { id: i, q: question(i) })
+    let go_on = (e) => {
+        e.preventDefault()
+        let v = get(answers, here)
+        let wrong = branching_survey_error(q, v)
+        problem = wrong
+        moved = true
+        if wrong == null {
+            let to = branching_survey_next(q, v, qs)
+            if to == "end" || question(to) == null {
+                stopped = null
+                done = true
+            } else if contains(path, to) {
+                stopped = `The survey stopped here, as "${question(to).text}" would have come round again.`
+                done = true
+            } else {
+                stopped = null
+                path = push(path, to)
+            }
+        }
+    }
+    let go_back = () => {
+        problem = null
+        moved = true
+        stopped = null
+        if done {
+            done = false
+        } else if len(path) > 1 {
+            path = take(path, len(path) - 1)
+        }
+    }
+    let change = (i: str) => {
+        path = take(path, index_of(path, i) + 1)
+        done = false
+        problem = null
+        moved = true
+        stopped = null
+    }
+    <section class={ui_cls(["ui-bsurvey", class])} id={id} aria-label="Survey">
+        {report && len(graph.problems) > 0 && <ul.ui-bsurvey-problems>
+            {for [i, p] in enumerate(graph.problems) => <li key={i}>{p}</li>}
+        </ul>}
+        {q == null && <p.ui-bsurvey-note>There are no questions to ask.</p>}
+        {q != null && !sent && <div.ui-bsurvey-progress>
+            <span aria-live="polite" data-progress="true">{done ? "All done: check your answers." : `Question ${before + 1}, at most ${left - 1} more after this.`}</span>
+            <div.ui-bsurvey-track role="progressbar" aria-label="Progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent}>
+                <div.ui-bsurvey-bar style={`width: ${percent}%`}></div>
+            </div>
+        </div>}
+        {q != null && !done && <form.ui-bsurvey-form novalidate="true" @submit={go_on}>
+            <h4.ui-bsurvey-question key={here} id={`${id}-question`} tabindex="-1" @mount={(el) => { if moved { el.focus() } }}>{q.text}</h4>
+            {q.help != null && <p.ui-bsurvey-help id={`${id}-help`}>{q.help}</p>}
+            <BranchingSurveyField key={here} id={id} q={q} value={get(answers, here)} error={problem}
+                                  on_value={(v) => { answers = set(answers, here, v); problem = null }}/>
+            {problem != null && <p.ui-bsurvey-error id={`${id}-error`} role="alert">{problem}</p>}
+            <div.ui-bsurvey-actions>
+                {before > 0 && <button.ui-bsurvey-btn type="button" data-back="true" @click={go_back}>Back</button>}
+                <button.ui-bsurvey-btn.ui-bsurvey-go type="submit">Next</button>
+            </div>
+        </form>}
+        {q != null && done && !sent && <form.ui-bsurvey-form action={action} method={method}
+                @submit={(e) => {
+                    e.preventDefault()
+                    sent = true
+                    on_finish && on_finish(final)
+                    if action != null { e.target.submit() }
+                }}>
+            <h4.ui-bsurvey-question tabindex="-1" @mount={(el) => { if moved { el.focus() } }}>Your answers</h4>
+            {stopped != null && <p.ui-bsurvey-note>{stopped}</p>}
+            <dl.ui-bsurvey-summary>
+                {for l in lines => <div.ui-bsurvey-line key={l.id} data-line={l.id}>
+                    <dt>{l.q.text}</dt>
+                    <dd>{branching_survey_shown(l.q, get(answers, l.id))}</dd>
+                    <button.ui-bsurvey-btn type="button" aria-label={`Change: ${l.q.text}`} @click={() => change(l.id)}>Change</button>
+                </div>}
+            </dl>
+            {for [k, v] in final => <span key={k}>{type_of(v) == "list"
+                ? (for x in v => <input type="hidden" name={k} value={x}/>)
+                : <input type="hidden" name={k} value={str(v)}/>}</span>}
+            <div.ui-bsurvey-actions>
+                <button.ui-bsurvey-btn type="button" data-back="true" @click={go_back}>Back</button>
+                <button.ui-bsurvey-btn.ui-bsurvey-go type="submit">{finish}</button>
+            </div>
+        </form>}
+        {sent && <p.ui-bsurvey-done role="status">Thank you: your answers are in.</p>}
+    </section>
+}

@@ -1,0 +1,401 @@
+// CronBuilder: a five-field cron line, built from dropdowns or typed. It reads what it
+// is given, says it in English, and lists the next 5 runs in a time zone. It knows
+// lists, ranges and steps (1,15  9-17  */5  10-40/10), names (MON-FRI, JAN), 7 for Sunday
+// and the @daily family, and it refuses what is wrong, saying which field and where,
+// and a day that never comes: 31 February, or 31 in April and June.
+//
+//   import ui/cron_builder.qwe use CronBuilder
+//
+//   <CronBuilder value="0 9 * * 1-5" zone="Europe/Lisbon"/>
+//   <CronBuilder id="backup" value="30 2 * * 0" now="2026-11-01T12:00:00Z" on_change={(c) => { cron = c.expression }}/>
+//
+// value: the line to start with ("0 9 * * 1-5"). zone: an IANA time zone name, "UTC" or
+// an offset such as "+05:30" ("UTC"). zones: the zones the dropdown offers to begin
+// with; the page adds all the browser knows once it starts. now: the moment to count
+// from, a date-time with its offset, so the first page can show the runs; left out,
+// the browser's clock, once it has started. id: a prefix for its ids ("cron-builder"),
+// unique on the page. name: the line's field ("cron"). title: the heading ("Cron
+// schedule"). class: more classes for its outer element.
+// on_change(result): inside one of your components, called after each change with
+// { expression, description, next (date-times), error (or null) }.
+//
+// As in crontab: when both the day of the month and the weekday are given, either will
+// do (`0 0 13 * 5` runs on each 13th and each Friday); a field starting with `*`, such
+// as `*/2`, counts as not given for this. Local times: a time the clocks skip does not
+// run that day, and a time that happens twice runs once, the first time. A zone not
+// known is said so, and the runs are in UTC.
+//
+// For a program's own use, all pure: cron_builder_parse(text) gives { fields, ... } or
+// { error, at }; cron_builder_describe(parsed) the English; cron_builder_next(parsed,
+// from, zone, n) the next runs as date-times, looking 40 years ahead at most.
+
+import ui/theme.qwe use ui_cls
+
+let cron_builder_css = css`
+.ui-crontab { display: grid; gap: 14px; min-width: 0; max-width: 680px; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-crontab .ui-crontab-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-crontab-picks { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; }
+.ui-crontab-field { display: grid; gap: 5px; min-width: 0; }
+.ui-crontab-field label { font-size: 13px; font-weight: 500; }
+.ui-crontab-input { box-sizing: border-box; width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); transition: border-color .15s, box-shadow .15s; }
+.ui-crontab-line { font-family: var(--ui-mono); }
+.ui-crontab-input:hover { border-color: var(--ui-strong); }
+.ui-crontab-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-crontab-input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-crontab-error { display: grid; gap: 4px; margin: 0; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); color: var(--ui-danger); font-size: 13px; }
+.ui-crontab-error pre { margin: 0; overflow-x: auto; font: 13px/1.4 var(--ui-mono); }
+.ui-crontab-says { margin: 0; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.ui-crontab-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-crontab .ui-crontab-sub { margin: 0; font-size: 13px; font-weight: 600; }
+.ui-crontab-runs { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; font-variant-numeric: tabular-nums; }
+@media (prefers-reduced-motion: reduce) { .ui-crontab-input { transition: none; } }
+`
+
+let cron_builder_months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+let cron_builder_days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+let cron_builder_longest = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+let cron_builder_most_chars = 500
+let cron_builder_most_years = 40
+
+let cron_builder_macros = { "@yearly": "0 0 1 1 *", "@annually": "0 0 1 1 *", "@monthly": "0 0 1 * *", "@weekly": "0 0 * * 0", "@daily": "0 0 * * *", "@midnight": "0 0 * * *", "@hourly": "0 * * * *" }
+
+// The five fields: what they are called, their bounds, and the names they take.
+let cron_builder_slots = [
+    { name: "minute", label: "Minute", lo: 0, hi: 59, words: [] },
+    { name: "hour", label: "Hour", lo: 0, hi: 23, words: [] },
+    { name: "day", label: "Day of the month", lo: 1, hi: 31, words: [] },
+    { name: "month", label: "Month", lo: 1, hi: 12, words: ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"] },
+    { name: "weekday", label: "Weekday", lo: 0, hi: 7, words: ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] },
+]
+
+let cron_builder_zone_list = ["UTC", "Africa/Johannesburg", "Africa/Lagos", "Africa/Nairobi", "America/Argentina/Buenos_Aires", "America/Chicago", "America/Denver", "America/Los_Angeles",
+                              "America/Mexico_City", "America/New_York", "America/Sao_Paulo", "America/Toronto", "Asia/Dubai", "Asia/Hong_Kong", "Asia/Kolkata", "Asia/Manila", "Asia/Seoul",
+                              "Asia/Shanghai", "Asia/Singapore", "Asia/Tokyo", "Australia/Sydney", "Europe/Berlin", "Europe/Lisbon", "Europe/London", "Europe/Madrid", "Europe/Paris", "Europe/Rome",
+                              "Pacific/Auckland"]
+
+// A number or a name in a field: { n } or { why }.
+fn cron_builder_value(token: str, slot: map) -> map {
+    if re.test(token, "^\\d{1,9}$") {
+        let n = int(token)
+        if n < slot.lo { return { why: `${token} is below ${slot.lo}.` } }
+        if n > slot.hi { return { why: `${token} is above ${slot.hi}.` } }
+        return { n }
+    }
+    let i = index_of(slot.words, lower(token))
+    if i != null { return { n: slot.name == "month" ? i + 1 : i } }
+    { why: token == "" ? "a value is missing here." : `"${token}" is not a value here.` }
+}
+
+// One item of a list: { values } or { why, at } with at inside the item.
+fn cron_builder_item(item: str, slot: map) -> map {
+    let halves = split(item, "/")
+    if len(halves) > 2 { return { why: "only one / goes in an item.", at: 0 } }
+    let body = halves[0]
+    let step = 1
+    if len(halves) == 2 {
+        if !re.test(halves[1], "^\\d{1,9}$") { return { why: `a step is a whole number, not "${halves[1]}".`, at: len(body) + 1 } }
+        step = int(halves[1])
+        if step == 0 { return { why: "a step of 0 never moves on.", at: len(body) + 1 } }
+        if body != "*" && !contains(body, "-") { return { why: `a step goes on * or a range: write ${body}-${slot.hi}/${step}.`, at: 0 } }
+    }
+    if body == "*" { return { values: range(slot.lo, slot.name == "weekday" ? 7 : slot.hi + 1) | filter((n) => (n - slot.lo) % step == 0), star: true } }
+    let ends = split(body, "-")
+    if len(ends) > 2 { return { why: `"${body}" has more than one -.`, at: 0 } }
+    let from = cron_builder_value(ends[0], slot)
+    if from.why != null { return { why: from.why, at: 0 } }
+    if len(ends) == 1 { return { values: [from.n] } }
+    let to = cron_builder_value(ends[1], slot)
+    if to.why != null { return { why: to.why, at: len(ends[0]) + 1 } }
+    if to.n < from.n { return { why: `${body} runs backwards: write the lower one first.`, at: 0 } }
+    { values: range(from.n, to.n + 1) | filter((n) => (n - from.n) % step == 0) }
+}
+
+// One field: { text, values, star, whole } or { why, at } with at inside the field.
+fn cron_builder_field(text: str, slot: map) -> map {
+    let values = []
+    let star = false
+    let offset = 0
+    for item in split(text, ",") {
+        let r = cron_builder_item(item, slot)
+        if r.why != null { return { why: r.why, at: offset + r.at } }
+        values = values + r.values
+        if r.star == true { star = true }
+        offset += len(item) + 1
+    }
+    // 7 is Sunday too.
+    let days = slot.name == "weekday" ? values | map((n) => n % 7) : values
+    let held = sort(unique(days))
+    { text, values: held, star: starts_with(text, "*"), whole: len(held) == (slot.name == "weekday" ? 7 : slot.hi - slot.lo + 1) }
+}
+
+// "a, b and c".
+fn cron_builder_words(xs: list) -> str {
+    let n = len(xs)
+    if n <= 1 { return join(xs, "") }
+    join(take(xs, n - 1), ", ") + " and " + xs[n - 1]
+}
+
+// The days of a schedule that no month has: why it never runs, or null. Only when the
+// weekday cannot rescue it, and a day that only leap years have is fine.
+fn cron_builder_never(day: map, month: map, weekday: map) {
+    if day.star || !weekday.star { return null }
+    let fits = (d: int, m: int) => d <= cron_builder_longest[m - 1]
+    if any(day.values, (d) => any(month.values, (m) => fits(d, m))) { return null }
+    let days = cron_builder_words(day.values | map(str))
+    let months = cron_builder_words(month.values | map((m) => cron_builder_months[m - 1]))
+    let many = len(day.values) > 1
+    `Day${many ? "s" : ""} ${days} never come${many ? "" : "s"} in ${months}.`
+}
+
+// A cron line read: { text, fields: [5 fields], minute, hour, day, month, weekday }, or
+// { error, at, end } with the place in the line.
+fn cron_builder_parse(line) -> map {
+    let raw = type_of(line) == "str" ? trim(line) : ""
+    if raw == "" { return { error: "Enter five fields: minute, hour, day of the month, month, weekday.", at: 0, end: 0 } }
+    if len(raw) > cron_builder_most_chars { return { error: `That is ${len(raw)} characters; a line here is at most ${cron_builder_most_chars}.`, at: 0, end: 1 } }
+    if raw == "@reboot" { return { error: "@reboot runs at start-up, so it has no times to show.", at: 0, end: 7 } }
+    let macro = get(cron_builder_macros, lower(raw))
+    if starts_with(raw, "@") && macro == null { return { error: `${raw} is not one of @yearly, @monthly, @weekly, @daily and @hourly.`, at: 0, end: len(raw) } }
+    let text = macro ?? raw
+    let parts = re.find_all(text, "\\S+")
+    if len(parts) != 5 {
+        let extra = len(parts) > 5 ? parts[5].start : len(text)
+        return { error: `A cron line has five fields; this has ${len(parts)}.`, at: extra, end: len(text) }
+    }
+    let fields = []
+    for [i, p] in enumerate(parts) {
+        let slot = cron_builder_slots[i]
+        let f = cron_builder_field(p.text, slot)
+        if f.why != null { return { error: `${slot.label}: ${f.why}`, at: p.start + f.at, end: p.end } }
+        fields = push(fields, f)
+    }
+    let never = cron_builder_never(fields[2], fields[3], fields[4])
+    if never != null { return { error: never, at: parts[2].start, end: parts[3].end } }
+    { text, fields, minute: fields[0], hour: fields[1], day: fields[2], month: fields[3], weekday: fields[4] }
+}
+
+fn cron_builder_two(n: int) -> str = n < 10 ? `0${n}` : str(n)
+
+// Runs of neighbours in sorted numbers: [[1, 2, 3], [7]].
+fn cron_builder_runs_of(xs: list) -> list {
+    let out = []
+    for x in xs {
+        let tail = len(out) > 0 ? out[-1] : null
+        out = tail != null && tail[-1] == x - 1 ? set(out, len(out) - 1, push(tail, x)) : push(out, [x])
+    }
+    out
+}
+
+// Numbers as words, runs of three or more as "1 to 5".
+fn cron_builder_spans(xs: list, word) -> str =
+    cron_builder_words(flatten(cron_builder_runs_of(xs) | map((r) => len(r) >= 3 ? [`${word(r[0])} to ${word(r[-1])}`] : r | map(word))))
+
+// The step an evenly spaced field has, or null: */15 is 15.
+fn cron_builder_step_of(f: map) {
+    let m = re.find(f.text, "^\\*/(\\d+)$")
+    m != null ? int(m.groups[0]) : null
+}
+
+// The time part in English.
+fn cron_builder_clock(c: map) -> str {
+    let mins = c.minute
+    let hours = c.hour
+    let every_hour = hours.whole
+    let step = cron_builder_step_of(mins)
+    let hour_step = cron_builder_step_of(hours)
+    if mins.whole && every_hour { return "Every minute" }
+    if mins.whole {
+        let blocks = cron_builder_runs_of(hours.values) | map((r) => `${cron_builder_two(r[0])}:00 to ${cron_builder_two(r[-1])}:59`)
+        return `Every minute from ${cron_builder_words(blocks)}`
+    }
+    if step != null && step > 1 && every_hour { return `Every ${step} minutes` }
+    if every_hour {
+        return mins.values == [0] ? "At the start of every hour" : `At minute ${cron_builder_spans(mins.values, str)} of every hour`
+    }
+    if hour_step != null && hour_step > 1 && len(mins.values) == 1 { return `Every ${hour_step} hours, at minute ${mins.values[0]}` }
+    let times = flatten(hours.values | map((h) => mins.values | map((m) => `${cron_builder_two(h)}:${cron_builder_two(m)}`)))
+    if len(times) <= 8 { return `At ${cron_builder_words(times)}` }
+    `At minute ${cron_builder_spans(mins.values, str)} of ${cron_builder_spans(hours.values, (h) => `${cron_builder_two(h)}:00`)}`
+}
+
+fn cron_builder_month_names(c: map) -> str =
+    cron_builder_spans(c.month.values, (m) => cron_builder_months[m - 1])
+
+// A weekday's words, Monday first, as a week is read here.
+fn cron_builder_day_names(c: map) -> str {
+    let values = c.weekday.values
+    let week = (values | filter((d) => d != 0)) + (contains(values, 0) ? [7] : [])
+    cron_builder_spans(week, (d) => cron_builder_days[d % 7])
+}
+
+// 2nd, 3rd, 11th.
+fn cron_builder_nth(n: int) -> str {
+    let tens = n % 100
+    let word = tens >= 11 && tens <= 13 ? "th" : (n % 10 == 1 ? "st" : (n % 10 == 2 ? "nd" : (n % 10 == 3 ? "rd" : "th")))
+    `${n}${word}`
+}
+
+// The line in English.
+fn cron_builder_describe(c: map) -> str {
+    let by_day = !c.day.whole
+    let by_week = !c.weekday.whole
+    let some_months = !c.month.whole
+    let step = cron_builder_step_of(c.day)
+    let day_words = step != null && step > 1 ? `on every ${cron_builder_nth(step)} day` : `on day ${cron_builder_spans(c.day.values, str)}`
+    let of_month = some_months ? ` of ${cron_builder_month_names(c)}` : " of the month"
+    let in_month = some_months ? ` in ${cron_builder_month_names(c)}` : ""
+    let names = cron_builder_day_names(c)
+    let when = if by_day && by_week {
+        c.day.star || c.weekday.star ? `${day_words}${of_month}, if it is a ${names}` : `${day_words}${of_month} or on ${names}${in_month}`
+    } else if by_day {
+        `${day_words}${of_month}`
+    } else if by_week {
+        `on ${names}${in_month}`
+    } else {
+        some_months ? `every day${in_month}` : ""
+    }
+    when == "" ? cron_builder_clock(c) : `${cron_builder_clock(c)} ${when}`
+}
+
+// Whether a date runs: as crontab, either of the day and the weekday when both are given.
+fn cron_builder_on(c: map, d: int, weekday: int) -> bool {
+    let by_day = contains(c.day.values, d)
+    let by_week = contains(c.weekday.values, weekday)
+    c.day.star || c.weekday.star ? by_day && by_week : by_day || by_week
+}
+
+// The next n runs after `from` as date-times at the zone's offset; fewer if 40 years
+// hold no more. Each day is walked in the zone's own calendar, and date.at gives the
+// instant, so daylight saving falls where it should.
+fn cron_builder_next(c: map, from: str, zone: str, n: int) -> list {
+    let start = date.to_zone(from, zone)
+    let was = date.parts(start)
+    let begun = date.ms(from)
+    let out = []
+    let y = was.year
+    let m = was.month
+    let d = was.day
+    let top = min([y + cron_builder_most_years, 9999])
+    while len(out) < n && y <= top {
+        let room = date.days_in_month(y, m)
+        if d > room || !contains(c.month.values, m) {
+            d = 1
+            m += 1
+            if m > 12 {
+                m = 1
+                y += 1
+            }
+        } else {
+            let day_text = date.of(y, m, d)
+            if cron_builder_on(c, d, date.weekday(day_text) % 7) {
+                let first_day = y == was.year && m == was.month && d == was.day
+                for h in c.hour.values {
+                    if len(out) < n && (!first_day || h >= was.hour - 1) {
+                        for mi in c.minute.values {
+                            if len(out) < n {
+                                let wall = `${cron_builder_two(h)}:${cron_builder_two(mi)}`
+                                let at = date.at(day_text, wall, zone)
+                                // A skipped time comes back moved forward: it is not this time.
+                                if slice(at, 11, 16) == wall && date.ms(at) > begun { out = push(out, at) }
+                            }
+                        }
+                    }
+                }
+            }
+            d += 1
+        }
+    }
+    out
+}
+
+// Whether a zone can be given to date.*, which throws on an unknown name: those the list
+// has, offsets, and UTC.
+fn cron_builder_known(zone: str, zones: list) -> bool =
+    contains(zones, zone) || zone == "UTC" || re.test(zone, "^[+-]\\d{2}:\\d{2}$")
+
+// The dropdown for a field: [{ value, label }], with what the line holds if none is it.
+fn cron_builder_choices(i: int, current) -> list {
+    let plain = match i {
+        0 => [{ value: "*", label: "Every minute" }, { value: "*/5", label: "Every 5 minutes" }, { value: "*/10", label: "Every 10 minutes" }, { value: "*/15", label: "Every 15 minutes" },
+              { value: "*/30", label: "Every 30 minutes" }] + (range(60) | map((n) => { value: str(n), label: `Minute ${n}` }))
+        1 => [{ value: "*", label: "Every hour" }, { value: "*/2", label: "Every 2 hours" }, { value: "*/3", label: "Every 3 hours" }, { value: "*/6", label: "Every 6 hours" },
+              { value: "*/12", label: "Every 12 hours" }] + (range(24) | map((n) => { value: str(n), label: `${cron_builder_two(n)}:00` }))
+        2 => [{ value: "*", label: "Every day" }] + (range(1, 32) | map((n) => { value: str(n), label: `Day ${n}` }))
+        3 => [{ value: "*", label: "Every month" }] + (range(1, 13) | map((n) => { value: str(n), label: cron_builder_months[n - 1] }))
+        _ => [{ value: "*", label: "Every weekday" }, { value: "1-5", label: "Monday to Friday" }, { value: "0,6", label: "Saturday and Sunday" }]
+             + (range(0, 7) | map((n) => { value: str(n), label: cron_builder_days[n] }))
+    }
+    current == null || any(plain, (o) => o.value == current) ? plain : [{ value: current, label: `As typed: ${current}` }] + plain
+}
+
+component CronBuilder(value: str = "0 9 * * 1-5", zone: str = "UTC", zones: list = cron_builder_zone_list, now: str? = null, id: str = "cron-builder", name: str = "cron",
+                      title: str = "Cron schedule", on_change = null, class: str? = null) {
+    style global cron_builder_css
+    state line = value
+    state known = zones
+    state where = zone
+    state clock = now != null && date.valid(now, "date-time") ? now : null
+    let zone_ok = cron_builder_known(where, known)
+    let live_zone = zone_ok ? where : "UTC"
+    let c = cron_builder_parse(line)
+    let bad = c.error != null
+    let says = bad ? "" : cron_builder_describe(c)
+    let runs = bad || clock == null ? [] : cron_builder_next(c, clock, live_zone, 5)
+    let tokens = re.find_all(line, "\\S+") | map((t) => t.text)
+    let usable = len(tokens) == 5
+    let leap_only = !bad && !c.day.star && c.weekday.star && c.month.values == [2] && all(c.day.values, (d) => d == 29)
+    let shown = (iso: str) => date.format(iso, "ddd D MMM YYYY, HH:mm") + ` (${iso == date.to_zone(iso, "UTC") ? "UTC" : date.format(iso, "Z")})`
+    let tell = () => {
+        if on_change != null {
+            on_change({ expression: trim(line), description: says, next: runs, error: bad ? c.error : null })
+        }
+    }
+    let choose = (i: int, v: str) => {
+        let pad = usable ? tokens : ["*", "*", "*", "*", "*"]
+        line = join(set(pad, i, v), " ")
+        tell()
+    }
+    <section class={ui_cls(["ui-crontab", class])} id={id} aria-labelledby={`${id}-title`}
+             @mount={(el) => {
+                 if clock == null { clock = date.now() }
+                 let all_zones = js("Intl.supportedValuesOf", "timeZone")
+                 if type_of(all_zones) == "list" { known = unique(zones + all_zones) }
+             }}>
+        <h3.ui-crontab-title id={`${id}-title`}>{title}</h3>
+        <div.ui-crontab-field>
+            <label for={`${id}-line`}>Cron line</label>
+            <input.ui-crontab-input.ui-crontab-line type="text" id={`${id}-line`} name={name} value={line} autocomplete="off" spellcheck="false"
+                   aria-invalid={bad ? "true" : null} aria-describedby={bad ? `${id}-error` : null} @input={(e) => { line = e.value; tell() }}/>
+        </div>
+        <div.ui-crontab-picks>
+            {for [i, s] in enumerate(cron_builder_slots) => <div.ui-crontab-field key={s.name}>
+                <label for={`${id}-${s.name}`}>{s.label}</label>
+                <select.ui-crontab-input id={`${id}-${s.name}`} data-slot={i} @change={(e) => choose(i, e.value)}>
+                    {for o in cron_builder_choices(i, usable ? tokens[i] : null) => <option key={o.value} value={o.value} selected={o.value == (usable ? tokens[i] : "*")}>{o.label}</option>}
+                </select>
+            </div>}
+        </div>
+        {bad && <div.ui-crontab-error id={`${id}-error`} role="alert">
+            <span>{c.error}</span>
+            <pre aria-hidden="true">{`${line}\n${repeat(" ", c.at + len(line) - len(re.replace(line, "^\\s+", "")))}^`}</pre>
+        </div>}
+        {!bad && <p.ui-crontab-says aria-live="polite">{says}</p>}
+        {leap_only && <p.ui-crontab-note>29 February comes only in leap years.</p>}
+        <div.ui-crontab-field>
+            <label for={`${id}-zone`}>Time zone</label>
+            <select.ui-crontab-input id={`${id}-zone`} @change={(e) => { where = e.value; tell() }}>
+                {!zone_ok && <option value={where} selected={true}>{`${where} (not known)`}</option>}
+                {for z in known => <option key={z} value={z} selected={z == where}>{z}</option>}
+            </select>
+        </div>
+        {!zone_ok && <p.ui-crontab-note role="alert">{`${where} is not a known time zone, so these are in UTC.`}</p>}
+        {!bad && <h4.ui-crontab-sub>Next 5 runs</h4>}
+        {!bad && len(runs) > 0 && <ol.ui-crontab-runs>
+            {for r in runs => <li key={r}><time datetime={r}>{shown(r)}</time></li>}
+        </ol>}
+        {!bad && clock != null && len(runs) == 0 && <p.ui-crontab-note>No run in the next 40 years.</p>}
+        {!bad && clock != null && len(runs) > 0 && len(runs) < 5 && <p.ui-crontab-note>{`Only ${len(runs)} in the next 40 years.`}</p>}
+    </section>
+}

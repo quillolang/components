@@ -1,0 +1,352 @@
+// JwtInspector: reads a JSON Web Token in the browser, and nothing leaves the page. It
+// decodes the header and payload, reads exp, nbf and iat as dates and as time from now,
+// and warns of what makes a token unsafe: alg none, no exp, an expired or not yet valid
+// token, dates that contradict each other, a header naming its own key, secrets in a
+// payload anyone can read. It says plainly, every time, that the signature was not
+// verified, as that needs the key, and decoded claims prove nothing until it is. Numbers
+// are shown as the token wrote them, as a parse in the browser would round a large id.
+//
+//   <JwtInspector token={token} now="2026-11-01T12:00:00Z"/>
+//   <JwtInspector on_change={(r) => { expired = r.expired }}/>
+//
+// token: the token it starts with. A pasted `Bearer ` prefix, quotes and line breaks are
+// taken off. now: the time to compare with, a date-time or milliseconds, for a page that
+// must not change; left out, the browser's clock, once it has started, so the server's
+// page says nothing about now. title: its heading. id: a prefix for its ids, unique on
+// the page. name: the field's name ("token"). on_change(result): inside one of your
+// components, given { ok, alg, expired, warnings } after a change: warnings is how many
+// there are, expired true, false or null without an exp. class: more classes for its
+// outer element.
+//
+// jwt_inspector_read(token, now_ms) is the reading, for a program's own use: { empty,
+// error, parts, header, payload (each { text, value, error }), signature_bytes, claims,
+// warnings: [{ tone, text }], expired }. jwt_inspector_bytes(text) and
+// jwt_inspector_utf8(bytes) are base64url and UTF-8, which Quillo has no builtin for.
+
+import ui/theme.qwe use ui_cls
+import ui/json_formatter.qwe use json_formatter_check, json_formatter_write
+
+let jwt_inspector_css = css`
+.ui-jwt { display: grid; gap: 12px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-jwt .ui-jwt-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-jwt-field { display: grid; gap: 5px; min-width: 0; }
+.ui-jwt-field label { font-size: 13px; font-weight: 500; }
+.ui-jwt-field textarea { box-sizing: border-box; width: 100%; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 13px/1.5 var(--ui-mono); overflow-wrap: anywhere; resize: vertical; }
+.ui-jwt-field textarea:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-jwt-field textarea[aria-invalid] { border-color: var(--ui-danger); }
+.ui-jwt-unverified { margin: 0; padding: 10px 12px; border-left: 4px solid var(--ui-warning); border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); font-weight: 500; }
+.ui-jwt-error { margin: 0; color: var(--ui-danger); font-size: 13px; overflow-wrap: anywhere; }
+.ui-jwt-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-jwt-warnings { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-jwt-warnings li { padding: 7px 12px; border-left: 4px solid var(--ui-warning); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); overflow-wrap: anywhere; }
+.ui-jwt-warnings .ui-jwt-danger { border-left-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-jwt-scroll { overflow-x: auto; }
+.ui-jwt-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-jwt table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-jwt caption { padding: 0 0 6px; text-align: left; font-weight: 600; }
+.ui-jwt th, .ui-jwt td { padding: 6px 8px; border-bottom: 1px solid var(--ui-border); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.ui-jwt tbody th { font: 500 13px var(--ui-mono); white-space: nowrap; }
+.ui-jwt thead th { color: var(--ui-muted); font-weight: 500; }
+.ui-jwt-time { display: block; color: var(--ui-muted); font-size: 12px; }
+.ui-jwt-parts { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.ui-jwt-part { display: grid; gap: 4px; min-width: 0; align-content: start; }
+.ui-jwt-part h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.ui-jwt-part pre { margin: 0; padding: 8px 10px; overflow: auto; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font: 12px/1.5 var(--ui-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-jwt-part pre:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+`
+
+let jwt_inspector_alphabet = split("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", "")
+let jwt_inspector_values = reduce(enumerate(jwt_inspector_alphabet), { "+": 62, "/": 63 }, (m, p) => set(m, p[1], p[0]))
+let jwt_inspector_hex = split("0123456789abcdef", "")
+let jwt_inspector_most = 100000
+let jwt_inspector_labels = { iss: "Issuer", sub: "Subject", aud: "Audience", exp: "Expires", nbf: "Not before", iat: "Issued at", jti: "Token id", auth_time: "Signed in at" }
+let jwt_inspector_order = ["iss", "sub", "aud", "iat", "nbf", "exp", "auth_time", "jti"]
+let jwt_inspector_times = ["iat", "nbf", "exp", "auth_time"]
+let jwt_inspector_algs = ["HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512", "EdDSA", "ES256K"]
+// The largest second the `date` module can write: the end of year 9999.
+let jwt_inspector_last_second = 253402300799
+
+// base64url (or plain base64, or with its padding) to bytes: { bytes } or { at, char },
+// the first character that cannot be one, or { short: true } for a length that cannot be.
+fn jwt_inspector_bytes(text: str) -> map {
+    let bare = re.replace(text, "=+$", "")
+    let chars = split(bare, "")
+    let n = len(chars)
+    let wrong = find(enumerate(chars), (p) => !has(jwt_inspector_values, p[1]))
+    if wrong != null { return { at: wrong[0], char: wrong[1] } }
+    if n % 4 == 1 { return { short: true } }
+    // Group by group with `for`, not `push`, which in the browser copies the list.
+    let val = (i: int) => i < n ? get(jwt_inspector_values, chars[i]) : 0
+    let groups = for g in 0..ceil(n / 4) {
+        let i = g * 4
+        let a = val(i)
+        let b = val(i + 1)
+        let c = val(i + 2)
+        let d = val(i + 3)
+        let have = min([n - i, 4])
+        let all_three = [a * 4 + floor(b / 16), (b % 16) * 16 + floor(c / 4), (c % 4) * 64 + d]
+        take(all_three, have - 1)
+    }
+    { bytes: flatten(groups) }
+}
+
+fn jwt_inspector_escape(unit: int) -> str =
+    `\\u${jwt_inspector_hex[floor(unit / 4096)]}${jwt_inspector_hex[floor(unit / 256) % 16]}${jwt_inspector_hex[floor(unit / 16) % 16]}${jwt_inspector_hex[unit % 16]}`
+
+// Bytes to text, as Quillo has no way to make a character from its number but this:
+// JSON's escapes, with json.parse reading them. Bad bytes become U+FFFD.
+fn jwt_inspector_utf8(bytes: list) -> str {
+    // Text gathers in pieces of 512 escapes, as `push` in the browser copies the list
+    // each time, which a long list cannot afford.
+    let done = []
+    let out = []
+    let n = len(bytes)
+    let i = 0
+    while i < n {
+        if len(out) >= 512 {
+            done = push(done, join(out, ""))
+            out = []
+        }
+        let b = bytes[i]
+        let need = b < 128 ? 0 : (b >= 194 && b <= 223 ? 1 : (b >= 224 && b <= 239 ? 2 : (b >= 240 && b <= 244 ? 3 : -1)))
+        let cp = need == 0 ? b : (need == 1 ? b - 192 : (need == 2 ? b - 224 : b - 240))
+        let ok = need >= 0
+        let j = 1
+        while ok && j <= need {
+            let c = i + j < n ? bytes[i + j] : 0
+            if c < 128 || c > 191 { ok = false } else { cp = cp * 64 + c - 128; j += 1 }
+        }
+        if ok && ((need == 2 && (cp < 2048 || (cp >= 55296 && cp <= 57343))) || (need == 3 && (cp < 65536 || cp > 1114111))) { ok = false }
+        if !ok {
+            out = push(out, "\\ufffd")
+            i += 1
+        } else {
+            if cp >= 65536 {
+                let v = cp - 65536
+                out = push(out, jwt_inspector_escape(55296 + floor(v / 1024)))
+                out = push(out, jwt_inspector_escape(56320 + v % 1024))
+            } else {
+                out = push(out, jwt_inspector_escape(cp))
+            }
+            i += need + 1
+        }
+    }
+    json.parse(`"${join(done, "")}${join(out, "")}"`)
+}
+
+// One of the JSON parts: { text, value, tree, error }.
+fn jwt_inspector_part(segment: str, name: str) -> map {
+    let no = (error: str) => { text: null, value: null, tree: null, error }
+    if segment == "" { return no(`The ${name} is empty.`) }
+    let d = jwt_inspector_bytes(segment)
+    if d.short == true { return no(`The ${name} has a length no base64url text can have, so it is cut short.`) }
+    if d.char != null { return no(`The ${name} is not base64url: ${d.char} at character ${d.at + 1}.`) }
+    let text = jwt_inspector_utf8(d.bytes)
+    let c = json_formatter_check(text)
+    if !c.ok { return { text, value: null, tree: null, error: `The ${name} decodes, but is not JSON${c.error != null ? ` (line ${c.error.line}, column ${c.error.column})` : ""}.` } }
+    if c.tree.o == null { return { text, value: null, tree: null, error: `The ${name} decodes, but is not a JSON object.` } }
+    { text, value: json.parse(text), tree: c.tree, error: null }
+}
+
+// A claim's text: a string as it reads, the rest as the token wrote it.
+fn jwt_inspector_shown(node: map) -> str {
+    if node.t != null && starts_with(node.t, "\"") { return json.parse(node.t) }
+    json_formatter_write(node, null, false, "")
+}
+
+// A length of time, the two largest units: "1 h 5 min", "2 days 3 h".
+fn jwt_inspector_span(seconds) -> str {
+    let s = int(seconds)
+    let d = floor(s / 86400)
+    let h = floor((s % 86400) / 3600)
+    let m = floor((s % 3600) / 60)
+    d > 0 ? join([`${d} ${d == 1 ? "day" : "days"}`, h > 0 ? `${h} h` : null] | filter((x) => x != null), " ")
+        : (h > 0 ? join([`${h} h`, m > 0 ? `${m} min` : null] | filter((x) => x != null), " ")
+        : (m > 0 ? `${m} min` : `${s} s`))
+}
+
+// "in 1 h 5 min", "2 days 3 h ago", "now". seconds: from now to then.
+fn jwt_inspector_relative(seconds) -> str {
+    if int(abs(seconds)) == 0 { return "now" }
+    seconds > 0 ? `in ${jwt_inspector_span(seconds)}` : `${jwt_inspector_span(abs(seconds))} ago`
+}
+
+// A claim's seconds as a date, or null past what a date can be.
+fn jwt_inspector_date(seconds) -> str? {
+    if seconds < 0 || seconds > jwt_inspector_last_second { return null }
+    date.format(date.from_ms(int(seconds * 1000), "UTC"), "YYYY-MM-DD HH:mm:ss [UTC]")
+}
+
+// The claims as rows: { key, label, text, date, relative, seconds, problem }, the
+// registered ones first, in the order they matter.
+fn jwt_inspector_claims(payload: map, now_ms) -> list {
+    let pairs = payload.tree.o | map((p) => { key: json.parse(p[0]), node: p[1] })
+    let named = jwt_inspector_order | map((k) => find(pairs, (p) => p.key == k)) | filter((p) => p != null)
+    let others = pairs | filter((p) => !contains(jwt_inspector_order, p.key))
+    (named + others) | map((p) => {
+        let base = { key: p.key, label: get(jwt_inspector_labels, p.key), text: jwt_inspector_shown(p.node), date: null, relative: null, seconds: null, problem: null }
+        if !contains(jwt_inspector_times, p.key) { return base }
+        let v = p.node.t != null ? json.parse(p.node.t) : null
+        let numeric = type_of(v) == "int" || type_of(v) == "float"
+        if !numeric { return { ...base, problem: `${p.key} must be a number of seconds, and this is not one.` } }
+        let when = jwt_inspector_date(v)
+        if when == null {
+            let as_ms = v > 0 ? jwt_inspector_date(v / 1000) : null
+            return { ...base, seconds: v, problem: as_ms != null ? `${p.key} looks like milliseconds: JWT times are seconds. As milliseconds it would be ${as_ms}.` : `${p.key} is not a date that can be.` }
+        }
+        { ...base, seconds: v, date: when, relative: now_ms == null ? null : jwt_inspector_relative(v - now_ms / 1000) }
+    })
+}
+
+fn jwt_inspector_claim(claims: list, key: str) = find(claims, (c) => c.key == key)
+
+// What is worth saying about a token: [{ tone, text }], the worst first.
+fn jwt_inspector_warnings(header: map, payload: map, parts: int, signature_bytes: int, claims: list, now_ms) -> list {
+    let danger = []
+    let warn = []
+    let h = header.value
+    let alg = h == null ? null : h.alg
+    if h != null {
+        if alg == null { danger = push(danger, "There is no alg in the header, so nothing says how it is signed.") }
+        else if type_of(alg) != "str" { danger = push(danger, "alg is not text.") }
+        else if lower(trim(alg)) == "none" {
+            danger = push(danger, signature_bytes > 0 ? `alg is ${alg}, yet there is a signature. A verifier that believes the header would skip it: refuse this token.`
+                : `alg is ${alg}: this token has no signature at all, and anyone could have written it. Refuse it.`)
+        } else {
+            if signature_bytes == 0 { danger = push(danger, `alg is ${alg}, but the signature is empty.`) }
+            if !contains(jwt_inspector_algs, alg) { warn = push(warn, `alg ${alg} is not one of the usual algorithms.`) }
+        }
+        for k in ["jku", "x5u", "jwk"] {
+            if has(h, k) { warn = push(warn, `The header carries ${k}, naming its own key. Never fetch or trust a key because the token says so.`) }
+        }
+    }
+    if payload.value != null {
+        let exp = jwt_inspector_claim(claims, "exp")
+        let nbf = jwt_inspector_claim(claims, "nbf")
+        let iat = jwt_inspector_claim(claims, "iat")
+        let e = exp == null ? null : exp.seconds
+        let n = nbf == null ? null : nbf.seconds
+        let i = iat == null ? null : iat.seconds
+        if exp == null { warn = push(warn, "There is no exp, so this token never expires.") }
+        for c in claims {
+            if c.problem != null { warn = push(warn, c.problem) }
+        }
+        if now_ms != null {
+            let at = now_ms / 1000
+            if e != null && exp.date != null && e <= at { danger = push(danger, `Expired ${jwt_inspector_relative(e - at)}.`) }
+            if n != null && nbf.date != null && n > at { danger = push(danger, `Not valid yet: nbf is ${jwt_inspector_relative(n - at)}.`) }
+            if i != null && iat.date != null && i > at { warn = push(warn, `Issued in the future, ${jwt_inspector_relative(i - at)}: a clock is wrong, or this was made by hand.`) }
+        }
+        if e != null && i != null && e <= i { warn = push(warn, "exp is not after iat, so it was never valid.") }
+        if e != null && n != null && e <= n { warn = push(warn, "exp is not after nbf, so it was never valid.") }
+        if e != null && i != null && e > i && e - i > 31536000 { warn = push(warn, `It lasts ${jwt_inspector_span(e - i)} from issue, over a year: a stolen copy works that long.`) }
+        let private_keys = keys(payload.value) | filter((k) => re.test(lower(k), "pass(word|wd)?$|pwd|secret|private|credit|card_?number|ssn|api_?key"))
+        if len(private_keys) > 0 { warn = push(warn, `The payload names ${join(private_keys, ", ")}. A payload is only encoded, so anyone holding the token can read it.`) }
+    }
+    (danger | map((t) => { tone: "danger", text: t })) + (warn | map((t) => { tone: "warn", text: t }))
+}
+
+// Takes off what comes with a pasted token.
+fn jwt_inspector_clean(text: str) -> str {
+    let t = re.replace(trim(text), "\\s+", " ")
+    let bare = re.replace(t, "^(?:Authorization:\\s*)?Bearer\\s+", "", "i")
+    let inner = re.test(bare, "^[\"'].*[\"']$") ? slice(bare, 1, len(bare) - 1) : bare
+    replace(inner, " ", "")
+}
+
+// Reads a token. See the top of the file.
+fn jwt_inspector_read(token: str, now_ms) -> map {
+    let none = { text: null, value: null, tree: null, error: null }
+    let base = { empty: false, error: null, parts: 0, header: none, payload: none, signature_bytes: 0, claims: [], warnings: [], encrypted: false, expired: null }
+    if len(token) > jwt_inspector_most { return { ...base, error: `This is ${format_number(len(token), "en-US", 0)} characters, too long for a token: it stops at ${format_number(jwt_inspector_most, "en-US", 0)}.` } }
+    let t = jwt_inspector_clean(token)
+    if t == "" { return { ...base, empty: true } }
+    let segs = split(t, ".")
+    let n = len(segs)
+    if n == 1 { return { ...base, parts: 1, error: "A token has parts with dots between them, and this has no dots." } }
+    if n != 2 && n != 3 && n != 5 { return { ...base, parts: n, error: `This has ${n} parts. A signed token has 3 and an encrypted one 5.` } }
+    let header = jwt_inspector_part(segs[0], "header")
+    if n == 5 {
+        let w = header.value != null ? [{ tone: "warn", text: "This token is encrypted, so its payload cannot be read here, only the header." }] : []
+        return { ...base, parts: 5, encrypted: true, header, warnings: w }
+    }
+    let payload = jwt_inspector_part(segs[1], "payload")
+    let sig_text = n == 3 ? segs[2] : ""
+    let sig = jwt_inspector_bytes(sig_text)
+    let sig_bytes = sig.bytes == null ? 0 : len(sig.bytes)
+    let claims = payload.tree != null ? jwt_inspector_claims(payload, now_ms) : []
+    let warnings = jwt_inspector_warnings(header, payload, n, sig_bytes, claims, now_ms)
+    let exp = jwt_inspector_claim(claims, "exp")
+    let sig_warn = n == 2 ? [{ tone: "danger", text: "There is no third part, so no signature." }]
+        : (sig.bytes == null ? [{ tone: "danger", text: "The signature is not base64url." }] : [])
+    { ...base, parts: n, header, payload, signature_bytes: sig_bytes, claims, warnings: sig_warn + warnings,
+      expired: now_ms == null || exp == null || exp.date == null ? null : exp.seconds <= now_ms / 1000 }
+}
+
+fn jwt_inspector_pretty(part: map) -> str {
+    if part.tree == null { return part.text ?? "" }
+    json_formatter_write(part.tree, "  ", false, "")
+}
+
+// A time given as a date-time or milliseconds, as milliseconds, or null.
+fn jwt_inspector_ms(x) {
+    if type_of(x) == "int" || type_of(x) == "float" { return int(x) }
+    type_of(x) == "str" && date.valid(x) ? date.ms(x) : null
+}
+
+// Here, as a prop named `now` hides the builtin in the component.
+fn jwt_inspector_clock() -> int = now()
+
+component JwtInspector(token: str = "", now = null, title: str = "JWT inspector", id: str = "jwt-inspector", name: str = "token", on_change = null, class: str? = null) {
+    style global jwt_inspector_css
+    state text = token
+    state clock = jwt_inspector_ms(now)
+    let r = jwt_inspector_read(text, clock)
+    let tell = (t: str) => {
+        if on_change != null {
+            let x = jwt_inspector_read(t, clock)
+            on_change({ ok: x.error == null && !x.empty && x.header.error == null && x.payload.error == null, alg: x.header.value == null ? null : x.header.value.alg,
+                        expired: x.expired, warnings: len(x.warnings) })
+        }
+    }
+    let read_any = r.header.text != null || r.payload.text != null
+    <section class={ui_cls(["ui-jwt", class])} aria-labelledby={`${id}-title`} @mount={() => { if clock == null { clock = jwt_inspector_clock() } }}>
+        <h3.ui-jwt-title id={`${id}-title`}>{title}</h3>
+        <div.ui-jwt-field>
+            <label for={`${id}-token`}>Token</label>
+            <textarea id={`${id}-token`} name={name} rows="4" spellcheck="false" autocomplete="off" value={text} placeholder="Paste a JWT. It stays in this page."
+                      aria-invalid={r.error != null ? "true" : null} @input={(e) => { text = e.value; tell(e.value) }}></textarea>
+        </div>
+        {r.empty && <p.ui-jwt-note>Paste a token to read it. Nothing is sent anywhere.</p>}
+        {r.error != null && <p.ui-jwt-error role="alert">{r.error}</p>}
+        {r.header.error != null && <p.ui-jwt-error role="alert">{r.header.error}</p>}
+        {r.payload.error != null && <p.ui-jwt-error role="alert">{r.payload.error}</p>}
+        {read_any && <p.ui-jwt-unverified role="status">The signature was not verified. This only decodes the token, so anyone could have written what it says.</p>}
+        {len(r.warnings) > 0 && <ul.ui-jwt-warnings aria-label="Warnings" aria-live="polite">
+            {for w in r.warnings => <li key={w.text} class={w.tone == "danger" ? "ui-jwt-danger" : null}>{w.text}</li>}
+        </ul>}
+        {len(r.claims) > 0 && <div.ui-jwt-scroll tabindex="0" role="region" aria-label="Claims">
+            <table>
+                <caption>Claims</caption>
+                <thead><tr><th scope="col">Claim</th><th scope="col">Means</th><th scope="col">Value</th></tr></thead>
+                <tbody>
+                    {for c in r.claims => <tr key={c.key}>
+                        <th scope="row">{c.key}</th>
+                        <td>{c.label ?? ""}</td>
+                        <td data-claim={c.key}>
+                            {c.date != null ? c.date : c.text}
+                            {c.date != null && <span.ui-jwt-time>{`${c.text}${c.relative != null ? `, ${c.relative}` : ""}`}</span>}
+                        </td>
+                    </tr>}
+                </tbody>
+            </table>
+        </div>}
+        {read_any && <div.ui-jwt-parts>
+            {r.header.text != null && <div.ui-jwt-part><h4>Header</h4><pre tabindex="0" data-part="header">{jwt_inspector_pretty(r.header)}</pre></div>}
+            {r.payload.text != null && <div.ui-jwt-part><h4>Payload</h4><pre tabindex="0" data-part="payload">{jwt_inspector_pretty(r.payload)}</pre></div>}
+        </div>}
+        {read_any && !r.encrypted && <p.ui-jwt-note data-signature>{r.parts == 3 ? `Signature: ${r.signature_bytes} ${r.signature_bytes == 1 ? "byte" : "bytes"}, not checked.` : "No signature part."}</p>}
+    </section>
+}

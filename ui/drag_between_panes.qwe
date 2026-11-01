@@ -1,0 +1,444 @@
+// DragBetweenPanes: move items from one pane to another by dragging, as on an iPad. On touch a
+// long press lifts an item, so a pane still scrolls under a passing finger, and its grip lifts it
+// at once; a pen or a mouse lifts it after a small move. A gap shows where it will land, and
+// says so when a pane is full. The keyboard has a route of its own, and each row a Move
+// list for anyone who would rather not drag.
+//
+//   import ui/drag_between_panes.qwe use DragBetweenPanes
+//
+//   component Plan() {
+//       state tasks = load_tasks()
+//       <div style="height: 70dvh">
+//           <DragBetweenPanes panes={[{ id: "todo", title: "To do" }, { id: "today", title: "Today", limit: 3 }]} items={tasks}
+//                             on_move={(id, from, to, index) => { save_move(id, to, index) }}/>
+//       </div>
+//   }
+//
+// panes: each { id, title, limit? }; limit is the most items it may hold. items: each { id, pane,
+// title, detail? }; one with no title, or a pane not listed, is left out, as is an id already
+// seen, and ids arrive as text. Their order is their order in the panes. A height from
+// outside lets the panes scroll by themselves. delay: the long press, in milliseconds (320).
+// label: its name for screen readers. class.
+// on_move(id, from_pane, to_pane, index): inside one of your components, called with where an
+// item landed, index being its place in the pane from 0. Letting go where it was, outside the
+// panes or over a full pane moves nothing and calls nothing.
+//
+// Keys, on a grip: Space or Enter lifts the item, the left and right arrows go from pane to
+// pane, up and down from place to place, Space or Enter puts it there and Escape puts it back.
+
+import ui/theme.qwe use ui_cls
+
+let drag_between_panes_css = css`
+.ui-drag-between-panes { position: relative; box-sizing: border-box; width: 100%; height: 100%; min-height: 280px; container-type: inline-size; color: var(--ui-fg); font: 15px/1.35 var(--ui-font); }
+.ui-drag-between-panes-grid { box-sizing: border-box; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 10px; height: 100%; padding: 10px max(10px, env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)); background: var(--ui-subtle); }
+.ui-drag-between-panes-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); transition: border-color .12s; }
+.ui-drag-between-panes-over { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-drag-between-panes-full { border-color: var(--ui-danger); }
+.ui-drag-between-panes-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex: none; padding: 10px 12px 8px; border-bottom: 1px solid var(--ui-border); }
+.ui-drag-between-panes-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+.ui-drag-between-panes-count { color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-drag-between-panes-list { flex: 1; min-height: 80px; margin: 0; padding: 6px; overflow-y: auto; overscroll-behavior-y: contain; list-style: none; }
+.ui-drag-between-panes-row { display: flex; align-items: center; gap: 2px; min-height: 60px; margin-bottom: 4px; padding-right: 4px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); touch-action: pan-y; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-drag-between-panes-parts { display: contents; }
+.ui-drag-between-panes-pressing { background: var(--ui-subtle); }
+.ui-drag-between-panes-source { opacity: .35; }
+.ui-drag-between-panes-grip { display: grid; flex: none; place-items: center; width: 44px; height: 52px; padding: 0; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: grab; touch-action: none; }
+.ui-drag-between-panes-grip svg { width: 20px; height: 20px; }
+.ui-drag-between-panes-grip:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-drag-between-panes-text { flex: 1; min-width: 0; }
+.ui-drag-between-panes-title { display: block; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-drag-between-panes-detail { display: block; overflow: hidden; color: var(--ui-muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.ui-drag-between-panes-move { flex: none; width: 76px; height: 44px; padding: 0 2px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); }
+.ui-drag-between-panes-move:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-drag-between-panes-slot { display: grid; place-items: center; height: 44px; margin-bottom: 4px; border: 2px dashed var(--ui-accent); border-radius: var(--ui-radius-sm); background: var(--ui-accent-soft); color: var(--ui-accent); font-size: 13px; font-weight: 500; }
+.ui-drag-between-panes-refused { border-color: var(--ui-danger); background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-drag-between-panes-empty { padding: 16px 8px; color: var(--ui-muted); font-size: 14px; text-align: center; }
+.ui-drag-between-panes-ghost { position: absolute; left: 0; top: 0; z-index: 20; display: none; box-sizing: border-box; min-height: 52px; padding: 8px 12px; align-items: center; border: 1px solid var(--ui-accent); border-radius: var(--ui-radius-sm); background: var(--ui-surface); box-shadow: var(--ui-shadow-lg); font-weight: 600; pointer-events: none; will-change: transform; }
+.ui-drag-between-panes-flying { display: flex; }
+/* In a narrow pane, in Split View or Slide Over, the panes stand one above the other. */
+@container (max-width: 560px) {
+  .ui-drag-between-panes-grid { grid-auto-flow: row; grid-auto-rows: minmax(0, 1fr); }
+  .ui-drag-between-panes-move { width: 64px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-drag-between-panes-pane { transition: none; } }
+`
+
+// The panes that can be used: those with a title, each id once, ids as text.
+fn drag_between_panes_panes(panes) -> list {
+    if type_of(panes) != "list" { return [] }
+    let named = panes | filter((p) => type_of(p) == "map" && get(p, "id") != null && get(p, "title") != null)
+    let all = named | map((p) => { { id: str(p.id), title: p.title, limit: type_of(get(p, "limit")) == "int" ? p.limit : null } })
+    let ids = all | map((p) => p.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// The items that can be shown: a title, a pane that exists, each id once, ids and panes as text.
+fn drag_between_panes_items(items, panes: list) -> list {
+    if type_of(items) != "list" { return [] }
+    let known = panes | map((p) => p.id)
+    let named = items | filter((i) => type_of(i) == "map" && get(i, "title") != null && contains(known, str(get(i, "pane") ?? "")))
+    let all = enumerate(named) | map((p) => { ...p[1], id: get(p[1], "id") != null ? str(p[1].id) : `_${p[0]}`, pane: str(p[1].pane) })
+    let ids = all | map((i) => i.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// All items, with id now the index-th of pane to. Others keep their order.
+fn drag_between_panes_move(rows: list, id: str, to: str, index: int) -> list {
+    let moved = find(rows, (r) => r.id == id)
+    if moved == null { return rows }
+    let others = rows | filter((r) => r.id != id)
+    let there = others | filter((r) => r.pane == to)
+    let placed = { ...moved, pane: to }
+    if index >= len(there) { return others | push(placed) }
+    let at = index_of(others | map((r) => r.id), there[max([index, 0])].id)
+    slice(others, 0, at) + [placed] + slice(others, at, len(others))
+}
+
+// May the item go into a pane holding count others? Staying where it is always may.
+fn drag_between_panes_fits(count: int, limit, same_pane: bool) -> bool {
+    same_pane || limit == null || count < limit
+}
+
+// The place at y in a pane, counting the rows whose middle is above it.
+fn drag_between_panes_place(middles: list, y: num) -> int {
+    len(middles | filter((m) => m < y))
+}
+
+// What a pane shows, in order, during a drag: its rows, and the gap at the place the item would
+// take, counted among the rows other than itself.
+fn drag_between_panes_shown(rows: list, moving: str, gap) -> list {
+    let plain = rows | map((r) => { { row: r, gap: false } })
+    if gap == null { return plain }
+    let slot = { row: null, gap: true }
+    let others = rows | filter((r) => r.id != moving)
+    if gap >= len(others) { return plain | push(slot) }
+    let at = index_of(rows | map((r) => r.id), others[gap].id)
+    slice(plain, 0, at) + [slot] + slice(plain, at, len(plain))
+}
+
+// Pixels a tick a pane scrolls for a finger near its ends.
+fn drag_between_panes_speed(y: num, top: num, bottom: num, zone: num, fastest: num) -> num {
+    if y < top + zone { return -round(fastest * min([1, (top + zone - y) / zone])) }
+    if y > bottom - zone { return round(fastest * min([1, (y - bottom + zone) / zone])) }
+    0
+}
+
+// The id of the sentence that says how the keys work.
+fn drag_between_panes_help(label: str) -> str {
+    `ui-drag-between-panes-help-${re.replace(lower(label), "[^a-z0-9]+", "-")}`
+}
+
+component DragBetweenPanes(panes = [], items = [], delay: int = 320, label: str = "Panes", on_move = null, class: str? = null) {
+    style global drag_between_panes_css
+    let boxes = drag_between_panes_panes(panes)
+    state rows = drag_between_panes_items(items, drag_between_panes_panes(panes))
+    state win = null
+    state root = null
+    state ghost = null
+    state ghost_title = ""
+    state lifted = ""          // the id of the item in the air
+    state by_key = false       // and it was lifted from the keyboard
+    state over = null          // { pane, index, ok } where it would land
+    state press = null         // a finger held on a row, waiting for its time
+    state said = ""
+    // What the handlers keep to themselves.
+    state g_pid = null
+    state g_wait = null        // a pen or a mouse on a row, not yet past the threshold: { x, y, row }
+    state g_row = null
+    state g_x = 0
+    state g_y = 0
+    state g_off_x = 0
+    state g_off_y = 0
+    state g_lists = []         // each pane's list, and the middles of its rows other than the one in the air
+    state g_from = ""
+    let in_pane = (id: str) => rows | filter((r) => r.pane == id)
+    let others_in = (id: str) => rows | filter((r) => r.pane == id && r.id != lifted)
+    let pane_title = (id: str) => (find(boxes, (p) => p.id == id) ?? { title: id }).title
+    let row_el = (id: str) => {
+        let all = root.querySelectorAll(".ui-drag-between-panes-row")
+        let found = range(0, all.length) | filter((i) => all[i].dataset.id == id)
+        len(found) > 0 ? all[found[0]] : null
+    }
+    let measure = (id: str) => {
+        let lists = root.querySelectorAll(".ui-drag-between-panes-list")
+        g_lists = range(0, lists.length) | map((n) => {
+            let el = lists[n]
+            let top = el.getBoundingClientRect().top
+            let kids = el.querySelectorAll(".ui-drag-between-panes-row")
+            let rects = range(0, kids.length) | filter((k) => kids[k].dataset.id != id) | map((k) => {
+                let r = kids[k].getBoundingClientRect()
+                r.top + r.height / 2 - top + el.scrollTop
+            })
+            { pane: el.dataset.pane, el, middles: rects }
+        })
+    }
+    let spot = (x: num, y: num) => {
+        let hit = g_lists | filter((l) => {
+            let r = l.el.closest(".ui-drag-between-panes-pane").getBoundingClientRect()
+            x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+        })
+        if len(hit) == 0 {
+            if over != null { over = null }
+        } else {
+            let l = hit[0]
+            let r = l.el.getBoundingClientRect()
+            let index = drag_between_panes_place(l.middles, y - r.top + l.el.scrollTop)
+            let box = find(boxes, (p) => p.id == l.pane)
+            let ok = drag_between_panes_fits(len(others_in(l.pane)), box.limit, l.pane == g_from)
+            if over == null || over.pane != l.pane || over.index != index || over.ok != ok { over = { pane: l.pane, index, ok } }
+        }
+    }
+    let fly = () => {
+        let r = root.getBoundingClientRect()
+        ghost.style.transform = `translate(${g_x - r.left - g_off_x}px, ${g_y - r.top - g_off_y}px)`
+    }
+    let clear_wait = () => {
+        g_wait = null
+        if press != null {
+            press.row.classList.remove("ui-drag-between-panes-pressing")
+            press = null
+        }
+    }
+    let lift = (row, id: int) => {
+        clear_wait()
+        let r = row.getBoundingClientRect()
+        let item = row.dataset.id
+        g_row = row
+        g_pid = id
+        g_from = find(rows, (x) => x.id == item).pane
+        g_off_x = min([g_x - r.left, 60])
+        g_off_y = g_y - r.top
+        ghost.style.width = `${r.width}px`
+        ghost_title = find(rows, (x) => x.id == item).title
+        measure(item)
+        lifted = item
+        by_key = false
+        ghost.classList.add("ui-drag-between-panes-flying")
+        fly()
+        root.setPointerCapture(id)
+        spot(g_x, g_y)
+        said = `${ghost_title} lifted.`
+        if win.quilloNative != null { js("quilloNative.haptic", "medium") }
+    }
+    let settle = (id: str, from_x: num, from_y: num) => {
+        // The row is in its place at once, and glides there from where it was let go.
+        js("requestAnimationFrame", (_t = null) => {
+            let row = row_el(id)
+            if row != null && !win.matchMedia("(prefers-reduced-motion: reduce)").matches {
+                let r = row.getBoundingClientRect()
+                row.animate([{ transform: `translate(${from_x - r.left}px, ${from_y - r.top}px)` }, { transform: "none" }], { duration: 170, easing: "ease-out" })
+            }
+        })
+    }
+    let commit = (id: str, to: str, index: int) => {
+        let was = rows
+        let from = find(rows, (r) => r.id == id).pane
+        let next = drag_between_panes_move(rows, id, to, index)
+        let same = join(next | map((r) => `${r.id}:${r.pane}`), ",") == join(was | map((r) => `${r.id}:${r.pane}`), ",")
+        if !same {
+            rows = next
+            let place = index_of(next | filter((r) => r.pane == to) | map((r) => r.id), id)
+            said = `${find(next, (r) => r.id == id).title} moved to ${pane_title(to)}, place ${place + 1}.`
+            on_move && on_move(id, from, to, place)
+        }
+        !same
+    }
+    let let_go = (cancel: bool) => {
+        let id = lifted
+        let spot_now = over
+        let g = ghost.getBoundingClientRect()
+        ghost.classList.remove("ui-drag-between-panes-flying")
+        lifted = ""
+        over = null
+        g_pid = null
+        if cancel || spot_now == null || !spot_now.ok {
+            said = spot_now != null && !cancel ? `${pane_title(spot_now.pane)} is full.` : "Put back."
+        } else {
+            commit(id, spot_now.pane, spot_now.index)
+        }
+        settle(id, g.left, g.top)
+    }
+    let key_spot = (pane: str, index: int) => {
+        let n = len(others_in(pane))
+        let box = find(boxes, (p) => p.id == pane)
+        let ok = drag_between_panes_fits(n, box.limit, pane == g_from)
+        over = { pane, index: max([0, min([index, n])]), ok }
+        said = ok ? `Over ${pane_title(pane)}, place ${over.index + 1} of ${n + 1}.` : `${pane_title(pane)} is full.`
+    }
+    let refocus = (id: str) => {
+        js("requestAnimationFrame", (_t = null) => {
+            let row = row_el(id)
+            if row != null { row.querySelector(".ui-drag-between-panes-grip").focus() }
+        })
+    }
+    let on_grip_key = (e, id: str) => {
+        if lifted == "" {
+            if e.key == " " || e.key == "Enter" {
+                e.preventDefault()
+                g_from = find(rows, (r) => r.id == id).pane
+                lifted = id
+                by_key = true
+                key_spot(g_from, index_of(in_pane(g_from) | map((r) => r.id), id))
+                said = `${find(rows, (r) => r.id == id).title} lifted. ${said}`
+            }
+        } else if lifted == id && by_key {
+            let names = boxes | map((p) => p.id)
+            let at = index_of(names, over.pane)
+            if e.key == "ArrowLeft" && at > 0 {
+                e.preventDefault()
+                key_spot(names[at - 1], over.index)
+            } else if e.key == "ArrowRight" && at < len(names) - 1 {
+                e.preventDefault()
+                key_spot(names[at + 1], over.index)
+            } else if e.key == "ArrowUp" {
+                e.preventDefault()
+                key_spot(over.pane, over.index - 1)
+            } else if e.key == "ArrowDown" {
+                e.preventDefault()
+                key_spot(over.pane, over.index + 1)
+            } else if e.key == "Escape" {
+                e.preventDefault()
+                lifted = ""
+                over = null
+                said = "Put back."
+            } else if e.key == " " || e.key == "Enter" {
+                e.preventDefault()
+                let s = over
+                lifted = ""
+                over = null
+                if s.ok {
+                    commit(id, s.pane, s.index)
+                    refocus(id)
+                } else {
+                    said = `${pane_title(s.pane)} is full.`
+                }
+            }
+        }
+    }
+    let tick = () => {
+        if lifted != "" && !by_key {
+            let under = g_lists | filter((l) => {
+                let r = l.el.getBoundingClientRect()
+                g_x >= r.left && g_x <= r.right
+            })
+            if len(under) > 0 {
+                let el = under[0].el
+                let r = el.getBoundingClientRect()
+                let by = drag_between_panes_speed(g_y, r.top, r.bottom, 44, 9)
+                if by != 0 {
+                    el.scrollTop += by
+                    spot(g_x, g_y)
+                }
+            }
+        }
+    }
+    if press != null { every(delay, () => {
+        if press != null { lift(press.row, press.id) }
+    }) }
+    if lifted != "" && !by_key { every(32, tick) }
+    <div class={ui_cls(["ui-drag-between-panes", class])} role="group" aria-label={label}
+         @mount={(me) => {
+             win = js("window")
+             root = me
+             ghost = me.querySelector(".ui-drag-between-panes-ghost")
+             // Once an item is in the air the finger is the drag's. pan-y would give it to the
+             // list on the first move, and a pen's touch on iOS likewise.
+             let guard = (e) => { if lifted != "" && e.cancelable { e.preventDefault() } }
+             me.addEventListener("touchmove", guard, { passive: false })
+             () => { me.removeEventListener("touchmove", guard) }
+         }}
+         @pointerdown={(e) => {
+             let row = e.target.closest(".ui-drag-between-panes-row")
+             let on_select = e.target.closest("select") != null
+             if row != null && !on_select && e.button == 0 && lifted == "" {
+                 g_x = e.clientX
+                 g_y = e.clientY
+                 if e.target.closest(".ui-drag-between-panes-grip") != null {
+                     e.preventDefault()
+                     lift(row, e.pointerId)
+                 } else if e.pointerType == "touch" {
+                     row.classList.add("ui-drag-between-panes-pressing")
+                     press = { row, id: e.pointerId, x: e.clientX, y: e.clientY }
+                 } else {
+                     g_wait = { row, id: e.pointerId, x: e.clientX, y: e.clientY }
+                 }
+             }
+         }}
+         @pointermove={(e) => {
+             g_x = e.clientX
+             g_y = e.clientY
+             if lifted != "" && !by_key && e.pointerId == g_pid {
+                 fly()
+                 spot(g_x, g_y)
+             } else if press != null && e.pointerId == press.id {
+                 if abs(g_x - press.x) + abs(g_y - press.y) > 10 { clear_wait() }
+             } else if g_wait != null && e.pointerId == g_wait.id {
+                 if abs(g_x - g_wait.x) + abs(g_y - g_wait.y) > 8 { lift(g_wait.row, g_wait.id) }
+             }
+         }}
+         @pointerup={(e) => {
+             clear_wait()
+             if lifted != "" && !by_key && e.pointerId == g_pid { let_go(false) }
+         }}
+         @pointercancel={(e) => {
+             clear_wait()
+             if lifted != "" && !by_key && e.pointerId == g_pid { let_go(true) }
+         }}>
+        <div.ui-drag-between-panes-grid>
+            {for p in boxes => <section key={p.id}
+                    class={ui_cls(["ui-drag-between-panes-pane", over != null && over.pane == p.id && over.ok && "ui-drag-between-panes-over", over != null && over.pane == p.id && !over.ok && "ui-drag-between-panes-full"])}
+                    aria-label={p.title}>
+                <div.ui-drag-between-panes-head>
+                    <h3>{p.title}</h3>
+                    <span.ui-drag-between-panes-count>{len(in_pane(p.id))}{p.limit != null ? ` of ${p.limit}` : ""}</span>
+                </div>
+                <ul.ui-drag-between-panes-list data-pane={p.id}>
+                    // One <li> for a row and for the gap, with the difference inside it: a row that is a
+                    // `? :` of two elements keeps its first element in its list of nodes, so once
+                    // the gap has stood in its place the row can never be removed.
+                    {for e in drag_between_panes_shown(in_pane(p.id), lifted, over != null && over.pane == p.id ? over.index : null) => <li key={e.gap ? "slot" : e.row.id} data-id={e.gap ? null : e.row.id}
+                            class={e.gap ? ui_cls(["ui-drag-between-panes-slot", over != null && !over.ok && "ui-drag-between-panes-refused"]) : ui_cls(["ui-drag-between-panes-row", lifted == e.row.id && "ui-drag-between-panes-source"])}>
+                        {e.gap ? (over != null && !over.ok ? "Full" : "Drop here") : <div.ui-drag-between-panes-parts>
+                            <button.ui-drag-between-panes-grip type="button" aria-label={`Move ${e.row.title}`} aria-describedby={drag_between_panes_help(label)}
+                                    @keydown={(ev) => { on_grip_key(ev, e.row.id) }}
+                                    @blur={() => {
+                                        if lifted == e.row.id && by_key {
+                                            lifted = ""
+                                            over = null
+                                        }
+                                    }}>
+                                <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><circle cx="7" cy="5" r="1.5"></circle><circle cx="13" cy="5" r="1.5"></circle><circle cx="7" cy="10" r="1.5"></circle><circle cx="13" cy="10" r="1.5"></circle><circle cx="7" cy="15" r="1.5"></circle><circle cx="13" cy="15" r="1.5"></circle></svg>
+                            </button>
+                            <span.ui-drag-between-panes-text>
+                                <span.ui-drag-between-panes-title>{e.row.title}</span>
+                                {get(e.row, "detail") != null && <span.ui-drag-between-panes-detail>{e.row.detail}</span>}
+                            </span>
+                            <select.ui-drag-between-panes-move aria-label={`Move ${e.row.title} to`}
+                                    @change={(ev) => {
+                                        let to = ev.value
+                                        ev.value = ""
+                                        let box = find(boxes, (b) => b.id == to)
+                                        if box != null {
+                                            let id = e.row.id
+                                            if drag_between_panes_fits(len(in_pane(to)), box.limit, to == e.row.pane) {
+                                                commit(id, to, len(in_pane(to)))
+                                                refocus(id)
+                                            } else {
+                                                said = `${box.title} is full.`
+                                            }
+                                        }
+                                    }}>
+                                <option value="">Move</option>
+                                {for b in boxes => <option key={b.id} value={b.id} disabled={b.id == e.row.pane}>{b.title}</option>}
+                            </select>
+                        </div>}
+                    </li>}
+                    {len(in_pane(p.id)) == 0 && (over == null || over.pane != p.id) && <li.ui-drag-between-panes-empty>Nothing here</li>}
+                </ul>
+            </section>}
+        </div>
+        <div.ui-drag-between-panes-ghost aria-hidden="true">{ghost_title}</div>
+        <span.ui-sr role="status">{said}</span>
+        <span.ui-sr id={drag_between_panes_help(label)}>Press Space to lift, then the arrow keys, then Space to drop or Escape to put it back.</span>
+    </div>
+}

@@ -1,0 +1,419 @@
+// KioskScreen: a locked-down screen for a tablet the public shares, as at a front desk or a
+// museum. Started by staff, it fills the screen, keeps it awake and holds back what a
+// visitor could wander off with: the back gesture, menus, zooming, and browser keys. When someone
+// walks away it counts down and goes back to the start, so the next visitor finds no one's
+// details. Staff leave by tapping a hidden corner and giving a PIN.
+//
+//   import ui/kiosk_screen.qwe use KioskScreen
+//
+//   component Desk() {
+//       state step = 1
+//       <KioskScreen title="Visitor check-in" pin_check={(pin) => check_pin(pin)} on_reset={() => { step = 1 }}>
+//           <CheckInSteps step={step} on_step={(s) => { step = s }}/>
+//       </KioskScreen>
+//   }
+//
+// title, intro: what the staff's start page says. start_label: its button ("Start kiosk").
+// idle_seconds: how long with no touch before going back to the start (90, at least 3).
+// warn_seconds: how much of that shows a countdown (15, kept below idle_seconds). Nothing
+// counts down until someone has touched it, so an untouched kiosk stays still.
+// pin: the staff's PIN, digits. It is sent to the page and anyone can read it there, so pin_check is
+// better: pin_check(entry), inside one of your components, is given what was typed and
+// answers true or false, and may be a server fn. pin_length: how many digits it wants (4, or
+// the length of pin). With neither, the corner offers Leave with no PIN.
+// corner: where the hidden corner is, "top-right" (default), "top-left", "bottom-right" or
+// "bottom-left". taps: how many, within 3 seconds, open the PIN pad (5). staff_key: a
+// letter that with Ctrl, Shift and Alt does the same, for a keyboard ("k"; there is no spoken
+// route on purpose). tries: wrong PINs before the pad locks (5). lock_seconds: how long it locks,
+// doubling each time after (30). class.
+// on_start(), on_reset(): inside one of your components. on_reset is your own state's way
+// back to the start: forms in it are cleared, details closed and everything scrolled up here, but
+// a component in it keeps its state until you say. on_exit(): staff left.
+//
+// A web page cannot truly lock a device. A visitor at a browser can leave full screen with a
+// system gesture or Escape, and then a button asks for it back, as only a press may. For a
+// real kiosk use the system's own lock too, Guided Access on iPad or screen pinning on Android.
+// In a phone app the app already fills the screen; keepAwake holds the screen on.
+// iPhones have no full screen for a page, and it says so on the start page.
+
+import ui/theme.qwe use ui_cls
+
+let kiosk_screen_css = css`
+.ui-kiosk-screen { box-sizing: border-box; display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 320px; color: var(--ui-fg); background: var(--ui-bg); font: 16px/1.45 var(--ui-font); }
+.ui-kiosk-screen-on { position: fixed; inset: 0; z-index: 1000; height: 100dvh; min-height: 0; overscroll-behavior: none; touch-action: pan-x pan-y; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-kiosk-screen-on input, .ui-kiosk-screen-on textarea { user-select: text; -webkit-user-select: text; }
+.ui-kiosk-screen-start { display: grid; place-content: center; justify-items: center; gap: 14px; flex: 1; padding: 24px; text-align: center; }
+.ui-kiosk-screen-start h2 { margin: 0; font-size: 28px; line-height: 1.2; }
+.ui-kiosk-screen-start p { max-width: 460px; margin: 0; color: var(--ui-muted); }
+.ui-kiosk-screen-facts { display: grid; gap: 4px; margin: 0; padding: 0; color: var(--ui-muted); font-size: 14px; list-style: none; }
+.ui-kiosk-screen-go { min-height: 56px; padding: 0 28px; border: 0; border-radius: var(--ui-radius); background: var(--ui-accent); color: var(--ui-accent-fg); font: 600 17px var(--ui-font); cursor: pointer; }
+.ui-kiosk-screen-go:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-kiosk-screen-stage { position: relative; flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+.ui-kiosk-screen-corner { position: absolute; z-index: 5; width: 72px; height: 72px; -webkit-tap-highlight-color: transparent; }
+.ui-kiosk-screen-top-right { top: 0; right: 0; }
+.ui-kiosk-screen-top-left { top: 0; left: 0; }
+.ui-kiosk-screen-bottom-right { right: 0; bottom: 0; }
+.ui-kiosk-screen-bottom-left { left: 0; bottom: 0; }
+.ui-kiosk-screen-layer { position: absolute; inset: 0; z-index: 4; display: grid; place-items: center; padding: 16px; background: var(--ui-overlay); }
+.ui-kiosk-screen-card { box-sizing: border-box; display: grid; justify-items: center; gap: 12px; width: min(420px, 100%); max-height: 100%; overflow-y: auto; padding: 22px; border-radius: calc(var(--ui-radius) + 6px); background: var(--ui-surface); box-shadow: var(--ui-shadow-lg); text-align: center; }
+.ui-kiosk-screen-card h2 { margin: 0; font-size: 22px; }
+.ui-kiosk-screen-card p { margin: 0; color: var(--ui-muted); }
+.ui-kiosk-screen-left { display: grid; place-items: center; width: 88px; height: 88px; border: 4px solid var(--ui-accent); border-radius: 50%; color: var(--ui-accent); font: 700 36px/1 var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-kiosk-screen-lost { position: absolute; left: 50%; bottom: calc(14px + env(safe-area-inset-bottom)); z-index: 3; transform: translateX(-50%); min-height: 48px; padding: 0 18px; border: 0; border-radius: 999px; background: var(--ui-fg); color: var(--ui-bg); font: 600 15px var(--ui-font); box-shadow: var(--ui-shadow-lg); cursor: pointer; }
+.ui-kiosk-screen-dots { display: flex; gap: 12px; height: 18px; }
+.ui-kiosk-screen-dot { width: 14px; height: 14px; border: 2px solid var(--ui-strong); border-radius: 50%; }
+.ui-kiosk-screen-dot-on { border-color: var(--ui-accent); background: var(--ui-accent); }
+.ui-kiosk-screen-wrong { animation: ui-kiosk-screen-shake .3s; }
+@keyframes ui-kiosk-screen-shake { 25% { transform: translateX(-6px); } 75% { transform: translateX(6px); } }
+.ui-kiosk-screen-pad { display: grid; grid-template-columns: repeat(3, 76px); gap: 8px; }
+.ui-kiosk-screen-digit { height: 64px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-subtle); color: var(--ui-fg); font: 600 22px var(--ui-font); cursor: pointer; }
+.ui-kiosk-screen-digit:disabled { opacity: .5; cursor: default; }
+.ui-kiosk-screen-digit:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-kiosk-screen-word { font-size: 14px; }
+.ui-kiosk-screen-note { min-height: 22px; font-size: 14px; }
+.ui-kiosk-screen-bad { color: var(--ui-danger) !important; }
+@media (prefers-reduced-motion: reduce) { .ui-kiosk-screen-wrong { animation: none; } }
+`
+
+// The two times made sensible: at least 3 seconds, and a warning that leaves a second before it.
+fn kiosk_screen_times(idle, warn) -> list {
+    let i = type_of(idle) == "int" || type_of(idle) == "float" ? max([3, floor(idle)]) : 90
+    let w = type_of(warn) == "int" || type_of(warn) == "float" ? max([1, floor(warn)]) : 15
+    [i, min([w, i - 1])]
+}
+
+// Where the time stands, after ms with no touch: "calm", "warn" or "reset".
+fn kiosk_screen_phase(ms: num, idle: int, warn: int, touched: bool) -> str {
+    if !touched { return "calm" }
+    if ms >= idle * 1000 { return "reset" }
+    ms >= (idle - warn) * 1000 ? "warn" : "calm"
+}
+
+// Whole seconds left, as a countdown shows them: 3 until it is under 2.
+fn kiosk_screen_left(ms: num, idle: int) -> int {
+    max([0, ceil((idle * 1000 - ms) / 1000)])
+}
+
+// Keys a page may hold back from a visitor: reload, print, save, open, new, find, and history.
+fn kiosk_screen_blocks(key: str, command: bool, alt: bool) -> bool {
+    if key == "F5" || key == "F11" || key == "F12" { return true }
+    if alt && (key == "ArrowLeft" || key == "ArrowRight") { return true }
+    command && contains(["r", "p", "s", "o", "n", "t", "f", "l"], lower(key))
+}
+
+// How long a lock lasts on its nth time: the seconds given, doubling.
+fn kiosk_screen_lock(seconds: int, nth: int) -> int {
+    seconds * pow(2, max([0, min([nth, 6]) - 1]))
+}
+
+// Are two entries the same? Characters compared one by one, to the end, whatever they are.
+fn kiosk_screen_same(a: str, b: str) -> bool {
+    let x = split(a, "")
+    let y = split(b, "")
+    if len(x) != len(y) { return false }
+    let wrong = range(0, len(x)) | filter((i) => x[i] != y[i])
+    len(wrong) == 0
+}
+
+component KioskScreen(title: str = "Kiosk", intro: str? = null, start_label: str = "Start kiosk", idle_seconds = 90, warn_seconds = 15, pin: str? = null, pin_check = null,
+                      pin_length: int = 4, corner: str = "top-right", taps: int = 5, staff_key: str = "k", tries: int = 5, lock_seconds: int = 30,
+                      on_start = null, on_reset = null, on_exit = null, class: str? = null, children) {
+    style global kiosk_screen_css
+    let times = kiosk_screen_times(idle_seconds, warn_seconds)
+    let idle = times[0]
+    let warn = times[1]
+    let want = pin != null && pin != "" ? len(pin) : pin_length
+    let open_exit = (pin == null || pin == "") && pin_check == null
+    let place = contains(["top-right", "top-left", "bottom-right", "bottom-left"], corner) ? corner : "top-right"
+    state win = null
+    state doc = null
+    state root = null
+    state stage = null
+    state running = false
+    state phase = "calm"
+    state left = 0
+    state pad = false
+    state entry = ""
+    state wrong = 0            // wrong PINs since the last lock
+    state locks = 0
+    state locked_until = 0
+    state lock_left = 0
+    state msg = ""
+    state shake = false
+    state lost = false
+    state full_ok = true
+    state wake_ok = true
+    state awake = ""           // what holds the screen on: "app", "web", "" for nothing
+    state resets = 0
+    state said = ""
+    state g_last = 0           // when it was last touched
+    state g_touched = false
+    state g_quiet = 0
+    state g_taps = []
+    state g_lock = null        // the screen's wake lock
+    state g_was_full = false
+    let locked_now = lock_left > 0
+    let reset_all = () => {
+        let forms = stage.querySelectorAll("form")
+        for i in range(0, forms.length) { forms[i].reset() }
+        let fields = stage.querySelectorAll("input, textarea, select")
+        for i in range(0, fields.length) {
+            let f = fields[i]
+            if f.type == "checkbox" || f.type == "radio" {
+                f.checked = f.defaultChecked
+            } else if f.type != "hidden" && f.type != "button" && f.type != "submit" {
+                f.value = f.defaultValue ?? ""
+            }
+        }
+        let open_ones = stage.querySelectorAll("details[open], dialog[open]")
+        for i in range(0, open_ones.length) {
+            let d = open_ones[i]
+            if d.tagName == "DIALOG" { d.close() } else { d.open = false }
+        }
+        let boxes = stage.querySelectorAll("*")
+        for i in range(0, boxes.length) { if boxes[i].scrollTop != 0 { boxes[i].scrollTop = 0 } }
+        stage.scrollTop = 0
+        let focused = doc.activeElement
+        if focused != null && stage.contains(focused) { focused.blur() }
+        g_touched = false
+        g_quiet = win.Date.now() + 400
+        phase = "calm"
+        pad = false
+        entry = ""
+        msg = ""
+        resets += 1
+        said = "Back to the start."
+        on_reset && on_reset()
+    }
+    let touch = (_e = null) => {
+        if running {
+            g_last = win.Date.now()
+            g_touched = true
+            if phase == "warn" { phase = "calm" }
+        }
+    }
+    let tick = () => {
+        let now = win.Date.now()
+        let ms = now - g_last
+        let p = kiosk_screen_phase(ms, idle, warn, g_touched)
+        if p == "reset" {
+            reset_all()
+        } else {
+            if p != phase {
+                phase = p
+                if p == "warn" { said = `Going back to the start in ${kiosk_screen_left(ms, idle)} seconds.` }
+            }
+            left = kiosk_screen_left(ms, idle)
+        }
+        lock_left = max([0, ceil((locked_until - now) / 1000)])
+    }
+    if running { every(200, tick) }
+    let is_full = () => (doc.fullscreenElement ?? doc.webkitFullscreenElement) != null
+    let go_full = () => {
+        if root.requestFullscreen != null {
+            let r = js("Promise.resolve", root.requestFullscreen())
+            if is_err(r) { full_ok = false }
+        } else if root.webkitRequestFullscreen != null {
+            root.webkitRequestFullscreen()
+        } else {
+            full_ok = false
+        }
+        lost = false
+    }
+    let hold_awake = () => {
+        if win.quilloNative != null {
+            js("quilloNative.keepAwake", true)
+            awake = "app"
+        } else if win.navigator.wakeLock != null {
+            let s = js("Promise.resolve", win.navigator.wakeLock.request("screen"))
+            if is_err(s) {
+                awake = ""
+            } else {
+                g_lock = s
+                awake = "web"
+            }
+        }
+    }
+    let let_sleep = () => {
+        if awake == "app" { js("quilloNative.keepAwake", false) }
+        if g_lock != null {
+            js("Promise.resolve", g_lock.release())
+            g_lock = null
+        }
+        awake = ""
+    }
+    let start = () => {
+        running = true
+        g_touched = false
+        g_last = win.Date.now()
+        phase = "calm"
+        win.history.pushState(null, "", win.location.href)
+        go_full()
+        hold_awake()
+        on_start && on_start()
+    }
+    let leave = () => {
+        running = false
+        pad = false
+        entry = ""
+        msg = ""
+        lost = false
+        wrong = 0
+        if is_full() {
+            g_was_full = false
+            if doc.exitFullscreen != null { js("Promise.resolve", doc.exitFullscreen()) } else { doc.webkitExitFullscreen() }
+        }
+        let_sleep()
+        on_exit && on_exit()
+    }
+    let open_pad = () => {
+        pad = true
+        entry = ""
+        msg = ""
+    }
+    let check = () => {
+        let typed = entry
+        let good = pin_check != null ? js("Promise.resolve", pin_check(typed)) : kiosk_screen_same(typed, pin ?? "")
+        entry = ""
+        if good == true {
+            wrong = 0
+            locks = 0
+            leave()
+        } else {
+            wrong += 1
+            shake = true
+            if wrong >= tries {
+                wrong = 0
+                locks += 1
+                locked_until = win.Date.now() + kiosk_screen_lock(lock_seconds, locks) * 1000
+                lock_left = kiosk_screen_lock(lock_seconds, locks)
+                msg = "Too many tries."
+            } else {
+                msg = `Wrong PIN. ${tries - wrong} left.`
+            }
+        }
+    }
+    let digit = (d: str) => {
+        if !locked_now && len(entry) < want {
+            shake = false
+            entry = entry + d
+            if len(entry) == want { check() }
+        }
+    }
+    let rub_digit = () => {
+        if len(entry) > 0 { entry = slice(entry, 0, len(entry) - 1) }
+    }
+    <div class={ui_cls(["ui-kiosk-screen", running && "ui-kiosk-screen-on", class])}
+         @mount={(me) => {
+             win = js("window")
+             doc = js("document")
+             root = me
+             stage = me.querySelector(".ui-kiosk-screen-stage")
+             let native = win.quilloNative != null
+             full_ok = native || me.requestFullscreen != null || me.webkitRequestFullscreen != null
+             wake_ok = native || win.navigator.wakeLock != null
+             // The scrolling back of a reset is not a visitor.
+             let scrolled = (_e) => { if win.Date.now() > g_quiet { touch() } }
+             let keys = (e) => {
+                 if running {
+                     touch()
+                     let command = e.ctrlKey || e.metaKey
+                     if command && e.shiftKey && e.altKey && lower(e.key) == staff_key {
+                         e.preventDefault()
+                         open_pad()
+                     } else if pad {
+                         e.preventDefault()
+                         if len(e.key) == 1 && e.key >= "0" && e.key <= "9" { digit(e.key) }
+                         if e.key == "Backspace" { rub_digit() }
+                         if e.key == "Escape" { pad = false }
+                     } else if kiosk_screen_blocks(e.key, command, e.altKey) {
+                         e.preventDefault()
+                     }
+                 }
+             }
+             let stop_gesture = (e) => { if running { e.preventDefault() } }
+             let stay = (_e) => {
+                 // Back is held here: a new entry takes the place of the one left.
+                 if running { win.history.pushState(null, "", win.location.href) }
+             }
+             let full_change = (_e) => {
+                 let now_full = (doc.fullscreenElement ?? doc.webkitFullscreenElement) != null
+                 if running && g_was_full && !now_full { lost = true }
+                 if now_full { lost = false }
+                 g_was_full = now_full
+             }
+             let shown = (_e) => {
+                 if running && doc.visibilityState == "visible" && awake == "web" { hold_awake() }
+             }
+             doc.addEventListener("pointerdown", touch, true)
+             doc.addEventListener("scroll", scrolled, true)
+             doc.addEventListener("input", touch, true)
+             doc.addEventListener("keydown", keys, true)
+             doc.addEventListener("gesturestart", stop_gesture, { passive: false })
+             doc.addEventListener("fullscreenchange", full_change)
+             doc.addEventListener("webkitfullscreenchange", full_change)
+             doc.addEventListener("visibilitychange", shown)
+             win.addEventListener("popstate", stay)
+             () => {
+                 doc.removeEventListener("pointerdown", touch, true)
+                 doc.removeEventListener("scroll", scrolled, true)
+                 doc.removeEventListener("input", touch, true)
+                 doc.removeEventListener("keydown", keys, true)
+                 doc.removeEventListener("gesturestart", stop_gesture)
+                 doc.removeEventListener("fullscreenchange", full_change)
+                 doc.removeEventListener("webkitfullscreenchange", full_change)
+                 doc.removeEventListener("visibilitychange", shown)
+                 win.removeEventListener("popstate", stay)
+             }
+         }}
+         @contextmenu={(e) => { if running { e.preventDefault() } }}
+         @dragstart={(e) => { if running { e.preventDefault() } }}>
+        {!running && <div.ui-kiosk-screen-start>
+            <h2>{title}</h2>
+            {intro != null && <p>{intro}</p>}
+            <ul.ui-kiosk-screen-facts>
+                <li>Goes back to the start after {idle} seconds untouched, with {warn} seconds' warning.</li>
+                <li>{full_ok ? "Fills the screen when started." : "This device has no full screen for a page: use the system's own lock."}</li>
+                <li>{wake_ok ? "Keeps the screen on." : "This device cannot keep the screen on from a page: turn off its Auto-Lock."}</li>
+            </ul>
+            <button.ui-kiosk-screen-go type="button" @click={start}>{start_label}</button>
+        </div>}
+        <div.ui-kiosk-screen-stage hidden={!running}>{children}</div>
+        {running && <div class={ui_cls(["ui-kiosk-screen-corner", `ui-kiosk-screen-${place}`])} aria-hidden="true"
+             @click={(e) => {
+                 let now = e.timeStamp
+                 let near = (g_taps | filter((t) => now - t < 3000)) | push(now)
+                 g_taps = near
+                 if len(near) >= taps {
+                     g_taps = []
+                     open_pad()
+                 }
+             }}></div>}
+        {running && phase == "warn" && !pad && <div.ui-kiosk-screen-layer>
+            <div.ui-kiosk-screen-card role="alertdialog" aria-label="Are you still there?">
+                <h2>Still there?</h2>
+                <span.ui-kiosk-screen-left>{left}</span>
+                <p>Going back to the start, and clearing what was entered.</p>
+                <button.ui-kiosk-screen-go type="button" @click={() => { phase = "calm" }}>Keep going</button>
+            </div>
+        </div>}
+        {running && pad && <div.ui-kiosk-screen-layer>
+            <div class={ui_cls(["ui-kiosk-screen-card", shake && "ui-kiosk-screen-wrong"])} role="dialog" aria-label="Staff PIN">
+                <h2>Staff</h2>
+                {open_exit ? <p>No PIN is set for this kiosk.</p> : <div.ui-kiosk-screen-dots aria-hidden="true">
+                    {for i in range(0, want) => <span key={i} class={ui_cls(["ui-kiosk-screen-dot", i < len(entry) && "ui-kiosk-screen-dot-on"])}></span>}
+                </div>}
+                <p class={ui_cls(["ui-kiosk-screen-note", msg != "" && "ui-kiosk-screen-bad"])} role="status">{locked_now ? `Locked. Try again in ${lock_left} s.` : msg}</p>
+                {open_exit ? <button.ui-kiosk-screen-go type="button" @click={leave}>Leave</button> : <div.ui-kiosk-screen-pad>
+                    {for d in ["1", "2", "3", "4", "5", "6", "7", "8", "9"] => <button.ui-kiosk-screen-digit key={d} type="button" disabled={locked_now} @click={() => { digit(d) }}>{d}</button>}
+                    <button.ui-kiosk-screen-digit.ui-kiosk-screen-word type="button" @click={rub_digit}>Delete</button>
+                    <button.ui-kiosk-screen-digit type="button" disabled={locked_now} @click={() => { digit("0") }}>0</button>
+                    <button.ui-kiosk-screen-digit.ui-kiosk-screen-word type="button" @click={() => { pad = false }}>Cancel</button>
+                </div>}
+                {open_exit && <button.ui-kiosk-screen-digit.ui-kiosk-screen-word type="button" @click={() => { pad = false }}>Cancel</button>}
+            </div>
+        </div>}
+        {running && lost && <button.ui-kiosk-screen-lost type="button" @click={go_full}>Return to full screen</button>}
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

@@ -1,0 +1,209 @@
+// OneTimeCode: the code from a text message. It looks like separate boxes and is one real
+// field laid over them, on purpose: that is what the system's offer of the code (iOS's
+// QuickType bar, autocomplete "one-time-code"; WebOTP in Chrome on Android) fills in one go,
+// and a paste lands whole, and Backspace works on every keyboard, including those on
+// Android that send no key name to a page. Tap a filled box to retype that digit. A
+// full code submits its form by itself, and a countdown holds back the resend button.
+//
+//   <form method="post" action="/verify">
+//       <OneTimeCode name="code" label="Code from the text message" on_resend={() => { send_again() }}/>
+//   </form>
+//   <OneTimeCode label="Code" length={4} auto_submit={false} on_complete={(c) => { check(c) }} error={wrong}/>
+//
+// length: how many boxes (6). digits: only 0-9 (true; false takes letters and digits, in
+// capitals). value: a code to start with. auto_submit: a full code submits the form it is in,
+// once for each code (true). resend_after: seconds before the resend button works (30;
+// 0 has no button). resend_label ("Send a new code"). web_otp: asks Chrome on Android for
+// the code from the text message when the field is first touched (true). hint, error,
+// name ("code"), label ("Code"), disabled, field (the input's id), class as for every field.
+// error also selects the whole code, so the next digit starts afresh.
+// on_change(code) after each change, on_complete(code) once it is full, on_resend() when
+// the resend button is pressed, which clears the code and starts the countdown again.
+//
+// The countdown goes by the clock, so a phone that slept comes back to the right time, and
+// a screen reader is told only when the button is ready, not every second.
+// A text message for WebOTP ends with "@your.site #123456". Android's web view has no
+// WebOTP, and the app gets the system's keyboard suggestion alone.
+//
+// one_time_code_clean(text, digits, length) and one_time_code_time(seconds) are the logic.
+
+import ui/theme.qwe use ui_cls
+
+let one_time_code_css = css`
+.ui-one-time-code { display: grid; gap: 8px; min-width: 0; font: 15px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-one-time-code-label { font-size: 14px; font-weight: 500; }
+.ui-one-time-code-row { position: relative; display: grid; grid-template-columns: repeat(var(--n), minmax(0, 1fr)); gap: 6px; max-width: calc(var(--n) * 58px); }
+.ui-one-time-code-box {
+  display: grid; place-items: center; height: 56px; min-width: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); font: 600 24px/1 var(--ui-mono); transition: border-color .12s, box-shadow .12s;
+}
+.ui-one-time-code-full { background: var(--ui-subtle); border-color: var(--ui-strong); }
+.ui-one-time-code-at { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-one-time-code-at:empty::after { content: ""; width: 2px; height: 26px; background: var(--ui-accent); animation: ui-one-time-code-blink 1.1s steps(2) infinite; }
+@keyframes ui-one-time-code-blink { 50% { opacity: 0; } }
+/* The one field, over every box: its text is not seen, the boxes show it. 16 px, as iOS zooms the page into anything smaller. */
+.ui-one-time-code-input {
+  position: absolute; inset: 0; box-sizing: border-box; width: 100%; height: 100%; margin: 0; padding: 0; border: 0; outline: none; background: transparent;
+  color: transparent; caret-color: transparent; font: 16px var(--ui-mono); letter-spacing: 1em; touch-action: manipulation;
+  -webkit-text-fill-color: transparent; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ui-one-time-code-input::selection { background: transparent; color: transparent; }
+.ui-one-time-code-bad .ui-one-time-code-box { border-color: var(--ui-danger); }
+.ui-one-time-code-hint, .ui-one-time-code-error { margin: 0; font-size: 14px; color: var(--ui-muted); }
+.ui-one-time-code-error { color: var(--ui-danger); }
+.ui-one-time-code-resend {
+  justify-self: start; min-height: 44px; margin: 0; padding: 0 12px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-accent);
+  font: 600 15px var(--ui-font); cursor: pointer; touch-action: manipulation; font-variant-numeric: tabular-nums;
+}
+.ui-one-time-code-resend[aria-disabled="true"] { color: var(--ui-muted); font-weight: 500; cursor: default; }
+.ui-one-time-code-resend:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) {
+  .ui-one-time-code-box { transition: none; }
+  .ui-one-time-code-at:empty::after { animation: none; }
+}
+`
+
+// What a code may hold of `text`: digits, or capitals and digits, as many as fit. A message
+// pasted whole keeps only its code, if it is the only run of digits in it long enough.
+fn one_time_code_clean(text: str, digits: bool, length: int) -> str {
+    let run = (digits ? re.find_all(text, "[0-9]+") : re.find_all(upper(text), "[0-9A-Z]+")) | map((m) => m.text)
+    let whole = run | filter((r) => len(r) == length)
+    let got = len(whole) == 1 ? whole[0] : join(run, "")
+    slice(got, 0, min([len(got), length]))
+}
+
+// Seconds as "0:27".
+fn one_time_code_time(seconds: int) -> str {
+    let s = seconds % 60
+    `${floor(seconds / 60)}:${s < 10 ? "0" : ""}${s}`
+}
+
+fn one_time_code_clock() -> int = js("Date.now")
+
+component OneTimeCode(name: str = "code", label: str = "Code", length: int = 6, digits: bool = true, value: str = "", auto_submit: bool = true,
+                      resend_after: int = 30, resend_label: str = "Send a new code", web_otp: bool = true, hint: str? = null, error: str? = null,
+                      disabled: bool = false, field: str? = null, on_change = null, on_complete = null, on_resend = null, class: str? = null) {
+    style global one_time_code_css
+    let size = max([1, min([length, 12])])
+    state code = one_time_code_clean(value, digits, size)
+    state at = len(code)            // the box the next character goes in
+    state focused = false
+    state left = resend_after
+    state ends = 0
+    state input = null
+    state sent = ""                 // the code last handed on, so one code goes once
+    state asked = false             // WebOTP is listening
+    state stop_asking = null
+    let id = field ?? `one-time-code-${name}`
+    let chars = split(code, "") | filter((c) => c != "")
+    let set_code = (next: str, el) => {
+        // The field is told first: a submit reads it, before the page has caught up.
+        if el.value != next { el.value = next }
+        if next != code {
+            code = next
+            on_change && on_change(next)
+        }
+        if len(next) < size {
+            sent = ""
+        } else {
+            if next != sent {
+                sent = next
+                if stop_asking != null {
+                    stop_asking()
+                    stop_asking = null
+                }
+                on_complete && on_complete(next)
+                if auto_submit && el.form != null { el.form.requestSubmit() }
+            }
+        }
+    }
+    let ask = (el) => {
+        if !asked && web_otp && js("window").OTPCredential != null {
+            asked = true
+            let stop = js_new("AbortController")
+            stop_asking = () => { stop.abort() }
+            let got = js("navigator.credentials.get", { otp: { transport: ["sms"] }, signal: stop.signal })
+            if !is_err(got) && got != null && got.code != null {
+                let next = one_time_code_clean(got.code, digits, size)
+                at = len(next)
+                set_code(next, el)
+            }
+        }
+    }
+    let tick = () => {
+        let s = ceil((ends - one_time_code_clock()) / 1000)
+        left = max([0, min([s, resend_after])])
+    }
+    if left > 0 && ends > 0 { every(500, tick) }
+    if error != null && input != null { input.select() }
+    let waiting = resend_after > 0 && left > 0
+    <div class={ui_cls(["ui-one-time-code", error != null && "ui-one-time-code-bad", class])}>
+        <label.ui-one-time-code-label for={id}>{label}</label>
+        <div.ui-one-time-code-row style={`--n: ${size}`}>
+            {for i in range(size) =>
+                <span key={i} aria-hidden="true"
+                      class={ui_cls(["ui-one-time-code-box", i < len(chars) && "ui-one-time-code-full", focused && i == min([at, size - 1]) && "ui-one-time-code-at"])}>{i < len(chars) ? chars[i] : ""}</span>}
+            <input.ui-one-time-code-input id={id} name={name} type="text" value={code} disabled={disabled}
+                   inputmode={digits ? "numeric" : "text"} pattern={digits ? "[0-9]*" : null} autocomplete="one-time-code" autocapitalize={digits ? "off" : "characters"}
+                   autocorrect="off" spellcheck="false" enterkeyhint="done" aria-invalid={error != null ? "true" : null}
+                   aria-describedby={error != null ? `${id}-error` : hint != null ? `${id}-hint` : null}
+                   @mount={(el) => {
+                       input = el
+                       ends = one_time_code_clock() + resend_after * 1000
+                       () => { stop_asking && stop_asking() }
+                   }}
+                   @focus={(e) => {
+                       focused = true
+                       at = min([len(code), size - 1])
+                       ask(e.target)
+                   }}
+                   @blur={() => { focused = false }}
+                   @input={(e) => {
+                       let el = e.target
+                       let raw = e.value
+                       let typed = starts_with(str(e.inputType), "insert")
+                       let caret = el.selectionStart
+                       let next = one_time_code_clean(raw, digits, size)
+                       // A letter in a digits field, or a whole message, is not what it looks like now.
+                       let same = next == raw
+                       at = same ? caret : len(next)
+                       set_code(next, el)
+                       // Retyping a box goes on to retype the next, as a row of boxes does.
+                       if same && typed && caret < len(next) {
+                           el.setSelectionRange(caret, caret + 1)
+                       }
+                   }}
+                   @click={(e) => {
+                       let el = e.target
+                       let r = el.getBoundingClientRect()
+                       let i = max([0, min([floor((e.clientX - r.left) / r.width * size), size - 1])])
+                       if i < len(code) {
+                           at = i
+                           el.setSelectionRange(i, i + 1)
+                       } else {
+                           at = min([len(code), size - 1])
+                           el.setSelectionRange(len(code), len(code))
+                       }
+                   }}
+                   @keyup={(e) => { at = min([e.target.selectionStart, size - 1]) }}/>
+        </div>
+        {error != null && <p.ui-one-time-code-error id={`${id}-error`} role="alert">{error}</p>}
+        {hint != null && <p.ui-one-time-code-hint id={`${id}-hint`}>{hint}</p>}
+        {resend_after > 0 && <button.ui-one-time-code-resend type="button" aria-disabled={waiting ? "true" : null} disabled={disabled}
+                                     @click={() => {
+                                         if !waiting {
+                                             // First: the keyboard stays only if the field has the focus before anything waits.
+                                             input.focus()
+                                             ends = one_time_code_clock() + resend_after * 1000
+                                             left = resend_after
+                                             at = 0
+                                             stop_asking && stop_asking()
+                                             stop_asking = null
+                                             asked = false
+                                             set_code("", input)
+                                             on_resend && on_resend()
+                                         }
+                                     }}>{waiting ? `${resend_label} in ${one_time_code_time(left)}` : resend_label}</button>}
+        <span.ui-sr aria-live="polite">{resend_after > 0 && !waiting ? "You can ask for a new code now." : ""}</span>
+    </div>
+}

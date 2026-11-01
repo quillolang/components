@@ -1,0 +1,424 @@
+// RouteSteps: turn-by-turn directions, for a phone held in a hand or on a dash: the step to do
+// next large, with how far to it, then how much of the route is done, the distance left and
+// when it should end. The rest of the steps run below, or beside it on a tablet. Steps come from
+// data, as a routing service gives them; nothing here calls one. A position moves it along by
+// real distance to each turn, and swiping the card, the buttons or the arrow keys look at other
+// steps, which is how a person checks what comes after this turn.
+//
+//   import ui/route_steps.qwe use RouteSteps
+//
+//   <RouteSteps now="2026-11-03T14:05:00+00:00" position={here} on_arrive={() => { done = true }} steps={[
+//       { text: "Head north on Rua Augusta", road: "Rua Augusta", turn: "straight", metres: 400, seconds: 300, lat: 38.7130, lng: -9.1370 },
+//       { text: "Turn right onto Rua da Prata", turn: "right", metres: 120, seconds: 90, lat: 38.7140, lng: -9.1356 },
+//       { text: "You have arrived", turn: "arrive", metres: 0, seconds: 0, lat: 38.7140, lng: -9.1356 },
+//   ]}/>
+//
+// steps: in order, each { text, road?, turn?, metres, seconds, lat?, lng? }: metres and seconds
+// are this step's own length; lat and lng the point it ends at, which a position is
+// measured to. turn: "straight", "slight-left", "left", "sharp-left", "slight-right", "right",
+// "sharp-right", "uturn", "roundabout" or "arrive". A number that cannot be read counts as 0.
+// current: the step it starts at (0), and a new value moves it. done: metres already gone
+// on the current step (0). position: [lat, lng] or { lat, lng }, moving it on as each turn is
+// reached; a step past the next is taken too, as a phone may wake up further along. near:
+// metres from a turn that count as there (25). now: the time, an ISO date-time with its offset,
+// as the ETA is in that local time, and so the server writes what the browser does; left
+// out, the ETA appears once started, by the phone's clock. tick: seconds between looks at the
+// clock (30). units: "km" (default) or "mi". label: what screen readers call it ("Directions").
+// on_step(i): another step shown. on_arrive(): the last step reached, by position or by
+// pressing Finish, once. Both inside one of your components.
+//
+// The equal of the swipe: Previous and Next, and ArrowLeft and ArrowRight on the card. The
+// list below goes straight to a step.
+//
+// route_steps_left, route_steps_progress, route_steps_eta, route_steps_follow and
+// route_steps_distance are the working.
+
+import ui/theme.qwe use ui_cls
+
+let route_steps_css = css`
+.ui-routest { position: relative; box-sizing: border-box; height: 100%; min-height: 0; display: flex; flex-direction: column; container-type: inline-size; overflow: hidden; background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-routest-in { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding: 12px 12px max(12px, env(safe-area-inset-bottom)); }
+.ui-routest-main { flex: none; display: grid; gap: 10px; }
+.ui-routest-card {
+  position: relative; display: grid; grid-template-columns: 72px minmax(0, 1fr); align-items: center; gap: 2px 14px; min-height: 148px; padding: 14px 16px; border-radius: calc(var(--ui-radius) + 4px);
+  background: var(--ui-accent); color: var(--ui-accent-fg); touch-action: pan-y; -webkit-touch-callout: none; user-select: none; will-change: transform; outline: none;
+  transition: transform .26s cubic-bezier(.22, 1, .36, 1);
+}
+.ui-routest-card:focus-visible { box-shadow: var(--ui-focus); }
+.ui-routest-card[data-dragging] { transition: none; }
+.ui-routest-arrow { grid-row: 1 / span 3; display: grid; place-items: center; width: 72px; height: 72px; }
+.ui-routest-arrow svg { width: 64px; height: 64px; transition: transform .2s; }
+.ui-routest-in-m { font-size: 34px; font-weight: 800; line-height: 1.05; font-variant-numeric: tabular-nums; }
+.ui-routest-text { font-size: 19px; font-weight: 600; line-height: 1.25; overflow-wrap: anywhere; }
+.ui-routest-count { font-size: 13px; opacity: .85; }
+.ui-routest-track { height: 8px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-routest-fill { display: block; height: 100%; border-radius: inherit; background: var(--ui-accent); transition: width .3s; }
+.ui-routest-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 0; text-align: center; }
+.ui-routest-stats div { min-width: 0; }
+.ui-routest-stats dt { color: var(--ui-muted); font-size: 12px; }
+.ui-routest-stats dd { margin: 0; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-routest-nav { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.ui-routest-btn {
+  box-sizing: border-box; min-height: 48px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg);
+  font: 600 15px/1 var(--ui-font); cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-routest-btn:disabled { opacity: .45; cursor: default; }
+.ui-routest-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-routest-list { flex: 1; min-height: 0; margin: 0; padding: 0; overflow: auto; overscroll-behavior: contain; list-style: none; -webkit-overflow-scrolling: touch; }
+.ui-routest-step {
+  box-sizing: border-box; display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 10px; width: 100%; min-height: 52px; padding: 6px 4px; border: 0; border-bottom: 1px solid var(--ui-border);
+  background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-routest-step:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-routest-step svg { width: 22px; height: 22px; }
+.ui-routest-step[data-state="done"] { color: var(--ui-muted); }
+.ui-routest-step[aria-current="step"] { background: var(--ui-accent-soft); font-weight: 600; }
+.ui-routest-far { color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-routest-empty { padding: 24px 12px; color: var(--ui-muted); text-align: center; }
+/* With the room, the step stays large on one side and the list runs down the other. */
+@container (min-width: 620px) {
+  .ui-routest-in { flex-direction: row; align-items: stretch; gap: 20px; padding: 20px max(20px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); }
+  .ui-routest-main { flex: 0 0 56%; align-content: start; }
+  .ui-routest-card { grid-template-columns: 110px minmax(0, 1fr); min-height: 220px; padding: 20px 22px; }
+  .ui-routest-arrow { width: 110px; height: 110px; }
+  .ui-routest-arrow svg { width: 96px; height: 96px; }
+  .ui-routest-in-m { font-size: 46px; }
+  .ui-routest-text { font-size: 24px; }
+}
+@media (hover: hover) { .ui-routest-step:hover { background: var(--ui-subtle); } }
+@media (prefers-reduced-motion: reduce) { .ui-routest-card, .ui-routest-arrow svg, .ui-routest-fill { transition: none; } }
+`
+
+fn route_steps_clock() = now()
+
+fn route_steps_num(x) = (type_of(x) == "int" || type_of(x) == "float" || type_of(x) == "dec") && math.isfinite(float(x))
+
+fn route_steps_time(s) = type_of(s) == "str" && date.valid(s, "date-time")
+
+// A number that can be counted on: not below 0, not text.
+fn route_steps_pos(x) = route_steps_num(x) && x > 0 ? float(x) : 0
+
+// Steps fit to sum up: the rest of the program need not ask.
+fn route_steps_clean(steps) =
+    (type_of(steps) == "list" ? steps : []) | filter((s) => type_of(s) == "map")
+        | map((s) => { text: str(s.text ?? "Continue"), road: s.road, turn: s.turn ?? "straight", metres: route_steps_pos(s.metres), seconds: route_steps_pos(s.seconds), at: route_steps_point(s) })
+
+// { lat, lng } from a pair or a map, or null if it is not a place on Earth.
+fn route_steps_point(p) {
+    if p == null { return null }
+    let lat = type_of(p) == "list" ? (len(p) > 1 ? p[0] : null) : p.lat
+    let lng = type_of(p) == "list" ? (len(p) > 1 ? p[1] : null) : (p.lng ?? p.lon)
+    if !route_steps_num(lat) || !route_steps_num(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180 { return null }
+    { lat: float(lat), lng: float(lng) }
+}
+
+fn route_steps_metres(a, b) {
+    let la = math.radians(a.lat)
+    let lb = math.radians(b.lat)
+    let dlat = lb - la
+    let dlng = math.radians(b.lng - a.lng)
+    let h = pow(math.sin(dlat / 2), 2) + math.cos(la) * math.cos(lb) * pow(math.sin(dlng / 2), 2)
+    2 * 6371008.8 * math.atan2(sqrt(h), sqrt(max([1 - h, 0])))
+}
+
+// { metres, seconds } left from `done` metres into step `i`: the part of this step not yet
+// walked, at this step's own speed, and all of those after it.
+fn route_steps_left(steps, i: int, done: num) {
+    let count = len(steps)
+    if i >= count { return { metres: 0, seconds: 0 } }
+    let here = steps[i]
+    let gone = max([0, min([done, here.metres])])
+    let share = here.metres > 0 ? 1 - gone / here.metres : 1
+    let after = slice(steps, i + 1, count)
+    { metres: here.metres - gone + sum(after | map((s) => s.metres)), seconds: here.seconds * share + sum(after | map((s) => s.seconds)) }
+}
+
+// Percent of the route's length behind, whole. A route of no length is done at its last step.
+fn route_steps_progress(steps, i: int, done: num) {
+    let total = sum(steps | map((s) => s.metres))
+    if total <= 0 { return len(steps) > 0 && i >= len(steps) - 1 ? 100 : 0 }
+    max([0, min([100, floor((total - route_steps_left(steps, i, done).metres) / total * 100)])])
+}
+
+// What a person is told to the next turn, or left: to the 10 m below 100 m, 50 m below a
+// kilometre; in miles, feet to the 50 below a tenth of a mile.
+fn route_steps_distance(m, units: str = "km") {
+    if units == "mi" {
+        let miles = m / 1609.344
+        if miles < 0.1 { return `${format_number(round(m / 0.3048 / 50) * 50, "en-US", 0)} ft` }
+        return miles < 10 ? `${format_number(miles, "en-US", 1)} mi` : `${format_number(round(miles), "en-US", 0)} mi`
+    }
+    if m < 100 { return `${format_number(round(m / 10) * 10, "en-US", 0)} m` }
+    if m < 1000 {
+        let fifties = round(m / 50) * 50
+        return fifties >= 1000 ? "1.0 km" : `${format_number(fifties, "en-US", 0)} m`
+    }
+    m < 10000 ? `${format_number(m / 1000, "en-US", 1)} km` : `${format_number(round(m / 1000), "en-US", 0)} km`
+}
+
+// 45 min, 1 h 5 min, rounded up: arriving before a promise is the better mistake.
+fn route_steps_duration(seconds) {
+    if seconds <= 0 { return "0 min" }
+    let mins = ceil(seconds / 60)
+    if mins < 60 { return `${mins} min` }
+    mins % 60 == 0 ? `${floor(mins / 60)} h` : `${floor(mins / 60)} h ${mins % 60} min`
+}
+
+// When it ends, by the clock at `off`: "14:42", and "14:42 +1 day" past midnight.
+fn route_steps_eta(from_ms, seconds, off) {
+    let start = date.from_ms(from_ms, off)
+    let end = date.from_ms(from_ms + ceil(seconds / 60) * 60000, off)
+    let days = date.days_between(slice(start, 0, 10), slice(end, 0, 10))
+    days > 0 ? `${date.format(end, "HH:mm")} +${days} ${days == 1 ? "day" : "days"}` : date.format(end, "HH:mm")
+}
+
+// Where a position puts a person: { i, done, arrived }. Each step's end is a turn; being near
+// one means that step is over. It looks three turns ahead, and the furthest reached wins, as
+// fixes may be minutes apart. Done is how much of the step has gone: never backwards from a
+// fix that wanders, and never more than its length.
+fn route_steps_follow(steps, i: int, was_done: num, p, near: num = 25) {
+    let count = len(steps)
+    let last = count - 1
+    let reached = range(i, min([i + 4, count])) | filter((j) => steps[j].at != null && route_steps_metres(p, steps[j].at) <= near)
+    if len(reached) > 0 {
+        let top = reached[len(reached) - 1]
+        return top >= last ? { i: last, done: steps[last].metres, arrived: true } : { i: top + 1, done: 0, arrived: false }
+    }
+    if i > last || steps[i].at == null { return { i: i, done: was_done, arrived: false } }
+    let to_go = route_steps_metres(p, steps[i].at)
+    { i: i, done: max([was_done, steps[i].metres - to_go]), arrived: false }
+}
+
+// An arrow pointing the way, drawn once and turned.
+fn route_steps_angle(turn) = match turn {
+    "slight-left" => -45
+    "left" => -90
+    "sharp-left" => -135
+    "uturn" => 180
+    "slight-right" => 45
+    "right" => 90
+    "sharp-right" => 135
+    _ => 0
+}
+
+fn route_steps_path(turn) = match turn {
+    "arrive" => "M12 2a7 7 0 0 0-7 7c0 5.2 7 13 7 13s7-7.8 7-13a7 7 0 0 0-7-7Zm0 9.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5Z"
+    "roundabout" => "M12 2 7 7h3.9v3.1a6 6 0 1 0 2.2 0V7H17l-5-5Zm0 10a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z"
+    _ => "M12 2 4.5 9.5 6.2 11.2 10.8 6.6V22h2.4V6.6l4.6 4.6 1.7-1.7L12 2Z"
+}
+
+// A finger as it goes: where it began, which axis it took (null until it has moved `slop`
+// pixels) and its last few places, to tell how fast it was going.
+fn route_steps_track(x: num, y: num, at: num) = { x0: x, y0: y, x: x, y: y, lock: null, samples: [[at, x]] }
+
+fn route_steps_track_move(track, x: num, y: num, at: num, slop: num = 8) {
+    let dx = abs(x - track.x0)
+    let dy = abs(y - track.y0)
+    let lock = track.lock
+    if lock == null && max([dx, dy]) >= slop { lock = dx > dy ? "x" : "y" }
+    { x0: track.x0, y0: track.y0, x: x, y: y, lock: lock, samples: slice(track.samples, -5, len(track.samples)) + [[at, x]] }
+}
+
+// Pixels a millisecond over the last tenth of a second. A finger that stopped before it
+// lifted (`at` is when it lifted) was going nowhere.
+fn route_steps_speed(track, at: num) {
+    let s = track.samples
+    let last = s[len(s) - 1]
+    if at - last[0] > 120 { return 0 }
+    let recent = s | filter((p) => last[0] - p[0] <= 100)
+    let first = len(recent) > 1 || len(s) < 2 ? recent[0] : s[len(s) - 2]
+    let took = last[0] - first[0]
+    took <= 0 ? 0 : (last[1] - first[1]) / took
+}
+
+// Where a released swipe goes: -1 to the step before, 1 to the one after, 0 back where it
+// was. Far enough, or fast enough, in the direction it was going.
+fn route_steps_release(dx: num, speed: num, width: num) {
+    let flung = abs(speed) >= 0.4 && abs(dx) >= 12
+    let far = abs(dx) >= width * 0.3
+    if !flung && !far { return 0 }
+    if flung && (speed > 0) != (dx > 0) { return 0 }
+    dx > 0 ? -1 : 1
+}
+
+// A pull past the first or last step gives a little, and comes back.
+fn route_steps_rubber(dx: num) = dx > 0 ? round(dx / (1 + dx / 160), 2) : 0 - round(abs(dx) / (1 + abs(dx) / 160), 2)
+
+fn route_steps_offset() {
+    let off = 0 - js_new("Date").getTimezoneOffset()
+    let hh = floor(abs(off) / 60)
+    `${off < 0 ? "-" : "+"}${hh < 10 ? "0" : ""}${hh}:${abs(off) % 60 < 10 ? "0" : ""}${abs(off) % 60}`
+}
+
+view RouteStepsArrow(turn, size: str = "") =
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class={size} style={`transform: rotate(${route_steps_angle(turn)}deg)`}><path d={route_steps_path(turn)}/></svg>
+
+component RouteSteps(steps = [], current: int = 0, done: num = 0, position = null, near: num = 25, now: str? = null, tick: num = 30, units: str = "km",
+                     label: str = "Directions", on_step = null, on_arrive = null, class: str? = null) {
+    style global route_steps_css
+    let list = route_steps_clean(steps)
+    let last = len(list) - 1
+    state at = max([0, min([current, len(route_steps_clean(steps)) - 1])])
+    state gone = route_steps_pos(done)
+    state seen_current = current
+    state seen_key = ""
+    state arrived = false
+    state told = false          // on_arrive said once, whatever is done after it
+    state base = route_steps_time(now) ? date.ms(now) : null
+    state offset = route_steps_time(now) ? date.parts(now).offset : null
+    state seen_now = now
+    state since = 0
+    state moved_on = 0
+    state card = null
+    state track = null
+    state dragging = false
+
+    let show = (i: int) => {
+        let to = max([0, min([i, last])])
+        if to != at {
+            at = to
+            gone = 0
+            arrived = false
+            on_step && on_step(to)
+        }
+    }
+    let arrive = () => {
+        arrived = true
+        if !told {
+            told = true
+            on_arrive && on_arrive()
+        }
+    }
+    if current != seen_current {
+        seen_current = current
+        show(current)
+    }
+    if now != seen_now {
+        seen_now = now
+        if route_steps_time(now) {
+            base = date.ms(now)
+            offset = date.parts(now).offset
+            since = route_steps_clock()
+            moved_on = 0
+        }
+    }
+    if tick > 0 && base != null { every(round(tick * 1000), () => { moved_on = route_steps_clock() - since }) }
+    // Each new position once: the key keeps this from running on what it sets.
+    let here = route_steps_point(position)
+    let key_now = here == null ? "" : `${here.lat},${here.lng}`
+    if key_now != seen_key {
+        seen_key = key_now
+        if here != null && last >= 0 {
+            let where = route_steps_follow(list, at, gone, here, near)
+            if where.i != at {
+                at = where.i
+                on_step && on_step(where.i)
+            }
+            gone = where.done
+            if where.arrived { arrive() }
+        }
+    }
+
+    let spring = () => {
+        card.style.removeProperty("transform")
+        dragging = false
+    }
+    let cancel = (_e = null) => {
+        track = null
+        if card != null { spring() }
+    }
+    let press_key = (e) => {
+        if e.key == "ArrowRight" {
+            e.preventDefault()
+            show(at + 1)
+        }
+        if e.key == "ArrowLeft" {
+            e.preventDefault()
+            show(at - 1)
+        }
+    }
+
+    let step = last >= 0 ? list[at] : null
+    let left = arrived ? { metres: 0, seconds: 0 } : route_steps_left(list, at, gone)
+    let pct = arrived ? 100 : route_steps_progress(list, at, gone)
+    let to_turn = step == null ? 0 : max([0, step.metres - gone])
+    let at_ms = base == null ? null : base + moved_on
+    <section class={ui_cls(["ui-routest", class])} aria-label={label} @mount={(_el) => {
+        since = route_steps_clock()
+        if base == null {
+            offset = route_steps_offset()
+            base = since
+        }
+    }}>
+        {step == null
+            ? <p.ui-routest-empty>No route to show.</p>
+            : <div.ui-routest-in>
+                  <div.ui-routest-main>
+                      <div.ui-routest-card tabindex="0" role="group" aria-roledescription="step" aria-label={`Step ${at + 1} of ${last + 1}`} data-dragging={dragging ? "" : null}
+                           @mount={(el) => { card = el }}
+                           @keydown={press_key}
+                           @pointerdown={(e) => {
+                               if e.button == 0 && (e.pointerType != "mouse" || e.target.closest("button") == null) {
+                                   track = route_steps_track(e.clientX, e.clientY, e.timeStamp)
+                               }
+                           }}
+                           @pointermove={(e) => {
+                               if track != null {
+                                   track = route_steps_track_move(track, e.clientX, e.clientY, e.timeStamp)
+                                   if track.lock == "y" {
+                                       cancel()
+                                   } else if track.lock == "x" {
+                                       if !dragging {
+                                           dragging = true
+                                           card.setPointerCapture(e.pointerId)
+                                       }
+                                       let dx = track.x - track.x0
+                                       let blocked = (dx > 0 && at == 0) || (dx < 0 && at == last)
+                                       card.style.transform = `translateX(${blocked ? route_steps_rubber(dx) : round(dx, 1)}px)`
+                                   }
+                               }
+                           }}
+                           @pointerup={(e) => {
+                               if track != null && track.lock == "x" {
+                                   let go = route_steps_release(track.x - track.x0, route_steps_speed(track, e.timeStamp), card.offsetWidth)
+                                   track = null
+                                   spring()
+                                   if go != 0 { show(at + go) }
+                               } else {
+                                   track = null
+                               }
+                           }}
+                           @pointercancel={cancel}>
+                          <span.ui-routest-arrow><RouteStepsArrow turn={step.turn}/></span>
+                          <span.ui-routest-in-m>{step.metres > 0 ? route_steps_distance(to_turn, units) : ""}</span>
+                          <span.ui-routest-text aria-live="polite">{arrived ? "You have arrived" : step.text}</span>
+                          <span.ui-routest-count>Step {at + 1} of {last + 1}{step.road != null ? `, ${step.road}` : ""}</span>
+                      </div>
+                      <div.ui-routest-track role="progressbar" aria-label="Route done" aria-valuemin="0" aria-valuemax="100" aria-valuenow={pct}>
+                          <span.ui-routest-fill style={`width: ${pct}%`}></span>
+                      </div>
+                      <dl.ui-routest-stats>
+                          <div><dt>Left</dt><dd.ui-routest-left>{route_steps_distance(left.metres, units)}</dd></div>
+                          <div><dt>Time</dt><dd.ui-routest-time>{route_steps_duration(left.seconds)}</dd></div>
+                          <div><dt>Arrive</dt><dd.ui-routest-eta>{at_ms != null ? route_steps_eta(at_ms, left.seconds, offset) : ""}</dd></div>
+                      </dl>
+                      <div.ui-routest-nav>
+                          <button.ui-routest-btn.ui-routest-prev type="button" disabled={at == 0} @click={() => { show(at - 1) }}>Previous</button>
+                          <button.ui-routest-btn.ui-routest-next type="button" disabled={arrived} @click={() => {
+                              if at == last { arrive() } else { show(at + 1) }
+                          }}>{at == last ? "Finish" : "Next"}</button>
+                      </div>
+                  </div>
+                  <ol.ui-routest-list aria-label="All steps">
+                      {for pair in enumerate(list) => <li key={pair[0]}>
+                          <button.ui-routest-step type="button" data-i={pair[0]} data-state={pair[0] < at ? "done" : "ahead"} aria-current={pair[0] == at ? "step" : null}
+                                  @click={() => { show(pair[0]) }}>
+                              <RouteStepsArrow turn={pair[1].turn}/>
+                              <span>{pair[1].text}</span>
+                              <span.ui-routest-far>{pair[1].metres > 0 ? route_steps_distance(pair[1].metres, units) : ""}</span>
+                          </button>
+                      </li>}
+                  </ol>
+              </div>}
+    </section>
+}

@@ -1,0 +1,387 @@
+// BoxPacker: what to ship a list of items in. It looks for the smallest box of a
+// given set that takes everything, turning items as needed, and splits across boxes
+// when none does, each box then cut down to the smallest that holds its share. It
+// works out each box's dimensional weight and billable weight, the larger of that
+// and the actual weight, rounded up to the carrier's step, and says of an item that
+// fits no box which side or how much weight is the trouble. Fit of one item in one
+// box is exact. Packing several is a heuristic, as finding the best packing is an
+// NP-hard problem: it places the largest first in the free spaces left, two ways
+// round, so it can use a larger box than a clever hand would, but what it says
+// fits does fit.
+//
+//   <BoxPacker unit="cm" boxes={[
+//       { name: "Small", size: "20 x 15 x 10", tare: 0.1, max_weight: 5 },
+//       { name: "Large", size: "40 x 30 x 30", tare: 0.4, max_weight: 20 }]}
+//       items={[{ name: "Mug", size: "12 x 9 x 10", weight: 0.4, qty: 2 }]}/>
+//
+// boxes: a list of { name, size, tare?, max_weight? }: size its outer measures, as
+// "l x w x h" or a list of three, tare what it weighs empty (0), max_weight the most
+// it may weigh full, tare included (no limit). items: a list of { name, size,
+// weight, qty?, upright? } to start with; more can be added, up to 30 rows. weight
+// is for one, qty how many (1), and upright keeps that side up, turning only around
+// its height. unit: "cm", with weights in kg (the default), or "in", with weights in
+// lb. divisor: the carrier's volume per weight, in the field the reader can change
+// (5000 for cm, 139 for in). step: what billable weight rounds up to (0.5 kg or 1
+// lb). title: the heading ("Pack this order"). id: a prefix for its ids ("box-packer"),
+// unique on the page. The fields are named item_name, item_size, item_weight and
+// item_qty, one of each a row, and divisor; name: a prefix for those names.
+// on_change(result): inside one of your components, given box_packer_pack's answer
+// after each change. It packs at most 100 pieces at a time, and says so past that.
+//
+// box_packer_boxes(boxes) reads boxes and box_packer_pack(boxes, rows, divisor, step)
+// packs, for a program's own use, with rows as { name, size, weight, qty, upright }.
+// It gives { shipments, unfit, problems, billable }, each shipment { box, pieces,
+// actual, dimensional, billable, fill } and each unfit { name, why }.
+
+import ui/theme.qwe use ui_cls
+
+let box_packer_css = css`
+.ui-boxpack { display: grid; gap: 14px; min-width: 0; max-width: 760px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-boxpack .ui-boxpack-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-boxpack-sizes { margin: 0; color: var(--ui-muted); font-size: 12px; }
+.ui-boxpack-rows { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.ui-boxpack-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 2fr) minmax(0, 1fr) minmax(0, .8fr) auto; gap: 4px 10px; align-items: end; }
+.ui-boxpack-cell { display: grid; gap: 3px; min-width: 0; }
+.ui-boxpack-cell label { color: var(--ui-muted); font-size: 12px; font-weight: 500; }
+.ui-boxpack-cell input { box-sizing: border-box; width: 100%; min-width: 0; height: 36px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); transition: border-color .15s, box-shadow .15s; }
+.ui-boxpack-cell input:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-boxpack-cell input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-boxpack-short { max-width: 150px; }
+.ui-boxpack-btn { min-height: 36px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-boxpack-btn:hover:not(:disabled) { border-color: var(--ui-accent); color: var(--ui-accent); }
+.ui-boxpack-btn:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-boxpack-btn:disabled { opacity: .55; cursor: not-allowed; }
+.ui-boxpack-rowerror { grid-column: 1 / -1; margin: 0; color: var(--ui-danger); font-size: 12px; }
+.ui-boxpack-verdict { margin: 0; font-size: 15px; font-weight: 650; color: var(--ui-success); }
+.ui-boxpack-ship { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-boxpack-box { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 10px 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-boxpack-name { font-weight: 650; overflow-wrap: anywhere; }
+.ui-boxpack-bill { font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-boxpack-what { grid-column: 1 / -1; font-size: 13px; overflow-wrap: anywhere; }
+.ui-boxpack-how { grid-column: 1 / -1; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-boxpack-unfit { margin: 0; padding: 8px 12px 8px 28px; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); color: var(--ui-danger); font-size: 13px; }
+.ui-boxpack-problems { margin: 0; padding: 8px 12px 8px 26px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 12px; }
+.ui-boxpack-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+@media (max-width: 560px) { .ui-boxpack { padding: 16px; } .ui-boxpack-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .ui-boxpack-row > :first-child, .ui-boxpack-row > :nth-child(2) { grid-column: 1 / -1; } }
+@media (prefers-reduced-motion: reduce) { .ui-boxpack-cell input { transition: none; } }
+`
+
+let box_packer_most = 100
+// Lengths are kept as whole hundredths: an item's rounded up, a box's down, so that
+// what is said to fit does, and ints add and compare exactly and fast.
+let box_packer_scale = 100
+
+// A number of 0 or more as a decimal, null when blank, an error value when it is not.
+fn box_packer_read(x) {
+    let t = trim(str(x ?? ""))
+    if t == "" { return null }
+    if !re.test(t, "^[0-9]{1,7}(\\.[0-9]{1,6})?$") { return err("is not a number") }
+    dec(t)
+}
+
+// Three sides as decimals, from "30 x 20 x 10", "30x20x10 cm" or a list.
+fn box_packer_dims(x) {
+    let text = type_of(x) == "list" ? x | map((d) => str(d)) | join(" x ") : lower(trim(str(x ?? "")))
+    if text == "" { return null }
+    let bare = trim(re.replace(text, "(cm|in|inches|\")", ""))
+    let parts = re.split(bare, "\\s*[x×*]\\s*|\\s+")
+    if len(parts) != 3 { return err("Size needs three numbers, such as 30 x 20 x 10") }
+    let read = parts | map(box_packer_read)
+    if any(read, (d) => d == null || is_err(d)) { return err("Size needs three numbers, such as 30 x 20 x 10") }
+    if any(read, (d) => d == 0) { return err("Each side must be more than 0") }
+    if any(read, (d) => d > 10000) { return err("A side is too large to pack") }
+    read
+}
+
+// The ways round a piece can go, without repeats: lying any way, or upright only.
+fn box_packer_turns(s, upright: bool) {
+    let all_ways = upright ? [[s[0], s[1], s[2]], [s[1], s[0], s[2]]]
+        : [[s[0], s[1], s[2]], [s[1], s[0], s[2]], [s[0], s[2], s[1]], [s[2], s[0], s[1]], [s[1], s[2], s[0]], [s[2], s[1], s[0]]]
+    unique(all_ways)
+}
+
+// The boxes as data, smallest first: { boxes, problems }.
+fn box_packer_boxes(boxes) {
+    let problems = []
+    let tidy = []
+    for b in type_of(boxes) == "list" ? take(boxes, 20) : [] {
+        let d = type_of(b) == "map" ? box_packer_dims(b.size) : null
+        let tare = type_of(b) == "map" ? box_packer_read(b.tare ?? 0) : null
+        let cap = type_of(b) == "map" && b.max_weight != null ? box_packer_read(b.max_weight) : null
+        if d == null || is_err(d) || tare == null || is_err(tare) || is_err(cap) {
+            problems = problems | push(`${type_of(b) == "map" ? str(b.name ?? "A box") : "A box"} has a size or weight it cannot read, so it is left out.`)
+        } else {
+            let sides = d | map((x) => int(floor(x * box_packer_scale)))
+            tidy = tidy | push({ name: str(b.name ?? "Box"), dims: d, sides, volume: d[0] * d[1] * d[2], tare, cap })
+        }
+    }
+    { boxes: sort_by(tidy, (b) => b.volume), problems }
+}
+
+// The way round that goes in a space leaving the least along some side, or null.
+fn box_packer_orient(s, turns) {
+    let best = null
+    let tight = null
+    for t in turns {
+        if t[0] <= s.l && t[1] <= s.w && t[2] <= s.h {
+            let gaps = [s.l - t[0], s.w - t[1], s.h - t[2]]
+            let gap = min(gaps)
+            if tight == null || gap < tight {
+                tight = gap
+                best = t
+            }
+        }
+    }
+    best
+}
+
+// As many of the pieces as go in a box, in their order. A piece goes in the first
+// space that takes it, and the rest of that space becomes up to three spaces
+// beside, behind and above it, tried first, which keeps pieces together.
+fn box_packer_fill(box, pieces) {
+    let spaces = [{ l: box.sides[0], w: box.sides[1], h: box.sides[2] }]
+    let placed = []
+    let left = []
+    let load = box.tare
+    for p in pieces {
+        let heavy = box.cap != null && load + p.weight > box.cap
+        let i = 0
+        let turn = null
+        while !heavy && turn == null && i < len(spaces) {
+            turn = box_packer_orient(spaces[i], p.turns)
+            if turn == null { i += 1 }
+        }
+        if turn == null {
+            left = left | push(p)
+        } else {
+            let s = spaces[i]
+            let fresh = [{ l: turn[0], w: turn[1], h: s.h - turn[2] }, { l: turn[0], w: s.w - turn[1], h: s.h }, { l: s.l - turn[0], w: s.w, h: s.h }]
+                | filter((x) => x.l > 0 && x.w > 0 && x.h > 0)
+            spaces = fresh + slice(spaces, 0, i) + slice(spaces, i + 1)
+            placed = placed | push(p)
+            load = load + p.weight
+        }
+    }
+    { placed, left }
+}
+
+fn box_packer_volume(pieces) = sum(pieces | map((p) => p.volume)) + 0m
+
+// The fuller of two tries at a box: largest first by volume, then by longest side.
+fn box_packer_try(box, pieces) {
+    let a = box_packer_fill(box, reverse(sort_by(pieces, (p) => p.volume)))
+    if len(a.left) == 0 { return a }
+    let b = box_packer_fill(box, reverse(sort_by(pieces, (p) => p.longest)))
+    box_packer_volume(b.placed) > box_packer_volume(a.placed) ? b : a
+}
+
+// The smallest box that takes all of these, or null. Volume and weight rule most
+// boxes out before any packing is tried.
+fn box_packer_smallest(boxes, pieces) {
+    let need = box_packer_volume(pieces)
+    let weight = sum(pieces | map((p) => p.weight)) + 0m
+    for b in boxes {
+        if b.volume >= need && (b.cap == null || b.tare + weight <= b.cap) && len(box_packer_try(b, pieces).left) == 0 { return b }
+    }
+    null
+}
+
+// Why a piece fits no box, or null when one takes it.
+fn box_packer_alone(boxes, p, unit: str, mass: str) {
+    if any(boxes, (b) => len(box_packer_fill(b, [p]).left) == 0) { return null }
+    let shape = boxes | filter((b) => len(box_packer_fill(merge(b, { cap: null }), [p]).left) == 0)
+    if len(shape) == 0 {
+        let longest = max(flatten(boxes | map((b) => b.dims)))
+        let side = max(p.dims)
+        return side > longest ? `Its longest side is ${str(side)} ${unit}, and the longest any box takes is ${str(longest)} ${unit}.` : p.upright ? "No box takes it standing upright." : "No box takes all three of its sides, however it is turned."
+    }
+    let most = max(shape | map((b) => b.cap - b.tare))
+    `It weighs ${str(p.weight)} ${mass}, and the most a box that takes it can carry is ${str(most)} ${mass}.`
+}
+
+// A row as pieces, or the sentence saying what is wrong with it: { error, pieces }.
+fn box_packer_row(r) {
+    let d = box_packer_dims(r.size)
+    let w = box_packer_read(r.weight)
+    let q = box_packer_read(r.qty)
+    if d == null && w == null { return { error: "", pieces: [] } }
+    if d == null { return { error: "Add a size", field: "size", pieces: [] } }
+    if is_err(d) { return { error: d.error, field: "size", pieces: [] } }
+    if w == null { return { error: "Add a weight", field: "weight", pieces: [] } }
+    if is_err(w) { return { error: "Weight is not a number", field: "weight", pieces: [] } }
+    if is_err(q) || (q != null && (q < 1 || q != floor(q))) { return { error: "Quantity is not a whole number", field: "qty", pieces: [] } }
+    if q != null && q > 10000 { return { error: "Quantity is too large", field: "qty", pieces: [] } }
+    let count = q != null ? int(q) : 1
+    let sides = d | map((x) => int(ceil(x * box_packer_scale)))
+    let up = r.upright == true
+    let piece = { name: filled(trim(str(r.name ?? ""))) ?? "Item", dims: d, turns: box_packer_turns(sides, up), upright: up, weight: w, volume: d[0] * d[1] * d[2], longest: max(d) }
+    { error: null, pieces: range(count) | map((i) => piece), count }
+}
+
+// One box's weights: dimensional from its outer size, billable rounded up to the step.
+fn box_packer_ship(box, pieces, divisor, step) {
+    let actual = box.tare + sum(pieces | map((p) => p.weight))
+    let dimensional = box.volume / divisor
+    let larger = actual > dimensional ? actual : dimensional
+    { box, pieces, actual, dimensional, billable: ceil(larger / step) * step, fill: round(box_packer_volume(pieces) * 100 / box.volume, 1, "half_up") }
+}
+
+// The whole answer: see the top of the file.
+fn box_packer_pack(boxes, rows, divisor, step, unit: str = "cm", mass: str = "kg") {
+    let read = rows | map(box_packer_row)
+    let every = flatten(read | map((r) => r.pieces))
+    let cut = len(every) > box_packer_most
+    let pieces = take(every, box_packer_most)
+    let problems = cut ? [`Only the first ${box_packer_most} of the ${len(every)} pieces are packed.`] : []
+    let unfit = []
+    let can = []
+    let seen = {}
+    for p in pieces {
+        // Pieces of a row are alike, so a row is asked once.
+        let look = str([p.name, p.dims, p.weight, p.upright])
+        if !has(seen, look) {
+            let why = box_packer_alone(boxes, p, unit, mass)
+            seen = set(seen, look, { why })
+            if why != null { unfit = unfit | push({ name: p.name, why }) }
+        }
+        if seen[look].why == null { can = can | push(p) }
+    }
+    let shipments = []
+    let rest = can
+    // Each round takes at least one piece, as each fits some box alone.
+    while len(rest) > 0 {
+        let whole = box_packer_smallest(boxes, rest)
+        if whole != null {
+            shipments = shipments | push(box_packer_ship(whole, box_packer_try(whole, rest).placed, divisor, step))
+            rest = []
+        } else {
+            let tries = boxes | map((b) => ({ box: b, go: box_packer_try(b, rest) })) | filter((t) => len(t.go.placed) > 0)
+            let best = last(sort_by(reverse(tries), (t) => box_packer_volume(t.go.placed)))
+            // The share may fit something smaller than the box it was packed for.
+            let snug = box_packer_smallest(boxes, best.go.placed) ?? best.box
+            shipments = shipments | push(box_packer_ship(snug, box_packer_try(snug, best.go.placed).placed, divisor, step))
+            rest = best.go.left
+        }
+    }
+    { shipments, unfit, problems, billable: sum(shipments | map((s) => s.billable)) + 0m, read }
+}
+
+// Each kind of piece in a box, with how many: "2 x Mug, Lid".
+fn box_packer_list(pieces) -> str {
+    let names = unique(pieces | map((p) => p.name))
+    names | map((n) => {
+        let c = pieces | filter((p) => p.name == n) | len
+        c > 1 ? `${c} × ${n}` : n
+    }) | join(", ")
+}
+
+fn box_packer_start(items) {
+    let good = type_of(items) == "list" ? take(items | filter((i) => type_of(i) == "map"), 30) : []
+    let rows = enumerate(good) | map((x) => {
+        let i = x[1]
+        { key: x[0], name: str(i.name ?? ""), size: type_of(i.size) == "list" ? i.size | map((d) => str(d)) | join(" x ") : str(i.size ?? ""), weight: str(i.weight ?? ""), qty: str(i.qty ?? 1), upright: i.upright == true }
+    })
+    len(rows) > 0 ? rows : [{ key: 0, name: "", size: "", weight: "", qty: "1", upright: false }]
+}
+
+component BoxPacker(boxes = [], items = [], unit: str = "cm", divisor = null, step = null, title: str = "Pack this order", id: str = "box-packer", name: str? = null,
+                    on_change = null, class: str? = null) {
+    style global box_packer_css
+    let limit = 30
+    let metric = unit != "in"
+    let side_unit = metric ? "cm" : "in"
+    let mass = metric ? "kg" : "lb"
+    let model = box_packer_boxes(boxes)
+    let start = box_packer_start(items)
+    state rows = start
+    state next_key = len(start)
+    state divide = str(divisor ?? (metric ? 5000 : 139))
+    state fresh = -1
+    state add_el = null
+    let step_read = box_packer_read(step)
+    let per = step_read == null || is_err(step_read) || step_read == 0 ? (metric ? 0.5m : 1m) : step_read
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let div_read = box_packer_read(divide)
+    let div_bad = div_read == null || is_err(div_read) || div_read == 0
+    let result = (list) => box_packer_pack(model.boxes, list, div_bad ? (metric ? 5000m : 139m) : div_read, per, side_unit, mass)
+    let r = len(model.boxes) > 0 ? result(rows) : null
+    let row_of = (k) => box_packer_row(rows | find((x) => x.key == k))
+    let tell = (list) => { if on_change != null && len(model.boxes) > 0 { on_change(result(list)) } }
+    let edit = (k, field: str, text: str) => {
+        let next = rows | map((x) => x.key == k ? set(x, field, text) : x)
+        rows = next
+        tell(next)
+    }
+    let add = () => {
+        let k = next_key
+        next_key = k + 1
+        fresh = k
+        rows = rows | push({ key: k, name: "", size: "", weight: "", qty: "1", upright: false })
+    }
+    let cut = (k) => {
+        let next = rows | filter((x) => x.key != k)
+        rows = next
+        tell(next)
+        if add_el != null { add_el.focus() }
+    }
+    let weight = (x) => `${str(round(x, 2, "half_up"))} ${mass}`
+    let verdict = () => {
+        if r == null || len(r.shipments) == 0 { return null }
+        let n = len(r.shipments)
+        n == 1 ? `One box: ${r.shipments[0].box.name}. Billable weight ${weight(r.billable)}.` : `Split across ${n} boxes, because no one box takes it all. Billable weight ${weight(r.billable)} in all.`
+    }
+    <section class={ui_cls(["ui-boxpack", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-boxpack-title id={`${id}-title`}>{title}</h3>
+        {len(model.problems) > 0 && <ul.ui-boxpack-problems>{for p in model.problems => <li>{p}</li>}</ul>}
+        {len(model.boxes) > 0 && <p.ui-boxpack-sizes>Boxes: {model.boxes | map((b) => `${b.name} ${b.dims | map((d) => str(d)) | join(" × ")} ${side_unit}`) | join(", ")}.</p>}
+        <ul.ui-boxpack-rows>
+            {for x in rows => <li.ui-boxpack-row key={x.key}>
+                <div.ui-boxpack-cell>
+                    <label for={`${id}-name-${x.key}`}>Item</label>
+                    <input type="text" id={`${id}-name-${x.key}`} name={named("item_name")} value={x.name} placeholder="Name" autocomplete="off"
+                           @mount={(el) => { if fresh == x.key { el.focus() } }} @input={(e) => { edit(x.key, "name", e.value) }}/>
+                </div>
+                <div.ui-boxpack-cell>
+                    <label for={`${id}-size-${x.key}`}>Size, {side_unit}</label>
+                    <input type="text" id={`${id}-size-${x.key}`} name={named("item_size")} value={x.size} placeholder="30 x 20 x 10" autocomplete="off"
+                           aria-invalid={row_of(x.key).field == "size" ? "true" : null} @input={(e) => { edit(x.key, "size", e.value) }}/>
+                </div>
+                <div.ui-boxpack-cell>
+                    <label for={`${id}-weight-${x.key}`}>Each, {mass}</label>
+                    <input type="text" inputmode="decimal" id={`${id}-weight-${x.key}`} name={named("item_weight")} value={x.weight} placeholder="0.5" autocomplete="off"
+                           aria-invalid={row_of(x.key).field == "weight" ? "true" : null} @input={(e) => { edit(x.key, "weight", e.value) }}/>
+                </div>
+                <div.ui-boxpack-cell>
+                    <label for={`${id}-qty-${x.key}`}>Qty</label>
+                    <input type="text" inputmode="numeric" id={`${id}-qty-${x.key}`} name={named("item_qty")} value={x.qty} autocomplete="off"
+                           aria-invalid={row_of(x.key).field == "qty" ? "true" : null} @input={(e) => { edit(x.key, "qty", e.value) }}/>
+                </div>
+                <button.ui-boxpack-btn type="button" aria-label={`Remove ${filled(trim(x.name)) ?? `item ${x.key + 1}`}`} @click={() => { cut(x.key) }}>Remove</button>
+                {filled(row_of(x.key).error) != null && <p.ui-boxpack-rowerror id={`${id}-error-${x.key}`}>{row_of(x.key).error}.</p>}
+            </li>}
+        </ul>
+        <div><button.ui-boxpack-btn type="button" id={`${id}-add`} disabled={len(rows) >= limit} @mount={(el) => { add_el = el }} @click={() => { add() }}>Add an item</button></div>
+        <div.ui-boxpack-cell.ui-boxpack-short>
+            <label for={`${id}-divisor`}>Dimensional divisor</label>
+            <input type="text" inputmode="numeric" id={`${id}-divisor`} name={named("divisor")} value={divide} autocomplete="off" aria-invalid={div_bad ? "true" : null} @input={(e) => { divide = e.value; tell(rows) }}/>
+        </div>
+        <div aria-live="polite">
+            {div_bad && <p.ui-boxpack-rowerror role="alert">The divisor is not a number above 0, so the usual {metric ? 5000 : 139} is used.</p>}
+            {len(model.boxes) == 0 && <p.ui-boxpack-rowerror role="alert">There are no boxes to pack into.</p>}
+            {r != null && len(r.problems) > 0 && <ul.ui-boxpack-problems>{for p in r.problems => <li>{p}</li>}</ul>}
+            {verdict() != null && <p.ui-boxpack-verdict>{verdict()}</p>}
+            {r != null && len(r.shipments) == 0 && len(r.unfit) == 0 && <p.ui-boxpack-note>Add an item with its size and weight to pack it.</p>}
+            {r != null && len(r.unfit) > 0 && <ul.ui-boxpack-unfit>{for u in r.unfit => <li key={u.name}>{u.name} fits no box. {u.why}</li>}</ul>}
+        </div>
+        {r != null && len(r.shipments) > 0 && <ol.ui-boxpack-ship>
+            {for s in r.shipments => <li.ui-boxpack-box>
+                <span.ui-boxpack-name>{s.box.name}</span>
+                <span.ui-boxpack-bill>{weight(s.billable)}</span>
+                <span.ui-boxpack-what>{box_packer_list(s.pieces)}</span>
+                <span.ui-boxpack-how>Actual {weight(s.actual)}, dimensional {weight(s.dimensional)}, {str(s.fill)}% full</span>
+            </li>}
+        </ol>}
+    </section>
+}

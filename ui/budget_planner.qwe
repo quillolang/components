@@ -1,0 +1,378 @@
+// BudgetPlanner: a month's money as envelopes. Income goes into envelopes marked as
+// needs, wants or savings until nothing is left to assign, and it checks that against the
+// 50/30/20 rule: how far needs and wants run over their part and savings under
+// theirs, in percent and in money. As spending comes in, each envelope shows what is left,
+// and an overspent one is flagged with where the money could come from, the
+// envelope with the most left, which one click moves. Moving between envelopes takes
+// only what is really left and keeps the total assigned exact. Everything is counted in
+// whole cents.
+//
+//   <BudgetPlanner income="5000" envelopes={[{ name: "Rent", kind: "needs", assigned: 1500, spent: 1500 },
+//                                            { name: "Dining", kind: "wants", assigned: 300, spent: 340 }]}/>
+//   <BudgetPlanner income={pay} currency="EUR" rule={[60, 25, 15]} on_change={(b) => { left = b.left_to_assign }}/>
+//
+// income: where the field starts. envelopes: maps { name, kind, assigned, spent }, kind
+// being "needs", "wants" or "savings" (needs when left out), at most 50. rule: the parts of
+// income for needs, wants and savings in percent ([50, 30, 20]; one that does not come
+// to 100 is replaced by that). currency: ISO code ("USD"; one Quillo does not know falls
+// back to it). locale: how to write amounts (the program's). title: the heading ("Budget").
+// id: a prefix for its ids ("budget-planner"), unique on the page. name: a prefix for the
+// names of its fields ("budget": budget_income, budget_envelope, budget_kind, budget_assigned,
+// budget_spent). on_change(b): inside one of your components, after each change, given
+// { income, assigned, spent, left_to_assign, needs, wants, savings, envelopes: [{ name, kind,
+// assigned, spent, left }] } as decimals when the figures are good.
+// class: more classes for its outer element.
+//
+// budget_planner_figures(income, envelopes, rule), budget_planner_advice(envelopes) and
+// budget_planner_move(envelopes, from, to, amount) are the logic, in whole minor units, for a
+// program's own use.
+
+import ui/theme.qwe use ui_cls
+
+let budget_planner_css = css`
+.ui-budget-planner { container-type: inline-size; display: grid; gap: 16px; min-width: 0; max-width: 760px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-budget-planner .ui-budget-planner-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-budget-planner-field { display: grid; gap: 5px; min-width: 0; max-width: 240px; }
+.ui-budget-planner-field label, .ui-budget-planner-cell label { font-size: 13px; font-weight: 500; }
+.ui-budget-planner input[type=text], .ui-budget-planner select { box-sizing: border-box; width: 100%; min-width: 0; height: 36px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-budget-planner input[type=text]:hover, .ui-budget-planner select:hover { border-color: var(--ui-strong); }
+.ui-budget-planner input[type=text]:focus, .ui-budget-planner select:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-budget-planner input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-budget-planner-rows { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-budget-planner-row, .ui-budget-planner-labels { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1.1fr) minmax(0, 1.1fr) minmax(0, 1.1fr) minmax(0, 1.2fr) 74px; gap: 8px; align-items: center; }
+.ui-budget-planner-labels { color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-budget-planner-cell { display: grid; gap: 3px; min-width: 0; }
+.ui-budget-planner-cell label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.ui-budget-planner-left { min-width: 0; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-budget-planner-over { color: var(--ui-danger); }
+.ui-budget-planner-bar { grid-column: 1 / -1; height: 4px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-budget-planner-bar span { display: block; height: 100%; background: var(--ui-accent); }
+.ui-budget-planner-bar .ui-budget-planner-full { background: var(--ui-danger); }
+@container (max-width: 560px) {
+  .ui-budget-planner-labels { display: none; }
+  .ui-budget-planner-row { grid-template-columns: repeat(2, minmax(0, 1fr)); padding-bottom: 10px; }
+  .ui-budget-planner-cell label { position: static; width: auto; height: auto; clip: auto; color: var(--ui-muted); font-size: 12px; }
+}
+.ui-budget-planner-btn { box-sizing: border-box; height: 34px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-budget-planner-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-budget-planner-btn:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-budget-planner-btn:disabled { color: var(--ui-muted); cursor: not-allowed; }
+.ui-budget-planner-add { justify-self: start; }
+.ui-budget-planner-errors { margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-budget-planner-out { display: grid; gap: 12px; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-budget-planner-sums { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px 16px; margin: 0; }
+.ui-budget-planner-sums dt { color: var(--ui-muted); font-size: 12px; }
+.ui-budget-planner-sums dd { margin: 0; font-size: 16px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-budget-planner-rule { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-budget-planner-rule caption { padding-bottom: 4px; color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: left; }
+.ui-budget-planner-rule th { padding: 3px 0; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: right; }
+.ui-budget-planner-rule td { padding: 4px 0; border-bottom: 1px solid var(--ui-border); text-align: right; }
+.ui-budget-planner-rule th + th, .ui-budget-planner-rule td + td { padding-left: 10px; }
+.ui-budget-planner-rule th:first-child, .ui-budget-planner-rule td:first-child { text-align: left; }
+.ui-budget-planner-rule td { overflow-wrap: anywhere; }
+@container (max-width: 420px) { .ui-budget-planner-rule th:nth-child(4), .ui-budget-planner-rule td:nth-child(4) { display: none; } }
+.ui-budget-planner-warn { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-budget-planner-warn li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; padding: 6px 10px; border-radius: var(--ui-radius-sm);
+  background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+.ui-budget-planner-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-budget-planner-move { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; align-items: end; margin: 0; padding: 12px 0 0; border: 0; border-top: 1px solid var(--ui-border); }
+.ui-budget-planner-move legend { padding: 0; font-size: 13px; font-weight: 600; }
+.ui-budget-planner-move .ui-budget-planner-field { max-width: none; }
+.ui-budget-planner-moved { margin: 0; color: var(--ui-success); font-size: 13px; }
+`
+
+// The currency's code, USD when Quillo does not know it.
+fn budget_planner_code(currency) -> str {
+    let c = upper(trim(str(currency ?? "")))
+    type_of(money.minor_units(c)) == "error" ? "USD" : c
+}
+
+// What was typed as a decimal: 0 when empty, null when it is not a plain number of 0 or
+// more. A comma counts only as a thousands comma, so "12,50" is refused, not 1250.
+fn budget_planner_read(text) {
+    let t = trim(str(text ?? ""))
+    if t == "" { return 0m }
+    if len(t) > 40 { return null }
+    let plain = re.test(t, "^[0-9]{1,3}(,[0-9]{3})+(\\.[0-9]*)?$") ? replace(t, ",", "") : t
+    if !re.test(plain, "^([0-9]+\\.?[0-9]*|\\.[0-9]+)$") { return null }
+    let d = dec(plain)
+    is_err(d) || d > 9999999999m ? null : d
+}
+
+// The rule as three decimals, [50, 30, 20] unless what was given is three numbers making 100.
+fn budget_planner_rule(rule) -> list {
+    let fallback = [50m, 30m, 20m]
+    if type_of(rule) != "list" || len(rule) != 3 { return fallback }
+    let parts = rule | map((x) => budget_planner_read(x))
+    if parts | any((x) => x == null) { return fallback }
+    sum(parts) == 100m ? parts : fallback
+}
+
+// a as a percent of b to one place, half up; b above 0.
+fn budget_planner_percent(a: int, b: int) -> dec = round(dec(a) * 100 / dec(b), 1, "half_up")
+
+// The month's figures, in minor units. envelopes: [{ id, name, kind, assigned, spent }],
+// rule: three percents. Gives { assigned, spent, left_to_assign, kinds: [{ kind, label,
+// assigned, percent, target, gap, ok }] }: a kind's gap is how far past its part needs and wants
+// run, or how far under theirs savings fall, 0 when fine. percent is null without income.
+fn budget_planner_figures(income: int, envelopes: list, rule: list) -> map {
+    let assigned = sum(envelopes | map((e) => e.assigned))
+    let spent = sum(envelopes | map((e) => e.spent))
+    let of_kind = (kind: str) => sum(envelopes | filter((e) => e.kind == kind) | map((e) => e.assigned))
+    let row = (kind: str, label: str, part: dec) => {
+        let have = of_kind(kind)
+        let target = int(round(dec(income) * part / 100, 0, "half_up"))
+        let gap = kind == "savings" ? max([target - have, 0]) : max([have - target, 0])
+        { kind, label, assigned: have, part, percent: income > 0 ? budget_planner_percent(have, income) : null, target, gap, ok: gap == 0 }
+    }
+    { assigned, spent, left_to_assign: income - assigned,
+      kinds: [row("needs", "Needs", rule[0]), row("wants", "Wants", rule[1]), row("savings", "Savings", rule[2])] }
+}
+
+// Where each overspent envelope could be covered from, in order: [{ from, to, amount }]
+// with ids, from being the envelope with the most left once earlier advice is taken,
+// and null when none has enough.
+fn budget_planner_advice(envelopes: list) -> list {
+    let left = envelopes | map((e) => ({ id: e.id, left: e.assigned - e.spent }))
+    let out = []
+    for e in envelopes {
+        let short = e.spent - e.assigned
+        if short > 0 {
+            let best = last(sort_by(left | filter((x) => x.left > 0), (x) => x.left))
+            if best != null && best.left >= short {
+                out = out | push({ from: best.id, to: e.id, amount: short })
+                left = left | map((x) => x.id == best.id ? { id: x.id, left: x.left - short } : x)
+            } else {
+                out = out | push({ from: null, to: e.id, amount: short })
+            }
+        }
+    }
+    out
+}
+
+// Moves money between envelopes: { envelopes } after it, the sum of `assigned` the same,
+// or { error } saying why not. Only what is left in an envelope can leave it.
+fn budget_planner_move(envelopes: list, from, to, amount: int) -> map {
+    let source = envelopes | find((e) => e.id == from)
+    let target = envelopes | find((e) => e.id == to)
+    if source == null || target == null { return { error: "Pick the two envelopes." } }
+    if from == to { return { error: "Pick two different envelopes." } }
+    if amount <= 0 { return { error: "Enter an amount above 0 to move." } }
+    let left = source.assigned - source.spent
+    if amount > left { return { error: "short", left: max([left, 0]) } }
+    { envelopes: envelopes | map((e) => e.id == from ? set(e, "assigned", e.assigned - amount) : (e.id == to ? set(e, "assigned", e.assigned + amount) : e)) }
+}
+
+// The props' envelopes as rows of text, at most 50.
+fn budget_planner_rows(envelopes) -> list {
+    let given = type_of(envelopes) == "list" ? take(envelopes, 50) | filter((e) => type_of(e) == "map") : []
+    let text = (x) => x == null ? "" : str(x)
+    given | enumerate() | map((row) => {
+        let e = row[1]
+        { id: row[0] + 1, name: text(e.name), kind: contains(["needs", "wants", "savings"], e.kind) ? e.kind : "needs", assigned: text(e.assigned), spent: text(e.spent) }
+    })
+}
+
+// An envelope's name, or "Envelope 2" for a blank one.
+fn budget_planner_label(rows: list, id) -> str {
+    let row = rows | enumerate() | find((r) => r[1].id == id)
+    if row == null { return "Envelope" }
+    filled(trim(row[1].name)) ?? `Envelope ${row[0] + 1}`
+}
+
+// All the figures from the fields as typed: { errors, income, envelopes, figures, advice }
+// in minor units; figures is null with errors.
+fn budget_planner_work(income_text, rows: list, rule: list, code: str) -> map {
+    let errors = []
+    let minor = (d: dec) => money.to_minor(money.of(d, code, "half_up"))
+    let income = budget_planner_read(income_text)
+    if income == null { errors = errors | push({ field: "income", text: "The income must be a number of 0 or more, up to 9,999,999,999." }) }
+    let envelopes = []
+    for r in rows {
+        let label = budget_planner_label(rows, r.id)
+        let a = budget_planner_read(r.assigned)
+        let s = budget_planner_read(r.spent)
+        if a == null { errors = errors | push({ field: `assigned-${r.id}`, text: `What is assigned to ${label} must be a number of 0 or more.` }) }
+        if s == null { errors = errors | push({ field: `spent-${r.id}`, text: `What was spent from ${label} must be a number of 0 or more.` }) }
+        if a != null && s != null {
+            envelopes = envelopes | push({ id: r.id, name: label, kind: r.kind, assigned: minor(a), spent: minor(s) })
+        }
+    }
+    if len(errors) > 0 { return { errors, income: 0, envelopes: [], figures: null, advice: [] } }
+    let whole = minor(income)
+    { errors, income: whole, envelopes, figures: budget_planner_figures(whole, envelopes, rule), advice: budget_planner_advice(envelopes) }
+}
+
+component BudgetPlanner(income = null, envelopes = null, rule = null, currency: str = "USD", locale: str? = null, title: str = "Budget", id: str = "budget-planner",
+                        name: str = "budget", on_change = null, class: str? = null) {
+    style global budget_planner_css
+    state income_text = income == null ? "" : str(income)
+    state rows = budget_planner_rows(envelopes)
+    state serial = 1000
+    state from_id = null
+    state to_id = null
+    state move_text = ""
+    state message = ""
+    state refusal = ""
+    let code = budget_planner_code(currency)
+    let parts = budget_planner_rule(rule)
+    let work = budget_planner_work(income_text, rows, parts, code)
+    let ok = work.figures != null
+    let shown = (minor: int) => locale != null ? money.format(money.from_minor(minor, code), locale) : money.format(money.from_minor(minor, code))
+    let bad = (field: str) => work.errors | any((e) => e.field == field)
+    let field_id = (part: str) => `${id}-${part}`
+    let named = (part: str) => `${name}_${part}`
+    let amount_of = (minor: int) => money.from_minor(minor, code).amount
+    let of_row = (rid) => work.envelopes | find((e) => e.id == rid)
+    let tell = () => {
+        if on_change != null && ok {
+            let f = work.figures
+            let kind = (i: int) => amount_of(f.kinds[i].assigned)
+            on_change({ income: amount_of(work.income), assigned: amount_of(f.assigned), spent: amount_of(f.spent), left_to_assign: amount_of(f.left_to_assign),
+                        needs: kind(0), wants: kind(1), savings: kind(2),
+                        envelopes: work.envelopes | map((e) => ({ name: e.name, kind: e.kind, assigned: amount_of(e.assigned), spent: amount_of(e.spent), left: amount_of(e.assigned - e.spent) })) })
+        }
+    }
+    let change = (rid, field: str, value) => {
+        rows = rows | map((r) => r.id == rid ? set(r, field, value) : r)
+        message = ""
+        tell()
+    }
+    // A move rewrites the two envelopes' fields from whole cents, so nothing can drift.
+    let move = (from, to, amount: int) => {
+        let done = budget_planner_move(work.envelopes, from, to, amount)
+        if done.error == "short" {
+            refusal = `${budget_planner_label(rows, from)} has only ${shown(done.left)} left to move.`
+            message = ""
+        } else if done.error != null {
+            refusal = done.error
+            message = ""
+        } else {
+            rows = rows | map((r) => {
+                let e = done.envelopes | find((x) => x.id == r.id)
+                e == null ? r : set(r, "assigned", str(amount_of(e.assigned)))
+            })
+            refusal = ""
+            message = `Moved ${shown(amount)} from ${budget_planner_label(rows, from)} to ${budget_planner_label(rows, to)}. Assigned in all stays ${shown(work.figures.assigned)}.`
+            move_text = ""
+            tell()
+        }
+    }
+    let move_typed = () => {
+        let x = budget_planner_read(move_text)
+        if !ok {
+            refusal = "Fix the figures above first."
+        } else if x == null {
+            refusal = "The amount to move must be a number of 0 or more."
+        } else {
+            let first_id = len(rows) > 0 ? rows[0].id : null
+            move(from_id ?? first_id, to_id ?? first_id, money.to_minor(money.of(x, code, "half_up")))
+        }
+    }
+    let add = () => {
+        if len(rows) < 50 {
+            serial += 1
+            rows = rows | push({ id: serial, name: "", kind: "wants", assigned: "", spent: "" })
+            tell()
+        }
+    }
+    <section class={ui_cls(["ui-budget-planner", class])} aria-labelledby={field_id("title")}>
+        <h3.ui-budget-planner-title id={field_id("title")}>{title}</h3>
+        <div.ui-budget-planner-field>
+            <label for={field_id("income")}>Income this month</label>
+            <input type="text" inputmode="decimal" autocomplete="off" id={field_id("income")} name={named("income")} value={income_text} placeholder="0.00"
+                   aria-invalid={bad("income") ? "true" : null} @input={(e) => { income_text = e.value; message = ""; tell() }}/>
+        </div>
+        <div.ui-budget-planner-labels aria-hidden="true">
+            <span>Envelope</span><span>Kind</span><span>Assigned</span><span>Spent</span><span style="text-align: right">Left</span><span></span>
+        </div>
+        <ul.ui-budget-planner-rows>
+            {for r in rows => <li.ui-budget-planner-row key={r.id}>
+                <div.ui-budget-planner-cell>
+                    <label for={field_id(`name-${r.id}`)}>Envelope</label>
+                    <input type="text" autocomplete="off" maxlength="60" id={field_id(`name-${r.id}`)} name={named("envelope")} value={r.name} placeholder="Name" @input={(e) => { change(r.id, "name", e.value) }}/>
+                </div>
+                <div.ui-budget-planner-cell>
+                    <label for={field_id(`kind-${r.id}`)}>Kind</label>
+                    <select id={field_id(`kind-${r.id}`)} name={named("kind")} @change={(e) => { change(r.id, "kind", e.value) }}>
+                        <option value="needs" selected={r.kind == "needs"}>Needs</option>
+                        <option value="wants" selected={r.kind == "wants"}>Wants</option>
+                        <option value="savings" selected={r.kind == "savings"}>Savings</option>
+                    </select>
+                </div>
+                <div.ui-budget-planner-cell>
+                    <label for={field_id(`assigned-${r.id}`)}>Assigned</label>
+                    <input type="text" inputmode="decimal" autocomplete="off" id={field_id(`assigned-${r.id}`)} name={named("assigned")} value={r.assigned} placeholder="0.00"
+                           aria-invalid={bad(`assigned-${r.id}`) ? "true" : null} @input={(e) => { change(r.id, "assigned", e.value) }}/>
+                </div>
+                <div.ui-budget-planner-cell>
+                    <label for={field_id(`spent-${r.id}`)}>Spent</label>
+                    <input type="text" inputmode="decimal" autocomplete="off" id={field_id(`spent-${r.id}`)} name={named("spent")} value={r.spent} placeholder="0.00"
+                           aria-invalid={bad(`spent-${r.id}`) ? "true" : null} @input={(e) => { change(r.id, "spent", e.value) }}/>
+                </div>
+                <div class={ui_cls(["ui-budget-planner-left", ok && of_row(r.id) != null && of_row(r.id).spent > of_row(r.id).assigned && "ui-budget-planner-over"])} data-left="">
+                    {ok && of_row(r.id) != null ? shown(of_row(r.id).assigned - of_row(r.id).spent) : ""}
+                </div>
+                <button.ui-budget-planner-btn type="button" aria-label={`Remove ${filled(r.name) ?? "this envelope"}`} @click={() => { rows = rows | filter((x) => x.id != r.id); message = ""; tell() }}>Remove</button>
+                {ok && of_row(r.id) != null && of_row(r.id).assigned > 0 && <div.ui-budget-planner-bar aria-hidden="true">
+                    <span class={of_row(r.id).spent > of_row(r.id).assigned ? "ui-budget-planner-full" : null}
+                          style={`width: ${min([round(dec(of_row(r.id).spent) * 100 / dec(of_row(r.id).assigned), 1), 100m])}%`}></span>
+                </div>}
+            </li>}
+        </ul>
+        <button.ui-budget-planner-btn.ui-budget-planner-add type="button" disabled={len(rows) >= 50} @click={add}>Add an envelope</button>
+        {len(work.errors) > 0 && <ul.ui-budget-planner-errors role="alert">{for e in work.errors => <li key={e.field}>{e.text}</li>}</ul>}
+        {ok && <div.ui-budget-planner-out aria-live="polite">
+            <dl.ui-budget-planner-sums>
+                <div><dt>Left to assign</dt><dd data-key="left">{shown(work.figures.left_to_assign)}</dd></div>
+                <div><dt>Assigned</dt><dd data-key="assigned">{shown(work.figures.assigned)}</dd></div>
+                <div><dt>Spent</dt><dd data-key="spent">{shown(work.figures.spent)}</dd></div>
+            </dl>
+            {work.income > 0
+                ? <table.ui-budget-planner-rule>
+                    <caption>The {parts[0]}/{parts[1]}/{parts[2]} check</caption>
+                    <thead><tr><th scope="col">Kind</th><th scope="col">Assigned</th><th scope="col">Of income</th><th scope="col">Rule</th><th scope="col">Verdict</th></tr></thead>
+                    <tbody>
+                        {for k in work.figures.kinds => <tr key={k.kind}>
+                            <td>{k.label}</td><td>{shown(k.assigned)}</td><td>{k.percent}%</td><td>{k.part}%</td>
+                            <td>{k.ok ? "On track" : (k.kind == "savings" ? `${shown(k.gap)} short` : `${shown(k.gap)} over`)}</td>
+                        </tr>}
+                    </tbody>
+                </table>
+                : <p.ui-budget-planner-note>Enter an income to see the {parts[0]}/{parts[1]}/{parts[2]} check.</p>}
+            {(work.figures.left_to_assign < 0 || len(work.advice) > 0) && <ul.ui-budget-planner-warn>
+                {work.figures.left_to_assign < 0 && <li>{`Assigned ${shown(0 - work.figures.left_to_assign)} more than the income.`}</li>}
+                {for a in work.advice => <li key={a.to}>
+                    <span>{budget_planner_label(rows, a.to)} is overspent by {shown(a.amount)}.{a.from == null ? " No envelope has enough left to cover it." : ""}</span>
+                    {a.from != null && <button.ui-budget-planner-btn type="button" @click={() => { move(a.from, a.to, a.amount) }}>Cover from {budget_planner_label(rows, a.from)}</button>}
+                </li>}
+            </ul>}
+        </div>}
+        {len(rows) > 1 && <fieldset.ui-budget-planner-move>
+            <legend>Move between envelopes</legend>
+            <div.ui-budget-planner-field>
+                <label for={field_id("from")}>From</label>
+                <select id={field_id("from")} @change={(e) => { from_id = int(e.value) }}>
+                    {for r in rows => <option key={r.id} value={r.id} selected={from_id == r.id}>{budget_planner_label(rows, r.id)}</option>}
+                </select>
+            </div>
+            <div.ui-budget-planner-field>
+                <label for={field_id("to")}>To</label>
+                <select id={field_id("to")} @change={(e) => { to_id = int(e.value) }}>
+                    {for r in rows => <option key={r.id} value={r.id} selected={to_id == r.id}>{budget_planner_label(rows, r.id)}</option>}
+                </select>
+            </div>
+            <div.ui-budget-planner-field>
+                <label for={field_id("amount")}>Amount</label>
+                <input type="text" inputmode="decimal" autocomplete="off" id={field_id("amount")} value={move_text} placeholder="0.00" @input={(e) => { move_text = e.value; refusal = "" }}
+                       @keydown={(e) => { if e.key == "Enter" { e.preventDefault(); move_typed() } }}/>
+            </div>
+            <button.ui-budget-planner-btn type="button" @click={move_typed}>Move</button>
+        </fieldset>}
+        {refusal != "" && <p.ui-budget-planner-errors role="alert">{refusal}</p>}
+        <p.ui-budget-planner-moved role="status">{message}</p>
+    </section>
+}

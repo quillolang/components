@@ -1,0 +1,143 @@
+// SafeArea: keeps what is inside it clear of the notch, the rounded corners and the
+// home bar, side by side, by the system's own `env(safe-area-inset-*)`. It turns with the
+// phone, as those values do, and needs no script. With debug it also shows the insets it
+// reads: the bands drawn on the content, the numbers, and a warning when the page has not
+// asked for them, since without `viewport-fit=cover` in its viewport meta the system
+// gives 0 on every side.
+//
+//   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+//   <SafeArea> ... </SafeArea>
+//   <SafeArea sides="top left right" least={12}> ... </SafeArea>
+//   <SafeArea sides="bottom" extra={8} debug={true}> ... </SafeArea>
+//
+// sides: which sides to pad, "all" (default) or any of "top right bottom left", spaced.
+// least: at least this many pixels on those sides, where the system gives less: 16 keeps
+// a bar off the edge of a phone with no notch. extra: pixels added on top of that.
+// margin: true uses margin in place of padding, for an element with a background that
+// should stop at the safe area. debug: show the insets. id, class: for the outer element.
+//
+// A frame that stands in for a phone sets --ui-safe-top, --ui-safe-right, --ui-safe-bottom
+// and --ui-safe-left, as DevicePreview does: they win over the system's values. A
+// tablet has insets too, and Split View changes them: nothing here looks at the screen.
+//
+// In the apps, iOS's web view starts under the status bar and runs to the bottom, so top
+// is 0 and bottom is the home bar; Android's shell keeps the web view off all its bars,
+// so all four are 0.
+
+import ui/theme.qwe use ui_cls
+
+let safe_area_css = css`
+.ui-safe-area { box-sizing: border-box; }
+.ui-safe-area-debug { position: relative; }
+.ui-safe-area-guide { position: absolute; inset: 0; z-index: 5; overflow: hidden; pointer-events: none; color: var(--ui-fg); font: 600 12px/1.3 var(--ui-mono); }
+.ui-safe-area-probe { position: absolute; left: 0; top: 0; visibility: hidden; }
+.ui-safe-area-probe-a { width: var(--ui-safe-left, env(safe-area-inset-left, 0px)); height: var(--ui-safe-top, env(safe-area-inset-top, 0px)); }
+.ui-safe-area-probe-b { width: var(--ui-safe-right, env(safe-area-inset-right, 0px)); height: var(--ui-safe-bottom, env(safe-area-inset-bottom, 0px)); }
+.ui-safe-area-band {
+  position: absolute; display: grid; place-items: center; overflow: hidden;
+  background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--ui-danger) 34%, transparent) 0 6px, color-mix(in srgb, var(--ui-danger) 14%, transparent) 6px 12px);
+}
+.ui-safe-area-band-top { inset: 0 0 auto 0; }
+.ui-safe-area-band-bottom { inset: auto 0 0 0; }
+.ui-safe-area-band-left { inset: 0 auto 0 0; }
+.ui-safe-area-band-right { inset: 0 0 0 auto; }
+.ui-safe-area-band-off { background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--ui-muted) 22%, transparent) 0 6px, transparent 6px 12px); }
+.ui-safe-area-legend {
+  position: absolute; left: 50%; top: 24%; display: grid; gap: 4px; width: max-content; max-width: min(320px, 86%); padding: 10px 12px; transform: translateX(-50%);
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: color-mix(in srgb, var(--ui-surface) 90%, transparent); box-shadow: var(--ui-shadow);
+}
+.ui-safe-area-numbers { margin: 0; font-variant-numeric: tabular-nums; }
+.ui-safe-area-warn { margin: 0; color: var(--ui-warning); font: 500 13px/1.4 var(--ui-font); }
+`
+
+fn safe_area_px(x) {
+    let kind = type_of(x)
+    (kind == "int" || kind == "float") && x > 0 ? x : 0
+}
+
+// The words of `sides`, in the order CSS writes them. Words it does not know are left out.
+fn safe_area_sides(sides) -> list {
+    let order = ["top", "right", "bottom", "left"]
+    if type_of(sides) != "str" || trim(sides) == "all" { return order }
+    let words = split(lower(sides), " ")
+    order | filter((s) => contains(words, s))
+}
+
+// The value of one side, with the frame's stand-in ahead of the system's.
+fn safe_area_value(side: str, least, extra) -> str {
+    let inset = `var(--ui-safe-${side}, env(safe-area-inset-${side}, 0px))`
+    let low = safe_area_px(least)
+    let more = safe_area_px(extra)
+    let floor_of = low > 0 ? `max(${low}px, ${inset})` : inset
+    more > 0 ? `calc(${floor_of} + ${more}px)` : floor_of
+}
+
+fn safe_area_style(sides, least, extra, margin) -> str {
+    let prop = margin == true ? "margin" : "padding"
+    safe_area_sides(sides) | map((s) => `${prop}-${s}: ${safe_area_value(s, least, extra)}`) | join("; ")
+}
+
+// Whether a viewport meta's content asks for the insets. Spaces and case do not matter.
+fn safe_area_covers(content) -> bool {
+    if type_of(content) != "str" { return false }
+    let parts = split(replace(lower(content), " ", ""), ",")
+    contains(parts, "viewport-fit=cover")
+}
+
+component SafeAreaGuide(sides = "all") {
+    state top = 0
+    state right = 0
+    state bottom = 0
+    state left = 0
+    state covered = true
+    let padded = safe_area_sides(sides)
+    let band = (side: str) => contains(padded, side) ? `ui-safe-area-band ui-safe-area-band-${side}` : `ui-safe-area-band ui-safe-area-band-${side} ui-safe-area-band-off`
+    <div.ui-safe-area-guide data-safe-top={top} data-safe-right={right} data-safe-bottom={bottom} data-safe-left={left}
+         @mount={(el) => {
+             let win = js("window")
+             let doc = win.document
+             let a = el.querySelector(".ui-safe-area-probe-a")
+             let b = el.querySelector(".ui-safe-area-probe-b")
+             let read = () => {
+                 let ra = a.getBoundingClientRect()
+                 let rb = b.getBoundingClientRect()
+                 top = round(ra.height)
+                 left = round(ra.width)
+                 bottom = round(rb.height)
+                 right = round(rb.width)
+                 let meta = doc.querySelector("meta[name=viewport]")
+                 covered = meta != null && safe_area_covers(meta.content)
+             }
+             read()
+             // A probe sized by each inset, so a change is seen whatever caused it.
+             let grown = js_new("ResizeObserver", read)
+             grown.observe(a)
+             grown.observe(b)
+             win.addEventListener("resize", read)
+             () => {
+                 grown.disconnect()
+                 win.removeEventListener("resize", read)
+             }
+         }}>
+        <i.ui-safe-area-probe.ui-safe-area-probe-a></i>
+        <i.ui-safe-area-probe.ui-safe-area-probe-b></i>
+        <div class={band("top")} style={`height: ${top}px`}>{top > 16 ? top : ""}</div>
+        <div class={band("bottom")} style={`height: ${bottom}px`}>{bottom > 16 ? bottom : ""}</div>
+        <div class={band("left")} style={`width: ${left}px`}>{left > 16 ? left : ""}</div>
+        <div class={band("right")} style={`width: ${right}px`}>{right > 16 ? right : ""}</div>
+        <div.ui-safe-area-legend role="status">
+            <p.ui-safe-area-numbers>top {top} · right {right} · bottom {bottom} · left {left}</p>
+            {!covered && <p.ui-safe-area-warn>This page has no viewport-fit=cover, so the system gives 0.</p>}
+        </div>
+    </div>
+}
+
+view SafeArea(sides: str = "all", least = 0, extra = 0, margin: bool = false, debug: bool = false,
+              id: str? = null, class: str? = null, children) {
+    style global safe_area_css
+    <div class={ui_cls(["ui-safe-area", debug && "ui-safe-area-debug", class])} id={id}
+         style={safe_area_style(sides, least, extra, margin)}>
+        {debug && <SafeAreaGuide sides={sides}/>}
+        {children}
+    </div>
+}

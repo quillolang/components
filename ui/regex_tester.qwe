@@ -1,0 +1,858 @@
+// RegexTester: a pattern, flags and sample text, and all that follows from them as
+// one types: the matches highlighted, each match's groups and named groups, a preview
+// of a replacement, and the pattern explained token by token. A mistake in the
+// pattern is shown where it is, with a caret under it.
+//
+// It takes what Quillo's `re` takes, the same patterns and flags, so a pattern that
+// works here works in a program, and what `re` refuses (lookaround, backreferences,
+// \p{...}) is refused here with `re`'s reason. It matches with an engine of its own,
+// written below, because a pattern in the browser's cannot be stopped: `(a+)+$` on
+// thirty a's and a b would hang the tab. This one counts its steps and gives up after
+// 500,000 of them, keeping the matches found so far, says so, and says which part of
+// the pattern is to blame.
+//
+//   import ui/regex_tester.qwe use RegexTester
+//
+//   <RegexTester pattern="(?<year>\\d{4})-(?<month>\\d{2})" sample="Due 2026-11 or 2027-01" replacement="$<month>/$<year>"/>
+//   <RegexTester id="slug" pattern="[a-z-]+" flags="i" on_change={(r) => { count = r.count }}/>
+//
+// pattern, flags ("i", "m", "s" in any order; others are left out), sample, replacement:
+// where the fields start. id: a prefix for its ids ("regex-tester"), unique on the
+// page. title: the heading ("Regex tester"). The fields are named pattern, flag_i,
+// flag_m, flag_s, sample and replacement. class: more classes for its outer element.
+// on_change(result): inside one of your components, called after each change with
+// { pattern, flags, count, gave_up, error } (error: { at, message } or null).
+//
+// Only the first 20,000 characters of the sample are tested, a pattern is at most
+// 1,000 characters, and 200 matches are listed: it says so when it cuts one.
+//
+// For a program's own use: regex_tester_parse(pattern, flags) gives { nodes, tokens,
+// groups, risks } or { error, at }, without throwing as `re` does on a bad pattern;
+// regex_tester_search(pattern, flags, text) gives { parsed, matches, gave_up, steps };
+// regex_tester_replace(result, template) gives { text } or { error, at }.
+
+import ui/theme.qwe use ui_cls
+
+let regex_tester_css = css`
+.ui-rxt { display: grid; gap: 14px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-rxt .ui-rxt-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-rxt .ui-rxt-sub { margin: 0; font-size: 13px; font-weight: 600; }
+.ui-rxt-field { display: grid; gap: 5px; min-width: 0; }
+.ui-rxt-field > label { font-size: 13px; font-weight: 500; }
+.ui-rxt-input { box-sizing: border-box; width: 100%; min-height: 38px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.5 var(--ui-mono); transition: border-color .15s, box-shadow .15s; }
+.ui-rxt-input:hover { border-color: var(--ui-strong); }
+.ui-rxt-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-rxt-input[aria-invalid="true"] { border-color: var(--ui-danger); }
+textarea.ui-rxt-input { min-height: 96px; resize: vertical; }
+.ui-rxt-flags { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 0; padding: 0; border: 0; font-size: 13px; }
+.ui-rxt-flags legend { float: left; margin-right: 8px; padding: 0; font-weight: 500; }
+.ui-rxt-flags label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ui-rxt-flags input { margin: 0; accent-color: var(--ui-accent); }
+.ui-rxt-flags input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-rxt-error { display: grid; gap: 4px; margin: 0; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); color: var(--ui-danger); font-size: 13px; }
+.ui-rxt-error pre { margin: 0; overflow-x: auto; font: 13px/1.4 var(--ui-mono); }
+.ui-rxt-warn { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; overflow-wrap: anywhere; }
+.ui-rxt-count { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-rxt-out { max-height: 260px; margin: 0; overflow: auto; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-subtle); color: var(--ui-fg); font: 13px/1.6 var(--ui-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-rxt-out:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-rxt-out mark { border-radius: 2px; background: var(--ui-accent-soft); color: var(--ui-accent); box-shadow: 0 0 0 1px var(--ui-accent); }
+.ui-rxt-out mark.ui-rxt-even { background: var(--ui-info-soft); color: var(--ui-info); box-shadow: 0 0 0 1px var(--ui-info); }
+.ui-rxt-out mark.ui-rxt-empty { padding: 0 1px; }
+.ui-rxt-table { overflow-x: auto; }
+.ui-rxt-table table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-rxt-table th, .ui-rxt-table td { padding: 5px 8px; border-bottom: 1px solid var(--ui-border); text-align: left; vertical-align: top; }
+.ui-rxt-table th { color: var(--ui-muted); font-weight: 600; white-space: nowrap; }
+.ui-rxt-table code { font: 12px var(--ui-mono); overflow-wrap: anywhere; }
+.ui-rxt-none { color: var(--ui-muted); }
+.ui-rxt-tokens { display: grid; gap: 3px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-rxt-token { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
+.ui-rxt-token code { padding: 1px 5px; border-radius: 4px; background: var(--ui-subtle); font: 12px var(--ui-mono); overflow-wrap: anywhere; }
+@media (prefers-reduced-motion: reduce) { .ui-rxt-input { transition: none; } }
+`
+
+let regex_tester_most_steps = 500000
+let regex_tester_most_chars = 20000
+let regex_tester_most_pattern = 1000
+let regex_tester_most_nodes = 20000
+let regex_tester_most_matches = 5000
+let regex_tester_most_listed = 200
+let regex_tester_most_depth = 64
+
+// JavaScript's \s and its line breaks, as `re` takes them on both sides.
+let regex_tester_spaces = "\t\n\u000B\u000C\r                  　﻿"
+let regex_tester_breaks = "\n\r  "
+
+fn regex_tester_is_digit(c) -> bool = c != null && c >= "0" && c <= "9"
+
+fn regex_tester_is_word(c) -> bool = c != null && ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "_")
+
+fn regex_tester_is_hex(c) -> bool = c != null && ((c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F"))
+
+// The value of hex digits, in any case.
+fn regex_tester_hex_value(s: str) -> int =
+    reduce(split(lower(s), ""), 0, (n, c) => n * 16 + index_of("0123456789abcdef", c))
+
+fn regex_tester_hex4(n: int) -> str {
+    let digits = "0123456789abcdef"
+    join([4096, 256, 16, 1] | map((p) => digits[floor(n / p) % 16]), "")
+}
+
+// A character from its number. There is no such builtin; JSON's escapes are one.
+fn regex_tester_char_of(n: int) -> str {
+    let units = n > 65535
+        ? "\\u" + regex_tester_hex4(55296 + floor((n - 65536) / 1024)) + "\\u" + regex_tester_hex4(56320 + (n - 65536) % 1024)
+        : "\\u" + regex_tester_hex4(n)
+    json.parse("\"" + units + "\"")
+}
+
+// How a character is shown in a sentence.
+fn regex_tester_name(c: str) -> str = match c {
+    "\n" => "a line feed"
+    "\r" => "a carriage return"
+    "\t" => "a tab"
+    "\u000C" => "a form feed"
+    "\u000B" => "a vertical tab"
+    "\u0000" => "a null character"
+    " " => "a space"
+    _ => `"${c}"`
+}
+
+fn regex_tester_hex_run(cs: list, from: int, n: int) -> bool =
+    from + n <= len(cs) && all(slice(cs, from, from + n), regex_tester_is_hex)
+
+// \uXXXX, a pair of them, or \u{X}: { c, size } or { error }.
+fn regex_tester_unicode(cs: list, i: int) -> map {
+    let bad = { error: "`\\u` takes four hex digits or {hex}, as in \\u00e9 or \\u{1F600}" }
+    if cs[i + 2] == "{" {
+        let end = i + 3
+        while end < len(cs) && cs[end] != "}" { end += 1 }
+        let size = end - i - 3
+        if end >= len(cs) || size < 1 || size > 6 || !regex_tester_hex_run(cs, i + 3, size) { return bad }
+        let n = regex_tester_hex_value(join(slice(cs, i + 3, end), ""))
+        if n > 1114111 || (n >= 55296 && n < 57344) { return bad }
+        return { c: regex_tester_char_of(n), size: end + 1 - i }
+    }
+    if !regex_tester_hex_run(cs, i + 2, 4) { return bad }
+    let hi = regex_tester_hex_value(join(slice(cs, i + 2, i + 6), ""))
+    if hi >= 55296 && hi < 56320 {
+        if cs[i + 6] == "\\" && cs[i + 7] == "u" && regex_tester_hex_run(cs, i + 8, 4) {
+            let lo = regex_tester_hex_value(join(slice(cs, i + 8, i + 12), ""))
+            if lo >= 56320 && lo < 57344 { return { c: regex_tester_char_of(65536 + (hi - 55296) * 1024 + lo - 56320), size: 12 } }
+        }
+        return { error: "half of a surrogate pair on its own" }
+    }
+    if hi >= 56320 && hi < 57344 { return { error: "half of a surrogate pair on its own" } }
+    { c: regex_tester_char_of(hi), size: 6 }
+}
+
+// The escape at i, as re.rs reads it: { c, size, says } for a character, { cls, neg,
+// size, says } for \d and its kind, { edge, size, says } for \b and \B, or { error }.
+fn regex_tester_escape(cs: list, i: int, in_class: bool) -> map {
+    let e = cs[i + 1]
+    if e == null { return { error: "the pattern ends with `\\`" } }
+    let cls = (k: str, neg: bool, says: str) => { cls: k, neg, size: 2, says }
+    let lit = (c: str) => { c, size: 2, says: regex_tester_name(c) }
+    match e {
+        "d" => cls("d", false, "a digit")
+        "D" => cls("d", true, "anything but a digit")
+        "w" => cls("w", false, "a word character (a letter, digit or _)")
+        "W" => cls("w", true, "anything but a word character")
+        "s" => cls("s", false, "a space, tab or line break")
+        "S" => cls("s", true, "anything but a space, tab or line break")
+        "b" | "B" => in_class ? { error: "`\\b` cannot go in [...]" }
+            : { edge: e == "b", size: 2, says: e == "b" ? "the edge of a word" : "not the edge of a word" }
+        "n" => lit("\n")
+        "t" => lit("\t")
+        "r" => lit("\r")
+        "f" => lit("\u000C")
+        "v" => lit("\u000B")
+        "0" => regex_tester_is_digit(cs[i + 2]) ? { error: "`\\0` followed by a digit is not one of the escapes patterns have" } : lit("\u0000")
+        "x" => {
+            if !regex_tester_hex_run(cs, i + 2, 2) { return { error: "`\\x` takes two hex digits, as in \\x41" } }
+            let c = regex_tester_char_of(regex_tester_hex_value(join(slice(cs, i + 2, i + 4), "")))
+            { c, size: 4, says: regex_tester_name(c) }
+        }
+        "u" => {
+            let u = regex_tester_unicode(cs, i)
+            u.error != null ? u : { c: u.c, size: u.size, says: regex_tester_name(u.c) }
+        }
+        "k" => { error: "backreferences (\\1, \\k<name>) are not supported" }
+        "p" | "P" => { error: "Unicode classes (\\p{...}) are not supported" }
+        _ => {
+            if e >= "1" && e <= "9" { return { error: "backreferences (\\1, \\k<name>) are not supported" } }
+            if contains("^$\\.*+?()[]{}|/", e) || (e == "-" && in_class) { return lit(e) }
+            { error: `\`\\${e}\` is not one of the escapes patterns have` }
+        }
+    }
+}
+
+// One item of a class at j: { c, size, says } or { cls, neg, size, says } or { error, at }.
+fn regex_tester_class_item(cs: list, j: int) -> map {
+    let c = cs[j]
+    if c == "\\" {
+        let e = regex_tester_escape(cs, j, true)
+        return e.error != null ? { error: e.error, at: j } : e
+    }
+    if c == "[" { return { error: "write `\\[` for a `[` in [...]", at: j } }
+    let next = cs[j + 1]
+    if next == c && (c == "&" || c == "~" || c == "-") { return { error: `write \`${c}\\${c}\` for two \`${c}\` in [...]`, at: j } }
+    { c, size: 1, says: regex_tester_name(c) }
+}
+
+// The class at i: { node, size, says } or { error, at }.
+fn regex_tester_class(cs: list, i: int) -> map {
+    let n = len(cs)
+    let j = i + 1
+    let neg = cs[j] == "^"
+    if neg { j += 1 }
+    if cs[j] == "]" { return { error: "an empty class `[]` matches nothing: write `\\[\\]` for the brackets", at: i } }
+    let items = []
+    let says = []
+    while j < n && cs[j] != "]" {
+        let lo = regex_tester_class_item(cs, j)
+        if lo.error != null { return lo }
+        j += lo.size
+        if cs[j] == "-" && j + 1 < n && cs[j + 1] != "]" {
+            let hi = regex_tester_class_item(cs, j + 1)
+            if hi.error != null { return hi }
+            if lo.cls != null || hi.cls != null { return { error: "a range in [...] is between two characters, not \\d, \\w or \\s", at: j } }
+            if lo.c > hi.c { return { error: "a range in [...] goes from the lower character to the higher", at: j } }
+            items = push(items, { lo: lo.c, hi: hi.c })
+            says = push(says, `${lo.says} to ${hi.says}`)
+            j += 1 + hi.size
+        } else {
+            items = push(items, lo.cls != null ? { cls: lo.cls, neg: lo.neg } : { lo: lo.c, hi: lo.c })
+            says = push(says, lo.says)
+        }
+    }
+    if j >= n { return { error: "`[` without its `]`", at: i } }
+    let list_text = join(says, ", ")
+    { node: { t: "set", neg, items }, size: j + 1 - i, says: neg ? `anything but ${list_text}` : (len(says) == 1 ? list_text : `one of ${list_text}`) }
+}
+
+// The quantifier at i: { lo, hi (null: no end), size, says } or { error }.
+fn regex_tester_quantifier(cs: list, i: int) -> map {
+    let c = cs[i]
+    if c == "*" { return { lo: 0, hi: null, size: 1, says: "0 or more times" } }
+    if c == "+" { return { lo: 1, hi: null, size: 1, says: "1 or more times" } }
+    if c == "?" { return { lo: 0, hi: 1, size: 1, says: "optional" } }
+    let lone = { error: "`{` on its own: write `\\{`, or repeat with {n}, {n,} or {n,m}" }
+    let j = i + 1
+    let digits = () => {
+        let from = j
+        while regex_tester_is_digit(cs[j]) { j += 1 }
+        // More digits than any count: only its size matters.
+        j == from ? null : (j - from > 6 ? 1000000 : int(join(slice(cs, from, j), "")))
+    }
+    let lo = digits()
+    if lo == null { return lone }
+    let hi = lo
+    let open = false
+    if cs[j] == "," {
+        j += 1
+        hi = digits()
+        open = hi == null
+    }
+    if cs[j] != "}" { return lone }
+    if lo > 1000 || (hi != null && hi > 1000) { return { error: "repeating more than 1000 times is not supported" } }
+    if !open && hi < lo { return { error: "in {n,m}, n is more than m" } }
+    let says = open ? `${lo} or more times` : (lo == hi ? `exactly ${lo} time${lo == 1 ? "" : "s"}` : `${lo} to ${hi} times`)
+    { lo, hi, size: j + 1 - i, says }
+}
+
+// A branch's atoms as one node; a group's branches as one.
+fn regex_tester_seq(items: list) -> map = len(items) == 1 ? items[0] : { t: "seq", items }
+
+fn regex_tester_alt(branches: list) -> map = len(branches) == 1 ? branches[0] : { t: "alt", branches }
+
+// The numbers of the capturing groups inside a node.
+fn regex_tester_groups_in(node: map) -> list = match node.t {
+    "group" => (node.n > 0 ? [node.n] : []) + regex_tester_groups_in(node.body)
+    "rep" => regex_tester_groups_in(node.body)
+    "seq" => flatten(node.items | map(regex_tester_groups_in))
+    "alt" => flatten(node.branches | map(regex_tester_groups_in))
+    _ => []
+}
+
+// Whether a node can match nothing at all, which a loop must stop on.
+fn regex_tester_nullable(node: map) -> bool = match node.t {
+    "group" => regex_tester_nullable(node.body)
+    "rep" => node.lo == 0 || regex_tester_nullable(node.body)
+    "seq" => all(node.items, regex_tester_nullable)
+    "alt" => any(node.branches, regex_tester_nullable)
+    "char" | "any" | "set" => false
+    _ => true
+}
+
+// Whether a node holds a repeat with no end, or a long one.
+fn regex_tester_loops(node: map) -> bool = match node.t {
+    "group" => regex_tester_loops(node.body)
+    "rep" => node.hi == null || node.hi > 8 || regex_tester_loops(node.body)
+    "seq" => any(node.items, regex_tester_loops)
+    "alt" => any(node.branches, regex_tester_loops)
+    _ => false
+}
+
+// The repeats inside repeats: { at, end }, for the warning.
+fn regex_tester_risks(node: map) -> list = match node.t {
+    "group" => regex_tester_risks(node.body)
+    "rep" => (node.hi == null || node.hi > 8) && regex_tester_loops(node.body) ? [{ at: node.at, end: node.end }] : regex_tester_risks(node.body)
+    "seq" => flatten(node.items | map(regex_tester_risks))
+    "alt" => flatten(node.branches | map(regex_tester_risks))
+    _ => []
+}
+
+// How many instructions a node makes, held below overflowing: {1000} nested is large.
+fn regex_tester_size(node: map) -> int {
+    let cap = (n) => min([n, 100000000])
+    match node.t {
+        "group" => cap(regex_tester_size(node.body) + 2)
+        "rep" => {
+            let body = regex_tester_size(node.body) + 3
+            cap(node.lo * body) + (node.hi == null ? body + 2 : cap((node.hi - node.lo) * (body + 1)))
+        }
+        "seq" => cap(sum(node.items | map(regex_tester_size)))
+        "alt" => cap(sum(node.branches | map(regex_tester_size)) + 2 * len(node.branches))
+        _ => 1
+    }
+}
+
+// Reads a pattern as `re` does (src/re.rs). Gives { nodes, groups, tokens, risks, regs }
+// or { error, at, end } with the place of the mistake, in characters. A token is one
+// line of the explanation: { at, end, text, says, depth }.
+fn regex_tester_parse(pattern, flags: str = "") -> map {
+    let p = type_of(pattern) == "str" ? pattern : ""
+    let cs = split(p, "")
+    let n = len(cs)
+    if n > regex_tester_most_pattern { return { error: `A pattern here is at most ${regex_tester_most_pattern} characters; this has ${n}.`, at: regex_tester_most_pattern, end: n } }
+    let lines = contains(flags, "m")
+    let dots = contains(flags, "s")
+    let stack = []
+    let seq = []
+    let branches = []
+    let tokens = []
+    let groups = []
+    let names = []
+    let atom = false
+    let plain = false
+    let atom_at = 0
+    let atom_says = ""
+    let reps = 0
+    let i = 0
+    let fail = (message: str, at: int, end: int) => { error: message, at, end }
+    let word = (from: int, to: int) => join(slice(cs, from, to), "")
+    let say = (from: int, to: int, says: str, is_plain: bool) => {
+        atom_at = from
+        atom_says = says
+        let last_token = len(tokens) > 0 ? tokens[-1] : null
+        if is_plain && plain && last_token != null && last_token.end == from {
+            tokens = set(tokens, len(tokens) - 1, { ...last_token, end: to, text: last_token.text + word(from, to), says: `${last_token.says}, then ${says}`, lead: last_token.says })
+        } else {
+            tokens = push(tokens, { at: from, end: to, text: word(from, to), says, depth: len(stack) })
+        }
+        plain = is_plain
+    }
+    while i < n {
+        let c = cs[i]
+        if c == "\\" {
+            let e = regex_tester_escape(cs, i, false)
+            if e.error != null { return fail(e.error, i, i + 2) }
+            if e.edge != null {
+                seq = push(seq, { t: e.edge ? "wb" : "nwb" })
+                atom = false
+                say(i, i + e.size, e.says, false)
+            } else {
+                seq = push(seq, e.cls != null ? { t: "set", neg: e.neg, items: [{ cls: e.cls, neg: false }] } : { t: "char", c: e.c })
+                atom = true
+                say(i, i + e.size, e.says, e.cls == null)
+            }
+            i += e.size
+        } else if c == "[" {
+            let k = regex_tester_class(cs, i)
+            if k.error != null { return fail(k.error, k.at, k.at + 1) }
+            seq = push(seq, k.node)
+            atom = true
+            say(i, i + k.size, k.says, false)
+            i += k.size
+        } else if c == "(" {
+            let size = 1
+            let num = 0
+            let label = null
+            if cs[i + 1] == "?" {
+                let a = cs[i + 2]
+                let b = cs[i + 3]
+                if a == ":" {
+                    size = 3
+                } else if a == "<" && b != null && b != "=" && b != "!" {
+                    let j = i + 3
+                    while regex_tester_is_word(cs[j]) { j += 1 }
+                    if j == i + 3 || regex_tester_is_digit(cs[i + 3]) || cs[j] != ">" {
+                        return fail("a group's name is letters, digits and `_`, as in (?<name>...)", i, j + 1)
+                    }
+                    label = word(i + 3, j)
+                    if contains(names, label) { return fail(`two groups are named \`${label}\``, i + 3, j) }
+                    names = push(names, label)
+                    size = j + 1 - i
+                } else if a == "=" || a == "!" || a == "<" {
+                    return fail("lookahead and lookbehind ((?= (?! (?<= (?<!) are not supported", i, i + 3)
+                } else {
+                    return fail("flags go in the last argument (\"i\", \"m\", \"s\"), not in the pattern", i, i + 2)
+                }
+            }
+            if size != 3 {
+                num = len(groups) + 1
+                groups = push(groups, { n: num, name: label })
+            }
+            if len(stack) >= regex_tester_most_depth { return fail(`Groups inside groups go at most ${regex_tester_most_depth} deep.`, i, i + 1) }
+            say(i, i + size, num == 0 ? "start of a group that is not captured" : `start of group ${num}${label != null ? `, named ${label}` : ""}`, false)
+            stack = push(stack, { branches, seq, n: num, name: label, at: i })
+            branches = []
+            seq = []
+            atom = false
+            i += size
+        } else if c == ")" {
+            if len(stack) == 0 { return fail("`)` without its `(`", i, i + 1) }
+            let open = stack[-1]
+            let body = regex_tester_alt(push(branches, regex_tester_seq(seq)))
+            stack = take(stack, len(stack) - 1)
+            branches = open.branches
+            seq = push(open.seq, { t: "group", n: open.n, name: open.name, body, at: open.at })
+            say(i, i + 1, open.n == 0 ? "end of the group" : `end of group ${open.n}`, false)
+            atom = true
+            i += 1
+        } else if c == "|" {
+            branches = push(branches, regex_tester_seq(seq))
+            seq = []
+            say(i, i + 1, "or", false)
+            atom = false
+            i += 1
+        } else if c == "^" {
+            seq = push(seq, { t: "bol" })
+            say(i, i + 1, lines ? "the start of a line" : "the start of the text", false)
+            atom = false
+            i += 1
+        } else if c == "$" {
+            seq = push(seq, { t: "eol" })
+            say(i, i + 1, lines ? "the end of a line" : "the end of the text", false)
+            atom = false
+            i += 1
+        } else if c == "." {
+            seq = push(seq, { t: "any" })
+            say(i, i + 1, dots ? "any character" : "any character but a line break", false)
+            atom = true
+            i += 1
+        } else if c == "*" || c == "+" || c == "?" || c == "{" {
+            let q = regex_tester_quantifier(cs, i)
+            if q.error != null { return fail(q.error, i, i + 1) }
+            if !atom { return fail(`nothing to repeat before \`${c}\``, i, i + 1) }
+            let lazy = cs[i + q.size] == "?"
+            let size = q.size + (lazy ? 1 : 0)
+            let body = seq[-1]
+            // A repeat takes only the last character of plain text said as one token.
+            let last_token = tokens[-1]
+            let more = `${q.says}${lazy ? ", as few as possible" : ""}`
+            if plain && atom_at > last_token.at {
+                tokens = set(tokens, len(tokens) - 1, { ...last_token, end: atom_at, text: word(last_token.at, atom_at), says: last_token.lead })
+                tokens = push(tokens, { at: atom_at, end: i + size, text: word(atom_at, i + size), says: `${atom_says}, ${more}`, depth: last_token.depth })
+            } else {
+                tokens = set(tokens, len(tokens) - 1, { ...last_token, end: i + size, text: last_token.text + word(i, i + size), says: `${last_token.says}, ${more}` })
+            }
+            plain = false
+            reps += 1
+            seq = set(seq, len(seq) - 1, { t: "rep", lo: q.lo, hi: q.hi, lazy, body, reg: reps - 1, at: body.at ?? atom_at, end: i + size, groups: regex_tester_groups_in(body) })
+            atom = false
+            i += size
+        } else if c == "]" || c == "}" {
+            return fail(`\`${c}\` on its own: write \`\\${c}\``, i, i + 1)
+        } else {
+            seq = push(seq, { t: "char", c })
+            say(i, i + 1, regex_tester_name(c), true)
+            atom = true
+            i += 1
+        }
+    }
+    if len(stack) > 0 { return fail("`(` without its `)`", stack[-1].at, stack[-1].at + 1) }
+    let nodes = regex_tester_alt(push(branches, regex_tester_seq(seq)))
+    if regex_tester_size(nodes) > regex_tester_most_nodes {
+        return fail(`This pattern grows too large to run: its repeats make over ${regex_tester_most_nodes} steps of program.`, 0, n)
+    }
+    { nodes, groups, tokens, risks: regex_tester_risks(nodes), regs: reps }
+}
+
+// ---- The engine ------------------------------------------------------------
+//
+// A pattern compiles to a list of instructions, whose jumps are relative so that a
+// repeat's body can simply be copied. It runs as a backtracking machine, leftmost and
+// first alternative first, as JavaScript's does and with its rules for groups in a
+// loop: a group is cleared at each round, and a round after the minimum that matched
+// nothing fails, which also ends `(a*)*`. What is left to try is a chain of cells, so
+// a long text needs no deep recursion.
+
+fn regex_tester_emit(node: map) -> list = match node.t {
+    "char" => [{ op: "char", c: node.c }]
+    "any" => [{ op: "any" }]
+    "set" => [{ op: "set", neg: node.neg, items: node.items }]
+    "bol" | "eol" | "wb" | "nwb" => [{ op: node.t }]
+    "seq" => reduce(node.items, [], (out, x) => out + regex_tester_emit(x))
+    "group" => node.n == 0 ? regex_tester_emit(node.body)
+        : [{ op: "save", slot: 2 * node.n }] + regex_tester_emit(node.body) + [{ op: "save", slot: 2 * node.n + 1 }]
+    "alt" => {
+        let parts = node.branches | map(regex_tester_emit)
+        let bottom = len(parts) - 1
+        reduce(range(bottom), parts[bottom], (rest, k) => {
+            let code = parts[bottom - 1 - k]
+            [{ op: "split", a: 1, b: len(code) + 2 }] + code + [{ op: "jump", to: len(rest) + 1 }] + rest
+        })
+    }
+    "rep" => regex_tester_emit_rep(node)
+    _ => []
+}
+
+fn regex_tester_emit_rep(node: map) -> list {
+    let body = regex_tester_emit(node.body)
+    let clear = len(node.groups) > 0 ? [{ op: "clear", from: 2 * min(node.groups), to: 2 * max(node.groups) + 1 }] : []
+    let guard = regex_tester_nullable(node.body)
+    let once = clear + body
+    let round = clear + (guard ? [{ op: "mark", reg: node.reg }] : []) + body + (guard ? [{ op: "moved", reg: node.reg }] : [])
+    let must = reduce(range(node.lo), [], (out, k) => out + once)
+    let split_to = (a: int, b: int) => node.lazy ? { op: "split", a: b, b: a } : { op: "split", a, b }
+    if node.hi == null {
+        return must + [split_to(1, len(round) + 2)] + round + [{ op: "jump", to: -(len(round) + 1) }]
+    }
+    let optional = reduce(range(node.hi - node.lo), [], (rest, k) => [split_to(1, len(round) + len(rest) + 1)] + round + rest)
+    must + optional
+}
+
+// Whether a character is in a class's items, in any case with `fold`.
+fn regex_tester_in_items(items: list, c: str) -> bool {
+    let i = 0
+    let n = len(items)
+    while i < n {
+        let it = items[i]
+        if it.cls != null {
+            let yes = it.cls == "d" ? regex_tester_is_digit(c) : (it.cls == "w" ? regex_tester_is_word(c) : contains(regex_tester_spaces, c))
+            if yes != it.neg { return true }
+        } else if c >= it.lo && c <= it.hi {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+fn regex_tester_in_set(ins: map, c: str, fold: bool) -> bool {
+    let yes = regex_tester_in_items(ins.items, c) || (fold && (regex_tester_in_items(ins.items, lower(c)) || regex_tester_in_items(ins.items, upper(c))))
+    yes != ins.neg
+}
+
+// Runs the program from `start`: { end, caps } on a match, { end: null } when there is
+// none, and { over: true } when `budget` steps run out; `steps` is what it took.
+fn regex_tester_run(prog: list, cs: list, low: list?, start: int, opts: map, budget: int) {
+    let n = len(cs)
+    let fold = low != null
+    let chars = fold ? low : cs
+    let stack = null
+    let pc = 0
+    let sp = start
+    let caps = opts.blank
+    let steps = 0
+    while true {
+        steps += 1
+        if steps > budget { return { over: true, steps } }
+        let ins = prog[pc]
+        let op = ins.op
+        let ok = true
+        if op == "char" {
+            if sp < n && chars[sp] == (fold ? lower(ins.c) : ins.c) {
+                sp += 1
+                pc += 1
+            } else { ok = false }
+        } else if op == "split" {
+            stack = { pc: pc + ins.b, sp, caps, next: stack }
+            pc += ins.a
+        } else if op == "jump" {
+            pc += ins.to
+        } else if op == "set" {
+            if sp < n && regex_tester_in_set(ins, cs[sp], fold) {
+                sp += 1
+                pc += 1
+            } else { ok = false }
+        } else if op == "any" {
+            if sp < n && (opts.dots || !contains(regex_tester_breaks, cs[sp])) {
+                sp += 1
+                pc += 1
+            } else { ok = false }
+        } else if op == "save" {
+            caps = set(caps, ins.slot, sp)
+            pc += 1
+        } else if op == "clear" {
+            let k = ins.from
+            while k <= ins.to {
+                caps = set(caps, k, null)
+                k += 1
+            }
+            pc += 1
+        } else if op == "mark" {
+            caps = set(caps, opts.reg_at + ins.reg, sp)
+            pc += 1
+        } else if op == "moved" {
+            if caps[opts.reg_at + ins.reg] == sp { ok = false } else { pc += 1 }
+        } else if op == "bol" {
+            if sp == 0 || (opts.lines && contains(regex_tester_breaks, cs[sp - 1])) { pc += 1 } else { ok = false }
+        } else if op == "eol" {
+            if sp == n || (opts.lines && contains(regex_tester_breaks, cs[sp])) { pc += 1 } else { ok = false }
+        } else if op == "wb" || op == "nwb" {
+            let edge = regex_tester_is_word(sp > 0 ? cs[sp - 1] : null) != regex_tester_is_word(sp < n ? cs[sp] : null)
+            if edge == (op == "wb") { pc += 1 } else { ok = false }
+        } else {
+            return { end: sp, caps, steps }
+        }
+        if !ok {
+            if stack == null { return { end: null, steps } }
+            pc = stack.pc
+            sp = stack.sp
+            caps = stack.caps
+            stack = stack.next
+        }
+    }
+}
+
+// Every match of a pattern in text, left to right and an empty one a character on, as
+// `re.find_all` finds them: { parsed, matches: [{ text, start, end, groups, named }],
+// gave_up, steps, cut (chars left out), full (the match list was cut) }. A bad pattern
+// gives { parsed } with parsed.error.
+fn regex_tester_search(pattern, flags: str, text) -> map {
+    let parsed = regex_tester_parse(pattern, flags)
+    let sample = type_of(text) == "str" ? text : ""
+    let whole = split(sample, "")
+    let cs = take(whole, regex_tester_most_chars)
+    let cut = len(whole) - len(cs)
+    if parsed.error != null { return { parsed, matches: [], gave_up: false, steps: 0, cut, full: false, cs } }
+    let prog = regex_tester_emit(parsed.nodes) + [{ op: "done" }]
+    let slots = 2 * (len(parsed.groups) + 1)
+    let blank = (0..(slots + parsed.regs)) | map((_) => null)
+    let opts = { blank, reg_at: slots, dots: contains(flags, "s"), lines: contains(flags, "m") }
+    let low = contains(flags, "i") ? cs | map(lower) : null
+    let n = len(cs)
+    let found = []
+    let at = 0
+    let steps = 0
+    let gave_up = false
+    let full = false
+    let chunk = (from: int, to) => to == null ? null : join(slice(cs, from, to), "")
+    while at <= n && !gave_up && !full {
+        let r = regex_tester_run(prog, cs, low, at, opts, regex_tester_most_steps - steps)
+        steps += r.steps
+        if r.over {
+            gave_up = true
+        } else if r.end == null {
+            at += 1
+        } else {
+            let groups = parsed.groups | map((g) => chunk(r.caps[2 * g.n] ?? 0, r.caps[2 * g.n + 1]))
+            let named = reduce(parsed.groups, {}, (m, g) => g.name != null ? set(m, g.name, groups[g.n - 1]) : m)
+            found = push(found, { text: chunk(at, r.end), start: at, end: r.end, groups, named })
+            at = r.end > at ? r.end : at + 1
+            full = len(found) >= regex_tester_most_matches
+        }
+    }
+    { parsed, matches: found, gave_up, steps, cut, full, cs }
+}
+
+// Checks a replacement: null, or { error, at }. As `re.replace` reads it: $$, $0 to
+// $9, $<name>; a $ before anything else is itself.
+fn regex_tester_template_error(parsed: map, template: str) {
+    let t = split(template, "")
+    let k = 0
+    let groups = len(parsed.groups)
+    while k < len(t) {
+        if t[k] == "$" {
+            let d = t[k + 1]
+            if d == "$" {
+                k += 1
+            } else if regex_tester_is_digit(d) {
+                if int(d) > groups { return { error: `$${d}, but the pattern has ${groups} group${groups == 1 ? "" : "s"}.`, at: k } }
+                k += 1
+            } else if d == "<" {
+                let end = k + 2
+                while end < len(t) && t[end] != ">" { end += 1 }
+                if end >= len(t) { return { error: "`$<` without its `>`.", at: k } }
+                let name = join(slice(t, k + 2, end), "")
+                if find(parsed.groups, (g) => g.name == name) == null { return { error: `No group is named ${name}.`, at: k } }
+                k = end
+            }
+        }
+        k += 1
+    }
+    null
+}
+
+// One match's replacement, a template already checked.
+fn regex_tester_expand(parsed: map, template: list, m: map) -> str {
+    let out = ""
+    let k = 0
+    while k < len(template) {
+        let c = template[k]
+        if c != "$" {
+            out += c
+        } else {
+            let d = template[k + 1]
+            if d == "$" {
+                out += "$"
+                k += 1
+            } else if regex_tester_is_digit(d) {
+                let g = int(d)
+                out += g == 0 ? m.text : (m.groups[g - 1] ?? "")
+                k += 1
+            } else if d == "<" {
+                let end = k + 2
+                while template[end] != ">" { end += 1 }
+                out += get(m.named, join(slice(template, k + 2, end), "")) ?? ""
+                k = end
+            } else {
+                out += "$"
+            }
+        }
+        k += 1
+    }
+    out
+}
+
+// The sample with each match replaced: { text } or { error, at }.
+fn regex_tester_replace(result: map, template: str) -> map {
+    let wrong = regex_tester_template_error(result.parsed, template)
+    if wrong != null { return wrong }
+    let t = split(template, "")
+    let parts = []
+    let last_end = 0
+    for m in result.matches {
+        parts = push(parts, join(slice(result.cs, last_end, m.start), ""))
+        parts = push(parts, regex_tester_expand(result.parsed, t, m))
+        last_end = m.end
+    }
+    { text: join(parts, "") + join(slice(result.cs, last_end, len(result.cs)), "") }
+}
+
+// The sample cut at the matches: [{ text, m (the match's number, or null) }], only as
+// many as are listed being marked.
+fn regex_tester_segments(result: map) -> list {
+    let out = []
+    let last_end = 0
+    let shown = take(result.matches, regex_tester_most_listed)
+    for [i, m] in enumerate(shown) {
+        if m.start > last_end { out = push(out, { id: `t${last_end}`, text: join(slice(result.cs, last_end, m.start), ""), m: null }) }
+        out = push(out, { id: `m${i}`, text: m.text, m: i })
+        last_end = m.end
+    }
+    if last_end < len(result.cs) { out = push(out, { id: `t${last_end}`, text: join(slice(result.cs, last_end, len(result.cs)), ""), m: null }) }
+    out
+}
+
+// What to say of a search.
+fn regex_tester_said(result: map) -> str {
+    let n = len(result.matches)
+    let more = result.gave_up || result.full ? " or more" : ""
+    n == 0 && !result.gave_up ? "No match" : `${n}${more} match${n == 1 ? "" : "es"}`
+}
+
+component RegexTester(pattern: str = "", flags: str = "", sample: str = "", replacement: str = "", id: str = "regex-tester",
+                      title: str = "Regex tester", on_change = null, class: str? = null) {
+    style global regex_tester_css
+    state source = pattern
+    state flag_i = contains(flags, "i")
+    state flag_m = contains(flags, "m")
+    state flag_s = contains(flags, "s")
+    state text = sample
+    state template = replacement
+    let flag_text = (flag_i ? "i" : "") + (flag_m ? "m" : "") + (flag_s ? "s" : "")
+    let result = regex_tester_search(source, flag_text, text)
+    let parsed = result.parsed
+    let bad = parsed.error != null
+    let segments = regex_tester_segments(result)
+    let listed = take(result.matches, regex_tester_most_listed)
+    let swapped = bad ? { text: "" } : regex_tester_replace(result, template)
+    let tell = () => {
+        if on_change != null {
+            on_change({ pattern: source, flags: flag_text, count: len(result.matches), gave_up: result.gave_up,
+                        error: bad ? { at: parsed.at, message: parsed.error } : null })
+        }
+    }
+    let flag = (letter: str, says: str) => <label>
+        <input type="checkbox" name={`flag_${letter}`} value="on" checked={letter == "i" ? flag_i : (letter == "m" ? flag_m : flag_s)}
+               @change={(e) => {
+                   if letter == "i" { flag_i = e.checked } else if letter == "m" { flag_m = e.checked } else { flag_s = e.checked }
+                   tell()
+               }}/>
+        <code>{letter}</code> {says}
+    </label>
+    <section class={ui_cls(["ui-rxt", class])} id={id} aria-labelledby={`${id}-title`}>
+        <h3.ui-rxt-title id={`${id}-title`}>{title}</h3>
+        <div.ui-rxt-field>
+            <label for={`${id}-pattern`}>Pattern</label>
+            <input.ui-rxt-input type="text" id={`${id}-pattern`} name="pattern" value={source} autocomplete="off" spellcheck="false"
+                   aria-invalid={bad ? "true" : null} aria-describedby={bad ? `${id}-error` : null}
+                   @input={(e) => { source = e.value; tell() }}/>
+        </div>
+        <fieldset.ui-rxt-flags>
+            <legend>Flags</legend>
+            {flag("i", "any case")}
+            {flag("m", "^ and $ at each line")}
+            {flag("s", ". takes line breaks")}
+        </fieldset>
+        {bad && <div.ui-rxt-error id={`${id}-error`} role="alert">
+            <span>{`Column ${parsed.at + 1}: ${parsed.error}`}</span>
+            <pre aria-hidden="true">{`${source}\n${repeat(" ", parsed.at)}^`}</pre>
+        </div>}
+        {!bad && len(parsed.risks) > 0 && <p.ui-rxt-warn>
+            {`A repeat inside a repeat, at column ${parsed.risks[0].at + 1}: on text that nearly matches, this kind of pattern can take a very long time.`}
+        </p>}
+        {result.gave_up && <p.ui-rxt-warn role="alert">
+            {`Gave up after ${format_number(regex_tester_most_steps, "en-US", 0)} steps, so a browser's own engine could hang on this. The matches so far are shown.`}
+        </p>}
+        <div.ui-rxt-field>
+            <label for={`${id}-sample`}>Sample text</label>
+            <textarea.ui-rxt-input id={`${id}-sample`} name="sample" spellcheck="false" value={text} @input={(e) => { text = e.value; tell() }}></textarea>
+        </div>
+        {result.cut > 0 && <p.ui-rxt-warn>{`Only the first ${format_number(regex_tester_most_chars, "en-US", 0)} characters are tested; ${format_number(result.cut, "en-US", 0)} are left out.`}</p>}
+        {!bad && <p.ui-rxt-count aria-live="polite">{regex_tester_said(result)}</p>}
+        {!bad && <pre.ui-rxt-out tabindex="0" aria-label="The sample, with its matches marked">
+            {for s in segments => <span key={s.id}>{s.m != null
+                ? <mark class={ui_cls([s.m % 2 == 1 && "ui-rxt-even", s.text == "" && "ui-rxt-empty"])} data-match={s.m}>{s.text}</mark>
+                : s.text}</span>}
+        </pre>}
+        {!bad && len(listed) > 0 && <h4.ui-rxt-sub>Matches</h4>}
+        {!bad && len(listed) > 0 && <div.ui-rxt-table tabindex="0" role="region" aria-label="Matches and their groups">
+            <table>
+                <thead>
+                    <tr>
+                        <th scope="col">#</th><th scope="col">At</th><th scope="col">Match</th>
+                        {for g in parsed.groups => <th key={g.n} scope="col">{g.name != null ? `${g.n}: ${g.name}` : `Group ${g.n}`}</th>}
+                    </tr>
+                </thead>
+                <tbody>
+                    {for [i, m] in enumerate(listed) => <tr key={i} data-row={i}>
+                        <td>{i + 1}</td>
+                        <td>{`${m.start}-${m.end}`}</td>
+                        <td><code>{m.text}</code></td>
+                        {for g in parsed.groups => <td key={g.n}>{m.groups[g.n - 1] != null ? <code>{m.groups[g.n - 1]}</code> : <span.ui-rxt-none>no part</span>}</td>}
+                    </tr>}
+                </tbody>
+            </table>
+        </div>}
+        {len(result.matches) > regex_tester_most_listed && <p.ui-rxt-count>{`The first ${regex_tester_most_listed} are listed and marked.`}</p>}
+        <div.ui-rxt-field>
+            <label for={`${id}-replacement`}>Replace with</label>
+            <input.ui-rxt-input type="text" id={`${id}-replacement`} name="replacement" value={template} autocomplete="off" spellcheck="false" placeholder="$1, $<name>, $$"
+                   aria-invalid={swapped.error != null ? "true" : null} aria-describedby={swapped.error != null ? `${id}-replace-error` : null}
+                   @input={(e) => { template = e.value }}/>
+        </div>
+        {swapped.error != null && <div.ui-rxt-error id={`${id}-replace-error`} role="alert"><span>{`Column ${swapped.at + 1}: ${swapped.error}`}</span></div>}
+        {!bad && template != "" && swapped.error == null && <pre.ui-rxt-out data-preview="true" tabindex="0" aria-label="The sample after replacing">{swapped.text}</pre>}
+        {!bad && len(parsed.tokens) > 0 && <h4.ui-rxt-sub>What the pattern says</h4>}
+        {!bad && <ol.ui-rxt-tokens>
+            {for [i, t] in enumerate(parsed.tokens) => <li.ui-rxt-token key={i} style={`padding-left: ${t.depth * 16}px`}><code>{t.text}</code><span>{t.says}</span></li>}
+        </ol>}
+    </section>
+}

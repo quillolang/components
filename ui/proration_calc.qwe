@@ -1,0 +1,225 @@
+// ProrationCalc: what changing plan part way through a billing period comes to:
+// the credit for the time left on the old plan, the charge for the new one, and
+// what is due now or left over. It goes by whole days, the day of the change
+// being the new plan's. Periods are counted from the day the subscription began,
+// never from the last renewal, so one begun on 31 January renews on 28 or 29
+// February and again on 31 March, and an annual one begun on 29 February keeps
+// that day in leap years. Each amount is rounded half up to the cent once, the
+// amount multiplied before it is divided so nothing is lost on the way, and the
+// total is the difference of those rounded lines, so they add up.
+//
+//   <ProrationCalc today="2026-11-01" anchor="2026-01-31" from="pro" to="team" plans={[
+//       { id: "basic", name: "Basic", price: 10, cycle: "monthly" },
+//       { id: "pro", name: "Pro", price: 30, cycle: "monthly" },
+//       { id: "team", name: "Team", price: 50, cycle: "monthly" },
+//       { id: "year", name: "Pro yearly", price: 300, cycle: "annual" }]}/>
+//
+// plans: a list of { id, name, price, cycle }, price for one period as a number,
+// decimal or text, cycle "monthly" or "annual"; one it cannot read is left out and
+// the reason shown. from, to: ids of the plans it starts on (the first two). anchor:
+// the day the subscription began ("YYYY-MM-DD"). change: the day of the change;
+// left out, today. today: the date to start from, a prop so the page the server
+// makes and the browser's are the same. downgrade: what a change that comes to
+// less does: "credit" keeps the difference for the next bills (the default),
+// "refund" pays it back, "renewal" changes nothing until the period ends.
+// currency: ISO code ("USD"). locale: how to write amounts and dates (the
+// program's, English for dates). title: the heading ("Change of plan"). id: a prefix
+// for its fields' ids ("proration-calc"), unique on the page. The fields are named
+// from, to, anchor and change, so a form around it sends them; name: a prefix for
+// those names. on_change(figures): inside one of your components, given what
+// proration_calc_figures gives after each change that has an answer.
+//
+// proration_calc_figures(old_price, new_price, anchor, change, old_cycle, new_cycle,
+// currency, downgrade) is the arithmetic, for a program's own use. It gives an error
+// value or { days, used, left, start, end, credit, charge, net, down, refund,
+// balance, due, next_date, next_amount, kept, bills } with the amounts as money.
+// A plan on another cycle starts a period of its own on the day of the change,
+// charged in full, with next_date a period after it.
+
+import ui/theme.qwe use ui_cls
+
+let proration_calc_css = css`
+.ui-proration { display: grid; gap: 16px; min-width: 0; max-width: 600px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-proration .ui-proration-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-proration-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; }
+.ui-proration-field { display: grid; gap: 5px; min-width: 0; }
+.ui-proration-field label { font-size: 13px; font-weight: 500; }
+.ui-proration-field select, .ui-proration-field input { box-sizing: border-box; width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); transition: border-color .15s, box-shadow .15s; }
+.ui-proration-field select:hover, .ui-proration-field input:hover { border-color: var(--ui-strong); }
+.ui-proration-field select:focus-visible, .ui-proration-field input:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-proration-field [aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-proration-out { display: grid; margin: 0; padding: 4px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-proration-line { display: grid; grid-template-columns: 1fr auto; gap: 2px 16px; padding: 9px 0; border-bottom: 1px solid var(--ui-border); }
+.ui-proration-line:last-child { border-bottom: 0; }
+.ui-proration-line dt { font-weight: 500; }
+.ui-proration-line dd { margin: 0; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-proration-how { display: block; color: var(--ui-muted); font-size: 12px; font-weight: 400; }
+.ui-proration-total dt, .ui-proration-total dd { font-size: 16px; font-weight: 700; }
+.ui-proration-total dd { color: var(--ui-accent); }
+.ui-proration-next { margin: 0; font-size: 13px; }
+.ui-proration-skipped { margin: 0; color: var(--ui-muted); font-size: 12px; }
+.ui-proration-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+@media (max-width: 480px) { .ui-proration { padding: 16px; } .ui-proration-grid { grid-template-columns: 1fr; } }
+@media (prefers-reduced-motion: reduce) { .ui-proration-field select, .ui-proration-field input { transition: none; } }
+`
+
+// A price as a decimal of 0 or more, or null.
+fn proration_calc_read(x) {
+    let t = trim(str(x ?? ""))
+    if !re.test(t, "^\\d{1,12}(\\.\\d{1,8})?$") { return null }
+    dec(t)
+}
+
+// The plans it can read, and a sentence for each it cannot.
+fn proration_calc_plans(plans) {
+    let list = type_of(plans) == "list" ? take(plans, 100) : []
+    let named = (p) => type_of(p) == "map" ? str(p.name ?? p.id ?? "A plan") : "A plan"
+    let fault = (p) => {
+        if type_of(p) != "map" || p.id == null { return "has no id" }
+        if proration_calc_read(p.price) == null { return "has no price it can read" }
+        if p.cycle != "monthly" && p.cycle != "annual" { return `has the cycle "${str(p.cycle)}", not monthly or annual` }
+        null
+    }
+    { good: list | filter((p) => fault(p) == null) | map((p) => { id: str(p.id), name: str(p.name ?? p.id), price: proration_calc_read(p.price), cycle: p.cycle }),
+      skipped: list | filter((p) => fault(p) != null) | map((p) => `${named(p)} ${fault(p)}.`) }
+}
+
+fn proration_calc_step(cycle: str) -> int = cycle == "annual" ? 12 : 1
+
+// The period of `cycle` that holds a day, counted from the anchor so a short month
+// does not move the renewals after it: { start, end, days, used, left }.
+fn proration_calc_period(anchor: str, change: str, cycle: str) {
+    let step = proration_calc_step(cycle)
+    let n = floor(date.months_between(anchor, change) / step)
+    let at = (k: int) => date.add_months(anchor, k * step)
+    // Month ends can leave the count one out either way.
+    let k = at(n) > change ? n - 1 : at(n + 1) <= change ? n + 1 : n
+    let start = at(k)
+    let end = at(k + 1)
+    let days = date.days_between(start, end)
+    let used = date.days_between(start, change)
+    { start, end, days, used, left: days - used }
+}
+
+// One part of a period's price: multiplied first, or 1.35 x 1/30 falls just short
+// of the half cent it is.
+fn proration_calc_part(price, left: int, days: int, currency: str) = money.of(dec(price) * left / days, currency, "half_up")
+
+// See the top of the file.
+fn proration_calc_figures(old_price, new_price, anchor: str, change: str, old_cycle: str, new_cycle: str, currency: str, downgrade: str = "credit") {
+    if !date.valid(anchor, "date") { return err("The start of the subscription is not a date.") }
+    if !date.valid(change, "date") { return err("The day of the change is not a date.") }
+    if change < anchor { return err("The change comes before the subscription began.") }
+    if date.parts(change).year > 9000 { return err("That day is too far away to bill.") }
+    let p = proration_calc_period(anchor, change, old_cycle)
+    let price = money.of(new_price, currency, "half_up")
+    let zero = money.zero(currency)
+    let on_cycle = old_cycle == new_cycle
+    let credit0 = proration_calc_part(old_price, p.left, p.days, currency)
+    let charge0 = on_cycle ? proration_calc_part(new_price, p.left, p.days, currency) : price
+    let down = money.compare(charge0, credit0) < 0
+    let waits = down && downgrade == "renewal"
+    let credit = waits ? zero : credit0
+    let charge = waits ? zero : charge0
+    let net = money.sub(charge, credit)
+    let refund = down && downgrade == "refund"
+    // A credit goes against the bills to come, which may take several.
+    let balance = down && !waits && !refund ? money.neg(net) : zero
+    let later = money.sub(price, balance)
+    let covered = later.amount < 0
+    let next_amount = covered ? zero : later
+    let kept = covered ? money.neg(later) : zero
+    let bills = price.amount > 0 ? int(floor(balance.amount / price.amount)) : 0
+    { days: p.days, used: p.used, left: p.left, start: p.start, end: p.end, credit, charge, net, down, waits, refund, balance,
+      due: down ? zero : net, next_date: on_cycle || waits ? p.end : date.add_months(change, proration_calc_step(new_cycle)),
+      next_amount, kept, bills, on_cycle }
+}
+
+component ProrationCalc(plans = [], from: str? = null, to: str? = null, anchor: str = "", change: str? = null, today: str = "", downgrade: str = "credit",
+                        currency: str = "USD", locale: str? = null, title: str = "Change of plan", id: str = "proration-calc", name: str? = null,
+                        on_change = null, class: str? = null) {
+    style global proration_calc_css
+    let code = is_err(money.minor_units(upper(trim(currency)))) ? "USD" : upper(trim(currency))
+    let read = proration_calc_plans(plans)
+    let plan = (i: str) => read.good | find((p) => p.id == i)
+    state a = from ?? (len(read.good) > 0 ? read.good[0].id : "")
+    state b = to ?? (len(read.good) > 1 ? read.good[1].id : a)
+    state since = anchor
+    state day = change ?? today
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let shown = (m) => locale != null ? money.format(m, locale) : money.format(m)
+    let when = (d: str) => date.format(d, { locale: locale ?? "en-US", style: "medium" })
+    let work = (i: str, j: str, s: str, d: str) => {
+        let o = plan(i)
+        let n = plan(j)
+        if o == null || n == null { return err("Choose both plans.") }
+        if trim(s) == "" { return err("Give the day the subscription began.") }
+        if trim(d) == "" { return err("Give the day of the change.") }
+        proration_calc_figures(o.price, n.price, s, d, o.cycle, n.cycle, code, downgrade)
+    }
+    let f = work(a, b, since, day)
+    let bad_since = trim(since) != "" && !date.valid(since, "date")
+    let bad_day = trim(day) != "" && !date.valid(day, "date")
+    let same = a == b
+    let old = plan(a)
+    let fresh = plan(b)
+    let tell = (i: str, j: str, s: str, d: str) => {
+        let g = work(i, j, s, d)
+        if on_change != null && !is_err(g) { on_change(g) }
+    }
+    <section class={ui_cls(["ui-proration", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-proration-title id={`${id}-title`}>{title}</h3>
+        <div.ui-proration-grid>
+            <div.ui-proration-field>
+                <label for={`${id}-from`}>Current plan</label>
+                <select id={`${id}-from`} name={named("from")} @change={(e) => { a = e.value; tell(a, b, since, day) }}>
+                    {for p in read.good => <option key={p.id} value={p.id} selected={p.id == a}>{p.name}, {shown(money.of(p.price, code, "half_up"))} {p.cycle == "annual" ? "a year" : "a month"}</option>}
+                </select>
+            </div>
+            <div.ui-proration-field>
+                <label for={`${id}-to`}>New plan</label>
+                <select id={`${id}-to`} name={named("to")} @change={(e) => { b = e.value; tell(a, b, since, day) }}>
+                    {for p in read.good => <option key={p.id} value={p.id} selected={p.id == b}>{p.name}, {shown(money.of(p.price, code, "half_up"))} {p.cycle == "annual" ? "a year" : "a month"}</option>}
+                </select>
+            </div>
+            <div.ui-proration-field>
+                <label for={`${id}-anchor`}>Subscribed on</label>
+                <input type="date" id={`${id}-anchor`} name={named("anchor")} value={since} aria-invalid={bad_since ? "true" : null}
+                       @input={(e) => { since = e.value; tell(a, b, since, day) }}/>
+            </div>
+            <div.ui-proration-field>
+                <label for={`${id}-change`}>Change on</label>
+                <input type="date" id={`${id}-change`} name={named("change")} value={day} aria-invalid={bad_day ? "true" : null}
+                       @input={(e) => { day = e.value; tell(a, b, since, day) }}/>
+            </div>
+        </div>
+        {len(read.skipped) > 0 && <p.ui-proration-skipped>Left out: {read.skipped | join(" ")}</p>}
+        <div aria-live="polite">
+            {len(read.good) == 0 && <p.ui-proration-error role="alert">No plans to compare.</p>}
+            {len(read.good) > 0 && is_err(f) && <p.ui-proration-error role="alert">{f.error}</p>}
+            {!is_err(f) && same && <p.ui-proration-next>That is the plan already on: nothing changes.</p>}
+            {!is_err(f) && !same && f.waits && <p.ui-proration-next>{fresh.name} starts when this period ends: nothing to pay until {when(f.end)}, then {shown(f.next_amount)}.</p>}
+            {!is_err(f) && !same && !f.waits && <div>
+                <dl.ui-proration-out>
+                    <div.ui-proration-line.ui-proration-credit>
+                        <dt>Credit for {old.name}<span.ui-proration-how>{f.left} of {f.days} days left, {when(f.start)} to {when(f.end)}</span></dt>
+                        <dd><span aria-hidden="true">−</span><span.ui-sr>minus </span>{shown(f.credit)}</dd>
+                    </div>
+                    <div.ui-proration-line.ui-proration-charge>
+                        <dt>Charge for {fresh.name}<span.ui-proration-how>{f.on_cycle ? `${f.left} of ${f.days} days` : "A full period from the change"}</span></dt>
+                        <dd>{shown(f.charge)}</dd>
+                    </div>
+                    <div.ui-proration-line.ui-proration-total>
+                        <dt>{f.down ? f.refund ? "Refund" : "Credit kept" : "Due now"}</dt>
+                        <dd>{shown(f.down ? money.neg(f.net) : f.net)}</dd>
+                    </div>
+                </dl>
+            </div>}
+            {!is_err(f) && !same && !f.waits && <p.ui-proration-next>
+                Next bill on {when(f.next_date)}: {shown(f.next_amount)}{f.bills > 1 ? `. The credit covers ${f.bills} bills in full, with ${shown(f.kept)} left after the next one.` : money.compare(f.kept, money.zero(code)) > 0 ? `, with ${shown(f.kept)} of credit left.` : "."}
+            </p>}
+        </div>
+    </section>
+}

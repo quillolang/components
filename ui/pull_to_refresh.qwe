@@ -1,0 +1,239 @@
+// PullToRefresh: a scrolling area that refreshes when it is pulled down from its top,
+// as a phone's lists do. The pull slows as it goes, past a threshold it says so, and on
+// release it holds a spinner until the work is done, then says whether it worked. It
+// only takes a pull that starts at the very top and goes down, with that top on the screen:
+// otherwise the area, or the page around it, scrolls as usual. It also stops the browser's
+// own pull from reloading the page.
+// A Refresh button beside it does the same for keyboards and screen readers.
+//
+//   component Feed() {
+//       state rows = first_rows()
+//       <PullToRefresh height="60dvh" on_refresh={(done) => {
+//           rows = load_rows()        // a server fn: the page waits for it here
+//           done(true)
+//       }}>
+//           {for r in rows => <p key={r.id}>{r.title}</p>}
+//       </PullToRefresh>
+//   }
+//
+// on_refresh(done): inside one of your components, called once per refresh. It must take
+// that one parameter. Call done(true) when it worked and done(false), or done with an error
+// value, when it did not; a call made after a timer or from another callback is fine. Or
+// give the answer back: true, false, an error value, or a Promise of one, which is waited
+// for, nothing in it meaning it worked and a refusal that it did not.
+// height: how tall the whole thing is, as CSS ("100%", for a screen that sets its own).
+// threshold: how far the pull must show, in pixels, to count (70). limit: how far it
+// can show, which sets the resistance: limit * d / (d + limit) for a finger moved d (180).
+// timeout: seconds to wait for done before calling it a failure (30).
+// label: what screen readers call the area. pull_text, ready_text, busy_text, done_text,
+// failed_text: what it says at each step. disabled: no pull and no button. class.
+// children: what scrolls.
+
+import ui/theme.qwe use ui_cls
+
+let pull_to_refresh_css = css`
+.ui-pull-refresh { position: relative; display: flex; flex-direction: column; min-height: 0; overflow: hidden; container-type: inline-size;
+  background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.5 var(--ui-font); }
+.ui-pull-refresh-bar { display: flex; flex: none; align-items: center; gap: 8px; min-height: 52px; padding: 4px 12px;
+  border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-pull-refresh-status { flex: 1; min-width: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-pull-refresh-btn { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: 6px; min-width: 44px; min-height: 44px;
+  padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-pull-refresh-btn svg { width: 20px; height: 20px; }
+.ui-pull-refresh-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-pull-refresh-btn[aria-disabled="true"] { color: var(--ui-muted); cursor: default; }
+.ui-pull-refresh-btn-text { display: none; }
+@media (hover: hover) { .ui-pull-refresh-btn:not([aria-disabled="true"]):hover { background: var(--ui-subtle); } }
+.ui-pull-refresh-view { position: relative; flex: 1; min-height: 0; overflow: hidden; background: var(--ui-subtle); --p: 0; }
+.ui-pull-refresh-ind { position: absolute; inset: 0 0 auto 0; display: flex; align-items: center; justify-content: center; gap: 8px; height: 56px;
+  color: var(--ui-muted); font-size: 13px; opacity: var(--p); }
+.ui-pull-refresh-arrow { display: grid; place-items: center; width: 24px; height: 24px; transform: rotate(calc(var(--p) * 180deg)); }
+.ui-pull-refresh-arrow svg { width: 20px; height: 20px; }
+.ui-pull-refresh-spin { width: 20px; height: 20px; border: 2px solid var(--ui-accent); border-right-color: transparent; border-radius: 50%;
+  animation: ui-pull-refresh-spin .7s linear infinite; }
+@keyframes ui-pull-refresh-spin { to { transform: rotate(360deg); } }
+.ui-pull-refresh-done { color: var(--ui-success); font-weight: 600; }
+.ui-pull-refresh-failed { color: var(--ui-danger); font-weight: 600; }
+/* Its own scroller, and contain keeps the browser's pull and the page behind out of it. pan-y lets the
+   browser scroll; a pull that is ours is kept from it by the touchmove guard in @mount. */
+.ui-pull-refresh-scroll { position: relative; height: 100%; overflow-y: auto; overscroll-behavior-y: contain; touch-action: pan-y;
+  background: var(--ui-bg); transition: transform .28s cubic-bezier(.2, .8, .2, 1); }
+.ui-pull-refresh-on .ui-pull-refresh-scroll { transition: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+@container (min-width: 480px) {
+  .ui-pull-refresh-btn { padding: 0 14px; }
+  .ui-pull-refresh-btn-text { display: inline; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-pull-refresh-scroll { transition: none; }
+  .ui-pull-refresh-spin { animation-duration: 2.4s; }
+}
+`
+
+// Which way a move has gone, once it is past the slop: "x", "y", or "" for not yet.
+fn pull_to_refresh_axis(dx: num, dy: num, slop: num) -> str {
+    if abs(dx) < slop && abs(dy) < slop { return "" }
+    abs(dx) > abs(dy) ? "x" : "y"
+}
+
+// How far the area shows for a finger moved d: all of it at first, less and less after,
+// and never as far as limit.
+fn pull_to_refresh_resist(d: num, limit: num) -> num {
+    if d <= 0 || limit <= 0 { return 0 }
+    limit * d / (d + limit)
+}
+
+// A pull counts past the threshold, or past 60% of it when it is still moving fast at
+// release, as a flick is over before it has gone far.
+fn pull_to_refresh_commit(shown: num, speed: num, threshold: num) -> bool {
+    shown >= threshold || (shown >= threshold * 0.6 && speed >= 0.6)
+}
+
+// A sample of the finger for its speed: replaced at most every 32 ms, as moves can come a
+// millisecond apart and one such pair would read as a huge speed. s is { pos, at, v }.
+fn pull_to_refresh_sample(s, pos: num, now: num) {
+    let dt = now - s.at
+    dt < 32 ? s : { pos, at: now, v: (pos - s.pos) / dt }
+}
+
+// Its speed at release, in pixels a millisecond: none if the finger stopped before it lifted.
+fn pull_to_refresh_speed(s, pos: num, now: num, moved: num) -> num {
+    if now - moved > 80 { return 0 }
+    // What has moved since the sample, when that says more than the sample does: a flick
+    // can be over before a second sample comes, and the last move may have just made one.
+    let dt = now - s.at
+    let since = dt >= 8 ? (pos - s.pos) / dt : 0
+    abs(since) > abs(s.v) ? since : s.v
+}
+
+component PullToRefresh(on_refresh = null, height: str = "420px", threshold: int = 70, limit: int = 180, timeout: int = 30,
+                        label: str = "Refreshable list", pull_text: str = "Pull to refresh", ready_text: str = "Release to refresh",
+                        busy_text: str = "Refreshing", done_text: str = "Up to date", failed_text: str = "Could not refresh",
+                        disabled: bool = false, class: str? = null, children) {
+    style global pull_to_refresh_css
+    state phase = "idle"    // idle, pulling, ready, busy, done, failed
+    state wrap = null
+    state sky = null        // what holds the indicator: not the root, whose style attribute follows height
+    state box = null
+    state g = null          // the finger's gesture, read by handlers only, so it updates nothing
+    state run = 0           // which refresh is under way: a late done from an earlier one is ignored
+    let held = 56           // the height the indicator is held at
+    let show = (px: num, p: num) => {
+        box.style.transform = px > 0 ? `translateY(${px}px)` : ""
+        sky.style.setProperty("--p", `${p}`)
+    }
+    let close = () => {
+        phase = "idle"
+        show(0, 0)
+    }
+    let finish = (r: int, ok) => {
+        if r == run && phase == "busy" { phase = ok == false || is_err(ok) ? "failed" : "done" }
+    }
+    let start = () => {
+        phase = "busy"
+        show(held, 1)
+        run += 1
+        let r = run
+        if on_refresh == null {
+            finish(r, true)
+        } else {
+            let v = on_refresh((ok = true) => { finish(r, ok) })
+            // A callback may wait, and then what it gives is a Promise.
+            if type_of(v) == "promise" {
+                v.then((x = true) => { finish(r, x) }, (_e = null) => { finish(r, false) })
+            } else {
+                if type_of(v) == "bool" || is_err(v) { finish(r, v) }
+            }
+        }
+    }
+    if phase == "busy" { every(timeout * 1000, () => { finish(run, false) }) }
+    if phase == "done" { every(1100, close) }
+    if phase == "failed" { every(2400, close) }
+    let working = phase == "busy" || phase == "done" || phase == "failed"
+    let word = match phase {
+        "ready" => ready_text
+        "busy" => busy_text
+        "done" => done_text
+        "failed" => failed_text
+        _ => pull_text
+    }
+    <div class={ui_cls(["ui-pull-refresh", (phase == "pulling" || phase == "ready") && "ui-pull-refresh-on", class])} style={`height: ${height}`}
+         @mount={(me) => { wrap = me }}>
+        <div.ui-pull-refresh-bar>
+            <span.ui-pull-refresh-status role="status">{working ? word : ""}</span>
+            <button.ui-pull-refresh-btn type="button" aria-label="Refresh" aria-disabled={working || disabled ? "true" : null}
+                    @click={() => { if !working && !disabled { start() } }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                     aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6"/></svg>
+                <span.ui-pull-refresh-btn-text>Refresh</span>
+            </button>
+        </div>
+        <div.ui-pull-refresh-view @mount={(me) => { sky = me }}>
+            <div.ui-pull-refresh-ind aria-hidden="true">
+                {phase == "busy"
+                    ? <span.ui-pull-refresh-spin></span>
+                    : phase == "done" || phase == "failed" ? null
+                    : <span.ui-pull-refresh-arrow><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                           stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg></span>}
+                <span class={phase == "done" ? "ui-pull-refresh-done" : phase == "failed" ? "ui-pull-refresh-failed" : null}>{word}</span>
+            </div>
+            <div.ui-pull-refresh-scroll tabindex="0" role="group" aria-label={label}
+                 @mount={(me) => {
+                     box = me
+                     // Pointer events alone cannot keep a downward pull: pan-y gives it to the browser
+                     // and pan-down has no Safari. A touchmove that says no can, on both engines, and
+                     // pointermove comes first, so it knows by then whether the pull is ours.
+                     let guard = (e) => { if g != null && g.on && e.cancelable { e.preventDefault() } }
+                     me.addEventListener("touchmove", guard, { passive: false })
+                     () => { me.removeEventListener("touchmove", guard) }
+                 }}
+                 @pointerdown={(e) => {
+                     // Its top above the screen: the page has more to bring down first, and that comes before a refresh.
+                     g = !disabled && !working && e.isPrimary && e.button == 0 && box.scrollTop <= 0 && wrap.getBoundingClientRect().top >= 0
+                         ? { id: e.pointerId, y: e.clientY, x: e.clientX, on: false, base: 0, moved: e.timeStamp, shown: 0,
+                             s: { pos: e.clientY, at: e.timeStamp, v: 0 } }
+                         : null
+                 }}
+                 @pointermove={(e) => {
+                     if g != null && e.pointerId == g.id {
+                         let dx = e.clientX - g.x
+                         let dy = e.clientY - g.y
+                         if !g.on {
+                             let way = pull_to_refresh_axis(dx, dy, 8)
+                             if way == "x" || (way == "y" && (dy < 0 || box.scrollTop > 0)) { g = null }
+                             if way == "y" && g != null {
+                                 box.setPointerCapture(e.pointerId)
+                                 // From where the slop ends, not from this move: moves are merged at speed,
+                                 // and the first of a flick can arrive most of the way there.
+                                 g = { ...g, on: true, base: g.y + 8 }
+                             }
+                         }
+                         if g != null && g.on {
+                             let d = e.clientY - g.base
+                             let px = pull_to_refresh_resist(d, limit)
+                             show(px, min([1, px / threshold]))
+                             // A finger back above where it began scrolls the list, as the browser no longer can.
+                             if d < 0 { box.scrollTop = -d }
+                             phase = px >= threshold ? "ready" : "pulling"
+                             g = { ...g, shown: px, moved: e.timeStamp, s: pull_to_refresh_sample(g.s, e.clientY, e.timeStamp) }
+                         }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     if g != null && e.pointerId == g.id {
+                         let was = g
+                         g = null
+                         let v = pull_to_refresh_speed(was.s, e.clientY, e.timeStamp, was.moved)
+                         if was.on { if pull_to_refresh_commit(was.shown, v, threshold) { start() } else { close() } }
+                     }
+                 }}
+                 @pointercancel={(e) => {
+                     if g != null && e.pointerId == g.id {
+                         let was = g
+                         g = null
+                         if was.on { close() }
+                     }
+                 }}>{children}</div>
+        </div>
+    </div>
+}

@@ -1,0 +1,241 @@
+// RatePrompt: asks for a rating, only once a person has really used the app, and just after
+// something went well. It keeps its own count, limits how often it asks, and gives anyone
+// the choice of telling you what is wrong instead of going to the store. Whatever the
+// stars, both routes are offered, as the stores forbid steering only the happy ones to a review.
+//
+//   component App() {
+//       state saved = 0
+//       <NoteEditor on_save={() => { saved = saved + 1 }}/>
+//       <RatePrompt app_name="Fieldbook" remember="rate" moment={saved} version="2.3.0"
+//           ios="https://apps.apple.com/app/id1234567890?action=write-review"
+//           android="https://play.google.com/store/apps/details?id=org.example.app&showAllReviews=true"
+//           on_problem={(text, stars) => send_feedback(text, stars)}/>
+//   }
+//
+// moment: a count of good moments, which you raise when something went well (a note saved, a
+// run finished): it asks only just after one. ready: false holds it back while the person is
+// in the middle of something. trouble: true holds it back after an error. version: this app's
+// version: a rating lasts for that version. app_name ("this app"). remember: the name its
+// count is kept under ("ui-rate-prompt"). ios, android, web: the store's page for rating, https.
+// min_days: days since the first start (7). min_uses: starts of the app (5), half an hour apart at
+// least. min_moments: good moments (3). gap_days: days between asks (120). per_year: asks in 365
+// days (3, Apple's own limit). problem_days: days of quiet after someone sent a problem (120).
+// now: the time in ms, for a test or a demo (the clock otherwise).
+// on_problem(text, stars): inside one of your components, given what was typed and the stars
+// (0 for none); it may wait, and an error value or false means it was not sent, and the text
+// stays to try again. on_rated(stars): when stars are picked. on_check(why): at each good moment,
+// "" when it asks, or the reason it did not: "never", "rated", "held", "trouble", "days", "uses",
+// "moments", "gap", "year" or "problem".
+//
+// rate_prompt_why_not(stats, rules, now, version) is the rule, alone. Apple's guidelines want its
+// own review sheet for ratings inside an app, which needs native code; a phone app's bridge has no
+// call for it, so this leads to the store's page instead.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/force_update.qwe use force_update_platform, force_update_link
+import ui/welcome_carousel.qwe use welcome_carousel_keep, welcome_carousel_recall
+
+let rate_prompt_css = css`
+.ui-rate-prompt-host { display: contents; }
+.ui-rate-prompt {
+  position: fixed; z-index: 55; inset: auto 12px calc(max(12px, env(safe-area-inset-bottom)) + var(--ui-rate-prompt-keyboard, 0px)) 12px; display: grid; gap: 10px; box-sizing: border-box; max-height: calc(100% - 24px); overflow: auto;
+  overscroll-behavior: contain; padding: 16px; border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 4px); background: var(--ui-surface); color: var(--ui-fg);
+  box-shadow: var(--ui-shadow-lg); font: 15px/1.45 var(--ui-font); animation: ui-rate-prompt-in .24s cubic-bezier(.2, .8, .2, 1);
+}
+@keyframes ui-rate-prompt-in { from { transform: translateY(24px); opacity: 0; } }
+.ui-rate-prompt h2 { margin: 0; font-size: 18px; line-height: 1.3; }
+.ui-rate-prompt p { margin: 0; color: var(--ui-muted); }
+.ui-rate-prompt-stars { display: flex; justify-content: center; flex-wrap: wrap; }
+.ui-rate-prompt-star { display: grid; place-items: center; width: 48px; height: 48px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ui-strong); cursor: pointer; }
+.ui-rate-prompt-star svg { width: 32px; height: 32px; }
+.ui-rate-prompt-star[aria-checked="true"], .ui-rate-prompt-star[data-lit] { color: var(--ui-warning); }
+.ui-rate-prompt-star:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-rate-prompt-acts { display: grid; gap: 6px; }
+.ui-rate-prompt-pair { display: flex; flex-wrap: wrap; gap: 4px; justify-content: space-between; }
+.ui-rate-prompt textarea {
+  box-sizing: border-box; width: 100%; min-height: 96px; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); resize: vertical;
+  background: var(--ui-bg); color: var(--ui-fg); font: 16px/1.4 var(--ui-font);
+}
+.ui-rate-prompt textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-rate-prompt-bad { color: var(--ui-danger) !important; font-size: 14px; }
+@media (min-width: 700px) { .ui-rate-prompt { inset: auto 24px calc(24px + var(--ui-rate-prompt-keyboard, 0px)) auto; width: 380px; } }
+@media (prefers-reduced-motion: reduce) { .ui-rate-prompt { animation: none; } }
+`
+
+let rate_prompt_day = 86400000
+
+// What was kept, as text, or a fresh start from `now`. Anything else in storage is a fresh start.
+fn rate_prompt_stats(text, now: num) {
+    let blank = { first: now, last_use: 0, uses: 0, moments: 0, asked: [], rated: null, never: false, problem: 0 }
+    if type_of(text) != "str" { return blank }
+    let got = json.parse(text)
+    if is_err(got) || type_of(got) != "map" { return blank }
+    let number = (k, d) => {
+        let v = get(got, k)
+        type_of(v) == "int" || type_of(v) == "float" ? v : d
+    }
+    let asked = get(got, "asked")
+    { first: number("first", now), last_use: number("last_use", 0), uses: number("uses", 0), moments: number("moments", 0),
+      asked: type_of(asked) == "list" ? (asked | filter((a) => type_of(a) == "int" || type_of(a) == "float")) : [],
+      rated: get(got, "rated"), never: get(got, "never") == true, problem: number("problem", 0) }
+}
+
+// One more start of the app, unless the last was within half an hour: the same sitting.
+fn rate_prompt_used(stats, now: num) =
+    now - stats.last_use >= 1800000 ? { ...stats, uses: stats.uses + 1, last_use: now } : stats
+
+// Why it should not ask, or "" when it should. In order: what never changes, then what
+// the person has not done yet, then the limits.
+fn rate_prompt_why_not(stats, rules, now: num, version) -> str {
+    if stats.never { return "never" }
+    if stats.rated != null && stats.rated == version { return "rated" }
+    if now - stats.first < rules.min_days * rate_prompt_day { return "days" }
+    if stats.uses < rules.min_uses { return "uses" }
+    if stats.moments < rules.min_moments { return "moments" }
+    let last = len(stats.asked) > 0 ? max(stats.asked) : 0
+    if last > 0 && now - last < rules.gap_days * rate_prompt_day { return "gap" }
+    if len(stats.asked | filter((a) => now - a < 365 * rate_prompt_day)) >= rules.per_year { return "year" }
+    if stats.problem > 0 && now - stats.problem < rules.problem_days * rate_prompt_day { return "problem" }
+    ""
+}
+
+// Keeps the last few asks: only a year of them ever counts.
+fn rate_prompt_asked(stats, now: num) {
+    let all = stats.asked + [now]
+    { ...stats, asked: slice(all, max([0, len(all) - 6]), len(all)) }
+}
+
+component RatePrompt(app_name: str = "this app", moment: int = 0, ready: bool = true, trouble: bool = false, version: str? = null, remember: str = "ui-rate-prompt",
+                     ios: str? = null, android: str? = null, web: str? = null, min_days: int = 7, min_uses: int = 5, min_moments: int = 3, gap_days: int = 120,
+                     per_year: int = 3, problem_days: int = 120, now = null, on_problem = null, on_rated = null, on_check = null, class: str? = null) {
+    style global rate_prompt_css
+    state loaded = false
+    state stats = null
+    state counted = moment
+    state platform = "web"
+    state step = ""             // "", "ask", "store", "problem" or "sent"
+    state stars = 0
+    state text = ""
+    state problem_said = ""
+    state sending = false
+    let link = force_update_link(platform, ios, android, web)
+    let clock = () => now ?? js("Date.now")
+    let rules = { min_days: min_days, min_uses: min_uses, min_moments: min_moments, gap_days: gap_days, per_year: per_year, problem_days: problem_days }
+    let keep = (s) => {
+        stats = s
+        welcome_carousel_keep(remember, json.stringify(s))
+    }
+    let good_moment = () => {
+        let by = moment - counted
+        counted = moment
+        let t = clock()
+        let next = { ...stats, moments: stats.moments + by }
+        let why = !ready ? "held" : trouble ? "trouble" : rate_prompt_why_not(next, rules, t, version)
+        if why == "" {
+            keep(rate_prompt_asked(next, t))
+            step = "ask"
+            stars = 0
+        } else {
+            keep(next)
+        }
+        on_check && on_check(why)
+    }
+    if loaded && moment > counted && step == "" { good_moment() }
+    let close = () => {
+        step = ""
+        problem_said = ""
+    }
+    let pick = (n: int) => {
+        stars = n
+        on_rated && on_rated(n)
+        step = n >= 4 || link == null ? "store" : "problem"
+        if n >= 4 && link == null { keep({ ...stats, rated: version ?? "any" }) }
+    }
+    let rated = () => {
+        keep({ ...stats, rated: version ?? "any" })
+        close()
+    }
+    let send = () => {
+        let words = trim(text)
+        if words == "" {
+            problem_said = "Write what went wrong first."
+        } else if !sending {
+            sending = true
+            problem_said = ""
+            let said = js("Promise.resolve", on_problem != null ? on_problem(words, stars) : null)
+            sending = false
+            if is_err(said) || said == false {
+                problem_said = "That did not send. Your words are still here. Try again."
+            } else {
+                keep({ ...stats, problem: clock() })
+                text = ""
+                step = "sent"
+            }
+        }
+    }
+    <div.ui-rate-prompt-host
+         @mount={(el) => {
+             platform = force_update_platform(js("navigator.userAgent"), js("navigator.maxTouchPoints"))
+             let kept = js("Promise.resolve", welcome_carousel_recall(remember))
+             let s = rate_prompt_used(rate_prompt_stats(is_err(kept) ? null : kept, clock()), clock())
+             keep(s)
+             loaded = true
+             let shut = (e) => { if e.key == "Escape" && step != "" { close() } }
+             let vv = js("window").visualViewport
+             let shift = (_e) => {
+                 let hidden = max([0, round(js("innerHeight") - vv.height - vv.offsetTop)])
+                 el.style.setProperty("--ui-rate-prompt-keyboard", `${hidden}px`)
+             }
+             js("document.addEventListener", "keydown", shut)
+             if vv != null { vv.addEventListener("resize", shift) }
+             () => {
+                 js("document.removeEventListener", "keydown", shut)
+                 if vv != null { vv.removeEventListener("resize", shift) }
+             }
+         }}>
+        {step != "" && <section class={ui_cls(["ui-rate-prompt", class])} role="dialog" aria-label={`Rate ${app_name}`}>
+            {step == "ask" && <h2>How is {app_name} going for you?</h2>}
+            {step == "ask" && <div.ui-rate-prompt-stars role="radiogroup" aria-label="Your rating">
+                {for n in range(1, 6) =>
+                    <button.ui-rate-prompt-star key={n} type="button" role="radio" aria-checked={stars == n ? "true" : "false"} aria-label={n == 1 ? "1 star" : `${n} stars`}
+                            data-lit={n <= stars ? "1" : null} @click={() => { pick(n) }}>
+                        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m12 2.8 2.8 6 6.5.8-4.8 4.5 1.3 6.5L12 17.3l-5.8 3.3 1.3-6.5L2.7 9.6l6.5-.8z"/></svg>
+                    </button>}
+            </div>}
+            {step == "ask" && <div.ui-rate-prompt-acts>
+                <Button size="lg" variant="soft" full={true} on_click={() => { step = "problem" }}>Report a problem instead</Button>
+                <div.ui-rate-prompt-pair>
+                    <Button size="lg" variant="ghost" tone="neutral" on_click={close}>Not now</Button>
+                    <Button size="lg" variant="ghost" tone="neutral" on_click={() => { keep({ ...stats, never: true }); close() }}>Do not ask again</Button>
+                </div>
+            </div>}
+            {step == "store" && <h2>Thank you</h2>}
+            {step == "store" && (link != null
+                ? <p>{stars >= 4 ? "Would you say so in the store? It takes a moment, and it helps others find us." : "You can leave a rating in the store."}</p>
+                : <p>That helps us a lot.</p>)}
+            {step == "store" && <div.ui-rate-prompt-acts>
+                {link != null && <Button size="lg" full={true} href={link}>Rate in the store</Button>}
+                {link != null && <Button size="lg" variant="ghost" full={true} tone="neutral" on_click={rated}>I have done it</Button>}
+                <div.ui-rate-prompt-pair>
+                    <Button size="lg" variant="ghost" tone="neutral" on_click={() => { step = "problem" }}>Report a problem</Button>
+                    <Button size="lg" variant="ghost" tone="neutral" on_click={close}>No thanks</Button>
+                </div>
+            </div>}
+            {step == "problem" && <h2>What went wrong?</h2>}
+            {step == "problem" && <label for="ui-rate-prompt-text"><span class="ui-sr">What went wrong?</span></label>}
+            {step == "problem" && <textarea id="ui-rate-prompt-text" maxlength="1000" placeholder="It goes straight to the people who make this." bind:value={text}></textarea>}
+            {step == "problem" && problem_said != "" && <p.ui-rate-prompt-bad role="alert">{problem_said}</p>}
+            {step == "problem" && <div.ui-rate-prompt-acts>
+                <Button size="lg" full={true} loading={sending} on_click={send}>Send</Button>
+                <div.ui-rate-prompt-pair>
+                    {link != null && <Button size="lg" variant="ghost" tone="neutral" href={link}>Rate in the store</Button>}
+                    <Button size="lg" variant="ghost" tone="neutral" on_click={close}>Not now</Button>
+                </div>
+            </div>}
+            {step == "sent" && <h2>Thank you</h2>}
+            {step == "sent" && <p role="status">We have it, and we read every one.</p>}
+            {step == "sent" && <Button size="lg" full={true} on_click={close}>Close</Button>}
+        </section>}
+    </div>
+}

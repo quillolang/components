@@ -1,0 +1,382 @@
+// LiveLocation: follows a person's position while they move: a walk, a run, a delivery. It
+// draws the path, adds up the distance, and shows speed and how close the fix is. GPS
+// wanders by metres even for someone standing still, so each new fix is weighed
+// against the last by how far it can be trusted, and only real movement adds distance. A
+// fix that is poor, stale or impossibly far away is left out. It stops when the page
+// leaves the screen or the component leaves the page, so it never runs a battery down
+// unseen, and picks up on coming back, with a break in the path where it was gone.
+//
+//   <LiveLocation/>
+//   <LiveLocation units="mi" on_update={(s) => { covered = s.distance }}/>
+//   <LiveLocation track={saved_fixes} on_stop={(s) => { save(s) }}/>
+//
+// track: fixes to begin from, { lat, lon, accuracy, at, speed }, at being milliseconds, as
+// a saved walk would be. start: follows from the first moment (false): a browser may ask
+// the person with nothing yet tapped, so it is better on a tap. units: "km" (default) or
+// "mi". gap: seconds between asks in the app, whose call gives one place at a time (3); in
+// a browser, fixes come as the device has them. worst: fixes less accurate than this many
+// metres are left out (100). on_update(stats): inside one of your components, called with
+// { distance, speed, accuracy, fixes, dropped } on each fix used: metres, metres a
+// second and metres, and speed is null until it is known. on_stop(stats): called when
+// a person stops it. In a browser it needs https, or the browser gives no place.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let live_location_css = css`
+.ui-liveloc { container-type: inline-size; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-liveloc-in { display: grid; gap: 10px; }
+.ui-liveloc-map { display: block; width: 100%; aspect-ratio: 3 / 2; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-subtle); }
+.ui-liveloc-path { fill: none; stroke: var(--ui-accent); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.ui-liveloc-halo { fill: color-mix(in srgb, var(--ui-accent) 18%, transparent); }
+.ui-liveloc-dot { fill: var(--ui-accent); stroke: var(--ui-surface); stroke-width: 2; }
+.ui-liveloc-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 0; }
+.ui-liveloc-stats > div { min-width: 0; padding: 6px 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-liveloc-stats dt { color: var(--ui-muted); font-size: 12px; }
+.ui-liveloc-stats dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-liveloc-say { margin: 0; color: var(--ui-muted); }
+.ui-liveloc-say:empty { display: none; }
+.ui-liveloc-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-liveloc-bar > .ui-btn { flex: 1 1 auto; }
+/* With room, the numbers run down the side of the map. The status comes last, as it comes and goes, so the buttons stay put. */
+@container (min-width: 420px) {
+  .ui-liveloc-in { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); column-gap: 14px; align-items: start; }
+  .ui-liveloc-map { grid-row: 1 / span 3; }
+  .ui-liveloc-stats { grid-template-columns: minmax(0, 1fr); }
+}
+`
+
+fn live_location_num(x) = (type_of(x) == "int" || type_of(x) == "float") && math.isfinite(x)
+
+// Metres along the ground between two places: the haversine, on a sphere of the mean
+// radius, which is close enough for a walk.
+fn live_location_metres(a, b) {
+    let la = math.radians(a.lat)
+    let lb = math.radians(b.lat)
+    let dla = lb - la
+    let dlo = math.radians(b.lon - a.lon)
+    let h = pow(math.sin(dla / 2), 2) + math.cos(la) * math.cos(lb) * pow(math.sin(dlo / 2), 2)
+    2 * 6371008.8 * math.atan2(sqrt(h), sqrt(max([1 - h, 0])))
+}
+
+// Before any fix.
+fn live_location_new() = { est: null, anchor: null, last: null, points: [], segment: 0, distance: 0, speed: null, accuracy: null, fixes: 0, dropped: 0 }
+
+// A fix in one shape, or null when it is not one. iOS gives -1 for a speed it lacks.
+fn live_location_fix(lat, lon, accuracy, at, speed) {
+    let ok = live_location_num
+    if !ok(lat) || !ok(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180 || !ok(at) {
+        null
+    } else {
+        { lat: lat, lon: lon, accuracy: ok(accuracy) && accuracy > 0 ? accuracy : 20, at: at, speed: ok(speed) && speed >= 0 ? speed : null }
+    }
+}
+
+// A filter of one number, kept as how unsure the place is, in square metres. Time adds
+// to that, as a person may have walked on (3 m/s is a run), and a fix cuts it by how
+// far that fix can be trusted. So a poor fix moves the place a little and a good one a lot.
+fn live_location_weigh(est, fix) {
+    let dt = max([fix.at - est.at, 0]) / 1000
+    let unsure = est.unsure + dt * 9
+    let r = fix.accuracy * fix.accuracy
+    let k = unsure / (unsure + r)
+    { lat: est.lat + k * (fix.lat - est.lat), lon: est.lon + k * (fix.lon - est.lon), unsure: (1 - k) * unsure, at: fix.at }
+}
+
+// One fix in, the next track out. `limit` is how many points are kept: past it, every
+// second one goes, which keeps the shape and leaves room to go on. Fixes are left out if
+// they are older than the last (the app's call may repeat one), poorer than `worst`
+// metres, or further off than even a fast train in the time: a jump is a bad fix, unless
+// the path had a break (`fresh`), when any distance may have been covered.
+fn live_location_add(t, fix, worst, limit, fresh) {
+    if fix == null {
+        { ...t, dropped: t.dropped + 1 }
+    } else if t.est != null && fix.at <= t.est.at {
+        t
+    } else if fix.accuracy > worst {
+        { ...t, accuracy: fix.accuracy, dropped: t.dropped + 1 }
+    } else if t.est == null || fresh {
+        let est = { lat: fix.lat, lon: fix.lon, unsure: fix.accuracy * fix.accuracy, at: fix.at }
+        let segment = t.est == null ? t.segment : t.segment + 1
+        { ...t, est: est, anchor: est, last: est, segment: segment, accuracy: fix.accuracy, speed: fix.speed ?? t.speed, fixes: t.fixes + 1,
+          points: live_location_thin(t.points | push({ lat: est.lat, lon: est.lon, segment: segment }), limit) }
+    } else if live_location_metres(t.est, fix) > 90 * max([(fix.at - t.est.at) / 1000, 1]) + fix.accuracy {
+        { ...t, dropped: t.dropped + 1 }
+    } else {
+        let est = live_location_weigh(t.est, fix)
+        let moved = live_location_metres(t.last, est)
+        let dt = (fix.at - t.last.at) / 1000
+        // The device's own figure if it gave one: it measures speed from Doppler, not from
+        // places, and is far better. Otherwise the way the estimate moved, eased.
+        let seen = moved / max([dt, 0.1])
+        let speed = fix.speed ?? (t.speed == null ? seen : t.speed * 0.6 + seen * 0.4)
+        // Wandering inside the fix's own error is not walking: distance counts only once the
+        // estimate has left the last counted place by more than that.
+        let step = live_location_metres(t.anchor, est)
+        let counted = step >= max([fix.accuracy / 2, 3])
+        { ...t, est: est, last: est, anchor: counted ? est : t.anchor, distance: counted ? t.distance + step : t.distance,
+          speed: speed, accuracy: fix.accuracy, fixes: t.fixes + 1,
+          points: counted ? live_location_thin(t.points | push({ lat: est.lat, lon: est.lon, segment: t.segment }), limit) : t.points }
+    }
+}
+
+// Every second point, keeping the last, once there are `limit`.
+fn live_location_thin(points, limit) {
+    let n = len(points)
+    if n < limit {
+        points
+    } else {
+        range(n) | filter((i) => i % 2 == 0 || i == n - 1) | map((i) => points[i])
+    }
+}
+
+// A run of saved fixes, given as they came.
+fn live_location_replay(fixes, worst, limit) =
+    reduce(fixes ?? [], live_location_new(), (t, f) => live_location_add(t, live_location_fix(f.lat, f.lon, f.accuracy, f.at, f.speed), worst, limit, false))
+
+// Places onto the map's w by h, north up, keeping shapes true: a degree of longitude is
+// shorter away from the equator. It shows at least 60 m across, so a person who has
+// barely moved is not a scribble filling the screen. Gives the middle, and pixels a metre.
+fn live_location_frame(points, w, h) {
+    let lats = points | map((p) => p.lat)
+    let lons = points | map((p) => p.lon)
+    let mid_lat = (min(lats) + max(lats)) / 2
+    let mid_lon = (min(lons) + max(lons)) / 2
+    let across = math.cos(math.radians(mid_lat)) * 111194.9
+    let high = max([(max(lats) - min(lats)) * 111194.9, 60])
+    let wide = max([(max(lons) - min(lons)) * across, 60])
+    { lat: mid_lat, lon: mid_lon, across: across, scale: min([(w - 32) / wide, (h - 32) / high]), w: w, h: h }
+}
+
+fn live_location_x(f, lon) = f.w / 2 + (lon - f.lon) * f.across * f.scale
+
+fn live_location_y(f, lat) = f.h / 2 - (lat - f.lat) * 111194.9 * f.scale
+
+// The text both sides write for a coordinate: the server and the browser print a whole float differently.
+fn live_location_px(x) = format_number(x, "en-US", 1)
+
+fn live_location_line(points, f, id) =
+    { id: id, points: join(points | filter((p) => p.segment == id) | map((p) => `${live_location_px(live_location_x(f, p.lon))},${live_location_px(live_location_y(f, p.lat))}`), " ") }
+
+// Each unbroken run of the path, as the points of a polyline.
+fn live_location_lines(points, f) {
+    let ids = points | map((p) => p.segment) | unique()
+    for id in ids => live_location_line(points, f, id)
+}
+
+fn live_location_distance_text(m, units) {
+    if units == "mi" {
+        m < 160.9344 ? `${format_number(round(m / 0.3048), "en-US", 0)} ft` : `${format_number(m / 1609.344, "en-US", 2)} mi`
+    } else {
+        m < 1000 ? `${format_number(round(m), "en-US", 0)} m` : `${format_number(m / 1000, "en-US", 2)} km`
+    }
+}
+
+fn live_location_speed_text(s, units) {
+    if s == null {
+        "--"
+    } else if units == "mi" {
+        `${format_number(s * 2.2369363, "en-US", 1)} mph`
+    } else {
+        `${format_number(s * 3.6, "en-US", 1)} km/h`
+    }
+}
+
+fn live_location_accuracy_text(a) = a == null ? "--" : `±${format_number(round(a), "en-US", 0)} m`
+
+// The numbers a page is given.
+fn live_location_stats(t) = { distance: t.distance, speed: t.speed, accuracy: t.accuracy, fixes: t.fixes, dropped: t.dropped }
+
+fn live_location_note(status, in_app) = match status {
+    "asking" => "Waiting for the first fix."
+    "away" => "Stopped while this page is off the screen."
+    "refused" => in_app ? "Location is turned off for this app. You can allow it in Settings." : "Location is blocked for this page. Allow it in your browser's site settings, then start again."
+    "weak" => "No signal just now. Still trying."
+    "none" => "This browser cannot give a location."
+    "insecure" => "Browsers give a location only to pages on https."
+    _ => ""
+}
+
+component LiveLocation(track: list = [], start: bool = false, units: str = "km", gap: num = 3, worst: num = 100, on_update = null, on_stop = null, class: str? = null) {
+    style global live_location_css
+    state t = live_location_replay(track, worst, 400)
+    state status = "idle"       // idle, asking, on, weak, away, refused, none, insecure
+    state in_app = false
+    state ticket = 0            // counts the starts and stops: an answer to an older one is dropped
+    state watch = null          // the browser's watch id
+    state polling = false       // the app has no watch: it is asked every `gap` seconds
+    state busy = false          // an ask is out: a slow phone must not stack them
+    state fresh = false         // the next fix starts a new run of the path
+    state to_settings = false
+    state pressed = 0           // when a button last changed what the bar shows
+
+    let take = (fix, mine) => {
+        if mine == ticket {
+            let n = live_location_add(t, fix, worst, 400, fresh)
+            if n.fixes > t.fixes {
+                fresh = false
+                status = "on"
+                t = n
+                on_update && on_update(live_location_stats(n))
+            } else {
+                t = n
+            }
+        }
+    }
+    let halt = () => {
+        ticket += 1
+        polling = false
+        busy = false
+        if watch != null {
+            js("navigator.geolocation.clearWatch", watch)
+            watch = null
+        }
+    }
+    let failed = (s) => {
+        halt()
+        status = s
+    }
+    let from_app = (mine) => {
+        if mine == ticket && !busy {
+            busy = true
+            let r = js("quilloNative.location")
+            busy = false
+            if mine == ticket {
+                if is_err(r) {
+                    let e = lower(r.error)
+                    if contains(e, "for this app") || contains(e, "denied") {
+                        failed("refused")
+                    } else {
+                        status = "weak"
+                    }
+                } else {
+                    take(live_location_fix(r.lat, r.lon, r.accuracy, r.at ?? js("Date.now"), r.speed), mine)
+                }
+            }
+        }
+    }
+    let begin = () => {
+        ticket += 1
+        let mine = ticket
+        status = "asking"
+        let r = js("quilloNative.location")
+        if is_err(r) && contains(r.error, "not defined") {
+            in_app = false
+            if js("isSecureContext") != true {
+                status = "insecure"
+            } else {
+                let id = js("navigator.geolocation.watchPosition",
+                    (pos) => {
+                        let c = pos.coords
+                        take(live_location_fix(c.latitude, c.longitude, c.accuracy, pos.timestamp, c.speed), mine)
+                    },
+                    (e) => {
+                        if mine == ticket {
+                            if e.code == 1 { failed("refused") } else { status = "weak" }
+                        }
+                    },
+                    { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 })
+                if is_err(id) {
+                    status = "none"
+                } else {
+                    watch = id
+                }
+            }
+        } else {
+            in_app = true
+            if is_err(r) {
+                let e = lower(r.error)
+                if contains(e, "for this app") || contains(e, "denied") {
+                    status = "refused"
+                } else {
+                    status = "weak"
+                    polling = true
+                }
+            } else {
+                polling = true
+                take(live_location_fix(r.lat, r.lon, r.accuracy, r.at ?? js("Date.now"), r.speed), mine)
+            }
+        }
+    }
+    if polling {
+        let mine = ticket
+        every(round(max([gap, 1]) * 1000), () => { from_app(mine) })
+    }
+
+    let following = status == "asking" || status == "on" || status == "weak" || status == "away"
+    let say = live_location_note(status, in_app)
+    let f = len(t.points) > 0 ? live_location_frame(t.points, 300, 200) : null
+    let lines = f != null ? live_location_lines(t.points, f) : []
+    let tip = f != null ? last(t.points) : null
+    let halo = f != null && t.accuracy != null ? min([t.accuracy * f.scale, 150]) : 0
+    <div class={ui_cls(["ui-liveloc", class])} data-status={status} @mount={(_el) => {
+        let d = js("document")
+        let turned = (_e = null) => {
+            let shown = js("document.visibilityState") == "visible"
+            if !shown && (status == "on" || status == "asking" || status == "weak") {
+                halt()
+                status = "away"
+            } else if shown && status == "away" {
+                fresh = t.est != null
+                begin()
+            } else if shown && to_settings {
+                to_settings = false
+                begin()
+            }
+        }
+        d.addEventListener("visibilitychange", turned)
+        if start { begin() }
+        () => {
+            d.removeEventListener("visibilitychange", turned)
+            halt()
+        }
+    }}>
+        <div.ui-liveloc-in>
+            <svg.ui-liveloc-map viewBox="0 0 300 200" role="img" aria-label={`Path of ${live_location_distance_text(t.distance, units)}`}>
+                {tip != null && <circle.ui-liveloc-halo cx={live_location_px(live_location_x(f, tip.lon))} cy={live_location_px(live_location_y(f, tip.lat))} r={live_location_px(halo)}/>}
+                {for line in lines => <polyline.ui-liveloc-path key={line.id} points={line.points}/>}
+                {tip != null && <circle.ui-liveloc-dot cx={live_location_px(live_location_x(f, tip.lon))} cy={live_location_px(live_location_y(f, tip.lat))} r="6"/>}
+            </svg>
+            <dl.ui-liveloc-stats>
+                <div><dt>Distance</dt><dd.ui-liveloc-distance>{live_location_distance_text(t.distance, units)}</dd></div>
+                <div><dt>Speed</dt><dd.ui-liveloc-speed>{live_location_speed_text(t.speed, units)}</dd></div>
+                <div><dt>Accuracy</dt><dd.ui-liveloc-accuracy>{live_location_accuracy_text(t.accuracy)}</dd></div>
+            </dl>
+            <div.ui-liveloc-bar>
+                {following
+                    ? <Button size="lg" tone="danger" class="ui-liveloc-stop" on_click={() => {
+                          let at = js("Date.now")
+                          if at - pressed > 350 {
+                              pressed = at
+                              halt()
+                              status = "idle"
+                              on_stop && on_stop(live_location_stats(t))
+                          }
+                      }}>Stop</Button>
+                    : <Button size="lg" class="ui-liveloc-start" on_click={() => {
+                          let at = js("Date.now")
+                          if at - pressed > 350 {
+                              pressed = at
+                              fresh = t.est != null
+                              begin()
+                          }
+                      }}>{t.fixes > 0 ? "Carry on" : "Start"}</Button>}
+                {!following && t.fixes > 0 && <Button size="lg" variant="outline" class="ui-liveloc-reset" on_click={() => {
+                    // These three share one place: the second tap of a double tap on Stop lands on
+                    // "Carry on" or on Reset, which would lose the whole walk.
+                    let at = js("Date.now")
+                    if at - pressed > 350 {
+                        pressed = at
+                        t = live_location_new()
+                        fresh = false
+                    }
+                }}>Reset</Button>}
+                {status == "refused" && in_app && <Button size="lg" variant="outline" class="ui-liveloc-settings" on_click={() => {
+                    to_settings = true
+                    js("quilloNative.openSettings")
+                }}>Open Settings</Button>}
+            </div>
+            <p.ui-liveloc-say role="status">{say}</p>
+        </div>
+    </div>
+}

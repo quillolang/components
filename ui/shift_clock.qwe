@@ -1,0 +1,390 @@
+// ShiftClock: punching in and out on a phone, with breaks and today's hours. A punch is
+// checked against where it should happen, and takes the moment of the tap, however long
+// the place takes to come. A double tap punches once, even though the second tap lands
+// on the button that has just taken the first one's place. With no connection, punches
+// wait here, in order and with their own times, and go when one comes.
+//
+// A place comes from the phone's location services in the Quillo app, the web's
+// geolocation in a browser. Too far away, or with no place to be had, the person is told
+// why and chooses: try again, or punch anyway, which marks the punch for a manager to
+// see. allow_off_site={false} takes that choice away.
+//
+//   import ui/shift_clock.qwe use ShiftClock
+//
+//   <ShiftClock time_now={date_ms} offset={-240} sites={[{ name: "Depot", lat: 45.5017, lon: -73.5673, radius: 150 }]}
+//               store="me" on_punch={(p) => send_punch(p)}/>
+//
+// time_now: the time in ms for the first render, which the browser replaces with its own,
+// so server and browser agree. offset: minutes east of UTC for that render (0).
+// sites: where a punch may be, each { name, lat, lon, radius (metres, 150) }; none
+// means anywhere. use_place: asks for the place at all (true). allow_off_site: true.
+// guard: ms after a press in which another is ignored (4000). limit_hours: past this, today's
+// hours are marked (10). title ("Time clock"). id: a prefix for its ids.
+//
+// What must last: in the phone apps localStorage comes back empty, so give back `punches`
+// (what on_change gave) from your own store. store: a key to keep them under in this
+// browser's localStorage as well, for a reload with no connection.
+//
+// on_change(punches): after each punch. on_punch(punch): for each punch in turn when
+// online; answer false, an error, or a Promise of either to leave it waiting.
+// A punch: { id, kind ("in", "break", "back" or "out"), at, offset, lat, lon, accuracy, site,
+// metres, flag (null, "off_site" or "no_place"), sent }.
+//
+// shift_clock_status(punches), shift_clock_totals(punches, ms, day_start),
+// shift_clock_metres(lat, lon, lat2, lon2), shift_clock_check(sites, place),
+// shift_clock_day_start(ms, offset), shift_clock_hours(ms) and shift_clock_time(ms, offset)
+// are the plain logic.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/photo_evidence.qwe use photo_evidence_place, photo_evidence_no_place, photo_evidence_when
+
+let shift_clock_css = css`
+.ui-punch { display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-punch h3 { margin: 0; font-size: 18px; }
+.ui-punch-cols { display: grid; gap: 12px; min-width: 0; }
+.ui-punch-col { display: grid; gap: 12px; min-width: 0; align-content: start; }
+.ui-punch-state { display: grid; gap: 2px; padding: 12px; border-left: 6px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-punch-state[data-state="in"] { border-color: var(--ui-success); background: var(--ui-success-soft); }
+.ui-punch-state[data-state="break"] { border-color: var(--ui-warning); background: var(--ui-warning-soft); }
+.ui-punch-state b { font-size: 20px; }
+.ui-punch-btns { display: grid; gap: 10px; }
+/* Big enough for a thumb in a glove, and held on the page while a place is awaited, so
+   what is under a second tap does not change. */
+.ui-punch-main, .ui-punch-other { display: grid; place-items: center; width: 100%; padding: 0 12px; border: 2px solid transparent; border-radius: var(--ui-radius); font: 700 22px/1.2 var(--ui-font); cursor: pointer; touch-action: manipulation; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.ui-punch-main { min-height: 104px; background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-punch-main[data-kind="out"] { background: var(--ui-danger); color: #fff; }
+.ui-punch-other { min-height: 76px; border-color: var(--ui-strong); background: var(--ui-surface); color: var(--ui-fg); font-size: 19px; }
+.ui-punch-other[hidden] { display: none; }
+.ui-punch-main:focus-visible, .ui-punch-other:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-punch-main[aria-disabled="true"], .ui-punch-other[aria-disabled="true"] { opacity: .6; cursor: default; }
+.ui-punch-said { min-height: 22px; margin: 0; font-weight: 600; }
+.ui-punch-said:empty { display: none; }
+.ui-punch-ask { display: grid; gap: 8px; padding: 12px; border: 2px solid var(--ui-warning); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-punch-ask p { margin: 0; font-weight: 600; }
+.ui-punch-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-punch-acts > * { flex: 1 1 130px; }
+.ui-punch-note { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); font-size: 14px; }
+.ui-punch-sum { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.ui-punch-sum div { padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-punch-sum div[data-over] { background: var(--ui-danger-soft); }
+.ui-punch-sum dt { color: var(--ui-muted); font-size: 13px; }
+.ui-punch-sum dd { margin: 0; font: 700 22px/1.3 var(--ui-font); }
+.ui-punch-log { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-punch-log li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; padding: 6px 10px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-punch-log b { font-family: var(--ui-mono); }
+.ui-punch-log small { color: var(--ui-muted); }
+.ui-punch-flag { padding: 0 6px; border-radius: 4px; background: var(--ui-warning-soft); color: var(--ui-fg); font-size: 13px; font-weight: 600; }
+.ui-punch-empty { margin: 0; color: var(--ui-muted); }
+@container (min-width: 640px) {
+  .ui-punch-cols { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+  .ui-punch-main { min-height: 140px; font-size: 26px; }
+}
+`
+
+fn shift_clock_is_num(x) -> bool = (type_of(x) == "int" || type_of(x) == "float") && math.isfinite(x)
+
+// "out", "in" or "break", from the last punch.
+fn shift_clock_status(punches: list) -> str {
+    if len(punches) == 0 { return "out" }
+    match punches[len(punches) - 1].kind {
+        "in" => "in"
+        "back" => "in"
+        "break" => "break"
+        _ => "out"
+    }
+}
+
+// What can be pressed in a state: the big one first.
+fn shift_clock_moves(status: str) -> list = match status {
+    "in" => ["out", "break"]
+    "break" => ["back", "out"]
+    _ => ["in"]
+}
+
+fn shift_clock_label(kind: str) -> str = match kind {
+    "in" => "Punch in"
+    "out" => "Punch out"
+    "break" => "Start break"
+    _ => "End break"
+}
+
+// Midnight of the day ms falls in, offset being minutes east of UTC.
+fn shift_clock_day_start(ms: int, offset: int) -> int {
+    let shift = offset * 60000
+    floor((ms + shift) / 86400000) * 86400000 - shift
+}
+
+// Worked and on break, in ms, between day_start and ms. A shift that began yesterday counts
+// from midnight. A punch after ms, from a clock put back, adds nothing.
+fn shift_clock_totals(punches: list, ms: int, day_start: int) -> map {
+    let pairs = enumerate(punches) | map((p) => {
+        let next = p[0] + 1 < len(punches) ? punches[p[0] + 1].at : ms
+        { kind: p[1].kind, from: max([p[1].at, day_start]), to: min([next, ms]) }
+    })
+    let span = (f) => pairs | filter(f) | reduce(0, (a, s) => a + max([0, s.to - s.from]))
+    { worked: span((s) => s.kind == "in" || s.kind == "back"), on_break: span((s) => s.kind == "break") }
+}
+
+// 7 h 42 min, by whole minutes.
+fn shift_clock_hours(ms) -> str {
+    let m = floor(max([0, ms]) / 60000)
+    m < 60 ? `${m} min` : `${floor(m / 60)} h ${m % 60} min`
+}
+
+// 08:02, the 24-hour clock being the same in every language.
+fn shift_clock_time(ms: int, offset: int) -> str {
+    let minutes = floor((ms + offset * 60000) / 60000) % 1440
+    let h = floor(minutes / 60)
+    let m = minutes % 60
+    `${h < 10 ? "0" : ""}${h}:${m < 10 ? "0" : ""}${m}`
+}
+
+// Metres between two places, along the ground, by the haversine formula.
+fn shift_clock_metres(lat, lon, lat2, lon2) -> int {
+    let rad = math.pi / 180
+    let a = math.sin((lat2 - lat) * rad / 2)
+    let b = math.sin((lon2 - lon) * rad / 2)
+    let h = a * a + math.cos(lat * rad) * math.cos(lat2 * rad) * b * b
+    round(2 * 6371008.8 * math.atan2(sqrt(h), sqrt(max([0, 1 - h]))))
+}
+
+fn shift_clock_good_sites(sites: list) -> list = sites | filter((s) =>
+    type_of(s) == "map" && shift_clock_is_num(get(s, "lat")) && shift_clock_is_num(get(s, "lon")))
+
+// A place against the sites: { state, site, metres, radius }. state is "inside", "outside",
+// "rough" (too vague to say: it might be inside) or "anywhere" (no sites). A phone that
+// says it is within 300 m cannot prove it is outside a 150 m fence.
+fn shift_clock_check(sites: list, place) -> map {
+    let good = shift_clock_good_sites(sites)
+    if len(good) == 0 { return { state: "anywhere", site: null, metres: null, radius: null } }
+    let near = good | map((s) => {
+        let r = shift_clock_is_num(get(s, "radius")) ? s.radius : 150
+        { site: str(get(s, "name") ?? "the site"), metres: shift_clock_metres(place.lat, place.lon, s.lat, s.lon), radius: r }
+    }) | sort_by((n) => n.metres - n.radius)
+    let n = near[0]
+    let acc = shift_clock_is_num(get(place, "accuracy")) ? place.accuracy : 0
+    { state: n.metres <= n.radius ? "inside" : (n.metres - acc <= n.radius ? "rough" : "outside"), site: n.site, metres: n.metres, radius: n.radius }
+}
+
+// Why a place was not good enough, in a sentence.
+fn shift_clock_check_text(c) -> str = c.state == "rough"
+    ? `Your place is too rough to tell: about ${c.metres} m from ${c.site}. Allowed: ${c.radius} m.`
+    : `You are ${c.metres} m from ${c.site}. Allowed: ${c.radius} m.`
+
+// A press this soon after the last one is the same press.
+fn shift_clock_guarded(last, at, guard: int) -> bool = last != null && at - last < guard
+
+// A shift left open from before today: forgotten, usually.
+fn shift_clock_stale(punches: list, day_start: int) -> bool =
+    shift_clock_status(punches) != "out" && len(punches) > 0 && punches[len(punches) - 1].at < day_start
+
+// What goes in the day's list beside a punch.
+fn shift_clock_log_kind(kind: str) -> str = match kind {
+    "in" => "In"
+    "out" => "Out"
+    "break" => "Break"
+    _ => "Back"
+}
+
+fn shift_clock_flag_text(flag) -> str = flag == "off_site" ? "Off site" : "No place"
+
+fn shift_clock_keep(name: str, text: str) {
+    js_new("Promise", (done) => {
+        js("localStorage.setItem", name, text)
+        done(true)
+    }).then((_ok = null) => true, (_e = null) => false)
+}
+
+fn shift_clock_kept(name: str) {
+    js_new("Promise", (done) => {
+        let text = js("localStorage.getItem", name)
+        let v = text == null ? null : json.parse(text)
+        done(is_err(v) ? null : v)
+    }).then((v = null) => v, (_e = null) => null)
+}
+
+component ShiftClock(time_now: int = 0, offset: int = 0, sites: list = [], use_place: bool = true, allow_off_site: bool = true, guard: int = 4000, limit_hours: num = 10,
+                     punches: list = [], store: str? = null, title: str = "Time clock", id: str = "ui-punch", on_change = null, on_punch = null, class: str? = null) {
+    style global shift_clock_css
+    state done = punches
+    state clock = time_now
+    state zone = offset
+    state busy = false
+    state pressed = null     // when the last press that counted was
+    state said = ""
+    state pending = null     // a punch waiting on the person's choice: { kind, at, place, check, why, in_app }
+    state online = true
+    state sending = false
+    let status = shift_clock_status(done)
+    let moves = shift_clock_moves(status)
+    let day_start = shift_clock_day_start(clock, zone)
+    let totals = shift_clock_totals(done, clock, day_start)
+    let today = done | filter((p) => p.at >= day_start)
+    let waiting = on_punch != null ? done | filter((p) => !p.sent) | len() : 0
+    let since = len(done) > 0 ? done[len(done) - 1].at : null
+    let told = () => {
+        on_change && on_change(done)
+        if store != null { js("Promise.resolve", shift_clock_keep(`ui-punch-${store}`, json.stringify(done))) }
+    }
+    let flush = () => {
+        if on_punch != null && online && !sending {
+            sending = true
+            let going = true
+            for p in done {
+                if going && !p.sent {
+                    let r = js("Promise.resolve", on_punch(p))
+                    if r == false || is_err(r) {
+                        going = false
+                    } else {
+                        done = done | map((x) => x.id == p.id ? set(x, "sent", true) : x)
+                    }
+                }
+            }
+            sending = false
+            told()
+        }
+    }
+    let felt = () => {
+        let w = js("window")
+        if w.quilloNative != null {
+            js("quilloNative.haptic", "success")
+        } else if js("navigator").vibrate != null {
+            js("navigator").vibrate(30)
+        }
+    }
+    let record = (kind, at, place, check, flag) => {
+        let c = check ?? {}
+        done = done + [{ id: `${at}-${kind}`, kind: kind, at: at, offset: zone, lat: place != null ? place.lat : null, lon: place != null ? place.lon : null,
+                         accuracy: place != null ? get(place, "accuracy") : null, site: get(c, "site"), metres: get(c, "metres"), flag: flag, sent: false }]
+        pending = null
+        clock = max([clock, now()])
+        said = `${shift_clock_label(kind)}: ${shift_clock_time(at, zone)}${get(c, "site") != null && flag == null ? ` at ${c.site}` : ""}`
+        felt()
+        told()
+        flush()
+    }
+    // Asks where the phone is, for a punch already pressed. `at` is the press's own time.
+    let locate = (kind, at) => {
+        busy = true
+        pending = null
+        said = "Checking where you are…"
+        let place = js("Promise.resolve", photo_evidence_place(8000, 0))
+        busy = false
+        said = ""
+        if get(place, "error") != null {
+            pending = { kind: kind, at: at, why: place.error, in_app: place.in_app, place: null, check: null }
+        } else {
+            let c = shift_clock_check(sites, place)
+            if c.state == "inside" || c.state == "anywhere" {
+                record(kind, at, place, c, null)
+            } else {
+                pending = { kind: kind, at: at, place: place, check: c, why: null, in_app: place.in_app }
+            }
+        }
+    }
+    let press = (kind) => {
+        // Nothing here may wait before the guard is set: a second tap comes that quickly.
+        let t = now()
+        if busy || pending != null {
+            null
+        } else if shift_clock_guarded(pressed, t, guard) {
+            said = `That was already done at ${shift_clock_time(pressed, zone)}.`
+        } else {
+            pressed = t
+            // A phone crosses zones with its owner, so each punch asks.
+            zone = 0 - js_new("Date").getTimezoneOffset()
+            if use_place && (kind == "in" || kind == "out") {
+                locate(kind, t)
+            } else {
+                record(kind, t, null, null, null)
+            }
+        }
+    }
+    if status != "out" { every(20000, () => { clock = now() }) }
+    <section class={ui_cls(["ui-punch", class])}
+             @mount={(_el) => {
+                 let w = js("window")
+                 let d = js("document")
+                 clock = now()
+                 zone = 0 - js_new("Date").getTimezoneOffset()
+                 online = js("navigator").onLine != false
+                 if len(punches) == 0 && store != null {
+                     let back = js("Promise.resolve", shift_clock_kept(`ui-punch-${store}`))
+                     if type_of(back) == "list" {
+                         done = back | filter((p) => type_of(p) == "map" && type_of(get(p, "kind")) == "str" && type_of(get(p, "at")) == "int")
+                     }
+                 }
+                 let up = (_e = null) => {
+                     online = true
+                     flush()
+                 }
+                 let down = (_e = null) => { online = false }
+                 // The clock is not worth running in the background, so coming back sets it.
+                 let back_on = (_e = null) => {
+                     if d.visibilityState == "visible" {
+                         clock = now()
+                         zone = 0 - js_new("Date").getTimezoneOffset()
+                     }
+                 }
+                 w.addEventListener("online", up)
+                 w.addEventListener("offline", down)
+                 d.addEventListener("visibilitychange", back_on)
+                 flush()
+                 () => {
+                     w.removeEventListener("online", up)
+                     w.removeEventListener("offline", down)
+                     d.removeEventListener("visibilitychange", back_on)
+                 }
+             }}>
+        <h3>{title}</h3>
+        <div.ui-punch-cols>
+            <div.ui-punch-col>
+                <div.ui-punch-state data-state={status}>
+                    <b>{status == "in" ? "On shift" : (status == "break" ? "On break" : "Not on shift")}</b>
+                    {since != null && status != "out" && <span>Since {shift_clock_time(since, zone)}</span>}
+                </div>
+                {shift_clock_stale(done, day_start) && <p.ui-punch-note>On shift since {slice(photo_evidence_when(since, zone), 0, 16)}. Did you forget to punch out?</p>}
+                <div.ui-punch-btns>
+                    <button.ui-punch-main type="button" data-kind={moves[0]} aria-disabled={busy || pending != null ? "true" : null} @click={() => { press(moves[0]) }}>{busy ? "Checking…" : shift_clock_label(moves[0])}</button>
+                    <button.ui-punch-other type="button" hidden={len(moves) < 2} aria-disabled={busy || pending != null ? "true" : null} @click={() => { press(moves[1]) }}>{shift_clock_label(len(moves) > 1 ? moves[1] : "break")}</button>
+                </div>
+                <p.ui-punch-said role="status">{said}</p>
+                {pending != null && <div.ui-punch-ask role="alert">
+                    <p>{pending.check != null ? shift_clock_check_text(pending.check) : photo_evidence_no_place(pending.why, pending.in_app == true)}</p>
+                    <div.ui-punch-acts>
+                        <Button size="lg" on_click={() => { locate(pending.kind, pending.at) }}>Try again</Button>
+                        {allow_off_site && <Button size="lg" variant="outline" on_click={() => {
+                            let p = pending
+                            record(p.kind, p.at, p.place, p.check, p.check != null ? "off_site" : "no_place")
+                        }}>Punch anyway</Button>}
+                        {pending.why == "refused" && pending.in_app == true && <Button size="lg" variant="outline" on_click={() => { js("quilloNative.openSettings") }}>Open Settings</Button>}
+                        <Button size="lg" variant="ghost" on_click={() => {
+                            pending = null
+                            pressed = null
+                            said = "Nothing was punched."
+                        }}>Cancel</Button>
+                    </div>
+                </div>}
+                {(!online || waiting > 0) && <p.ui-punch-note>{!online ? "No connection. " : ""}{waiting > 0 ? `${waiting} ${waiting == 1 ? "punch" : "punches"} waiting to send.` : "Punches stay on this device until it is back."}</p>}
+            </div>
+            <div.ui-punch-col>
+                <dl.ui-punch-sum>
+                    <div data-over={totals.worked > limit_hours * 3600000 ? "" : null}><dt>Worked today</dt><dd>{shift_clock_hours(totals.worked)}</dd></div>
+                    <div><dt>Breaks</dt><dd>{shift_clock_hours(totals.on_break)}</dd></div>
+                </dl>
+                {len(today) == 0
+                    ? <p.ui-punch-empty>No punches today.</p>
+                    : <ol.ui-punch-log>
+                        {for p in today => <li key={p.id}>
+                            <b>{shift_clock_time(p.at, zone)}</b>
+                            <span>{shift_clock_log_kind(p.kind)}</span>
+                            {p.site != null && <small>{p.flag == "off_site" ? `${p.metres} m from ${p.site}` : p.site}</small>}
+                            {p.flag != null && <span.ui-punch-flag>{shift_clock_flag_text(p.flag)}</span>}
+                            {on_punch != null && !p.sent && <span.ui-punch-flag>Waiting</span>}
+                        </li>}
+                    </ol>}
+            </div>
+        </div>
+    </section>
+}

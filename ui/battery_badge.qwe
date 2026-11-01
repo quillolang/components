@@ -1,0 +1,230 @@
+// BatteryBadge: a small badge with the battery's level and whether the phone is charging
+// or saving power, from the phone itself in the Quillo app (quilloNative) or the web's
+// Battery Status API. Where neither says, as in Safari and Firefox, it says that. When the
+// battery runs low it asks the page to go easy: it sets data-go-easy on <html>, sends the
+// `ui-go-easy` event, and calls on_go_easy, so that a page can stop what it does for show.
+// It lets go again a little above the level it began at, so a battery wavering on the line
+// does not turn a page's animations on and off.
+//
+//   <BatteryBadge/>
+//   <BatteryBadge low={0.15} on_go_easy={(on, _info) => { live_updates = !on }}/>
+//   <BatteryBadge level={0.64} status="charging"/>          what a server or a test knows
+//
+// html[data-go-easy] .my-hero { animation: none; }          the page's side of it
+//
+// low: the level, 0 to 1, at which it asks (0.2); being in Low Power Mode or Battery
+// Saver asks at any level, and charging never does. level, status ("charging", "full",
+// "unplugged"), low_power: a reading given rather than taken from the device. seconds:
+// how often the app is asked, as the app has no events (60); it is asked on coming
+// back too. on_go_easy(on, info): inside one of your components, called as the request
+// starts and ends. on_change(info): called with each new reading, { level, status,
+// low_power, seconds, from }, level being 0 to 1 or null, seconds the time to full or
+// empty where the browser says, and from "app", "web" or "given". The request is one
+// attribute on the page, so a page has one badge asking: give any others a low of 0.
+
+import ui/theme.qwe use ui_cls
+
+let battery_badge_css = css`
+.ui-batbadge-box { container-type: inline-size; }
+.ui-batbadge { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding: 3px 10px; border: 1px solid var(--ui-border); border-radius: 999px;
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1.3 var(--ui-font); font-variant-numeric: tabular-nums; --t: var(--ui-fg); }
+.ui-batbadge-good { --t: var(--ui-success); }
+.ui-batbadge-low { --t: var(--ui-danger); border-color: color-mix(in srgb, var(--ui-danger) 45%, var(--ui-border)); }
+.ui-batbadge-power { --t: var(--ui-warning); }
+.ui-batbadge-unknown { color: var(--ui-muted); }
+.ui-batbadge-icon { flex: none; width: 26px; height: 14px; color: var(--t); }
+.ui-batbadge-word { color: var(--ui-muted); font-weight: 400; }
+.ui-batbadge-more { display: none; color: var(--ui-muted); font-weight: 400; }
+.ui-batbadge-ask { margin: 6px 0 0; color: var(--ui-muted); font: 13px/1.4 var(--ui-font); }
+/* With room, the time left stands beside the level. */
+@container (min-width: 420px) { .ui-batbadge-more { display: inline; } }
+`
+
+fn battery_badge_num(x) = (type_of(x) == "int" || type_of(x) == "float") && math.isfinite(x)
+
+// A level from either source: 0 to 1, or null when the system does not say.
+fn battery_badge_level(x) = battery_badge_num(x) ? min([1, max([0, x])]) : null
+
+fn battery_badge_status(x) = ["charging", "full", "unplugged"] | contains(x) ? x : "unknown"
+
+// A reading in one shape, whichever source it came from.
+fn battery_badge_reading(level, status, low_power, seconds, from) =
+    { level: battery_badge_level(level), status: battery_badge_status(status), low_power: low_power == true,
+      seconds: battery_badge_num(seconds) && seconds > 0 ? seconds : null, from: from }
+
+// What the web's BatteryManager says, in those words. A browser gives Infinity for a
+// time it does not know, and 0 for no time at all.
+fn battery_badge_from_web(level, charging, charging_time, discharging_time) {
+    let full = charging == true && level == 1
+    battery_badge_reading(level, full ? "full" : (charging == true ? "charging" : "unplugged"), false,
+                          charging == true ? charging_time : discharging_time, "web")
+}
+
+// Whether a page should go easy, given whether it already is. It starts at `low` and
+// ends 5 points above it, so a level going 20, 21, 20 asks once. A phone on a charger
+// has power to spare, even in Low Power Mode, which often stays on while it charges.
+fn battery_badge_go_easy(info, was, low) {
+    let charging = info.status == "charging" || info.status == "full"
+    if charging {
+        false
+    } else if info.low_power {
+        true
+    } else if info.level == null {
+        false
+    } else if was {
+        info.level <= low + 0.05
+    } else {
+        info.level <= low
+    }
+}
+
+fn battery_badge_percent(level) = round(level * 100)
+
+// 1 h 5 min, 12 min. Under a minute says nothing useful.
+fn battery_badge_time(seconds) {
+    if seconds == null || seconds < 60 {
+        ""
+    } else {
+        let mins = round(seconds / 60)
+        let hours = floor(mins / 60)
+        hours > 0 ? `${hours} h ${mins - hours * 60} min` : `${mins} min`
+    }
+}
+
+// What a screen reader is told, as the badge is mostly a picture and a number.
+fn battery_badge_words(info) {
+    if info == null || info.level == null {
+        ""
+    } else {
+        let doing = match info.status {
+            "charging" => ", charging"
+            "full" => ", full"
+            _ => ""
+        }
+        `Battery ${battery_badge_percent(info.level)} percent${doing}${info.low_power ? ", saving power" : ""}`
+    }
+}
+
+fn battery_badge_tone(info, low) {
+    if info == null || info.level == null {
+        "unknown"
+    } else if info.status == "charging" || info.status == "full" {
+        "good"
+    } else if info.level <= low {
+        "low"
+    } else if info.low_power {
+        "power"
+    } else {
+        "plain"
+    }
+}
+
+fn battery_badge_word(info) {
+    if info == null {
+        ""
+    } else if info.status == "full" {
+        "Full"
+    } else if info.status == "charging" {
+        "Charging"
+    } else if info.low_power {
+        "Low power"
+    } else {
+        ""
+    }
+}
+
+// How much of the time remaining a line needs: "2 h 5 min to full".
+fn battery_badge_left(info) {
+    let t = info == null ? "" : battery_badge_time(info.seconds)
+    t == "" ? "" : (info.status == "charging" ? `${t} to full` : `${t} left`)
+}
+
+component BatteryBadge(low: num = 0.2, level: num? = null, status: str? = null, low_power: bool = false, seconds: num = 60,
+                       on_go_easy = null, on_change = null, class: str? = null) {
+    style global battery_badge_css
+    state info = null        // the reading, or null before the first
+    state none = false       // nothing here says
+    state easy = false
+    state ready = false      // on the page: reads the device, or the props
+    state manager = null     // the web's BatteryManager, once it is listened to
+
+    let given = level != null || status != null
+    let page = () => js("document.documentElement")
+    let settle = (r) => {
+        info = r
+        none = false
+        let next = battery_badge_go_easy(r, easy, low)
+        if next != easy {
+            easy = next
+            if next { page().setAttribute("data-go-easy", "battery") } else { page().removeAttribute("data-go-easy") }
+            js("document.dispatchEvent", js_new("CustomEvent", "ui-go-easy", { detail: { on: next, level: r.level } }))
+            on_go_easy && on_go_easy(next, r)
+        }
+        on_change && on_change(r)
+    }
+    let from_manager = (_e = null) => {
+        if manager != null { settle(battery_badge_from_web(manager.level, manager.charging, manager.chargingTime, manager.dischargingTime)) }
+    }
+    let read = () => {
+        let r = js("quilloNative.battery")
+        if !is_err(r) {
+            settle(battery_badge_reading(r.level, r.state, r.low_power, null, "app"))
+        } else {
+            let b = js("navigator.getBattery")
+            if is_err(b) {
+                info = null
+                none = true
+            } else {
+                // Once: each getBattery() gives the same object.
+                if manager == null {
+                    for name in ["levelchange", "chargingchange", "chargingtimechange", "dischargingtimechange"] { b.addEventListener(name, from_manager) }
+                }
+                manager = b
+                from_manager()
+            }
+        }
+    }
+    let leave = (_e = null) => {
+        if manager != null {
+            let b = manager
+            for name in ["levelchange", "chargingchange", "chargingtimechange", "dischargingtimechange"] { b.removeEventListener(name, from_manager) }
+        }
+        if easy { page().removeAttribute("data-go-easy") }
+    }
+    // A reading passed as props stands for the device, and follows them.
+    if ready && given { settle(battery_badge_reading(level, status, low_power, null, "given")) }
+    // The app has no events, so it is asked now and then.
+    if ready && !given { every(round(max([seconds, 5]) * 1000), () => { read() }) }
+
+    let tone = battery_badge_tone(info, low)
+    let shown = info != null && info.level != null
+    let word = battery_badge_word(info)
+    let left = battery_badge_left(info)
+    <div class={ui_cls(["ui-batbadge-box", class])} @mount={(_el) => {
+        let d = js("document")
+        let back = (_e = null) => {
+            if !given && js("document.visibilityState") == "visible" { read() }
+        }
+        d.addEventListener("visibilitychange", back)
+        ready = true
+        if !given { read() }
+        () => {
+            d.removeEventListener("visibilitychange", back)
+            leave()
+        }
+    }}>
+        <span class={ui_cls(["ui-batbadge", `ui-batbadge-${tone}`])} role="img" aria-label={shown ? battery_badge_words(info) : "Battery level not known"}>
+            <svg.ui-batbadge-icon viewBox="0 0 26 14" aria-hidden="true">
+                <rect x="0.5" y="0.5" width="22" height="13" rx="3" fill="none" stroke="currentColor"/>
+                <rect x="23" y="4" width="2.5" height="6" rx="1" fill="currentColor"/>
+                {shown && <rect.ui-batbadge-fill x="2" y="2" width={round(info.level * 19, 1)} height="10" rx="1.5" fill="currentColor"/>}
+            </svg>
+            {none
+                ? <span.ui-batbadge-word>Level not available here</span>
+                : (shown ? <span.ui-batbadge-pct>{battery_badge_percent(info.level)}%</span> : <span.ui-batbadge-word>{info == null ? "Battery" : "Level not said"}</span>)}
+            {word != "" && <span.ui-batbadge-word>{word}</span>}
+            {left != "" && <span.ui-batbadge-more>{left}</span>}
+        </span>
+        {easy && <p.ui-batbadge-ask role="status">Battery low: this page is doing less to save it.</p>}
+    </div>
+}

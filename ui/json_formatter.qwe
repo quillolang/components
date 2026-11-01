@@ -1,0 +1,451 @@
+// JsonFormatter: formats, minifies and sorts JSON, keeping every number and string
+// exactly as written. `1.10`, `1e400` and `12345678901234567890` stay those characters,
+// which a trip through a JSON parser would change, so it has its own parser, and that
+// parser can also say what is wrong: on an error it names the line and column, shows
+// the text around them with a caret, and says the likely cause. Where the trouble is
+// trailing commas or single quotes it offers a repair, done on the tokens, so text
+// inside strings is never touched. A key given twice is kept and reported.
+//
+//   <JsonFormatter value={`{"b": 1.10, "a": [1, 2,],}`}/>
+//   <JsonFormatter value={body} mode="minify" sort={true} on_change={(r) => { ok = r.valid }}/>
+//
+// value: the JSON it starts with. mode: "format" (the default) or "minify". sort: sorts
+// keys, at every depth, by code point (false). indent: "2", "4" or "tab" ("2"). title:
+// its heading. id: a prefix for its ids, unique on the page. name: the field's name
+// ("json"), so a form around it sends the text. live_limit: past this many characters it
+// waits for the Format button rather than working on each keystroke (200,000), and
+// past 5,000,000 it does not try, and says so. on_change(result): inside one of your
+// components, given { valid, output, error } after each change, error being
+// { line, column, message } or null. class: more classes for its outer element.
+//
+// json_formatter_check(text) reads text: { ok, tree, error, repairs, duplicates },
+// error being { at, line, column, message, excerpt, caret }.
+// json_formatter_pretty(text, indent, sort) and json_formatter_minify(text, sort) give
+// the text, or null when it is not JSON. json_formatter_repair(text) gives { text,
+// commas, quotes }. They work in a program too. Nesting past 500 levels is refused.
+
+import ui/theme.qwe use ui_cls
+
+let json_formatter_css = css`
+.ui-json-fmt { display: grid; gap: 12px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-json-fmt .ui-json-fmt-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-json-fmt-field { display: grid; gap: 5px; min-width: 0; }
+.ui-json-fmt-field > label, .ui-json-fmt-label { font-size: 13px; font-weight: 500; }
+.ui-json-fmt-field textarea { box-sizing: border-box; width: 100%; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.5 var(--ui-mono); resize: vertical; }
+.ui-json-fmt-field textarea:focus-visible, .ui-json-fmt-bar select:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-json-fmt-field textarea[aria-invalid] { border-color: var(--ui-danger); }
+.ui-json-fmt-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.ui-json-fmt-seg { display: inline-flex; gap: 0; }
+.ui-json-fmt-btn { height: 32px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-json-fmt-seg .ui-json-fmt-btn:first-child { border-radius: var(--ui-radius-sm) 0 0 var(--ui-radius-sm); }
+.ui-json-fmt-seg .ui-json-fmt-btn:last-child { margin-left: -1px; border-radius: 0 var(--ui-radius-sm) var(--ui-radius-sm) 0; }
+.ui-json-fmt-btn:hover { background: var(--ui-subtle); }
+.ui-json-fmt-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); position: relative; }
+.ui-json-fmt-btn[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-json-fmt-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.ui-json-fmt-check input { margin: 0; accent-color: var(--ui-accent); }
+.ui-json-fmt-check input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-json-fmt-bar select { height: 32px; padding: 0 6px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); }
+.ui-json-fmt-indent { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.ui-json-fmt-error { display: grid; gap: 6px; padding: 10px 12px; border-left: 4px solid var(--ui-danger); border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); }
+.ui-json-fmt-where { margin: 0; font-weight: 600; color: var(--ui-danger); }
+.ui-json-fmt-why { margin: 0; overflow-wrap: anywhere; }
+.ui-json-fmt-excerpt { margin: 0; padding: 6px 8px; overflow-x: auto; border-radius: 4px; background: var(--ui-surface); font: 12px/1.5 var(--ui-mono); white-space: pre; }
+.ui-json-fmt-excerpt:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-json-fmt-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-json-fmt-output { max-height: 360px; margin: 0; padding: 10px 12px; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle);
+  font: 13px/1.5 var(--ui-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-json-fmt-output:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-json-fmt-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-json-fmt-warn { margin: 0; color: var(--ui-warning); font-size: 13px; overflow-wrap: anywhere; }
+`
+
+let json_formatter_most = 5000000
+let json_formatter_depth = 500
+
+// One token: a string (open or closed) in either quote, something number-like, a
+// bracket or punctuation, a word, a comment, or any single other character. What is
+// not matched is JSON's own white space, as the last class leaves out only those four.
+let json_formatter_token_re = "\"(?:[^\"\\\\\\n\\r]|\\\\.)*\"?|'(?:[^'\\\\\\n\\r]|\\\\.)*'?|[-+]?[0-9.][0-9A-Za-z.+-]*|[-+][A-Za-z]*|[{}\\[\\],:]|[A-Za-z_$][\\w$]*|//[^\\n]*|/\\*|[^ \\t\\r\\n]"
+let json_formatter_string_re = "^\"(?:[^\"\\\\\\x00-\\x1f]|\\\\[\"\\\\/bfnrt]|\\\\u[0-9a-fA-F]{4})*\"$"
+let json_formatter_number_re = "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?$"
+let json_formatter_hints = { True: "true", False: "false", TRUE: "true", FALSE: "false", None: "null", NULL: "null", Null: "null", nil: "null", undefined: "null" }
+
+// The tokens: { k (kind), t (text), at (place in characters) }. Fast, as the regular
+// expression does the walking, so the Quillo around it stays small.
+fn json_formatter_tokens(text: str) -> list =
+    re.find_all(text, json_formatter_token_re) | map((m) => {
+        let t = m.text
+        let c = t[0]
+        let k = c == "\"" ? "str" : (c == "'" ? "sq"
+            : (t == "{" || t == "}" || t == "[" || t == "]" || t == "," || t == ":" ? t
+            : (re.test(c, "[-+0-9.]") ? "num"
+            : (re.test(c, "[A-Za-z_$]") ? "word" : "other"))))
+        { k, t, at: m.start }
+    })
+
+// What is wrong with a double-quoted string token, as { at (offset in it), message },
+// or null.
+fn json_formatter_string_problem(t: str) {
+    if re.test(t, json_formatter_string_re) { return null }
+    let closed = len(t) >= 2 && re.test(t, "^\"(?:[^\"\\\\]|\\\\.)*\"$")
+    if !closed { return { at: 0, message: "This string is never closed: its ending \" is missing on this line." } }
+    let tab = re.find(t, "[\\x00-\\x1f]")
+    if tab != null { return { at: tab.start, message: "A string cannot hold a raw tab or control character: write it as \\t or \\u00XX." } }
+    let esc = re.find(t, "\\\\(?:[^\"\\\\/bfnrtu]|u[0-9a-fA-F]{0,3}(?:[^0-9a-fA-F]|$))")
+    if esc != null { return { at: esc.start, message: `${slice(esc.text, 0, 2)} is not an escape JSON knows.` } }
+    { at: 0, message: "This string is not valid." }
+}
+
+// What is wrong with a token that should be a value, or null.
+fn json_formatter_scalar_problem(tok: map) -> str? {
+    let t = tok.t
+    match tok.k {
+        "num" => re.test(t, json_formatter_number_re) ? null : json_formatter_number_problem(t)
+        "word" => {
+            if t == "true" || t == "false" || t == "null" { return null }
+            let hint = get(json_formatter_hints, t)
+            if hint != null { return `${t} is not JSON: did you mean ${hint}?` }
+            if t == "NaN" || t == "Infinity" { return `${t} is not JSON: there is no such number.` }
+            `${t} is not a value: a string needs double quotes.`
+        }
+        "sq" => "A string needs double quotes, not single quotes."
+        "other" => json_formatter_other_problem(t)
+        _ => null
+    }
+}
+
+fn json_formatter_number_problem(t: str) -> str {
+    if starts_with(t, "+") { return `${t} is not a number in JSON: a number has no plus sign.` }
+    if re.test(t, "^-?0[0-9]") { return `${t} is not a number in JSON: it has a zero in front.` }
+    if re.test(t, "^-?0[xX]") { return `${t} is not a number in JSON: there is no hex.` }
+    if re.test(t, "^-?\\.") { return `${t} is not a number in JSON: it needs a digit before the point.` }
+    if re.test(t, "\\.$|\\.[eE]") { return `${t} is not a number in JSON: it needs a digit after the point.` }
+    if re.test(t, "^-?[0-9.]+[eE][-+]?$") { return `${t} is not a number in JSON: its exponent has no digits.` }
+    `${t} is not a number in JSON.`
+}
+
+fn json_formatter_other_problem(t: str) -> str {
+    if starts_with(t, "//") || t == "/*" { return "JSON has no comments." }
+    if t == "\u{FEFF}" { return "A byte order mark is here: take it out." }
+    if t == " " { return "A no-break space is here, which JSON does not count as space." }
+    if t == "“" || t == "”" || t == "‘" || t == "’" { return "This is a curly quote: JSON needs a straight \"." }
+    `${t} is not expected here.`
+}
+
+fn json_formatter_found(tok) -> str = tok == null ? "the end of the text" : (len(tok.t) > 24 ? `${slice(tok.t, 0, 24)}…` : tok.t)
+
+// One value from token i: { n (node), i (the next token) } or { e: { at, message } }.
+// A node is { t: text }, { a: [nodes] } or { o: [[key text, node, place]] }. Items gather
+// in chunks of 256 and are joined at the end: `push` in a loop copies the list in the
+// browser, which a list of 100,000 numbers would feel on every keystroke.
+fn json_formatter_value(toks: list, i: int, depth: int, end: int) -> map {
+    let tok = i < len(toks) ? toks[i] : null
+    if tok == null { return { e: { at: end, message: "The text ends where a value should be." } } }
+    if depth > json_formatter_depth { return { e: { at: tok.at, message: `This is nested deeper than ${json_formatter_depth} levels.` } } }
+    match tok.k {
+        "{" => json_formatter_object(toks, i, depth, end)
+        "[" => json_formatter_array(toks, i, depth, end)
+        "str" => {
+            let p = json_formatter_string_problem(tok.t)
+            p != null ? { e: { at: tok.at + p.at, message: p.message } } : { n: { t: tok.t }, i: i + 1 }
+        }
+        "num" | "word" | "sq" | "other" => {
+            let p = json_formatter_scalar_problem(tok)
+            p != null ? { e: { at: tok.at, message: p } } : { n: { t: tok.t }, i: i + 1 }
+        }
+        _ => { e: { at: tok.at, message: tok.t == "," ? "A comma here has no value before it." : `Expected a value, found ${tok.t}.` } }
+    }
+}
+
+fn json_formatter_array(toks: list, start: int, depth: int, end: int) {
+    let n = len(toks)
+    let items = []
+    let chunks = []
+    let i = start + 1
+    if i < n && toks[i].k == "]" { return { n: { a: [] }, i: i + 1 } }
+    while true {
+        let r = json_formatter_value(toks, i, depth + 1, end)
+        if r.e != null { return r }
+        items = push(items, r.n)
+        if len(items) == 256 {
+            chunks = push(chunks, items)
+            items = []
+        }
+        i = r.i
+        let tok = i < n ? toks[i] : null
+        if tok == null { return { e: { at: end, message: `The text ends inside the list opened at character ${toks[start].at + 1}: a ] is missing.` } } }
+        if tok.k == "]" { return { n: { a: flatten(push(chunks, items)) }, i: i + 1 } }
+        if tok.k != "," { return { e: { at: tok.at, message: `Expected a comma or ] after a list item, found ${json_formatter_found(tok)}.` } } }
+        i += 1
+        if i < n && toks[i].k == "]" { return { e: { at: tok.at, message: "Trailing comma: nothing follows it before the ]." } } }
+    }
+}
+
+fn json_formatter_object(toks: list, start: int, depth: int, end: int) {
+    let n = len(toks)
+    let pairs = []
+    let chunks = []
+    let i = start + 1
+    if i < n && toks[i].k == "}" { return { n: { o: [] }, i: i + 1 } }
+    while true {
+        let key = i < n ? toks[i] : null
+        if key == null { return { e: { at: end, message: `The text ends inside the object opened at character ${toks[start].at + 1}: a } is missing.` } } }
+        if key.k == "sq" { return { e: { at: key.at, message: "A key needs double quotes, not single quotes." } } }
+        if key.k != "str" { return { e: { at: key.at, message: key.k == "word" ? `The key ${key.t} needs double quotes.` : `Expected a key in double quotes, found ${json_formatter_found(key)}.` } } }
+        let bad = json_formatter_string_problem(key.t)
+        if bad != null { return { e: { at: key.at + bad.at, message: bad.message } } }
+        let colon = i + 1 < n ? toks[i + 1] : null
+        if colon == null || colon.k != ":" { return { e: { at: colon == null ? end : colon.at, message: `Expected a colon after the key ${json_formatter_found(key)}, found ${json_formatter_found(colon)}.` } } }
+        let r = json_formatter_value(toks, i + 2, depth + 1, end)
+        if r.e != null { return r }
+        pairs = push(pairs, [key.t, r.n, key.at])
+        if len(pairs) == 256 {
+            chunks = push(chunks, pairs)
+            pairs = []
+        }
+        i = r.i
+        let tok = i < n ? toks[i] : null
+        if tok == null { return { e: { at: end, message: `The text ends inside the object opened at character ${toks[start].at + 1}: a } is missing.` } } }
+        if tok.k == "}" { return { n: { o: flatten(push(chunks, pairs)) }, i: i + 1 } }
+        if tok.k != "," { return { e: { at: tok.at, message: `Expected a comma or } after a value, found ${json_formatter_found(tok)}.` } } }
+        i += 1
+        if i < n && toks[i].k == "}" { return { e: { at: tok.at, message: "Trailing comma: nothing follows it before the }." } } }
+    }
+}
+
+// A place as a line and column from 1, and the text around it with a caret under it.
+// Wide lines are cut around the place, and a tab shows as a space to keep the caret true.
+fn json_formatter_place(text: str, at: int) -> map {
+    let before = split(slice(text, 0, at), "\n")
+    let line = len(before)
+    let column = len(before[-1]) + 1
+    let whole = split(text, "\n")[line - 1] ?? ""
+    let shown = replace(replace(whole, "\t", " "), "\r", "")
+    let from = max([0, column - 31])
+    let to = min([len(shown), column + 30])
+    let cut = `${from > 0 ? "…" : ""}${slice(shown, from, to)}${to < len(shown) ? "…" : ""}`
+    let pad = column - 1 - from + (from > 0 ? 1 : 0)
+    { at, line, column, excerpt: cut, caret: `${repeat(" ", pad)}^` }
+}
+
+// Tokens to repair: which single-quoted strings and trailing commas there are.
+fn json_formatter_fixable(toks: list) -> map {
+    let commas = 0
+    let quotes = 0
+    let n = len(toks)
+    let i = 0
+    while i < n {
+        let k = toks[i].k
+        if k == "sq" { quotes += 1 }
+        if k == "," && i + 1 < n && (toks[i + 1].k == "}" || toks[i + 1].k == "]") { commas += 1 }
+        i += 1
+    }
+    { commas, quotes }
+}
+
+// A single-quoted token as a double-quoted one: \' is ' and a bare " is \".
+fn json_formatter_requote(t: str) -> str {
+    let closed = len(t) >= 2 && ends_with(t, "'")
+    let inner = slice(t, 1, closed ? len(t) - 1 : len(t))
+    let body = re.replace(inner, "\\\\.|\"", (m) => m.text == "\\'" ? "'" : (m.text == "\"" ? "\\\"" : m.text))
+    `"${body}${closed ? "\"" : ""}`
+}
+
+// Takes out trailing commas and turns single quotes to double, by tokens, so that a
+// comma or a quote inside a string stays. { text, commas, quotes }.
+fn json_formatter_repair(text: str) -> map {
+    let toks = json_formatter_tokens(text)
+    let n = len(toks)
+    let done = []
+    let pieces = []
+    let pos = 0
+    let commas = 0
+    let quotes = 0
+    let i = 0
+    while i < n {
+        let tok = toks[i]
+        let next = i + 1 < n ? toks[i + 1].k : ""
+        if tok.k == "sq" {
+            pieces = push(pieces, slice(text, pos, tok.at))
+            pieces = push(pieces, json_formatter_requote(tok.t))
+            pos = tok.at + len(tok.t)
+            quotes += 1
+        } else if tok.k == "," && (next == "}" || next == "]") {
+            pieces = push(pieces, slice(text, pos, tok.at))
+            pos = tok.at + 1
+            commas += 1
+        }
+        if len(pieces) >= 512 {
+            done = push(done, join(pieces, ""))
+            pieces = []
+        }
+        i += 1
+    }
+    pieces = push(pieces, slice(text, pos, len(text)))
+    { text: `${join(done, "")}${join(pieces, "")}`, commas, quotes }
+}
+
+// Keys given twice, by the path of the object, the first few.
+fn json_formatter_duplicates(node: map, path: str, out: list) -> list {
+    if len(out) >= 5 { return out }
+    let found = out
+    if node.o != null {
+        let seen = {}
+        for p in node.o {
+            if has(seen, p[0]) && len(found) < 5 { found = push(found, `${p[0]} is given twice in ${path == "" ? "the top object" : path}.`) }
+            seen = set(seen, p[0], true)
+            found = json_formatter_duplicates(p[1], `${path}.${slice(p[0], 1, len(p[0]) - 1)}`, found)
+        }
+    }
+    if node.a != null {
+        for x in node.a { found = json_formatter_duplicates(x, `${path}[]`, found) }
+    }
+    found
+}
+
+// Reads text. See the top of the file.
+fn json_formatter_check(text: str) -> map {
+    let body = starts_with(text, "\u{FEFF}") ? slice(text, 1, len(text)) : text
+    let toks = json_formatter_tokens(body)
+    let fix = json_formatter_fixable(toks)
+    let repairs = { commas: fix.commas, quotes: fix.quotes }
+    let failed = (at: int, message: str) => {
+        let p = json_formatter_place(body, at)
+        { ok: false, tree: null, repairs, duplicates: [], error: { ...p, message } }
+    }
+    if len(toks) == 0 { return { ok: false, tree: null, repairs, duplicates: [], error: null, empty: true } }
+    let r = json_formatter_value(toks, 0, 0, len(body))
+    if r.e != null { return failed(r.e.at, r.e.message) }
+    if r.i < len(toks) { return failed(toks[r.i].at, `Only one value is allowed, and more follows it: ${json_formatter_found(toks[r.i])}.`) }
+    { ok: true, tree: r.n, repairs, error: null, duplicates: json_formatter_duplicates(r.n, "", []) }
+}
+
+// The text a key sorts by: what it says, escapes read, without its quotes.
+fn json_formatter_key(k: str) -> str {
+    if !contains(k, "\\") { return slice(k, 1, len(k) - 1) }
+    let v = json.parse(k)
+    type_of(v) == "str" ? v : k
+}
+
+fn json_formatter_pairs(node: map, sort: bool) -> list = sort ? sort_by(node.o, (p) => json_formatter_key(p[0])) : node.o
+
+// A tree as text: pad is one level's indent, or null for none at all.
+fn json_formatter_write(node: map, pad: str?, sort: bool, here: str) -> str {
+    if node.t != null { return node.t }
+    let inner = pad == null ? "" : here + pad
+    let comma = pad == null ? "," : `,\n${inner}`
+    let open_with = pad == null ? "" : `\n${inner}`
+    let close_with = pad == null ? "" : `\n${here}`
+    if node.a != null {
+        if len(node.a) == 0 { return "[]" }
+        return `[${open_with}${join(node.a | map((x) => json_formatter_write(x, pad, sort, inner)), comma)}${close_with}]`
+    }
+    if len(node.o) == 0 { return "{}" }
+    let colon = pad == null ? ":" : ": "
+    `{${open_with}${join(json_formatter_pairs(node, sort) | map((p) => `${p[0]}${colon}${json_formatter_write(p[1], pad, sort, inner)}`), comma)}${close_with}}`
+}
+
+fn json_formatter_pad(indent: str) -> str = indent == "tab" ? "\t" : (indent == "4" ? "    " : "  ")
+
+fn json_formatter_pretty(text: str, indent: str = "2", sort: bool = false) -> str? {
+    let c = json_formatter_check(text)
+    c.ok ? json_formatter_write(c.tree, json_formatter_pad(indent), sort, "") : null
+}
+
+fn json_formatter_minify(text: str, sort: bool = false) -> str? {
+    let c = json_formatter_check(text)
+    c.ok ? json_formatter_write(c.tree, null, sort, "") : null
+}
+
+fn json_formatter_repair_words(r: map) -> str {
+    let parts = [r.commas > 0 ? `${r.commas} trailing ${r.commas == 1 ? "comma" : "commas"}` : null,
+                 r.quotes > 0 ? `${r.quotes} single-quoted ${r.quotes == 1 ? "string" : "strings"}` : null] | filter((p) => p != null)
+    `Repair ${join(parts, " and ")}`
+}
+
+component JsonFormatter(value: str = "", mode: str = "format", sort: bool = false, indent: str = "2", title: str = "JSON formatter", id: str = "json-formatter",
+                        name: str = "json", live_limit: int = 200000, on_change = null, class: str? = null) {
+    style global json_formatter_css
+    state text = value
+    state how = mode
+    state sorted = sort
+    state pad_kind = indent
+    state pressed = value
+    state copied = ""
+    state box = null
+    let size = len(text)
+    let too_big = size > json_formatter_most
+    let live = size <= live_limit
+    let source = live ? text : pressed
+    let waiting = !live && pressed != text
+    let c = too_big ? { ok: false, tree: null, repairs: { commas: 0, quotes: 0 }, duplicates: [], error: null, big: true } : json_formatter_check(source)
+    let out = c.ok ? json_formatter_write(c.tree, how == "minify" ? null : json_formatter_pad(pad_kind), sorted, "") : ""
+    let fixes = c.repairs.commas + c.repairs.quotes
+    let tell = () => {
+        if on_change != null {
+            let g = json_formatter_check(text)
+            let e = g.error
+            on_change({ valid: g.ok, output: g.ok ? json_formatter_write(g.tree, how == "minify" ? null : json_formatter_pad(pad_kind), sorted, "") : null,
+                        error: e == null ? null : { line: e.line, column: e.column, message: e.message } })
+        }
+    }
+    let show_place = () => {
+        if box != null && c.error != null {
+            // The field counts UTF-16 units; a character past U+FFFF is two of them.
+            let wide = len(re.find_all(slice(source, 0, c.error.at), "[\u{10000}-\u{10FFFF}]"))
+            let at = c.error.at + wide
+            box.focus()
+            box.setSelectionRange(at, at + 1)
+        }
+    }
+    let copy = () => {
+        js("navigator.clipboard.writeText", out).then((_ = null) => { copied = "Copied" }, (_ = null) => { copied = "Could not copy: select the text instead" })
+    }
+    <section class={ui_cls(["ui-json-fmt", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-json-fmt-title id={`${id}-title`}>{title}</h3>
+        <div.ui-json-fmt-field>
+            <label for={`${id}-input`}>JSON</label>
+            <textarea id={`${id}-input`} name={name} rows="8" spellcheck="false" autocomplete="off" value={text} aria-invalid={c.error != null ? "true" : null}
+                      @mount={(el) => { box = el }} @input={(e) => { text = e.value; copied = ""; tell() }}></textarea>
+        </div>
+        <div.ui-json-fmt-bar>
+            <div.ui-json-fmt-seg role="group" aria-label="Layout">
+                <button.ui-json-fmt-btn type="button" data-mode="format" aria-pressed={how == "format" ? "true" : "false"} @click={() => { how = "format"; pressed = text; tell() }}>Format</button>
+                <button.ui-json-fmt-btn type="button" data-mode="minify" aria-pressed={how == "minify" ? "true" : "false"} @click={() => { how = "minify"; pressed = text; tell() }}>Minify</button>
+            </div>
+            <label.ui-json-fmt-check><input type="checkbox" name={`${name}_sort`} checked={sorted} @change={(e) => { sorted = e.checked; tell() }}/> Sort keys</label>
+            <label.ui-json-fmt-indent>Indent
+                <select name={`${name}_indent`} disabled={how == "minify"} @change={(e) => { pad_kind = e.value; tell() }}>
+                    <option value="2" selected={pad_kind == "2"}>2 spaces</option>
+                    <option value="4" selected={pad_kind == "4"}>4 spaces</option>
+                    <option value="tab" selected={pad_kind == "tab"}>Tabs</option>
+                </select>
+            </label>
+        </div>
+        {too_big && <p.ui-json-fmt-warn role="alert">{`This is ${format_number(size, "en-US", 0)} characters, over the ${format_number(json_formatter_most, "en-US", 0)} it will read.`}</p>}
+        {waiting && <p.ui-json-fmt-note>{`Large text: it is not read as you type. Press Format or Minify.`}</p>}
+        {c.empty == true && <p.ui-json-fmt-note>Paste or type JSON to start.</p>}
+        {c.error != null && <div.ui-json-fmt-error role="alert">
+            <p.ui-json-fmt-where>{`Line ${c.error.line}, column ${c.error.column}`}</p>
+            <p.ui-json-fmt-why>{c.error.message}</p>
+            <pre.ui-json-fmt-excerpt tabindex="0" aria-label="The text around it">{`${c.error.excerpt}\n${c.error.caret}`}</pre>
+            <div.ui-json-fmt-actions>
+                {fixes > 0 && <button.ui-json-fmt-btn type="button" data-repair @click={() => { let r = json_formatter_repair(text); text = r.text; pressed = r.text; tell() }}>{json_formatter_repair_words(c.repairs)}</button>}
+                <button.ui-json-fmt-btn type="button" data-show @click={show_place}>Show in the text</button>
+            </div>
+        </div>}
+        {c.ok && <div.ui-json-fmt-field>
+            <span.ui-json-fmt-label id={`${id}-output-label`}>Result</span>
+            <pre.ui-json-fmt-output tabindex="0" role="region" aria-labelledby={`${id}-output-label`}>{out}</pre>
+            <div.ui-json-fmt-actions>
+                <button.ui-json-fmt-btn type="button" data-copy @click={copy}>Copy</button>
+                <span.ui-json-fmt-note aria-live="polite">{copied != "" ? copied : `Valid JSON, ${format_number(len(out), "en-US", 0)} characters.`}</span>
+            </div>
+        </div>}
+        {for d in c.duplicates => <p.ui-json-fmt-warn key={d}>{d}</p>}
+    </section>
+}

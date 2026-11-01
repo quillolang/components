@@ -1,0 +1,265 @@
+// ScrubBar: a seek bar for a thumb. The whole 56 px strip takes the finger, not just the
+// line. A tap goes there. A drag moves the time, with a bubble above the finger saying
+// where it is; move the finger away from the bar, up or down, and the same movement
+// counts for less, down to a tenth, for finding one second in an hour. The picture does
+// not move until the finger lifts, so the audio is not asked to seek on every move.
+//
+//   import ui/scrub_bar.qwe use ScrubBar
+//
+//   <ScrubBar value={time} duration={total} on_seek={(t) => { audio.currentTime = t }}/>
+//   <ScrubBar media="player"/>      // follows and seeks <audio id="player"> by itself
+//
+// value, duration: seconds. buffered: what is loaded, a list of [from, to] in seconds.
+// media: the id of an <audio> or <video> on the page, for it to follow: then value,
+// duration and buffered are not needed, and the element may appear after this does.
+// label: what screen readers call it ("Seek"). step: seconds an arrow key moves (5);
+// PageUp and PageDown move 30, Home and End go to the ends. disabled: it does nothing.
+// page_scrolls: true leaves a finger going up or down first to the page (the browser then
+// takes it, ending the drag), so a bar in a long page does not trap a scroll; false, for
+// a player with nothing to scroll, lets a finger go straight up into fine scrubbing.
+// on_scrub(t): inside one of your components, on each move of a drag, for a preview.
+// on_seek(t): when the finger lifts or a key moves it. A drag the system takes away,
+// or a tap that became a scroll of the page, calls neither and leaves the time as it was.
+//
+// After a seek it shows the new time until value catches up, for 2 seconds at most, so
+// the thumb does not jump back while the media gets there.
+
+import ui/theme.qwe use ui_cls
+
+let scrub_bar_css = css`
+.ui-scrubbar { display: grid; gap: 0; min-width: 0; padding-inline: 10px; container-type: inline-size; color: var(--ui-fg); font: 12px/1.3 var(--ui-font); }
+/* Sideways is ours; a finger going up or down first is the page's, which ends the drag with pointercancel. */
+.ui-scrubbar-rail {
+  position: relative; display: flex; align-items: center; height: 56px; cursor: pointer; outline: none; touch-action: pan-y;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+}
+.ui-scrubbar-own .ui-scrubbar-rail { touch-action: none; }
+.ui-scrubbar-rail[aria-disabled="true"] { cursor: default; opacity: .55; }
+.ui-scrubbar-line { position: relative; width: 100%; height: 5px; overflow: hidden; border-radius: 999px; background: var(--ui-strong); transition: height .12s; }
+.ui-scrubbar-held .ui-scrubbar-line { height: 9px; }
+.ui-scrubbar-got { position: absolute; top: 0; bottom: 0; background: var(--ui-muted); opacity: .5; }
+.ui-scrubbar-fill { position: absolute; inset: 0; background: var(--ui-accent); transform-origin: 0 50%; transform: scaleX(var(--ui-scrubbar-drag, var(--ui-scrubbar-at, 0))); }
+.ui-scrubbar-thumb {
+  position: absolute; top: 50%; left: calc(var(--ui-scrubbar-drag, var(--ui-scrubbar-at, 0)) * 100%); width: 16px; height: 16px; margin: -8px 0 0 -8px;
+  border-radius: 50%; background: var(--ui-accent); box-shadow: 0 0 0 2px var(--ui-surface); transition: scale .12s; pointer-events: none;
+}
+.ui-scrubbar-held .ui-scrubbar-thumb { scale: 1.35; }
+.ui-scrubbar-rail:focus-visible .ui-scrubbar-thumb { box-shadow: 0 0 0 2px var(--ui-surface), var(--ui-focus); }
+.ui-scrubbar-tip {
+  position: absolute; left: 0; bottom: 100%; display: none; gap: 1px; justify-items: center; padding: 5px 10px; border-radius: var(--ui-radius-sm);
+  background: var(--ui-fg); color: var(--ui-bg); box-shadow: var(--ui-shadow); pointer-events: none; white-space: nowrap; z-index: 3;
+}
+.ui-scrubbar-held .ui-scrubbar-tip { display: grid; }
+.ui-scrubbar-tip-time { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-scrubbar-tip-rate { font-size: 11px; opacity: .8; }
+.ui-scrubbar-tip-rate:empty { display: none; }
+.ui-scrubbar-times { display: flex; justify-content: space-between; margin-top: -12px; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+/* With room, the times sit at the bar's ends and it keeps the row's height. */
+@container (min-width: 460px) {
+  .ui-scrubbar-row { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; }
+  .ui-scrubbar-times { display: contents; }
+  .ui-scrubbar-now { grid-column: 1; grid-row: 1; }
+  .ui-scrubbar-left { grid-column: 3; grid-row: 1; }
+  .ui-scrubbar-rail { grid-column: 2; grid-row: 1; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-scrubbar-line, .ui-scrubbar-thumb { transition: none; } }
+`
+
+// A number, or 0 for anything else: a media element says NaN until it knows.
+fn scrub_bar_num(v) {
+    let t = type_of(v)
+    if t != "int" && t != "float" { return 0 }
+    math.isfinite(v) ? v : 0
+}
+
+fn scrub_bar_keep(t, total) = max([0, min([t, total])])
+
+// Seconds as "m:ss", or "h:mm:ss" from an hour.
+fn scrub_bar_clock(s) -> str {
+    let t = floor(max([0, scrub_bar_num(s)]))
+    let h = floor(t / 3600)
+    let m = floor((t % 3600) / 60)
+    let sec = t % 60
+    let two = (n) => n < 10 ? `0${n}` : `${n}`
+    h > 0 ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`
+}
+
+// The time under a point on the bar.
+fn scrub_bar_at(x, left, width, total) = width <= 0 ? 0 : scrub_bar_keep((x - left) / width * total, total)
+
+// How much a sideways pixel counts, by how far the finger is from the bar, either way.
+fn scrub_bar_rate(away) {
+    let d = abs(away)
+    d < 60 ? 1 : d < 130 ? 0.5 : d < 200 ? 0.25 : 0.1
+}
+
+fn scrub_bar_rate_name(rate) -> str = rate == 1 ? "" : rate == 0.5 ? "Half speed" : rate == 0.25 ? "Quarter speed" : "Fine scrubbing"
+
+// Where a press starts from: a press on the thumb takes it where it is, so grabbing
+// it does not nudge the time; any other press goes to the finger.
+fn scrub_bar_grab(x, left, width, total, was) {
+    let thumb = total > 0 ? left + was / total * width : left
+    abs(x - thumb) <= 28 ? was : scrub_bar_at(x, left, width, total)
+}
+
+// The tip's place along the bar, kept from hanging over either end.
+fn scrub_bar_tip(at_x, width, tip_width) = max([tip_width / 2 - 8, min([at_x, width - tip_width / 2 + 8])])
+
+// The parts of a media element's buffered ranges, as a list.
+fn scrub_bar_ranges(b) {
+    let out = []
+    let i = 0
+    while b != null && i < b.length {
+        out = out | push([b.start(i), b.end(i)])
+        i += 1
+    }
+    out
+}
+
+component ScrubBar(value = 0, duration = 0, buffered = [], media: str = "", label: str = "Seek", step = 5, disabled: bool = false,
+                   page_scrolls: bool = true, on_scrub = null, on_seek = null, class: str? = null) {
+    style global scrub_bar_css
+    state rail = null
+    state tip = null
+    state tip_time = null
+    state tip_rate = null
+    state win = null
+    state doc = null
+    state held = false        // a finger or pointer is on it
+    state from = null         // the press: nothing shows this, so moves render nothing
+    state hold_at = null      // the time just sought, until the media says it is there
+    state live_t = 0
+    state live_d = 0
+    state live_got = []
+    let time_now = media != "" ? live_t : scrub_bar_num(value)
+    let total = media != "" ? live_d : max([0, scrub_bar_num(duration)])
+    let ranges = media != "" ? live_got : (type_of(buffered) == "list" ? buffered : [])
+    let shown = scrub_bar_keep(hold_at != null ? hold_at : time_now, total)
+    let off = disabled || total <= 0
+    if hold_at != null && abs(time_now - hold_at) < 1.5 { hold_at = null }
+    if hold_at != null { every(2000, () => { hold_at = null }) }
+    let element = () => media == "" || doc == null ? null : doc.getElementById(media)
+    let seek = (t) => {
+        hold_at = t
+        let m = element()
+        if m != null { m.currentTime = t }
+        on_seek && on_seek(t)
+    }
+    let show = (t, away, rate) => {
+        rail.style.setProperty("--ui-scrubbar-drag", `${total > 0 ? t / total : 0}`)
+        tip_time.textContent = scrub_bar_clock(t)
+        tip_rate.textContent = scrub_bar_rate_name(rate)
+        let w = rail.clientWidth
+        let x = scrub_bar_tip(total > 0 ? t / total * w : 0, w, tip.offsetWidth)
+        // A finger that has gone up would cover the tip, so the tip goes up ahead of it.
+        let y = away < -8 ? away - 44 : -6
+        tip.style.transform = `translate(calc(${x}px - 50%), ${y}px)`
+    }
+    let done = () => {
+        held = false
+        from = null
+        rail.style.removeProperty("--ui-scrubbar-drag")
+    }
+    // The time goes on this element and the drag on the rail inside it. A `style={...}` is written whole
+    // when what it reads changes, so on the rail each new time would wipe the drag and the thumb would jump home.
+    <div class={ui_cls(["ui-scrubbar", held && "ui-scrubbar-held", !page_scrolls && "ui-scrubbar-own", class])} style={`--ui-scrubbar-at: ${total > 0 ? shown / total : 0}`}>
+        <div.ui-scrubbar-row>
+            <div.ui-scrubbar-rail role="slider" tabindex={disabled ? null : "0"} aria-label={label} aria-disabled={off ? "true" : null}
+                 aria-valuemin="0" aria-valuemax={floor(total)} aria-valuenow={floor(shown)}
+                 aria-valuetext={`${scrub_bar_clock(shown)} of ${scrub_bar_clock(total)}`}
+                 @mount={(el) => {
+                     rail = el
+                     win = js("window")
+                     doc = win.document
+                     let pull = (m) => {
+                         live_t = scrub_bar_num(m.currentTime)
+                         live_d = scrub_bar_num(m.duration)
+                         live_got = scrub_bar_ranges(m.buffered)
+                     }
+                     // Media events do not bubble, but they can be caught on the way down, so
+                     // this hears an element that comes later or is made again.
+                     let heard = (e) => { if e.target.id == media { pull(e.target) } }
+                     let names = ["timeupdate", "durationchange", "loadedmetadata", "progress", "seeked", "emptied"]
+                     if media != "" {
+                         for n in names { doc.addEventListener(n, heard, true) }
+                         let m = doc.getElementById(media)
+                         if m != null { pull(m) }
+                     }
+                     () => {
+                         if media != "" { for n in names { doc.removeEventListener(n, heard, true) } }
+                     }
+                 }}
+                 @pointerdown={(e) => {
+                     if !off && e.button == 0 {
+                         rail.setPointerCapture(e.pointerId)
+                         let r = rail.getBoundingClientRect()
+                         let at = scrub_bar_grab(e.clientX, r.left, r.width, total, shown)
+                         from = { x: e.clientX, y: e.clientY, last: e.clientX, top: r.top + r.height / 2, width: r.width, left: r.left, at: at, scrubbing: false, rate: 1 }
+                         held = true
+                         show(at, 0, 1)
+                     }
+                 }}
+                 @pointermove={(e) => {
+                     if from != null {
+                         let p = from
+                         let moved = abs(e.clientX - p.x)
+                         if p.scrubbing || moved >= 6 || ((e.pointerType == "mouse" || !page_scrolls) && abs(e.clientY - p.y) >= 6) {
+                             let away = e.clientY - p.top
+                             let rate = scrub_bar_rate(away)
+                             let at = scrub_bar_keep(p.at + (e.clientX - p.last) / p.width * total * rate, total)
+                             if rate != p.rate {
+                                 let phone = win.quilloNative
+                                 if phone != null { phone.haptic("selection") }
+                             }
+                             from = { x: p.x, y: p.y, last: e.clientX, top: p.top, width: p.width, left: p.left, at: at, scrubbing: true, rate: rate }
+                             show(at, away, rate)
+                             on_scrub && on_scrub(at)
+                         }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     if from != null {
+                         let p = from
+                         let at = p.scrubbing ? p.at : scrub_bar_at(e.clientX, p.left, p.width, total)
+                         done()
+                         seek(at)
+                     }
+                 }}
+                 @pointercancel={() => { if from != null { done() } }}
+                 @keydown={(e) => {
+                     if !off {
+                         let k = e.key
+                         let to = match k {
+                             "ArrowLeft" => shown - scrub_bar_num(step)
+                             "ArrowDown" => shown - scrub_bar_num(step)
+                             "ArrowRight" => shown + scrub_bar_num(step)
+                             "ArrowUp" => shown + scrub_bar_num(step)
+                             "PageDown" => shown - 30
+                             "PageUp" => shown + 30
+                             "Home" => 0
+                             "End" => total
+                             _ => null
+                         }
+                         if to != null {
+                             e.preventDefault()
+                             seek(scrub_bar_keep(to, total))
+                         }
+                     }
+                 }}>
+                <div.ui-scrubbar-line>
+                    {for [i, g] in enumerate(ranges) => <span.ui-scrubbar-got key={i} style={`left: ${total > 0 ? g[0] / total * 100 : 0}%; width: ${total > 0 ? (g[1] - g[0]) / total * 100 : 0}%`}></span>}
+                    <div.ui-scrubbar-fill></div>
+                </div>
+                <div.ui-scrubbar-thumb></div>
+                <div.ui-scrubbar-tip aria-hidden="true" @mount={(el) => { tip = el }}>
+                    <span.ui-scrubbar-tip-time @mount={(el) => { tip_time = el }}></span>
+                    <span.ui-scrubbar-tip-rate @mount={(el) => { tip_rate = el }}></span>
+                </div>
+            </div>
+            <div.ui-scrubbar-times aria-hidden="true">
+                <span.ui-scrubbar-now>{scrub_bar_clock(shown)}</span>
+                <span.ui-scrubbar-left>-{scrub_bar_clock(total - shown)}</span>
+            </div>
+        </div>
+    </div>
+}

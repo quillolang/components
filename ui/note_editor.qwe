@@ -1,0 +1,491 @@
+// NoteEditor: a note on a phone. The text is Markdown in a real <textarea>, so the system's own
+// cursor, selection, dictation and autocorrect all work, and a second copy of the text
+// lies under it to colour headings and strong words, draw finished items struck through, and
+// hold real checkboxes that a thumb can tick. The toolbar stands on top of the on-screen
+// keyboard: heading, bold, italic, list, checklist, indent, undo, redo and a button to put
+// the keyboard away. Enter carries a list on, and ends it on an empty item. Typing [] at the
+// start of a line makes a checkbox, and * a bullet. It saves by itself a moment after the
+// typing stops, when the page leaves the screen, and when it leaves the page; if a save
+// fails it says so and offers another try. On a tablet a side panel has the outline and
+// the count, and the toolbar sits at the top.
+//
+//   component Page() {
+//       <NoteEditor title="Lisbon" text={note}
+//                   on_save={(text, title) => { save_note(text, title) }}/>
+//   }
+//
+// text, title: what it starts with. show_title: has a title field (true). placeholder.
+// autosave_ms: how long after the last change it saves (800). label: the text's name for screen
+// readers. class. on_save(text, title): inside one of your components; it may wait, and false or an error
+// means it failed. Nothing here keeps the note: without on_save it is gone with the page.
+// on_change(text, title): at each change.
+// Keys: Ctrl or Cmd with B, I, Z, Shift+Z; Tab and Shift+Tab indent a list; the rest is the textarea's.
+
+import ui/theme.qwe use ui_cls
+
+let note_editor_css = css`
+.ui-note-editor { position: relative; container-type: inline-size; display: flex; flex-direction: column; height: 100%; min-height: 0; color: var(--ui-fg); font: 16px/1.5 var(--ui-font); background: var(--ui-surface); }
+.ui-note-editor-frame { display: flex; flex: 1; min-height: 0; }
+.ui-note-editor-paper { flex: 1; min-width: 0; min-height: 0; padding: 10px 14px 16px; overflow-y: auto; overscroll-behavior: contain; }
+.ui-note-editor-title { box-sizing: border-box; display: block; width: 100%; min-height: 44px; margin: 0 0 4px; padding: 0; border: 0; outline: none; background: transparent; color: var(--ui-fg); font: 600 20px/1.3 var(--ui-font); }
+.ui-note-editor-status { display: flex; align-items: center; gap: 8px; min-height: 22px; margin: 0 0 6px; color: var(--ui-muted); font-size: 13px; }
+.ui-note-editor-status[data-bad] { min-height: 44px; color: var(--ui-danger); }
+.ui-note-editor-retry { min-width: 44px; min-height: 44px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); color: var(--ui-danger); font: 600 14px/1 var(--ui-font); cursor: pointer; }
+/* One grid cell holds both copies: the drawn one sets the height, so the box grows with the text and never scrolls by itself. */
+.ui-note-editor-stack { position: relative; display: grid; min-height: 12em; }
+.ui-note-editor-draw, .ui-note-editor-input { box-sizing: border-box; grid-area: 1 / 1; width: 100%; margin: 0; padding: 0; border: 0; font: 16px/1.5 var(--ui-font); letter-spacing: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal; tab-size: 4; }
+.ui-note-editor-draw { z-index: 2; color: var(--ui-fg); pointer-events: none; }
+.ui-note-editor-input { z-index: 1; height: 100%; min-height: 100%; overflow: hidden; resize: none; outline: none; background: transparent; color: transparent; -webkit-text-fill-color: transparent; caret-color: var(--ui-fg); }
+.ui-note-editor-input::placeholder { color: var(--ui-muted); -webkit-text-fill-color: var(--ui-muted); opacity: 1; }
+.ui-note-editor-input::selection { background: color-mix(in srgb, var(--ui-accent) 30%, transparent); }
+.ui-note-editor-line { min-height: 1.5em; }
+/* Weight and size would move the words away from the caret, so strength is drawn with a shadow and colour. */
+.ui-note-editor-line[data-kind="h1"], .ui-note-editor-line[data-kind="h2"], .ui-note-editor-line[data-kind="h3"] { color: var(--ui-accent); text-shadow: .35px 0 currentColor; }
+.ui-note-editor-line[data-kind="quote"] { color: var(--ui-muted); }
+.ui-note-editor-line[data-kind="done"] .ui-note-editor-rest { color: var(--ui-muted); text-decoration: line-through; }
+.ui-note-editor-strong { text-shadow: .35px 0 currentColor; }
+.ui-note-editor-code { color: var(--ui-info); }
+.ui-note-editor-prefix { position: relative; color: var(--ui-strong); }
+.ui-note-editor-line[data-kind="check"] .ui-note-editor-prefix, .ui-note-editor-line[data-kind="done"] .ui-note-editor-prefix { color: transparent; }
+.ui-note-editor-tick { position: absolute; left: -12px; top: calc(.75em - 22px); display: grid; place-items: center; width: 44px; height: 44px; pointer-events: auto; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.ui-note-editor-tick input { width: 20px; height: 20px; margin: 0; accent-color: var(--ui-accent); cursor: pointer; }
+.ui-note-editor-bar { position: sticky; bottom: 0; z-index: 3; display: flex; flex: none; gap: 2px; padding: 2px 4px max(2px, env(safe-area-inset-bottom)); border-top: 1px solid var(--ui-border); background: var(--ui-subtle); }
+/* The tools scroll on a narrow phone; Done stands outside them, as the way out of the keyboard must always show. */
+.ui-note-editor-tools { display: flex; flex: 1; gap: 2px; min-width: 0; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
+.ui-note-editor-tools::-webkit-scrollbar { display: none; }
+.ui-note-editor[data-up="1"] .ui-note-editor-bar { position: fixed; left: 0; right: 0; bottom: var(--ui-note-editor-kb, 0px); padding-bottom: 2px; }
+.ui-note-editor-tool { display: grid; flex: none; place-items: center; min-width: 44px; min-height: 44px; padding: 0 8px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 600 15px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.ui-note-editor-tool:disabled { color: var(--ui-strong); cursor: default; }
+.ui-note-editor-tool:focus-visible, .ui-note-editor-jump:focus-visible, .ui-note-editor-retry:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-note-editor-tool svg { width: 20px; height: 20px; }
+.ui-note-editor-side { display: none; }
+/* A tablet has room for the note's shape, and its toolbar sits above the text. */
+@container (min-width: 640px) {
+  .ui-note-editor-bar { order: -1; position: sticky; top: 0; bottom: auto; border-top: 0; border-bottom: 1px solid var(--ui-border); }
+  .ui-note-editor-paper { padding: 16px 24px; }
+  .ui-note-editor-side { display: block; flex: 0 0 min(30%, 260px); padding: 14px 12px; overflow-y: auto; border-left: 1px solid var(--ui-border); background: var(--ui-subtle); font-size: 14px; }
+  .ui-note-editor-side h3 { margin: 0 0 6px; color: var(--ui-muted); font-size: 13px; font-weight: 600; }
+  .ui-note-editor-side ul { margin: 0 0 14px; padding: 0; list-style: none; }
+  .ui-note-editor-side p { margin: 0 0 4px; color: var(--ui-muted); }
+  .ui-note-editor-jump { display: block; width: 100%; min-height: 44px; padding: 0 8px 0 calc(8px + var(--depth, 0) * 12px); overflow: hidden; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 500 14px/1.2 var(--ui-font); text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+}
+@media (hover: hover) {
+  .ui-note-editor-tool:hover:not(:disabled), .ui-note-editor-jump:hover { background: var(--ui-border); }
+}
+`
+
+// A line's shape: { kind, indent, prefix, rest, n }. kind: plain, h1 to h3, quote, bullet, number,
+// check, done. prefix is what opens it, spaces included; rest the words.
+fn note_editor_parse(l: str) {
+    let bare = re.replace(l, "^ +", "")
+    let indent = len(l) - len(bare)
+    let lead = slice(l, 0, indent)
+    let with_rest = (kind: str, opens: str, n) => ({ kind, indent, prefix: lead + opens, rest: slice(bare, len(opens), len(bare)), n })
+    if starts_with(bare, "- [ ] ") { return with_rest("check", "- [ ] ", null) }
+    if starts_with(bare, "- [x] ") || starts_with(bare, "- [X] ") { return with_rest("done", slice(bare, 0, 6), null) }
+    if starts_with(bare, "- ") || starts_with(bare, "* ") || starts_with(bare, "+ ") { return with_rest("bullet", slice(bare, 0, 2), null) }
+    let m = re.find(bare, "^[0-9]{1,6}\\. ")
+    if m != null { return with_rest("number", m.text, int(slice(m.text, 0, len(m.text) - 2))) }
+    if indent == 0 && starts_with(l, "### ") { return with_rest("h3", "### ", null) }
+    if indent == 0 && starts_with(l, "## ") { return with_rest("h2", "## ", null) }
+    if indent == 0 && starts_with(l, "# ") { return with_rest("h1", "# ", null) }
+    if indent == 0 && starts_with(l, "> ") { return with_rest("quote", "> ", null) }
+    { kind: "plain", indent: 0, prefix: "", rest: l, n: null }
+}
+
+// Words cut at **strong** and `code`, as { t, kind }, for the drawn copy.
+fn note_editor_inline(s: str) -> list {
+    if s == "" { return [] }
+    let hits = re.find_all(s, "\\*\\*[^*\\n]{1,200}\\*\\*|`[^`\\n]{1,200}`")
+    if len(hits) == 0 { return [{ t: s, kind: "" }] }
+    let chars = split(s, "")
+    let at = 0
+    let out = []
+    for h in hits {
+        if h.start > at { out = out + [{ t: slice(chars, at, h.start) | join(""), kind: "" }] }
+        out = out + [{ t: h.text, kind: starts_with(h.text, "`") ? "code" : "strong" }]
+        at = h.end
+    }
+    if at < len(chars) { out = out + [{ t: slice(chars, at, len(chars)) | join(""), kind: "" }] }
+    out
+}
+
+fn note_editor_lines(text: str) -> list = split(text, "\n") | map((l) => note_editor_parse(l))
+
+// What a note is made of, for the side panel: headings with their line, and the checklist's count.
+fn note_editor_shape(lines: list) {
+    let heads = enumerate(lines) | filter((p) => contains(["h1", "h2", "h3"], p[1].kind)) | map((p) => ({ line: p[0], text: p[1].rest, depth: int(slice(p[1].kind, 1, 2)) - 1 }))
+    let boxes = lines | filter((l) => l.kind == "check" || l.kind == "done")
+    { heads, done: len(boxes | filter((l) => l.kind == "done")), boxes: len(boxes) }
+}
+
+// The words of a note, without the marks that open its lines.
+fn note_editor_words(lines: list) -> int = len(split(trim(re.replace(join(lines | map((l) => l.rest), " "), "\\s+", " ")), " ") | filter((w) => w != ""))
+
+// The offset of the start of a line, in characters.
+fn note_editor_line_start(text: str, line: int) -> int {
+    let ls = split(text, "\n")
+    sum(slice(ls, 0, line) | map((l) => len(l) + 1))
+}
+
+// The first and last line a selection touches.
+fn note_editor_span(text: str, s: int, e: int) {
+    let first = len(split(slice(text, 0, s), "\n")) - 1
+    let last = len(split(slice(text, 0, e), "\n")) - 1
+    { first, last }
+}
+
+// A change: the text with lines first..last made by f, the selection kept on the same words.
+fn note_editor_map_lines(text: str, s: int, e: int, f) {
+    let ls = split(text, "\n")
+    let sp = note_editor_span(text, s, e)
+    let out = enumerate(ls) | map((p) => p[0] >= sp.first && p[0] <= sp.last ? f(p[1]) : p[1])
+    let shift = len(out[sp.first]) - len(ls[sp.first])
+    let total = sum(range(sp.first, sp.last + 1) | map((i) => len(out[i]) - len(ls[i])))
+    let start_of = note_editor_line_start(text, sp.first)
+    { text: join(out, "\n"), start: max([start_of, s + shift]), end: max([start_of, e + total]) }
+}
+
+// A line with its opening changed to `opens`, or taken off if it has that kind already.
+fn note_editor_toggle_line(l: str, kind: str, opens: str) -> str {
+    let p = note_editor_parse(l)
+    let same = p.kind == kind || (kind == "check" && p.kind == "done")
+    let lead = repeat(" ", p.indent)
+    same ? `${lead}${p.rest}` : `${lead}${opens}${p.rest}`
+}
+
+// # to ## to ### to none.
+fn note_editor_heading_line(l: str) -> str {
+    let p = note_editor_parse(l)
+    match p.kind {
+        "h1" => `## ${p.rest}`
+        "h2" => `### ${p.rest}`
+        "h3" => p.rest
+        _ => `# ${p.rest}`
+    }
+}
+
+fn note_editor_indent_line(l: str, by: int) -> str {
+    if by > 0 { return `  ${l}` }
+    starts_with(l, "  ") ? slice(l, 2, len(l)) : starts_with(l, " ") ? slice(l, 1, len(l)) : l
+}
+
+// Marks around the selection, taken off if they are there; with nothing selected, a pair to type in.
+fn note_editor_wrap(text: str, s: int, e: int, mark: str) {
+    let m = len(mark)
+    let before = slice(text, 0, s)
+    let inside = slice(text, s, e)
+    let after = slice(text, e, len(text))
+    if ends_with(before, mark) && starts_with(after, mark) {
+        return { text: slice(before, 0, s - m) + inside + slice(after, m, len(after)), start: s - m, end: e - m }
+    }
+    { text: `${before}${mark}${inside}${mark}${after}`, start: s + m, end: e + m }
+}
+
+// After a line break typed at pos: a list goes on, and an empty item ends it. null if neither.
+fn note_editor_after_enter(text: str, pos: int) {
+    let before = slice(text, 0, pos - 1)
+    let after = slice(text, pos, len(text))
+    let pieces = split(before, "\n")
+    let prev = pieces[len(pieces) - 1]
+    let p = note_editor_parse(prev)
+    if !contains(["check", "done", "bullet", "number"], p.kind) { return null }
+    if trim(p.rest) == "" {
+        let head = slice(before, 0, len(before) - len(prev))
+        return { text: head + after, start: len(head), end: len(head) }
+    }
+    let lead = repeat(" ", p.indent)
+    let next = match p.kind {
+        "number" => `${lead}${p.n + 1}. `
+        "bullet" => p.prefix
+        _ => `${lead}- [ ] `
+    }
+    { text: `${before}\n${next}${after}`, start: pos + len(next), end: pos + len(next) }
+}
+
+// After a space typed at pos: what stands at the start of a line becomes what it stands for.
+fn note_editor_after_space(text: str, pos: int) {
+    let before = slice(text, 0, pos)
+    let pieces = split(before, "\n")
+    let line = pieces[len(pieces) - 1]
+    let to = match line {
+        "[] " => "- [ ] "
+        "[ ] " => "- [ ] "
+        "-[] " => "- [ ] "
+        "- [] " => "- [ ] "
+        "[x] " => "- [x] "
+        "* " => "- "
+        _ => ""
+    }
+    if to == "" { return null }
+    let head = slice(before, 0, len(before) - len(line))
+    let spot = len(head) + len(to)
+    { text: head + to + slice(text, pos, len(text)), start: spot, end: spot }
+}
+
+// The note with a line's box ticked or not.
+fn note_editor_tick(text: str, line: int, on: bool) -> str {
+    let ls = split(text, "\n")
+    let l = ls[line]
+    let p = note_editor_parse(l)
+    let lead = repeat(" ", p.indent)
+    let made = `${lead}- [${on ? "x" : " "}] ${p.rest}`
+    join(enumerate(ls) | map((q) => q[0] == line ? made : q[1]), "\n")
+}
+
+// The undo list with one more, a hundred kept.
+fn note_editor_remember(past: list, snap) -> list {
+    let n = len(past)
+    n >= 100 ? slice(past, n - 99, n) + [snap] : past + [snap]
+}
+
+view NoteEditorWords(line) =
+    <span.ui-note-editor-rest>{for w in note_editor_inline(line.rest) => <span class={w.kind == "strong" ? "ui-note-editor-strong" : w.kind == "code" ? "ui-note-editor-code" : null}>{w.t}</span>}</span>
+
+component NoteEditor(text: str = "", title: str = "", show_title: bool = true, placeholder: str = "Write something. [] makes a checkbox.", autosave_ms: int = 800,
+                     label: str = "Note", on_save = null, on_change = null, class: str? = null) {
+    style global note_editor_css
+    state body = text
+    state head = title
+    state past = []
+    state future = []
+    state snap_at = 0
+    state dirty = false
+    state busy = false
+    state status = "idle"    // idle, waiting, saving, saved, failed
+    state saved_at = ""
+    state edited = 0
+    state ta = null
+    state root = null
+    let lines = note_editor_lines(body)
+    let shape = note_editor_shape(lines)
+    let words = note_editor_words(lines)
+    let units = (s: str) => js_new("String", s).length
+    let here = () => {
+        let a = ta.selectionStart
+        let b = ta.selectionEnd
+        let v = ta.value
+        let s = js_new("String", v)
+        { start: len(s.slice(0, a)), end: len(s.slice(0, b)) }
+    }
+    let touched = () => {
+        dirty = true
+        status = "waiting"
+        edited = js("Date.now")
+        on_change && on_change(body, head)
+    }
+    // The value and the selection go in together, so the state never sets the caret back.
+    let show = (r) => {
+        body = r.text
+        ta.value = r.text
+        let a = units(slice(r.text, 0, r.start))
+        let b = units(slice(r.text, 0, r.end))
+        ta.setSelectionRange(a, b)
+    }
+    let edit = (r) => {
+        let spot = here()
+        past = note_editor_remember(past, { text: body, start: spot.start, end: spot.end })
+        future = []
+        show(r)
+        touched()
+    }
+    let undo = () => {
+        if len(past) > 0 {
+            let spot = here()
+            let last = past[len(past) - 1]
+            future = future + [{ text: body, start: spot.start, end: spot.end }]
+            past = slice(past, 0, len(past) - 1)
+            show(last)
+            touched()
+        }
+    }
+    let redo = () => {
+        if len(future) > 0 {
+            let spot = here()
+            let next = future[len(future) - 1]
+            past = note_editor_remember(past, { text: body, start: spot.start, end: spot.end })
+            future = slice(future, 0, len(future) - 1)
+            show(next)
+            touched()
+        }
+    }
+    let wrap = (mark: str) => {
+        let s = here()
+        edit(note_editor_wrap(body, s.start, s.end, mark))
+    }
+    let lines_by = (f) => {
+        let s = here()
+        edit(note_editor_map_lines(body, s.start, s.end, f))
+    }
+    let save = () => {
+        if !busy {
+            let sent = body
+            let sent_head = head
+            busy = true
+            dirty = false
+            status = "saving"
+            let r = on_save != null ? js("Promise.resolve", on_save(sent, sent_head)) : true
+            busy = false
+            if is_err(r) || r == false {
+                dirty = false
+                status = "failed"
+            } else if sent != body || sent_head != head {
+                dirty = true
+                status = "waiting"
+            } else {
+                let t = js_new("Date")
+                let m = t.getMinutes()
+                saved_at = `${t.getHours()}:${m < 10 ? "0" : ""}${m}`
+                status = "saved"
+            }
+        }
+    }
+    let tick = () => {
+        if dirty && !busy && js("Date.now") - edited >= autosave_ms { save() }
+    }
+    if dirty { every(100, tick) }
+    let say = match status {
+        "waiting" => "Not saved yet"
+        "saving" => "Saving"
+        "saved" => `Saved ${saved_at}`
+        "failed" => "Not saved."
+        _ => ""
+    }
+    <div class={ui_cls(["ui-note-editor", class])} data-up=""
+         @mount={(me) => {
+             root = me
+             ta = me.querySelector(".ui-note-editor-input")
+             let win = js("window")
+             let doc = js("document")
+             let leaving = (_e = null) => {
+                 if (dirty || status == "failed") && js("document.visibilityState") == "hidden" { save() }
+             }
+             let gone = (_e = null) => { if dirty || status == "failed" { save() } }
+             doc.addEventListener("visibilitychange", leaving)
+             win.addEventListener("pagehide", gone)
+             let v = win.visualViewport
+             let fit = (_e = null) => {
+                 let gap = max([0, win.innerHeight - v.height - v.offsetTop])
+                 me.style.setProperty("--ui-note-editor-kb", `${gap}px`)
+                 me.dataset.up = gap > 80 ? "1" : ""
+             }
+             if v != null {
+                 v.addEventListener("resize", fit)
+                 v.addEventListener("scroll", fit)
+             }
+             () => {
+                 doc.removeEventListener("visibilitychange", leaving)
+                 win.removeEventListener("pagehide", gone)
+                 if v != null {
+                     v.removeEventListener("resize", fit)
+                     v.removeEventListener("scroll", fit)
+                 }
+                 if dirty { save() }
+             }
+         }}>
+        <div.ui-note-editor-frame>
+            <div.ui-note-editor-paper>
+                {show_title && <input.ui-note-editor-title type="text" value={head} placeholder="Title" aria-label="Title" enterkeyhint="next"
+                       @input={(e) => {
+                           let v = e.value
+                           head = v
+                           touched()
+                       }}/>}
+                <p.ui-note-editor-status role="status" data-bad={status == "failed" ? "" : null}>
+                    <span>{say}</span>
+                    {status == "failed" && <button.ui-note-editor-retry type="button" @click={() => { save() }}>Try again</button>}
+                </p>
+                <div.ui-note-editor-stack>
+                    <textarea.ui-note-editor-input value={body} placeholder={placeholder} aria-label={label} autocapitalize="sentences" enterkeyhint="enter"
+                              @input={(e) => {
+                                  let v = e.value
+                                  let at = e.target.selectionStart
+                                  let was = body
+                                  let composing = e.isComposing == true
+                                  let stamp = e.timeStamp
+                                  // A word's end, or a second, is one undo; each letter would be too many.
+                                  if stamp - snap_at > 1000 || len(v) < len(was) || ends_with(v, " ") {
+                                      past = note_editor_remember(past, { text: was, start: len(was), end: len(was) })
+                                      future = []
+                                      snap_at = stamp
+                                  }
+                                  body = v
+                                  touched()
+                                  if !composing && len(v) == len(was) + 1 {
+                                      let pos = len(js_new("String", v).slice(0, at))
+                                      let typed = slice(v, pos - 1, pos)
+                                      let r = typed == "\n" ? note_editor_after_enter(v, pos) : typed == " " ? note_editor_after_space(v, pos) : null
+                                      if r != null {
+                                          show(r)
+                                          touched()
+                                      }
+                                  }
+                              }}
+                              @keydown={(e) => {
+                                  let cmd = e.ctrlKey == true || e.metaKey == true
+                                  let k = lower(e.key)
+                                  if cmd && k == "z" { e.preventDefault(); if e.shiftKey { redo() } else { undo() } }
+                                  if cmd && k == "b" { e.preventDefault(); wrap("**") }
+                                  if cmd && k == "i" { e.preventDefault(); wrap("*") }
+                                  if e.key == "Tab" {
+                                      e.preventDefault()
+                                      let by = e.shiftKey ? -1 : 1
+                                      lines_by((l) => note_editor_indent_line(l, by))
+                                  }
+                              }}></textarea>
+                    <div.ui-note-editor-draw aria-hidden="true">
+                        {for [i, l] in enumerate(lines) => <div.ui-note-editor-line data-kind={l.kind} data-line={i}>
+                            {l.prefix != "" && <span.ui-note-editor-prefix>{l.prefix}{(l.kind == "check" || l.kind == "done") && <label.ui-note-editor-tick>
+                                <input type="checkbox" checked={l.kind == "done"} tabindex="-1" aria-label={l.rest}
+                                       @mousedown={(e) => { e.preventDefault() }}
+                                       @change={(e) => {
+                                           let on = e.checked
+                                           let s = here()
+                                           edit({ text: note_editor_tick(body, i, on), start: s.start, end: s.end })
+                                       }}/>
+                            </label>}</span>}
+                            <NoteEditorWords line={l}/>{l.rest == "" && l.prefix == "" ? " " : ""}
+                        </div>}
+                    </div>
+                </div>
+            </div>
+            <aside.ui-note-editor-side aria-label="About this note">
+                {len(shape.heads) > 0 && <h3>Outline</h3>}
+                {len(shape.heads) > 0 && <ul>{for h in shape.heads => <li><button.ui-note-editor-jump type="button" style={`--depth: ${h.depth}`}
+                        @click={() => {
+                            let at = note_editor_line_start(body, h.line)
+                            let u = units(slice(body, 0, at))
+                            ta.focus()
+                            ta.setSelectionRange(u, u)
+                            let row = root.querySelector(`.ui-note-editor-line[data-line="${h.line}"]`)
+                            row && row.scrollIntoView({ block: "center" })
+                        }}>{h.text}</button></li>}</ul>}
+                <p>{words == 1 ? "1 word" : `${words} words`}</p>
+                {shape.boxes > 0 && <p>{shape.done} of {shape.boxes} done</p>}
+            </aside>
+        </div>
+        <div.ui-note-editor-bar role="toolbar" aria-label="Formatting" @mousedown={(e) => { e.preventDefault() }}>
+            <div.ui-note-editor-tools>
+            <button.ui-note-editor-tool type="button" aria-label="Heading" @click={() => { lines_by((l) => note_editor_heading_line(l)) }}>H</button>
+            <button.ui-note-editor-tool type="button" aria-label="Bold" @click={() => { wrap("**") }}>B</button>
+            <button.ui-note-editor-tool type="button" aria-label="Italic" @click={() => { wrap("*") }}><i>I</i></button>
+            <button.ui-note-editor-tool type="button" aria-label="List" @click={() => { lines_by((l) => note_editor_toggle_line(l, "bullet", "- ")) }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01"/></svg>
+            </button>
+            <button.ui-note-editor-tool type="button" aria-label="Checklist" @click={() => { lines_by((l) => note_editor_toggle_line(l, "check", "- [ ] ")) }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 12l3 3 5-6"/></svg>
+            </button>
+            <button.ui-note-editor-tool type="button" aria-label="Indent" @click={() => { lines_by((l) => note_editor_indent_line(l, 1)) }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h12M12 8l4 4-4 4M20 5v14"/></svg>
+            </button>
+            <button.ui-note-editor-tool type="button" aria-label="Undo" disabled={len(past) == 0 ? true : null} @click={undo}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 7L4 12l5 5M4 12h11a5 5 0 0 1 0 10h-3"/></svg>
+            </button>
+            <button.ui-note-editor-tool type="button" aria-label="Redo" disabled={len(future) == 0 ? true : null} @click={redo}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 7l5 5-5 5M20 12H9a5 5 0 0 0 0 10h3"/></svg>
+            </button>
+            </div>
+            <button.ui-note-editor-tool type="button" aria-label="Done" @click={() => { ta.blur() }}>Done</button>
+        </div>
+    </div>
+}

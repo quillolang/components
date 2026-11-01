@@ -1,0 +1,345 @@
+// HttpRequestBuilder: writes an HTTP request as a command to run. From a method, URL,
+// headers, query and body it shows curl, fetch and HTTPie, each quoted so that a shell
+// or JavaScript gets the bytes meant: a ' in a body, a $ in a header, an & in a URL.
+// It sends nothing. It warns of what would go wrong: a body on GET (which fetch refuses),
+// a body with no content type, JSON that does not parse, a secret sent in the clear,
+// headers a browser will not send, and it knows what each tool does at the edges: curl
+// needs -g for brackets in a URL, an empty header is written `X-Name;`, and `--data-raw`
+// keeps a leading @ from reading a file. A secret (Authorization, a cookie, an API key,
+// a password in the URL or the body) is hidden in every snippet and field until asked,
+// and Copy gives what is on screen.
+//
+//   <HttpRequestBuilder method="POST" url="https://api.example.com/v1/orders"
+//                       headers={[{ name: "Authorization", value: "Bearer abc" }]} body={`{"sku": 7}`}/>
+//   <HttpRequestBuilder url={u} query={[{ name: "page", value: "2" }]} on_change={(r) => { cmd = r.curl }}/>
+//
+// method: GET, POST, PUT, PATCH, DELETE, HEAD or OPTIONS ("GET"). url: the address.
+// headers, query: where those start, lists of { name, value } or a map. body: the body's
+// text. tool: the snippet shown first, "curl", "fetch" or "httpie" ("curl"). title: its
+// heading. id: a prefix for its ids, unique on the page. name: a prefix for the fields'
+// names (method, url, body, header_name, header_value, query_name, query_value).
+// on_change(result): inside one of your components, given { curl, fetch, httpie, ok,
+// warnings } after a change, the three being as shown, so hidden secrets stay hidden,
+// null without a usable URL. class: more classes for its outer element. Left and Right
+// move between the snippets.
+//
+// http_request_builder_read(method, url, headers, query, body) checks a request: { url,
+// method, headers, body, problems, warnings, secrets }, and http_request_builder_curl(req,
+// hide), http_request_builder_fetch(req, hide) and http_request_builder_httpie(req, hide)
+// give the text, for a program's own use. http_request_builder_sh(text) quotes for a
+// POSIX shell.
+
+import ui/theme.qwe use ui_cls
+
+let http_request_builder_css = css`
+.ui-http-req { display: grid; gap: 12px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-http-req .ui-http-req-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-http-req-line { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 8px; }
+.ui-http-req-field { display: grid; gap: 4px; min-width: 0; }
+.ui-http-req-field label, .ui-http-req-label { font-size: 13px; font-weight: 500; }
+.ui-http-req-input { box-sizing: border-box; width: 100%; height: 34px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 13px var(--ui-mono); }
+textarea.ui-http-req-input { height: auto; padding: 8px; line-height: 1.5; resize: vertical; }
+.ui-http-req-input:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-http-req-input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-http-req-rows { display: grid; gap: 4px; min-width: 0; }
+.ui-http-req-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr) auto; gap: 6px; }
+.ui-http-req-btn { height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1 var(--ui-font); white-space: nowrap; cursor: pointer; }
+.ui-http-req-btn:hover { background: var(--ui-subtle); }
+.ui-http-req-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-http-req-add { justify-self: start; }
+.ui-http-req-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-http-req-list li { padding: 6px 10px; border-left: 4px solid var(--ui-warning); border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); overflow-wrap: anywhere; }
+.ui-http-req-list.ui-http-req-bad li { border-left-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-http-req-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.ui-http-req-tabs { display: inline-flex; gap: 2px; border-bottom: 1px solid var(--ui-border); }
+.ui-http-req-tab { height: 32px; padding: 0 12px; border: 0; border-bottom: 2px solid transparent; background: none; color: var(--ui-muted); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-http-req-tab[aria-selected="true"] { border-bottom-color: var(--ui-accent); color: var(--ui-fg); }
+.ui-http-req-tab:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 4px; }
+.ui-http-req-code { max-height: 340px; margin: 0; padding: 10px 12px; overflow: auto; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font: 13px/1.5 var(--ui-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-http-req-code:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-http-req-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-http-req-note { color: var(--ui-muted); font-size: 13px; }
+@media (max-width: 480px) { .ui-http-req-line { grid-template-columns: 1fr; } .ui-http-req-row { grid-template-columns: 1fr 1fr auto; } }
+`
+
+let http_request_builder_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+let http_request_builder_tools = [{ id: "curl", label: "curl" }, { id: "fetch", label: "fetch" }, { id: "httpie", label: "HTTPie" }]
+let http_request_builder_secret_re = "^(authorization|proxy-authorization|cookie|set-cookie)$|token|secret|passw|pwd|api[-_]?key|apikey|session|credential"
+let http_request_builder_forbidden = ["cookie", "host", "content-length", "origin", "referer", "connection", "accept-encoding", "transfer-encoding", "te", "trailer", "upgrade", "via", "date", "dnt", "expect", "keep-alive"]
+let http_request_builder_dots = "••••••••"
+
+// Text a POSIX shell reads back as exactly that text: as it is if nothing in it is
+// special, else in single quotes, where nothing is but ' itself, written '\''.
+fn http_request_builder_sh(s: str) -> str =
+    s != "" && re.test(s, "^[A-Za-z0-9_./:=@%+,-]+$") ? s : `'${replace(s, "'", "'\\''")}'`
+
+// Whether a header or parameter name holds a secret.
+fn http_request_builder_is_secret(name: str) -> bool = re.test(lower(name), http_request_builder_secret_re)
+
+// A list of { name, value } from a list or a map.
+fn http_request_builder_pairs(x) -> list {
+    if type_of(x) == "map" { return for [k, v] in x => { name: k, value: str(v ?? "") } }
+    if type_of(x) != "list" { return [] }
+    x | filter((p) => type_of(p) == "map") | map((p) => { name: str(p.name ?? ""), value: str(p.value ?? "") })
+}
+
+// What a header's value shows when hidden: a scheme stays, as it is no secret.
+fn http_request_builder_hide_value(value: str) -> str {
+    let m = re.find(value, "^(Bearer|Basic|Digest|Token|ApiKey) +", "i")
+    m != null ? `${m.text}${http_request_builder_dots}` : http_request_builder_dots
+}
+
+// A body with the values of secret-looking keys hidden, as JSON or a form.
+fn http_request_builder_hide_body(body: str) -> str {
+    let names = "[^\"=&]*(?:passw|pwd|secret|token|api[-_]?key|apikey|credential)[^\"=&]*"
+    let json_done = re.replace(body, `("${names}"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"`, (m) => `${m.groups[0]}"${http_request_builder_dots}"`, "i")
+    re.replace(json_done, `(^|&)(${names})=[^&]*`, (m) => `${m.groups[0]}${m.groups[1]}=${http_request_builder_dots}`, "i")
+}
+
+// Encodes what a URL cannot hold, leaving valid escapes and legal characters alone.
+fn http_request_builder_encode(s: str) -> str =
+    re.replace(s, "%[0-9A-Fa-f]{2}|[^A-Za-z0-9._~!$&'()*+,;=:@/?\\[\\]-]", (m) => len(m.text) == 3 && starts_with(m.text, "%") ? m.text : url_encode(m.text))
+
+// The URL as a tool gets it, and its secrets as text to hide: { base, query: [pieces, each
+// { text, hidden }], fragment, password, problems, notes }.
+fn http_request_builder_url(url: str, query: list) -> map {
+    let t = trim(url)
+    let out = { base: "", hidden_base: "", pieces: [], fragment: null, problems: [], notes: [], secure: true, secrets: 0 }
+    if t == "" { return { ...out, problems: ["Enter a URL."] } }
+    if len(t) > 20000 { return { ...out, problems: [`The URL is ${format_number(len(t), "en-US", 0)} characters, past the 20,000 it will read.`] } }
+    let schemed = re.test(t, "^[a-z][a-z0-9+.-]*://", "i")
+    if !schemed && re.test(t, "^[a-z][a-z0-9+.-]*:[^0-9/]", "i") { return { ...out, problems: ["This is not an HTTP URL: it must start with http:// or https://."] } }
+    let full = schemed ? t : `https://${t}`
+    let m = re.find(full, "^([a-z][a-z0-9+.-]*)://([^/?#]*)([^?#]*)(?:\\?([^#]*))?(?:#(.*))?$", "is")
+    if m == null || m.groups[1] == "" { return { ...out, problems: ["The URL has no host."] } }
+    let scheme = lower(m.groups[0])
+    if scheme != "http" && scheme != "https" { return { ...out, problems: ["This is not an HTTP URL: it must start with http:// or https://."] } }
+    if re.test(m.groups[1], "\\s") { return { ...out, problems: ["The URL's host has a space in it."] } }
+    let notes = schemed ? [] : ["No scheme on the URL, so https:// was added."]
+    let info = re.find(m.groups[1], "^([^:@]*):([^@]*)@(.*)$")
+    let secrets = info != null ? 1 : 0
+    let shown_host = info != null ? `${info.groups[0]}:${http_request_builder_dots}@${info.groups[2]}` : m.groups[1]
+    let path = http_request_builder_encode(m.groups[2])
+    let own = split(m.groups[3] ?? "", "&") | filter((p) => p != "") | map((p) => {
+        let key = split(p, "=")[0]
+        { text: http_request_builder_encode(p), hidden: http_request_builder_is_secret(key) ? `${http_request_builder_encode(key)}=${http_request_builder_dots}` : http_request_builder_encode(p), secret: http_request_builder_is_secret(key) }
+    })
+    let added = query | filter((q) => trim(q.name) != "") | map((q) => {
+        let secret = http_request_builder_is_secret(q.name)
+        let text = `${url_encode(q.name)}=${url_encode(q.value)}`
+        { text, hidden: secret ? `${url_encode(q.name)}=${http_request_builder_dots}` : text, secret }
+    })
+    let pieces = own + added
+    let in_query = count(pieces, (p) => p.secret)
+    let more_notes = in_query > 0 ? push(notes, "A secret in the query ends up in logs and browser history: a header is safer.") : notes
+    let frag = m.groups[4] != null ? push(more_notes, `The fragment #${m.groups[4]} is never sent to a server, so the snippets leave it out.`) : more_notes
+    let host_local = re.test(m.groups[1], "^(?:[^@]*@)?(localhost|127\\.|\\[::1\\])")
+    { ...out, base: `${scheme}://${m.groups[1]}${path}`, hidden_base: `${scheme}://${shown_host}${path}`, pieces, notes: frag, secure: scheme == "https" || host_local, secrets: secrets + in_query }
+}
+
+// A URL with its query, plain or hidden.
+fn http_request_builder_full(u: map, hide: bool) -> str {
+    let base = hide ? u.hidden_base : u.base
+    let q = u.pieces | map((p) => hide ? p.hidden : p.text)
+    len(q) > 0 ? `${base}?${join(q, "&")}` : base
+}
+
+// Checks a request. problems stop the snippets; warnings do not.
+fn http_request_builder_read(method: str, url: str, headers, query, body: str) -> map {
+    let verb = upper(method)
+    let u = http_request_builder_url(url, http_request_builder_pairs(query))
+    let rows = http_request_builder_pairs(headers) | filter((h) => trim(h.name) != "" || trim(h.value) != "")
+    let problems = u.problems
+    let warnings = u.notes
+    for h in rows {
+        if trim(h.name) == "" { problems = push(problems, `The header with value "${slice(h.value, 0, 30)}" has no name.`) }
+        else if !re.test(trim(h.name), "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$") { problems = push(problems, `The header name "${slice(h.name, 0, 30)}" has characters a header name cannot.`) }
+        if re.test(h.value, "[\\r\\n]") { problems = push(problems, `The header ${h.name} has a line break, which would start another header.`) }
+    }
+    let good = rows | filter((h) => trim(h.name) != "") | map((h) => { name: trim(h.name), value: trim(h.value), secret: http_request_builder_is_secret(trim(h.name)) })
+    let low = (h) => lower(h.name)
+    let names = good | map(low)
+    let has_body = trim(body) != ""
+    let ctype = find(good, (h) => low(h) == "content-type")
+    if verb == "GET" || verb == "HEAD" {
+        if has_body { warnings = push(warnings, `A body on ${verb}: many servers and proxies ignore it, and fetch refuses it, so the fetch snippet leaves it out.`) }
+    }
+    if verb == "DELETE" && has_body { warnings = push(warnings, "A body on DELETE: some servers and proxies ignore it.") }
+    let looks_json = re.test(trim(body), "^[\\[{]")
+    if has_body && ctype == null {
+        warnings = push(warnings, looks_json ? "The body looks like JSON, but no Content-Type says so: curl would send it as a form."
+            : "The body has no Content-Type: curl would send it as a form, and fetch as text.")
+    }
+    if has_body && ctype != null && contains(lower(ctype.value), "json") && is_err(json.parse(body)) { warnings = push(warnings, "Content-Type says JSON, but the body does not parse as JSON.") }
+    if has_body && ctype != null && contains(lower(ctype.value), "form-urlencoded") && looks_json { warnings = push(warnings, "Content-Type says a form, but the body looks like JSON.") }
+    let dupes = unique(names | filter((n) => count(names, (x) => x == n) > 1))
+    for d in dupes {
+        let single = d == "content-type" || d == "authorization" || d == "host" || d == "content-length"
+        if single { warnings = push(warnings, `${d} is given twice: a server takes one of them, or refuses the request.`) }
+    }
+    if contains(names, "content-length") { warnings = push(warnings, "Content-Length is worked out by each tool: a wrong one here cuts the body short.") }
+    let blocked = unique(good | filter((h) => contains(http_request_builder_forbidden, low(h)) || starts_with(low(h), "sec-") || starts_with(low(h), "proxy-")) | map((h) => h.name))
+    if len(blocked) > 0 { warnings = push(warnings, `A browser does not let fetch set ${join(blocked, ", ")}: those are left out in a page, and work only outside one.`) }
+    let hidden_body = http_request_builder_hide_body(body)
+    let header_secrets = count(good, (h) => h.secret)
+    let secrets = u.secrets + header_secrets + (hidden_body != body ? 1 : 0)
+    if !u.secure && secrets > 0 { warnings = push(warnings, "This sends a secret over plain http, where anyone on the way can read it.") }
+    { method: verb, url: u, headers: good, body: has_body ? body : "", hidden_body: has_body ? hidden_body : "", problems, warnings, secrets, needs_type: has_body && ctype == null, looks_json }
+}
+
+fn http_request_builder_value(h: map, hide: bool) -> str = hide && h.secret ? http_request_builder_hide_value(h.value) : h.value
+
+// curl needs -g or it reads [ ] { } in a URL as its own ranges.
+fn http_request_builder_curl(r: map, hide: bool) -> str {
+    let url = http_request_builder_full(r.url, hide)
+    let body = hide ? r.hidden_body : r.body
+    let method = r.method == "GET" ? (body != "" ? "-X GET" : null) : (r.method == "HEAD" ? "--head" : (r.method == "POST" && body != "" ? null : `-X ${r.method}`))
+    let first = join(["curl", method, re.test(url, "[\\[\\]{}]") ? "-g" : null, http_request_builder_sh(url)] | filter((p) => p != null), " ")
+    let lines = r.headers | map((h) => {
+        let v = http_request_builder_value(h, hide)
+        `-H ${http_request_builder_sh(v == "" ? `${h.name};` : `${h.name}: ${v}`)}`
+    })
+    join([first] + ((lines + (body != "" ? [`--data-raw ${http_request_builder_sh(body)}`] : [])) | map((l) => `  ${l}`)), " \\\n")
+}
+
+fn http_request_builder_fetch(r: map, hide: bool) -> str {
+    let url = json.stringify(http_request_builder_full(r.url, hide))
+    let body = hide ? r.hidden_body : r.body
+    let no_body = r.method == "GET" || r.method == "HEAD"
+    let parts = r.method == "GET" ? [] : [`  method: ${json.stringify(r.method)},`]
+    let heads = r.headers | map((h) => `    ${json.stringify(h.name)}: ${json.stringify(http_request_builder_value(h, hide))},`)
+    let with_heads = len(heads) > 0 ? parts + ["  headers: {"] + heads + ["  },"] : parts
+    let all_parts = body != "" && !no_body ? with_heads + [`  body: ${json.stringify(body)},`] : with_heads
+    let note = body != "" && no_body ? `// fetch refuses a body on ${r.method}, so it is left out.\n` : ""
+    len(all_parts) == 0 ? `${note}const response = await fetch(${url});`
+        : `${note}const response = await fetch(${url}, {\n${join(all_parts, "\n")}\n});`
+}
+
+// HTTPie takes `Name:value` and, for an empty value, `Name;`. --raw is the body as it is.
+fn http_request_builder_httpie(r: map, hide: bool) -> str {
+    let url = http_request_builder_full(r.url, hide)
+    let body = hide ? r.hidden_body : r.body
+    let first = `http ${r.method} ${http_request_builder_sh(url)}`
+    let lines = r.headers | map((h) => {
+        let v = http_request_builder_value(h, hide)
+        http_request_builder_sh(v == "" ? `${h.name};` : `${h.name}:${v}`)
+    })
+    join([first] + ((lines + (body != "" ? [`--raw ${http_request_builder_sh(body)}`] : [])) | map((l) => `  ${l}`)), " \\\n")
+}
+
+view HttpRequestBuilderRows(legend: str, kind: str, rows: list, id: str, field_name, hidden, on_edit, on_remove, on_add, add_label: str) =
+    <div.ui-http-req-rows role="group" aria-labelledby={`${id}-${kind}-label`}>
+        <span.ui-http-req-label id={`${id}-${kind}-label`}>{legend}</span>
+        {for r in rows => <div.ui-http-req-row key={str(r.id)}>
+            <input.ui-http-req-input type="text" name={field_name(`${kind}_name`)} aria-label={`${legend}: name`} value={r.name} spellcheck="false" autocomplete="off"
+                   @input={(e) => { on_edit(r.id, "name", e.value) }}/>
+            <input.ui-http-req-input type={hidden(r) ? "password" : "text"} name={field_name(`${kind}_value`)} aria-label={`${r.name}: value`} value={r.value} spellcheck="false" autocomplete="off"
+                   @input={(e) => { on_edit(r.id, "value", e.value) }}/>
+            <button.ui-http-req-btn type="button" aria-label={`Remove ${r.name}`} @click={() => { on_remove(r.id) }}>Remove</button>
+        </div>}
+        <button class="ui-http-req-btn ui-http-req-add" type="button" data-add={kind} @click={on_add}>{add_label}</button>
+    </div>
+
+component HttpRequestBuilder(method: str = "GET", url: str = "", headers = [], query = [], body: str = "", tool: str = "curl", title: str = "HTTP request", id: str = "http-request",
+                             name: str? = null, on_change = null, class: str? = null) {
+    style global http_request_builder_css
+    state verb = upper(method)
+    state address = url
+    state header_rows = enumerate(http_request_builder_pairs(headers)) | map((p) => { ...p[1], id: p[0] })
+    state query_rows = enumerate(http_request_builder_pairs(query)) | map((p) => { ...p[1], id: p[0] })
+    state text = body
+    state tab = tool
+    state reveal = false
+    state next = 1000
+    state copied = ""
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let r = http_request_builder_read(verb, address, header_rows, query_rows, text)
+    let hide = !reveal
+    let usable = len(r.url.problems) == 0
+    let snippet = (which: str) => match which {
+        "fetch" => http_request_builder_fetch(r, hide)
+        "httpie" => http_request_builder_httpie(r, hide)
+        _ => http_request_builder_curl(r, hide)
+    }
+    let code = usable ? snippet(tab) : ""
+    let tell = () => {
+        if on_change != null {
+            let x = http_request_builder_read(verb, address, header_rows, query_rows, text)
+            let ok = len(x.url.problems) == 0
+            on_change({ curl: ok ? http_request_builder_curl(x, !reveal) : null, fetch: ok ? http_request_builder_fetch(x, !reveal) : null, httpie: ok ? http_request_builder_httpie(x, !reveal) : null,
+                        ok: len(x.problems) == 0, warnings: len(x.warnings) })
+        }
+    }
+    let edit = (which: str, row_id, field: str, v: str) => {
+        let change = (rows) => rows | map((x) => x.id == row_id ? set(x, field, v) : x)
+        if which == "header" { header_rows = change(header_rows) } else { query_rows = change(query_rows) }
+        copied = ""
+        tell()
+    }
+    let add_row = (which: str) => {
+        let row = { name: "", value: "", id: next }
+        next += 1
+        if which == "header" { header_rows = push(header_rows, row) } else { query_rows = push(query_rows, row) }
+    }
+    let move_tab = (e) => {
+        let ids = http_request_builder_tools | map((t) => t.id)
+        let at = index_of(ids, tab) ?? 0
+        let n = len(ids)
+        let to = e.key == "ArrowRight" ? (at + 1) % n : (e.key == "ArrowLeft" ? (at + n - 1) % n : (e.key == "Home" ? 0 : (e.key == "End" ? n - 1 : null)))
+        if to != null {
+            e.preventDefault()
+            tab = ids[to]
+            js("document.getElementById", `${id}-tab-${ids[to]}`).focus()
+        }
+    }
+    let copy = () => {
+        js("navigator.clipboard.writeText", code).then((_ = null) => { copied = hide && r.secrets > 0 ? "Copied, with secrets hidden" : "Copied" }, (_ = null) => { copied = "Could not copy: select the text instead" })
+    }
+    <section class={ui_cls(["ui-http-req", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-http-req-title id={`${id}-title`}>{title}</h3>
+        <div.ui-http-req-line>
+            <div.ui-http-req-field>
+                <label for={`${id}-method`}>Method</label>
+                <select.ui-http-req-input id={`${id}-method`} name={named("method")} @change={(e) => { verb = e.value; copied = ""; tell() }}>
+                    {for m in http_request_builder_methods => <option key={m} value={m} selected={m == verb}>{m}</option>}
+                </select>
+            </div>
+            <div.ui-http-req-field>
+                <label for={`${id}-url`}>URL</label>
+                <input.ui-http-req-input type="text" inputmode="url" id={`${id}-url`} name={named("url")} value={address} spellcheck="false" autocomplete="off" placeholder="https://api.example.com/v1/orders"
+                       aria-invalid={!usable ? "true" : null} @input={(e) => { address = e.value; copied = ""; tell() }}/>
+            </div>
+        </div>
+        <HttpRequestBuilderRows legend="Headers" kind="header" rows={header_rows} id={id} field_name={named} hidden={(x) => hide && http_request_builder_is_secret(x.name)}
+                                on_edit={(row_id, field, v) => { edit("header", row_id, field, v) }} on_remove={(row_id) => { header_rows = header_rows | filter((x) => x.id != row_id); tell() }}
+                                on_add={() => { add_row("header") }} add_label="Add header"/>
+        <HttpRequestBuilderRows legend="Query" kind="query" rows={query_rows} id={id} field_name={named} hidden={(x) => hide && http_request_builder_is_secret(x.name)}
+                                on_edit={(row_id, field, v) => { edit("query", row_id, field, v) }} on_remove={(row_id) => { query_rows = query_rows | filter((x) => x.id != row_id); tell() }}
+                                on_add={() => { add_row("query") }} add_label="Add parameter"/>
+        <div.ui-http-req-field>
+            <label for={`${id}-body`}>Body</label>
+            <textarea.ui-http-req-input id={`${id}-body`} name={named("body")} rows="5" spellcheck="false" autocomplete="off" value={text} @input={(e) => { text = e.value; copied = ""; tell() }}></textarea>
+        </div>
+        {len(r.problems) > 0 && <ul class="ui-http-req-list ui-http-req-bad" data-problems role="alert">{for p in r.problems => <li key={p}>{p}</li>}</ul>}
+        {len(r.warnings) > 0 && <ul.ui-http-req-list data-warnings aria-live="polite">{for w in r.warnings => <li key={w}>{w}</li>}</ul>}
+        {r.needs_type && r.looks_json && <div.ui-http-req-actions><button.ui-http-req-btn type="button" data-fix-type @click={() => {
+            header_rows = push(header_rows, { name: "Content-Type", value: "application/json", id: next })
+            next += 1
+            tell()
+        }}>Add Content-Type: application/json</button></div>}
+        {usable && <div.ui-http-req-bar>
+            <div.ui-http-req-tabs role="tablist" aria-label="Snippet" @keydown={move_tab}>
+                {for t in http_request_builder_tools => <button.ui-http-req-tab key={t.id} type="button" role="tab" id={`${id}-tab-${t.id}`} aria-selected={tab == t.id ? "true" : "false"}
+                        aria-controls={`${id}-panel`} tabindex={tab == t.id ? "0" : "-1"} @click={() => { tab = t.id; copied = "" }}>{t.label}</button>}
+            </div>
+            <div.ui-http-req-actions>
+                {r.secrets > 0 && <button.ui-http-req-btn type="button" data-reveal aria-pressed={reveal ? "true" : "false"} @click={() => { reveal = !reveal; copied = ""; tell() }}>{reveal ? "Hide secrets" : "Show secrets"}</button>}
+                <button.ui-http-req-btn type="button" data-copy @click={copy}>Copy</button>
+            </div>
+        </div>}
+        {usable && <pre.ui-http-req-code id={`${id}-panel`} role="tabpanel" tabindex="0" aria-labelledby={`${id}-tab-${tab}`}>{code}</pre>}
+        {usable && <span.ui-http-req-note aria-live="polite" data-note>{copied != "" ? copied : (r.secrets > 0 && hide ? `${r.secrets} ${r.secrets == 1 ? "secret is" : "secrets are"} hidden, here and in what Copy gives.` : "")}</span>}
+    </section>
+}

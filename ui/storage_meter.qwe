@@ -1,0 +1,297 @@
+// StorageMeter: how much space this app takes on the device, by kind, from navigator.storage
+// and what it can measure itself, with a Clear for each kind that asks first and says what
+// will go. Unsent work is left alone by default.
+//
+//   import ui/storage_meter.qwe use StorageMeter
+//
+//   <StorageMeter/>
+//
+//   // A phone app's own database and files are not the web view's, so navigator.storage
+//   // knows nothing of them. Say what they take, and how to clear them:
+//   server fn photo_bytes() -> int = ...
+//   component Space(photos: int) {
+//       state bytes = photos
+//       <StorageMeter kinds={[{ id: "photos", label: "Photos", bytes, warn: "They come back from the server when you are online." }]}
+//                     on_clear={(k) => { clear_photos() }} on_cleared={(_id, _freed) => { bytes = photo_bytes() }}/>
+//   }
+//
+// kinds: the program's own, each { id, label, bytes, note (a smaller line), warn (what the
+// question says will happen) }. on_clear(kind): clears one of those, and may wait: false or an
+// error value says it did not; without it they have no Clear. on_cleared(id, freed): after
+// any clear, with its bytes, or null where the size was not known. id: "local", "cache",
+// "indexeddb", or one of yours.
+// keep: names never cleared, each the start of a localStorage key or an IndexedDB name.
+// By default that is what the kit keeps unsent work in: DraftKeeper, OfflineQueue, PendingUploads.
+// title: the heading. id, class. wait_ms: how long a clear may take (30000).
+//
+// What can be read differs. Chrome's estimate gives each kind; Safari's gives a total, so
+// each kind there says "Size not given". An estimate is rounded on purpose, and cached files
+// from other sites are padded, so a size may be far from the bytes. localStorage is outside
+// the estimate, and is measured here, at two bytes a character. A browser with no
+// navigator.storage is told as such, with what could still be measured.
+//
+// storage_meter_size(bytes) writes a size, storage_meter_model(estimate, local, kinds) is the
+// sum, and storage_meter_kept(name, keep) says whether a name stays.
+
+import ui/theme.qwe use ui_cls
+
+let storage_meter_css = css`
+.ui-stormeter { position: relative; container-type: inline-size; display: grid; gap: 12px; min-width: 0; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-stormeter-title { margin: 0; font-size: 16px; font-weight: 600; }
+.ui-stormeter-sum { display: grid; gap: 8px; min-width: 0; align-content: start; }
+.ui-stormeter-total { margin: 0; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-stormeter-of { margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-stormeter-bar { display: flex; overflow: hidden; height: 12px; border-radius: 999px; background: var(--ui-subtle); }
+.ui-stormeter-seg { min-width: 0; background: var(--ui-stormeter-tone); }
+.ui-stormeter-seg + .ui-stormeter-seg { border-left: 1px solid var(--ui-surface); }
+.ui-stormeter-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; min-width: 0; }
+.ui-stormeter-part { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-stormeter-name { display: flex; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; font-weight: 500; }
+.ui-stormeter-dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--ui-stormeter-tone); }
+.ui-stormeter-tone-0 { --ui-stormeter-tone: var(--ui-accent); }
+.ui-stormeter-tone-1 { --ui-stormeter-tone: var(--ui-info); }
+.ui-stormeter-tone-2 { --ui-stormeter-tone: var(--ui-success); }
+.ui-stormeter-tone-3 { --ui-stormeter-tone: var(--ui-warning); }
+.ui-stormeter-tone-4 { --ui-stormeter-tone: var(--ui-danger); }
+.ui-stormeter-tone-5 { --ui-stormeter-tone: var(--ui-strong); }
+.ui-stormeter-bytes { display: block; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-stormeter-note { grid-column: 1 / -1; margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-stormeter-btn { min-width: 76px; min-height: 44px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-stormeter-btn:disabled { opacity: .6; cursor: default; }
+.ui-stormeter-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-stormeter-danger { border-color: var(--ui-danger); background: var(--ui-danger); color: var(--ui-surface); }
+.ui-stormeter-ask { grid-column: 1 / -1; display: grid; gap: 8px; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); }
+.ui-stormeter-q { margin: 0; font-weight: 600; }
+.ui-stormeter-warn { margin: 0; font-size: 14px; }
+.ui-stormeter-ask-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-stormeter-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.ui-stormeter-said { flex: 1 1 200px; margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-stormeter-said[data-bad] { color: var(--ui-danger); }
+.ui-stormeter-where { margin: 0; color: var(--ui-muted); font-size: 13px; }
+@media (hover: hover) { .ui-stormeter-btn:hover:enabled { border-color: var(--ui-strong); background: var(--ui-subtle); } .ui-stormeter-danger:hover:enabled { border-color: var(--ui-danger); background: color-mix(in srgb, var(--ui-danger) 85%, #000); } }
+@container (min-width: 600px) {
+  .ui-stormeter-body { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(0, 2fr); gap: 20px; align-items: start; }
+}
+@container (max-width: 599px) {
+  .ui-stormeter-body { display: grid; gap: 12px; }
+}
+`
+
+let storage_meter_keep = ["ui-draft-keeper:", "ui-offline-queue:", "ui-pending-uploads"]
+
+// Bytes as text: "840 B", "2.1 MB". Null is not known.
+fn storage_meter_size(n) -> str {
+    if type_of(n) != "int" && type_of(n) != "float" { return "Size not given" }
+    if n < 1024 { return `${round(n)} B` }
+    let unit = n < 1048576 ? 1024 : (n < 1073741824 ? 1048576 : 1073741824)
+    let tenths = round(n * 10 / unit)
+    `${floor(tenths / 10)}${tenths % 10 == 0 ? "" : `.${tenths % 10}`} ${unit == 1024 ? "KB" : (unit == 1048576 ? "MB" : "GB")}`
+}
+
+// Whether a name stays when its kind is cleared.
+fn storage_meter_kept(name: str, keep: list) -> bool = any(keep, (k) => starts_with(name, str(k)))
+
+fn storage_meter_number(x) = type_of(x) == "int" || type_of(x) == "float" ? x : null
+
+// A kind from the program, or null when it cannot be shown.
+fn storage_meter_own(k) {
+    if type_of(k) != "map" || type_of(k.id) != "str" || k.id == "" { return null }
+    { id: k.id, label: str(k.label ?? k.id), bytes: storage_meter_number(k.bytes), note: type_of(k.note) == "str" ? k.note : null, warn: type_of(k.warn) == "str" ? k.warn : null, own: true }
+}
+
+// The sum. estimate: what navigator.storage gave, or null; local: bytes in localStorage, or
+// null when it is blocked; kinds: the program's. Gives { parts, total, quota, reads }, with
+// reads "kinds" (each kind told), "total" (only a total) or "none" (no estimate at all).
+fn storage_meter_model(estimate, local, kinds) -> map {
+    let usage = type_of(estimate) == "map" ? storage_meter_number(estimate.usage) : null
+    let quota = type_of(estimate) == "map" ? storage_meter_number(estimate.quota) : null
+    let details = type_of(estimate) == "map" && type_of(estimate.usageDetails) == "map" ? estimate.usageDetails : null
+    let reads = usage == null ? "none" : (details != null ? "kinds" : "total")
+    let got = (k) => details != null ? (storage_meter_number(get(details, k, 0)) ?? 0) : null
+    let told = reads == "kinds" ? got("caches") + got("indexedDB") + got("serviceWorkerRegistrations") : 0
+    let rest = reads == "kinds" ? usage - told : 0
+    let own = (type_of(kinds) == "list" ? kinds : []) | map(storage_meter_own) | filter((k) => k != null)
+    let browser = [
+        local != null ? { id: "local", label: "Settings kept here", bytes: local } : null,
+        usage != null ? { id: "cache", label: "Cached files", bytes: got("caches") } : null,
+        usage != null ? { id: "indexeddb", label: "Offline data", bytes: got("indexedDB") } : null,
+        reads == "kinds" && got("serviceWorkerRegistrations") > 0 ? { id: "worker", label: "Background worker", bytes: got("serviceWorkerRegistrations"), locked: true } : null,
+        rest > 0 ? { id: "other", label: "Other", bytes: rest, locked: true } : null,
+    ] | filter((p) => p != null)
+    let own_bytes = sum(own | map((k) => k.bytes ?? 0))
+    { parts: browser + own, total: (usage ?? 0) + (local ?? 0) + own_bytes, quota, reads }
+}
+
+// The parts of the bar, each as a share of the whole, in percent, with what has a size.
+fn storage_meter_bar(parts: list, total) -> list =
+    total <= 0 ? [] : (parts | enumerate | filter((p) => (p[1].bytes ?? 0) > 0) | map((p) => { tone: p[0] % 6, share: round(p[1].bytes * 1000 / total) / 10, id: p[1].id }))
+
+// What the question warns of.
+fn storage_meter_warning(p: map) -> str {
+    if p.warn != null { return p.warn }
+    match p.id {
+        "local" => "This removes settings kept in this browser. Unsent drafts and queues stay."
+        "cache" => "These come back when you are online. Until then some pages may not open offline."
+        "indexeddb" => "This removes data kept for offline use. Anything not yet sent is lost, except unsent uploads."
+        _ => "This cannot be undone."
+    }
+}
+
+// The line under it all, by where it runs and what could be read.
+fn storage_meter_where(app: bool, reads: str, own: bool) -> str {
+    if app {
+        return `The web view's storage starts empty each time the app opens.${own ? "" : " The app's own database is not counted here."}`
+    }
+    match reads {
+        "none" => "This browser does not say how much space is used, so this shows what could be measured."
+        "total" => "This browser gives one total, so each kind says no size."
+        _ => "Sizes are the browser's estimates, rounded on purpose."
+    }
+}
+
+component StorageMeter(kinds = [], keep: list = storage_meter_keep, on_clear = null, on_cleared = null, title: str = "Storage on this device", wait_ms: int = 30000,
+                       id: str? = null, class: str? = null) {
+    style global storage_meter_css
+    state read = null
+    state app = false
+    state asking = null
+    state busy = false
+    state said = ""
+    state bad = false
+    state has_cache = false
+    state has_idb = false
+    let model = storage_meter_model(read == null ? null : read.estimate, read == null ? null : read.local, kinds)
+    let bar = storage_meter_bar(model.parts, model.total)
+    let can = (p) => match p.id {
+        "local" => p.bytes != null && p.bytes > 0
+        "cache" => has_cache && p.bytes != 0
+        "indexeddb" => has_idb && p.bytes != 0
+        _ => p.own == true && on_clear != null
+    }
+    let measure = () => {
+        let w = js("window")
+        let st = js("navigator").storage
+        let estimate = st != null && st.estimate != null
+            ? js("Promise.resolve", js_new("Promise", (done) => { st.estimate().then(done, (_e = null) => { done(null) }) })) : null
+        // Reading localStorage can throw where it is blocked, and it is outside the estimate.
+        let local = js("Promise.resolve", js_new("Promise", (done) => {
+            let ls = w.localStorage
+            let n = ls.length
+            let total = 0
+            for i in range(n) {
+                let k = ls.key(i)
+                total += js_new("String", k).length + js_new("String", ls.getItem(k)).length
+            }
+            done(total * 2)
+        }))
+        has_cache = w.caches != null && w.caches.keys != null
+        has_idb = w.indexedDB != null && w.indexedDB.databases != null
+        read = { estimate: is_err(estimate) ? null : estimate, local: is_err(local) ? null : local }
+    }
+    // Each returns true, or an error value when it could not.
+    let clear_local = () => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            let ls = js("window").localStorage
+            let names = range(ls.length) | map((i) => ls.key(i))
+            for k in names {
+                if !storage_meter_kept(k, keep) { ls.removeItem(k) }
+            }
+            done(true)
+        }))
+    }
+    // `for`, not `map`: a function that waits cannot go through `map`.
+    let clear_cache = () => {
+        let c = js("window").caches
+        let names = js("Promise.resolve", js_new("Promise", (done) => { c.keys().then(done, (_e = null) => { done(err("failed")) }) }))
+        if is_err(names) { return names }
+        for n in names {
+            let gone = js("Promise.resolve", js_new("Promise", (done) => { c.delete(n).then(done, (_e = null) => { done(err("failed")) }) }))
+            if is_err(gone) { return gone }
+        }
+        true
+    }
+    let clear_idb = () => {
+        let d = js("window").indexedDB
+        let list = js("Promise.resolve", js_new("Promise", (done) => { d.databases().then(done, (_e = null) => { done(err("failed")) }) }))
+        if is_err(list) { return list }
+        for x in list {
+            if x.name != null && !storage_meter_kept(x.name, keep) {
+                let gone = js("Promise.resolve", js_new("Promise", (done) => {
+                    let r = d.deleteDatabase(x.name)
+                    r.addEventListener("success", (_e) => { done(true) })
+                    r.addEventListener("error", (_e = null) => { done(err("failed")) })
+                    // Held open elsewhere: it goes when that closes, so there is nothing to wait for.
+                    r.addEventListener("blocked", (_e) => { done(true) })
+                }))
+                if is_err(gone) { return gone }
+            }
+        }
+        true
+    }
+    let clear_own = (p) => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            js("AbortSignal.timeout", wait_ms).addEventListener("abort", (_e = null) => { done(err("no answer")) })
+            js("Promise.resolve", on_clear({ id: p.id, label: p.label, bytes: p.bytes })).then(done, (_e = null) => { done(err("failed")) })
+        }))
+    }
+    let clear = (p) => {
+        if !busy {
+            busy = true
+            asking = null
+            bad = false
+            said = `Clearing ${p.label}…`
+            let r = match p.id {
+                "local" => clear_local()
+                "cache" => clear_cache()
+                "indexeddb" => clear_idb()
+                _ => clear_own(p)
+            }
+            let failed = is_err(r) || r == false
+            if !failed { on_cleared && on_cleared(p.id, p.bytes) }
+            measure()
+            bad = failed
+            said = failed ? `${p.label} could not be cleared.` : (p.bytes != null ? `Cleared ${storage_meter_size(p.bytes)} of ${p.label}.` : `Cleared ${p.label}.`)
+            busy = false
+        }
+    }
+    <section class={ui_cls(["ui-stormeter", class])} id={id} aria-label={title}
+             @mount={(_el) => {
+                 app = js("window").quilloNative != null
+                 measure()
+             }}>
+        <h3.ui-stormeter-title>{title}</h3>
+        <div.ui-stormeter-body>
+            <div.ui-stormeter-sum>
+                <p.ui-stormeter-total>{read == null ? "Measuring…" : storage_meter_size(model.total)}</p>
+                {read != null && model.quota != null && <p.ui-stormeter-of>{`used, of about ${storage_meter_size(model.quota)} this browser allows`}</p>}
+                <div.ui-stormeter-bar role="img" aria-label={`Space by kind: ${join(model.parts | map((p) => `${p.label} ${storage_meter_size(p.bytes)}`), ", ")}`}>
+                    {for s in bar => <span key={s.id} class={`ui-stormeter-seg ui-stormeter-tone-${s.tone}`} data-id={s.id} style={`width: ${s.share}%`}></span>}
+                </div>
+            </div>
+            <ul.ui-stormeter-list>
+                {for p in model.parts | enumerate => <li.ui-stormeter-part key={p[1].id} data-id={p[1].id}>
+                    <div>
+                        <span.ui-stormeter-name><span class={`ui-stormeter-dot ui-stormeter-tone-${p[0] % 6}`} aria-hidden="true"></span>{p[1].label}</span>
+                        <span.ui-stormeter-bytes>{storage_meter_size(p[1].bytes)}</span>
+                    </div>
+                    {can(p[1]) && <button.ui-stormeter-btn type="button" aria-label={`Clear ${p[1].label}`} disabled={busy} aria-expanded={asking == p[1].id ? "true" : "false"}
+                                          @click={() => { asking = asking == p[1].id ? null : p[1].id }}>Clear</button>}
+                    {p[1].note != null && <p.ui-stormeter-note>{p[1].note}</p>}
+                    {asking == p[1].id && <div.ui-stormeter-ask role="group" aria-label={`Clear ${p[1].label}?`}>
+                        <p.ui-stormeter-q>{p[1].bytes != null ? `Clear ${storage_meter_size(p[1].bytes)} of ${p[1].label}?` : `Clear ${p[1].label}?`}</p>
+                        <p.ui-stormeter-warn>{storage_meter_warning(p[1])}</p>
+                        <div.ui-stormeter-ask-acts>
+                            <button.ui-stormeter-btn type="button" @mount={(el) => { el.focus() }} @click={() => { asking = null }}>Keep it</button>
+                            <button.ui-stormeter-btn.ui-stormeter-danger type="button" @click={() => { clear(p[1]) }}>Clear it</button>
+                        </div>
+                    </div>}
+                </li>}
+            </ul>
+        </div>
+        <div.ui-stormeter-foot>
+            <p.ui-stormeter-said role="status" data-bad={bad ? "" : null}>{said}</p>
+            <button.ui-stormeter-btn type="button" disabled={busy} @click={() => { measure() }}>Measure again</button>
+        </div>
+        <p.ui-stormeter-where>{read == null ? "" : storage_meter_where(app, model.reads, len(model.parts | filter((p) => p.own == true)) > 0)}</p>
+    </section>
+}

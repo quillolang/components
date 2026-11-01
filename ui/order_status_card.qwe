@@ -1,0 +1,202 @@
+// OrderStatusCard: where an order has got to: its stages, a bar that moves with time as
+// well as with stages, when it should come, worked out from how long each stage takes, and
+// when it is late, what to do, which depends on how late and whether it has stopped moving.
+// A view, with no script: the links and the fold are the browser's.
+//
+//   import ui/order_status_card.qwe use OrderStatusCard
+//
+//   <OrderStatusCard order="#4102" now={date.now()} promised="2026-11-05" carrier="Northline" track_href="/track/4102"
+//                    help_href="/help" refund_href="/orders/4102/refund"
+//                    stages={[{ label: "Ordered", at: "2026-10-30T09:00:00Z", hours: 1 }, { label: "Packed", at: "2026-10-30T16:00:00Z", hours: 12 },
+//                             { label: "Shipped", hours: 24 }, { label: "Delivered", hours: 48 }]}/>
+//
+// stages: in order, each { label, at, hours }: at, the date-time it was reached (left out
+// until it has); hours, how long it usually takes to get there from the stage before
+// (24). now: the date-time, passed in so the page is the same on server and browser.
+// promised: the date or date-time promised. offset: minutes ahead of UTC to show days in
+// (0; 480 for Manila).
+// order: its number. carrier. track_href, help_href, refund_href: links; those left out
+// are not offered, and they must be http or https, as the phone apps open nothing else (no tel: or mailto:). cancelled: true when it will not come, with stages kept as they are.
+//
+// order_status_card_model(stages, now, promised) is the working: { done, total, percent,
+// eta (ms), late_days, stuck, level }, where level is "done", "ok", "slipping" (it may
+// be late, but the date has not passed), "late" or "very_late" (three days past the date,
+// or nothing has moved for twice as long as that stage takes, and two days at least).
+
+import ui/theme.qwe use ui_cls
+
+let order_status_card_css = css`
+.ui-ordst {
+  display: grid; gap: 12px; min-width: 0; padding: 14px 16px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface);
+  color: var(--ui-fg); font: 14px/1.45 var(--ui-font); container-type: inline-size;
+}
+.ui-ordst-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 2px 10px; }
+.ui-ordst-head h3 { margin: 0; font-size: 16px; }
+.ui-ordst-order { color: var(--ui-muted); font-size: 13px; }
+.ui-ordst-eta { margin: 0; color: var(--ui-muted); }
+.ui-ordst-eta strong { display: block; color: var(--ui-fg); font-size: 18px; }
+.ui-ordst-bar { height: 8px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-ordst-bar span { display: block; height: 100%; border-radius: inherit; background: var(--ui-accent); }
+.ui-ordst-late .ui-ordst-bar span { background: var(--ui-warning); }
+.ui-ordst-very_late .ui-ordst-bar span { background: var(--ui-danger); }
+.ui-ordst-stages { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
+.ui-ordst-stage { position: relative; display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 0 10px; padding-bottom: 12px; }
+.ui-ordst-stage:last-child { padding-bottom: 0; }
+.ui-ordst-stage::before { content: ""; position: absolute; left: 9px; top: 16px; bottom: -2px; width: 2px; background: var(--ui-border); }
+.ui-ordst-stage:last-child::before { display: none; }
+.ui-ordst-dot { box-sizing: border-box; width: 14px; height: 14px; margin: 3px; border: 2px solid var(--ui-strong); border-radius: 50%; background: var(--ui-surface); }
+.ui-ordst-did .ui-ordst-dot { border-color: var(--ui-accent); background: var(--ui-accent); }
+.ui-ordst-did::before { background: var(--ui-accent); }
+.ui-ordst-now .ui-ordst-dot { border-color: var(--ui-accent); }
+.ui-ordst-now .ui-ordst-name { font-weight: 700; }
+.ui-ordst-name { font-weight: 500; }
+.ui-ordst-when { display: block; color: var(--ui-muted); font-size: 12px; }
+.ui-ordst-help { border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-ordst-help summary { display: flex; align-items: center; min-height: 44px; padding: 0 12px; font-weight: 600; cursor: pointer; touch-action: manipulation; }
+.ui-ordst-help summary:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-ordst-help-body { display: grid; gap: 6px; padding: 0 12px 10px; }
+.ui-ordst-help-body p { margin: 0; }
+.ui-ordst-links { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-ordst-link {
+  display: inline-flex; align-items: center; min-height: 44px; min-width: 44px; padding: 0 12px; box-sizing: border-box; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-accent); font-weight: 600; text-decoration: none; touch-action: manipulation;
+}
+.ui-ordst-link:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-ordst-very_late .ui-ordst-help { background: var(--ui-danger-soft); }
+.ui-ordst-late .ui-ordst-help, .ui-ordst-slipping .ui-ordst-help { background: var(--ui-warning-soft); }
+@container (min-width: 520px) {
+  .ui-ordst-stages { grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); }
+  .ui-ordst-stage { grid-template-columns: minmax(0, 1fr); gap: 6px 0; padding-bottom: 0; }
+  .ui-ordst-stage::before { left: 17px; right: -3px; top: 9px; bottom: auto; width: auto; height: 2px; }
+}
+`
+
+let order_status_card_hour = 3600000
+let order_status_card_day = 86400000
+
+// A time in ms, or null when it cannot be read; a bare date is the end of that day, as a
+// promise for a day runs to its end.
+fn order_status_card_ms(t, end_of_day: bool = false) {
+    if type_of(t) != "str" || !date.valid(t) { return null }
+    let ms = date.ms(t)
+    end_of_day && date.valid(t, "date") ? ms + order_status_card_day - 1000 : ms
+}
+
+// The stages that can be used.
+fn order_status_card_rows(stages) -> list {
+    if type_of(stages) != "list" { return [] }
+    stages | filter((s) => type_of(s) == "map") | map((s) => {
+        let h = get(s, "hours")
+        { label: str(get(s, "label") ?? ""), at: order_status_card_ms(get(s, "at")), hours: type_of(h) == "int" || type_of(h) == "float" ? max([h, 0]) : 24 }
+    })
+}
+
+// The stages reached, in a row from the start: a later one reached alone counts its
+// place, as a carrier's scan can skip one.
+fn order_status_card_done(rows: list) -> int {
+    let reached = enumerate(rows) | filter((p) => p[1].at != null) | map((p) => p[0])
+    len(reached) > 0 ? reached[len(reached) - 1] + 1 : 0
+}
+
+fn order_status_card_model(stages, now, promised = null) -> map {
+    let rows = order_status_card_rows(stages)
+    let total = len(rows)
+    let done = order_status_card_done(rows)
+    let t = order_status_card_ms(now) ?? 0
+    let sure = order_status_card_ms(promised, true)
+    let delivered = total > 0 && done == total
+    let hours = rows | map((r) => r.hours)
+    let whole = sum(hours)
+    let past = sum(take(hours, done))
+    let last = done > 0 ? (rows[done - 1].at ?? t) : t
+    let cur = done < total ? rows[done].hours : 0
+    let spent = max([0, min([(t - last) / order_status_card_hour, cur])])
+    let ratio = whole > 0 ? (past + spent) / whole : (total > 0 ? done / total : 0)
+    // Never 100 before it is there: however long a stage has run, the rest are still to come.
+    let percent = delivered ? 100 : min([99, int(floor(ratio * 100))])
+    let due = last + cur * order_status_card_hour
+    let eta = delivered ? last : max([t, due]) + sum(drop(hours, done + 1)) * order_status_card_hour
+    let late_days = sure != null && t > sure ? int(ceil((t - sure) / order_status_card_day)) : 0
+    let idle = (t - last) / order_status_card_hour
+    let stuck = !delivered && done > 0 && idle >= 48 && idle >= cur * 2
+    let level = delivered ? "done"
+        : late_days >= 3 || (late_days > 0 && stuck) ? "very_late"
+        : late_days > 0 ? "late"
+        : sure != null && eta > sure ? "slipping" : "ok"
+    { done: done, total: total, percent: percent, eta: eta, late_days: late_days, stuck: stuck, level: level,
+      slip_days: sure != null && eta > sure ? int(ceil((eta - sure) / order_status_card_day)) : 0 }
+}
+
+// What to say when it is not going to plan.
+fn order_status_card_advice(m: map, carrier) -> str? {
+    let who = carrier ?? "the carrier"
+    let days = (n) => n == 1 ? "1 day" : `${n} days`
+    match m.level {
+        "slipping" => `It may come ${days(m.slip_days)} after the date we gave. Nothing to do yet: we will say if that changes.`
+        "late" => `It is ${days(m.late_days)} late. Most late parcels arrive within three days: check the tracking, and ask ${who} if it has not moved today.`
+        "very_late" => m.stuck ? `It has not moved for a while and is ${days(m.late_days)} late. It may be lost: ask for a refund or a new one, and we will look for it with ${who}.`
+                               : `It is ${days(m.late_days)} late, which is too long. Ask for a refund or a new one.`
+        _ => null
+    }
+}
+
+// A day as people say it. offset rather than a zone's name: an unknown zone stops the
+// page, and there is no asking first.
+fn order_status_card_day_text(ms, offset: int) -> str = date.format(slice(date.from_ms(ms + offset * 60000, "UTC"), 0, 10), "ddd D MMM")
+
+fn order_status_card_title(m: map, cancelled: bool, rows: list) -> str {
+    if cancelled { return "Cancelled" }
+    if m.level == "done" { return "Delivered" }
+    if m.done == 0 { return "Not started" }
+    rows[m.done - 1].label
+}
+
+view OrderStatusCardAdvice(advice: str, track_href: str? = null, help_href: str? = null, refund_href: str? = null) =
+    <div.ui-ordst-help-body>
+        <p>{advice}</p>
+        <div.ui-ordst-links>
+            {track_href != null && <a.ui-ordst-link href={track_href}>Track it</a>}
+            {help_href != null && <a.ui-ordst-link href={help_href}>Ask us</a>}
+            {refund_href != null && <a.ui-ordst-link href={refund_href}>Refund or new one</a>}
+        </div>
+    </div>
+
+view OrderStatusCard(stages = [], now: str = "", promised: str? = null, offset: int = 0, order: str? = null, carrier: str? = null,
+                     track_href: str? = null, help_href: str? = null, refund_href: str? = null, cancelled: bool = false, class: str? = null) {
+    style global order_status_card_css
+    let m = order_status_card_model(stages, now, promised)
+    let rows = order_status_card_rows(stages)
+    let advice = cancelled ? null : order_status_card_advice(m, carrier)
+    let level = cancelled ? "ok" : m.level
+    <section class={ui_cls(["ui-ordst", `ui-ordst-${level}`, class])} aria-label={order != null ? `Order ${order}` : "Order status"}>
+        <div.ui-ordst-head>
+            <h3>{order_status_card_title(m, cancelled, rows)}</h3>
+            {order != null && <span.ui-ordst-order>Order {order}</span>}
+        </div>
+        {!cancelled && m.total > 0 && <p.ui-ordst-eta>
+            {m.level == "done" ? "It came on" : m.level == "ok" || m.level == "slipping" ? "Expected" : "Now expected"}
+            <strong>{order_status_card_day_text(m.eta, offset)}</strong>
+        </p>}
+        {!cancelled && <div.ui-ordst-bar role="progressbar" aria-label="How far it has come" aria-valuemin="0" aria-valuemax="100" aria-valuenow={m.percent}>
+            <span style={`width: ${m.percent}%`}></span>
+        </div>}
+        <ol.ui-ordst-stages>
+            {for [i, r] in enumerate(rows) => <li class={ui_cls(["ui-ordst-stage", i < m.done && "ui-ordst-did", i == m.done && !cancelled && "ui-ordst-now"])}
+                                                  aria-current={i == m.done && !cancelled ? "step" : null}>
+                <span.ui-ordst-dot aria-hidden="true"></span>
+                <span>
+                    <span.ui-ordst-name>{r.label}</span>
+                    {r.at != null && <span.ui-ordst-when>{order_status_card_day_text(r.at, offset)}</span>}
+                </span>
+            </li>}
+        </ol>
+        {advice != null && m.level == "slipping" && <details.ui-ordst-help>
+            <summary>It may be a little late</summary>
+            <OrderStatusCardAdvice advice={advice} track_href={track_href}/>
+        </details>}
+        {advice != null && m.level != "slipping" && <details.ui-ordst-help open="">
+            <summary>What to do</summary>
+            <OrderStatusCardAdvice advice={advice} track_href={track_href} help_href={help_href} refund_href={m.level == "very_late" ? refund_href : null}/>
+        </details>}
+    </section>
+}

@@ -1,0 +1,519 @@
+// PodcastQueue: the episodes to listen to, in the order you choose. Drag a row by its grip to
+// reorder it; swipe a row right to mark it played, left to take it out, with an undo. Each row
+// shows where you left off and how long is left; the top says how long the whole queue takes at this
+// speed. It plays them itself, resuming each where it was and going on to the next unplayed one. On a
+// tablet the chosen episode's notes and actions stay open beside the list.
+//
+//   import ui/podcast_queue.qwe use PodcastQueue
+//
+//   <PodcastQueue speed={1.5} episodes={[
+//       { id: "e12", title: "Views first", show: "The Quillo Podcast", src: "/e12.m4a", duration: 2710, position: 640, size: 41000000 },
+//   ]} on_change={(list) => { save_queue(list) }} on_position={(id, s) => { save_place(id, s) }}/>
+//
+// episodes: each { id, title, show, art, notes, src, duration, position, played, size, downloaded }, with
+// duration and position in seconds and size in bytes. A new list replaces the queue; one with the same
+// ids in the same order leaves it alone. speed: the playing speed (1), which the times left follow. progress:
+// a map from an episode's id to how far its download is, 0 to 1 ({}). id: the id of its <audio>,
+// for others to follow ("ui-podq-audio"). label: what screen readers call it.
+//
+// on_change(list): inside one of your components, the queue after any change, each item with its position
+// and played. on_position(id, seconds): every 5 seconds of playing, and on pausing. Keep these in a
+// `server fn`: browser storage does not last from one launch of a phone app to the next. on_play(episode): it
+// was started; an episode with no src only calls this. on_download(episode): the download button, which
+// shows only with this; on_remove(episode): it was taken out, past the undo.
+//
+// The box needs a height: `--ui-podq-height`, 70dvh unless set.
+//
+// The keys: ArrowUp and ArrowDown on a grip move the row. Every swipe has its button in the row's
+// actions, opened by a tap on its title: Mark played, Remove, and Move to top.
+
+import ui/theme.qwe use ui_cls
+
+let podcast_queue_css = css`
+.ui-podq { position: relative; box-sizing: border-box; height: var(--ui-podq-height, 70dvh); min-width: 0; container: ui-podq / inline-size; color: var(--ui-fg); font: 14px/1.35 var(--ui-font); }
+.ui-podq-in { display: grid; grid-template-columns: minmax(0, 1fr); height: 100%; }
+.ui-podq-main { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.ui-podq-top { flex: none; padding: 10px 14px; border-bottom: 1px solid var(--ui-border); }
+.ui-podq-total { margin: 0; font-size: 16px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-podq-sub { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-podq-list { position: relative; flex: 1; min-height: 0; margin: 0; padding: 0; overflow-y: auto; overscroll-behavior: contain; list-style: none; }
+.ui-podq-item { position: relative; background: var(--ui-bg); border-bottom: 1px solid var(--ui-border); }
+.ui-podq-sorting .ui-podq-item { transition: transform .16s; }
+.ui-podq-sorting .ui-podq-held { z-index: 2; transition: none; box-shadow: var(--ui-shadow-lg); }
+/* What shows behind a row as it is swiped. */
+.ui-podq-under { position: absolute; inset: 0; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; font-weight: 650; color: #fff; }
+.ui-podq-under span:first-child { color: var(--ui-success); }
+.ui-podq-under span:last-child { color: var(--ui-danger); }
+.ui-podq-row { position: relative; display: flex; align-items: center; gap: 2px; min-height: 72px; padding: 4px 4px 4px 8px; background: var(--ui-bg); touch-action: pan-y; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-podq-now .ui-podq-row { background: var(--ui-accent-soft); }
+.ui-podq-play {
+  display: grid; flex: none; place-items: center; width: 48px; height: 48px; padding: 0; border: 0; border-radius: 50%; background: var(--ui-subtle); color: var(--ui-fg); cursor: pointer; touch-action: manipulation;
+}
+.ui-podq-now .ui-podq-play { background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-podq-play svg { width: 22px; height: 22px; }
+.ui-podq-open { display: block; flex: 1; min-width: 0; min-height: 60px; padding: 4px 8px; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; touch-action: pan-y; }
+.ui-podq-title { display: block; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-podq-played .ui-podq-title { color: var(--ui-muted); font-weight: 400; }
+.ui-podq-line { display: flex; flex-wrap: wrap; gap: 0 8px; color: var(--ui-muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.ui-podq-bar { display: block; height: 3px; margin-top: 5px; border-radius: 999px; background: var(--ui-subtle); overflow: hidden; }
+.ui-podq-bar i { display: block; height: 100%; background: var(--ui-accent); transform-origin: 0 50%; }
+.ui-podq-grip { display: grid; flex: none; place-items: center; width: 44px; height: 60px; padding: 0; border: 0; border-radius: 10px; background: none; color: var(--ui-muted); cursor: grab; touch-action: none; }
+.ui-podq-grip svg { width: 20px; height: 20px; }
+.ui-podq-more { position: relative; padding: 2px 12px 12px; background: var(--ui-bg); }
+.ui-podq-notes { margin: 6px 0 10px; color: var(--ui-muted); }
+.ui-podq-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-podq-act { min-height: 46px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: 12px; background: var(--ui-surface); color: var(--ui-fg); font: 600 14px var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-podq-danger { color: var(--ui-danger); }
+.ui-podq-side { display: none; }
+.ui-podq-undo { position: absolute; left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom, 0px)); display: flex; align-items: center; gap: 10px; padding: 4px 6px 4px 14px; border-radius: 12px; background: var(--ui-fg); color: var(--ui-bg); z-index: 3; box-shadow: var(--ui-shadow-lg); }
+.ui-podq-undo span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-podq-undo button { min-height: 44px; min-width: 64px; padding: 0 12px; border: 0; border-radius: 10px; background: none; color: inherit; font: 700 14px var(--ui-font); cursor: pointer; }
+.ui-podq-empty { margin: 0; padding: 36px 16px; text-align: center; color: var(--ui-muted); }
+.ui-podq :focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-podq-act:hover, .ui-podq-grip:hover { background: var(--ui-subtle); } }
+/* Wide: what would open in the row stays open beside the list. */
+@container ui-podq (min-width: 700px) {
+  .ui-podq-in { grid-template-columns: minmax(0, 1fr) minmax(260px, 36%); }
+  .ui-podq-more { display: none; }
+  .ui-podq-side { display: block; min-height: 0; padding: 16px; overflow-y: auto; border-left: 1px solid var(--ui-border); }
+  .ui-podq-side h2 { margin: 0 0 2px; font-size: 18px; }
+  .ui-podq-chosen .ui-podq-row { background: var(--ui-subtle); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-podq-sorting .ui-podq-item { transition: none; } }
+`
+
+fn podcast_queue_num(v) {
+    let t = type_of(v)
+    if t != "int" && t != "float" { return 0 }
+    math.isfinite(v) && v > 0 ? v : 0
+}
+
+// A queue that can be used: each item a map with an id, as text, once.
+fn podcast_queue_clean(eps) -> list {
+    if type_of(eps) != "list" { return [] }
+    let rows = eps | filter((x) => type_of(x) == "map" && get(x, "id") != null)
+    let sound = rows | map((x) => {
+        let d = podcast_queue_num(get(x, "duration"))
+        let at = podcast_queue_num(get(x, "position"))
+        {
+            id: str(x.id), title: str(get(x, "title") ?? "Untitled"), show: str(get(x, "show") ?? ""), art: str(get(x, "art") ?? ""), notes: str(get(x, "notes") ?? ""),
+            src: str(get(x, "src") ?? ""), duration: d, position: d > 0 ? min([at, d]) : at, played: get(x, "played") == true,
+            size: podcast_queue_num(get(x, "size")), downloaded: get(x, "downloaded") == true,
+        }
+    })
+    let ids = sound | map((x) => x.id)
+    sound | enumerate() | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// Seconds left of an episode; none once played.
+fn podcast_queue_left(ep: map) = ep.played ? 0 : max([0, ep.duration - ep.position])
+
+// Seconds left of the whole queue at a speed.
+fn podcast_queue_total(items: list, speed) = sum(items | map((e) => podcast_queue_left(e))) / (podcast_queue_num(speed) > 0 ? speed : 1)
+
+// Seconds as a person says them, to the minute.
+fn podcast_queue_words(s) -> str {
+    let m = ceil(s / 60)
+    if m < 1 { return "No time" }
+    let h = floor(m / 60)
+    h == 0 ? `${m} min` : m % 60 == 0 ? `${h} h` : `${h} h ${m % 60} min`
+}
+
+// Seconds as "m:ss", or "h:mm:ss" from an hour.
+fn podcast_queue_clock(s) -> str {
+    let t = floor(s)
+    let h = floor(t / 3600)
+    let m = floor((t % 3600) / 60)
+    let sec = t % 60
+    let two = (n) => n < 10 ? `0${n}` : `${n}`
+    h > 0 ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`
+}
+
+// Where to start an episode: where it was left, or the start if it was finished, or as good as:
+// inside the last 30 seconds, or the last 5% of a short one.
+fn podcast_queue_resume(ep: map) = ep.played || (ep.duration > 0 && ep.duration - ep.position < min([30, ep.duration * 0.05])) ? 0 : ep.position
+
+// Bytes as a person says them.
+fn podcast_queue_size(b) -> str {
+    if b <= 0 { return "" }
+    b >= 1000000000 ? `${round(b / 1000000000, 1)} GB` : `${round(b / 1000000)} MB`
+}
+
+// A list with one item moved.
+fn podcast_queue_move(items: list, from: int, to: int) -> list {
+    let n = len(items)
+    if from < 0 || from >= n { return items }
+    let dest = max([0, min([to, n - 1])])
+    let rest = items | enumerate() | filter((p) => p[0] != from) | map((p) => p[1])
+    flatten([slice(rest, 0, dest), [items[from]], slice(rest, dest, n)])
+}
+
+// A list with an item changed, by id.
+fn podcast_queue_edit(items: list, id: str, field: str, v) -> list = items | map((e) => e.id == id ? set(e, field, v) : e)
+
+// The next one to play after an id: the first unplayed after it, with none before it counted.
+fn podcast_queue_next(items: list, id: str) {
+    let ids = items | map((e) => e.id)
+    let at = index_of(ids, id)
+    let after = at == null ? items : slice(items, at + 1, len(items))
+    find(after, (e) => !e.played && e.src != "")
+}
+
+// Where a row dropped at height y lands, among the middles of the rows as they were.
+fn podcast_queue_slot(mids: list, from: int, y) -> int {
+    let above = mids | enumerate() | filter((p) => p[0] != from && p[1] < y)
+    len(above)
+}
+
+// A swipe at release: 1 right (played), -1 left (remove), 0 stays. 40% of the width does it, or a
+// flick of 0.5 px/ms over at least 40 px, as long as the finger is not by then going back.
+fn podcast_queue_swipe(dx, speed, width) -> int {
+    if dx >= width * 0.4 || (dx >= 40 && speed >= 0.5) { return speed < -0.3 ? 0 : 1 }
+    if dx <= 0 - width * 0.4 || (dx <= -40 && speed <= -0.5) { return speed > 0.3 ? 0 : -1 }
+    0
+}
+
+// Two points, moving on every 50 ms, so the speed at release is never read from one last move.
+fn podcast_queue_mark(g: map, x, t) -> map = t - g.b_t > 50 ? set(set(set(set(g, "a_x", g.b_x), "a_t", g.b_t), "b_x", x), "b_t", t) : g
+
+let podcast_queue_pause = "M6 4h4v16H6zM14 4h4v16h-4z"
+let podcast_queue_play = "M7 4v16l14-8z"
+
+view PodcastQueueActions(ep, done, got, can_download: bool, on_played, on_top, on_remove, on_get) =
+    <div.ui-podq-acts>
+        <button.ui-podq-act type="button" @click={() => { on_played() }}>{ep.played ? "Mark unplayed" : "Mark played"}</button>
+        <button.ui-podq-act type="button" @click={() => { on_top() }}>Move to top</button>
+        {can_download && !done && <button.ui-podq-act type="button" disabled={got != null} @click={() => { on_get() }}>{got != null ? "Downloading" : "Download"}</button>}
+        <button.ui-podq-act.ui-podq-danger type="button" @click={() => { on_remove() }}>Remove</button>
+    </div>
+
+component PodcastQueue(episodes = [], speed = 1, progress = {}, id: str = "ui-podq-audio", label: str = "Up next",
+                       on_change = null, on_position = null, on_play = null, on_download = null, on_remove = null, class: str? = null) {
+    style global podcast_queue_css
+    let sig = join(podcast_queue_clean(episodes) | map((e) => e.id), ",")
+    state items = podcast_queue_clean(episodes)
+    state seen = sig
+    state audio = null
+    state list_el = null
+    state now_id = ""         // the episode loaded
+    state playing = false
+    state live = 0            // where it has got to, between commits
+    state told = 0            // when the position was last reported
+    state wanted = 0          // where to start, once the audio says it can
+    state chosen = ""
+    state said = ""
+    state undo = null
+    state undo_from = 0
+    state sorting = false
+    state held_i = -1
+    state drag = null         // a row moving by its grip; no markup reads it
+    state swipe = null        // a row moving sideways; no markup reads it
+    state last_y = 0
+    if sig != seen {
+        seen = sig
+        items = podcast_queue_clean(episodes)
+    }
+    let tell = () => { on_change && on_change(items) }
+    let place_of = (ep) => ep.id == now_id ? live : ep.position
+    let now_list = () => items | map((e) => e.id == now_id ? set(e, "position", live) : e)
+    let show_ep = (ep) => {
+        let copy = set(ep, "position", place_of(ep))
+        let left = podcast_queue_left(copy)
+        ep.played ? "Played" : ep.duration <= 0 ? "" : `${podcast_queue_words(left / (podcast_queue_num(speed) > 0 ? speed : 1))} left`
+    }
+    let shown_left = podcast_queue_total(now_id == "" ? items : items | map((e) => e.id == now_id ? set(e, "position", live) : e), speed)
+    let unplayed = len(items | filter((e) => !e.played))
+    let count_got = len(items | filter((e) => e.downloaded || get(progress, e.id) == 1))
+    let bytes_got = sum(items | filter((e) => e.downloaded || get(progress, e.id) == 1) | map((e) => e.size))
+    let start = (ep) => {
+        on_play && on_play(ep)
+        if ep.src != "" {
+            if ep.id != now_id {
+                if now_id != "" {
+                    items = now_list()
+                    on_position && on_position(now_id, live)
+                }
+                now_id = ep.id
+                live = ep.position
+                wanted = podcast_queue_resume(ep)
+                audio.src = ep.src
+                audio.defaultPlaybackRate = podcast_queue_num(speed) > 0 ? speed : 1
+                audio.load()
+            }
+            said = ""
+            audio.play().catch((err) => {
+                if err.name == "NotAllowedError" { said = "This device wants a tap first: press play." }
+                if err.name == "NotSupportedError" { said = "This episode cannot be played." }
+            })
+        }
+    }
+    let toggle = (ep) => {
+        if ep.id == now_id && playing { audio.pause() } else { start(ep) }
+    }
+    let set_played = (ep, to) => {
+        if ep.id == now_id && to {
+            audio.pause()
+            live = ep.duration
+        }
+        items = podcast_queue_edit(now_list(), ep.id, "played", to)
+        if !to { items = podcast_queue_edit(items, ep.id, "position", 0) }
+        if !to && ep.id == now_id { live = 0 }
+        said = to ? `${ep.title}: played.` : `${ep.title}: not played.`
+        tell()
+    }
+    let take_out = (ep) => {
+        let at = index_of(items | map((e) => e.id), ep.id)
+        if undo != null { on_remove && on_remove(undo.ep) }
+        if ep.id == now_id {
+            audio.pause()
+            audio.removeAttribute("src")
+            audio.load()
+            now_id = ""
+            playing = false
+        }
+        undo = { ep: ep, at: at }
+        undo_from = js("Date.now")
+        items = items | filter((e) => e.id != ep.id)
+        if chosen == ep.id { chosen = "" }
+        said = `${ep.title} removed.`
+        tell()
+    }
+    let move_to = (from, to) => {
+        items = podcast_queue_move(items, from, to)
+        said = `Moved to place ${max([0, min([to, len(items) - 1])]) + 1} of ${len(items)}.`
+        tell()
+    }
+    let rows = () => list_el.querySelectorAll(".ui-podq-item")
+    let shift_rows = (from, to, h) => {
+        let all = rows()
+        let i = 0
+        while i < all.length {
+            if i != from {
+                let by = from < to && i > from && i <= to ? 0 - h : from > to && i >= to && i < from ? h : 0
+                all[i].style.transform = by == 0 ? "" : `translateY(${by}px)`
+            }
+            i += 1
+        }
+    }
+    let follow_finger = (y) => {
+        if drag != null {
+            let d = drag
+            let dy = y - d.y + list_el.scrollTop - d.top
+            rows()[d.from].style.transform = `translateY(${dy}px)`
+            let to = podcast_queue_slot(d.mids, d.from, d.mids[d.from] + dy)
+            shift_rows(d.from, to, d.h)
+            drag = set(d, "to", to)
+        }
+    }
+    let end_sort = (keep) => {
+        if drag != null {
+            let d = drag
+            let all = rows()
+            let i = 0
+            while i < all.length {
+                all[i].style.transform = ""
+                i += 1
+            }
+            drag = null
+            sorting = false
+            held_i = -1
+            if keep && d.to != d.from { move_to(d.from, d.to) }
+        }
+    }
+    if undo != null {
+        every(1000, () => {
+            let clock = js("Date.now")
+            if undo != null && clock - undo_from > 6000 {
+                let u = undo
+                undo = null
+                on_remove && on_remove(u.ep)
+            }
+        })
+    }
+    if sorting {
+        // A finger near the edge of the list scrolls it.
+        every(40, () => {
+            if drag != null {
+                let r = list_el.getBoundingClientRect()
+                let by = last_y < r.top + 56 ? -10 : last_y > r.bottom - 56 ? 10 : 0
+                if by != 0 {
+                    list_el.scrollTop = list_el.scrollTop + by
+                    follow_finger(last_y)
+                }
+            }
+        })
+    }
+    let picked = find(items, (e) => e.id == chosen) ?? (len(items) > 0 ? items[0] : null)
+    <div class={ui_cls(["ui-podq", sorting && "ui-podq-sorting", class])} role="region" aria-label={label}>
+        <audio id={id} preload="none"
+               @mount={(el) => { audio = el }}
+               @loadedmetadata={() => {
+                   if wanted > 0 {
+                       audio.currentTime = wanted
+                       wanted = 0
+                   }
+                   audio.playbackRate = podcast_queue_num(speed) > 0 ? speed : 1
+               }}
+               @play={() => { playing = true }}
+               @pause={() => {
+                   playing = false
+                   if now_id != "" {
+                       items = now_list()
+                       on_position && on_position(now_id, live)
+                       tell()
+                   }
+               }}
+               @timeupdate={(e) => {
+                   let t = e.currentTime
+                   live = t
+                   if abs(t - told) >= 5 {
+                       told = t
+                       on_position && on_position(now_id, t)
+                   }
+               }}
+               @error={() => {
+                   if now_id != "" {
+                       said = "This episode cannot be played."
+                       playing = false
+                   }
+               }}
+               @ended={() => {
+                   let was = now_id
+                   items = podcast_queue_edit(items | map((e) => e.id == was ? set(e, "position", e.duration) : e), was, "played", true)
+                   tell()
+                   let next = podcast_queue_next(items, was)
+                   if next != null { start(next) } else { said = "That is the end of the queue." }
+               }}></audio>
+        <div.ui-podq-in>
+            <div.ui-podq-main>
+                <div.ui-podq-top>
+                    <p.ui-podq-total>{podcast_queue_words(shown_left)} left</p>
+                    <p.ui-podq-sub>{unplayed} {unplayed == 1 ? "episode" : "episodes"} to play{podcast_queue_num(speed) != 1 ? ` at ${speed}×` : ""}{count_got > 0 ? `, ${count_got} downloaded${bytes_got > 0 ? ` (${podcast_queue_size(bytes_got)})` : ""}` : ""}</p>
+                </div>
+                {len(items) == 0 && <p.ui-podq-empty>The queue is empty.</p>}
+                <ol.ui-podq-list @mount={(el) => { list_el = el }}>
+                    {for [i, ep] in enumerate(items) => {
+                        let is_now = ep.id == now_id
+                        let at_s = is_now ? live : ep.position
+                        let got = get(progress, ep.id)
+                        let done = ep.downloaded || got == 1
+                        <li class={ui_cls(["ui-podq-item", is_now && "ui-podq-now", ep.played && "ui-podq-played", held_i == i && "ui-podq-held", chosen == ep.id && "ui-podq-chosen"])} key={ep.id} data-id={ep.id}>
+                            <div.ui-podq-under aria-hidden="true"><span>{ep.played ? "Unplayed" : "Played"}</span><span>Remove</span></div>
+                            <div.ui-podq-row
+                                 @pointerdown={(e) => {
+                                     if e.target.closest(".ui-podq-play, .ui-podq-grip") == null {
+                                         swipe = { x: e.clientX, y: e.clientY, on: false, a_x: e.clientX, a_t: e.timeStamp, b_x: e.clientX, b_t: e.timeStamp, el: e.target.closest(".ui-podq-row"), ep: ep }
+                                     }
+                                 }}
+                                 @pointermove={(e) => {
+                                     if swipe != null {
+                                         let dx = e.clientX - swipe.x
+                                         if !swipe.on && abs(dx) >= 10 && abs(dx) > abs(e.clientY - swipe.y) {
+                                             swipe = set(swipe, "on", true)
+                                             swipe.el.setPointerCapture(e.pointerId)
+                                             swipe.el.style.transition = "none"
+                                         }
+                                         if swipe.on {
+                                             swipe = podcast_queue_mark(swipe, e.clientX, e.timeStamp)
+                                             swipe.el.style.transform = `translateX(${dx}px)`
+                                         }
+                                     }
+                                 }}
+                                 @pointerup={(e) => {
+                                     if swipe != null {
+                                         let s = swipe
+                                         swipe = null
+                                         if s.on {
+                                             let by = podcast_queue_swipe(e.clientX - s.x, (e.clientX - s.a_x) / max([1, e.timeStamp - s.a_t]), s.el.offsetWidth)
+                                             s.el.style.transition = "transform .2s"
+                                             s.el.style.transform = ""
+                                             if by == 1 { set_played(s.ep, !s.ep.played) }
+                                             if by == -1 { take_out(s.ep) }
+                                         }
+                                     }
+                                 }}
+                                 @pointercancel={() => {
+                                     if swipe != null {
+                                         let s = swipe
+                                         swipe = null
+                                         s.el.style.transition = "transform .2s"
+                                         s.el.style.transform = ""
+                                     }
+                                 }}>
+                                <button.ui-podq-play type="button" aria-label={is_now && playing ? `Pause ${ep.title}` : `${at_s > 0 && !ep.played ? "Resume" : "Play"} ${ep.title}`} @click={() => { toggle(ep) }}>
+                                    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={is_now && playing ? podcast_queue_pause : podcast_queue_play}/></svg>
+                                </button>
+                                <button.ui-podq-open type="button" aria-expanded={chosen == ep.id ? "true" : "false"} @click={() => { chosen = chosen == ep.id ? "" : ep.id }}>
+                                    <span.ui-podq-title>{ep.title}</span>
+                                    <span.ui-podq-line>
+                                        {ep.show != "" && <span>{ep.show}</span>}
+                                        <span.ui-podq-left>{show_ep(ep)}</span>
+                                        {at_s > 0 && !ep.played && <span.ui-podq-at>from {podcast_queue_clock(at_s)}</span>}
+                                        {done && <span.ui-podq-got>Downloaded</span>}
+                                        {!done && got != null && <span.ui-podq-got>{round(float(got) * 100)}%</span>}
+                                    </span>
+                                    {!ep.played && ep.duration > 0 && at_s > 0 && <span.ui-podq-bar><i style={`transform: scaleX(${min([at_s / ep.duration, 1])})`}></i></span>}
+                                </button>
+                                <button.ui-podq-grip type="button" aria-label={`Move ${ep.title}, with the arrow keys`}
+                                        @pointerdown={(e) => {
+                                            e.target.closest(".ui-podq-grip").setPointerCapture(e.pointerId)
+                                            let all = rows()
+                                            let mids = []
+                                            let j = 0
+                                            while j < all.length {
+                                                mids = mids | push(all[j].offsetTop + all[j].offsetHeight / 2)
+                                                j += 1
+                                            }
+                                            drag = { from: i, to: i, y: e.clientY, top: list_el.scrollTop, mids: mids, h: all[i].offsetHeight }
+                                            last_y = e.clientY
+                                            held_i = i
+                                            sorting = true
+                                        }}
+                                        @pointermove={(e) => {
+                                            last_y = e.clientY
+                                            follow_finger(e.clientY)
+                                        }}
+                                        @pointerup={() => { end_sort(true) }}
+                                        @pointercancel={() => { end_sort(false) }}
+                                        @keydown={(e) => {
+                                            if e.key == "ArrowUp" && i > 0 { e.preventDefault(); move_to(i, i - 1) }
+                                            if e.key == "ArrowDown" && i + 1 < len(items) { e.preventDefault(); move_to(i, i + 1) }
+                                        }}>
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 8h14M5 12h14M5 16h14"/></svg>
+                                </button>
+                            </div>
+                            {chosen == ep.id && <div.ui-podq-more>
+                                {ep.notes != "" && <p.ui-podq-notes>{ep.notes}</p>}
+                                <PodcastQueueActions ep={ep} done={done} got={got} can_download={on_download != null}
+                                                     on_played={() => { set_played(ep, !ep.played) }} on_top={() => { move_to(i, 0) }}
+                                                     on_remove={() => { take_out(ep) }} on_get={() => { on_download(ep) }}/>
+                            </div>}
+                        </li>
+                    }}
+                </ol>
+                {undo != null && <div.ui-podq-undo>
+                    <span>Removed {undo.ep.title}</span>
+                    <button type="button" @click={() => {
+                        let u = undo
+                        undo = null
+                        items = flatten([slice(items, 0, u.at), [u.ep], slice(items, u.at, len(items))])
+                        said = `${u.ep.title} is back.`
+                        tell()
+                    }}>Undo</button>
+                </div>}
+                <p.ui-sr role="status">{said}</p>
+            </div>
+            <div.ui-podq-side>
+                {picked != null && <div>
+                    <h2>{picked.title}</h2>
+                    <p.ui-podq-sub>{picked.show}{picked.size > 0 ? `, ${podcast_queue_size(picked.size)}` : ""}</p>
+                    {picked.notes != "" && <p.ui-podq-notes>{picked.notes}</p>}
+                    <PodcastQueueActions ep={picked} done={picked.downloaded || get(progress, picked.id) == 1} got={get(progress, picked.id)} can_download={on_download != null}
+                                         on_played={() => { set_played(picked, !picked.played) }}
+                                         on_top={() => { move_to(index_of(items | map((e) => e.id), picked.id), 0) }}
+                                         on_remove={() => { take_out(picked) }} on_get={() => { on_download(picked) }}/>
+                </div>}
+            </div>
+        </div>
+    </div>
+}

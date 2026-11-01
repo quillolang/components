@@ -1,0 +1,303 @@
+// PermissionChecklist: what the app would like to use, each with why, what it is now,
+// and the next thing to do about it. Allow asks the system; what was refused gets a way
+// to Settings in a phone app, and words saying where to go in a browser. The state
+// stays live: a change made in Settings or in the browser shows when the person is back.
+//
+//   <PermissionChecklist on_done={(states) => { go_on(states) }} items={[
+//       { kind: "camera", reason: "To photograph a page into your notes.", required: true },
+//       { kind: "location", reason: "To keep the place with a note. Never in the background." },
+//       { kind: "notifications", reason: "Only for a reminder you set yourself." }
+//   ]}/>
+//
+// items: a list of { kind, reason, label, required }. kind: "camera", "microphone",
+// "location", "notifications" or "motion" (the compass and tilt, which iOS asks about and
+// others do not); another kind shows as not available. reason: why, in the person's terms.
+// label: its name, for another word than the kind's own. required: done cannot be pressed
+// until it is allowed; use this rarely. label_text: what screen readers call it ("Permissions").
+// done_label: the button ("Continue"). notify_title, notify_text: the note a phone app
+// sends to ask about notifications, since it has no way to ask without sending one.
+// on_change(states): inside one of your components, called with a map from kind to its
+// state whenever one changes. on_done(states): called when done is pressed. A state is
+// "ask" (not asked yet), "allowed", "refused", "none" (this device or browser has no such
+// thing) or "checking".
+//
+// It uses `quilloNative` in a phone app and the web's own calls elsewhere. Asking is always
+// one tap per thing, as systems require, and a refusal is a normal end: nothing here
+// stops a person going on unless an item is `required`.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let permission_checklist_css = css`
+.ui-permission-checklist { position: relative; display: grid; gap: 14px; min-width: 0; container: ui-permission-checklist / inline-size; color: var(--ui-fg); font: 15px/1.45 var(--ui-font); }
+.ui-permission-checklist-list { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.ui-permission-checklist-row {
+  display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 10px 12px; align-items: start; padding: 14px; min-width: 0;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface);
+}
+.ui-permission-checklist-icon { display: grid; place-items: center; width: 44px; height: 44px; border-radius: 50%; background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-permission-checklist-icon svg { width: 24px; height: 24px; }
+.ui-permission-checklist-row[data-state="allowed"] .ui-permission-checklist-icon { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-permission-checklist-row[data-state="refused"] .ui-permission-checklist-icon { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-permission-checklist-row[data-state="none"] .ui-permission-checklist-icon { background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-permission-checklist-text { min-width: 0; }
+.ui-permission-checklist-text h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; margin: 0; font-size: 16px; line-height: 1.3; }
+.ui-permission-checklist-state { color: var(--ui-muted); font-size: 13px; font-weight: 500; }
+.ui-permission-checklist-row[data-state="allowed"] .ui-permission-checklist-state { color: var(--ui-success); }
+.ui-permission-checklist-row[data-state="refused"] .ui-permission-checklist-state { color: var(--ui-danger); }
+.ui-permission-checklist-reason, .ui-permission-checklist-help { margin: 3px 0 0; color: var(--ui-muted); font-size: 14px; overflow-wrap: anywhere; }
+.ui-permission-checklist-needed { color: var(--ui-warning); font-size: 12px; font-weight: 600; }
+.ui-permission-checklist-act { grid-column: 2; min-width: 0; }
+.ui-permission-checklist-foot { display: grid; gap: 8px; }
+.ui-permission-checklist-count, .ui-permission-checklist-missing { margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-permission-checklist-missing { color: var(--ui-warning); }
+@container ui-permission-checklist (min-width: 560px) {
+  .ui-permission-checklist-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ui-permission-checklist-foot { grid-template-columns: minmax(0, 1fr) minmax(200px, 280px); align-items: center; }
+}
+`
+
+let permission_checklist_kinds = [
+    { kind: "camera", label: "Camera", query: "camera",
+      icon: "M3 8a2 2 0 0 1 2-2h2l2-2h6l2 2h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM12 16a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z" },
+    { kind: "microphone", label: "Microphone", query: "microphone",
+      icon: "M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM5 11v1a7 7 0 0 0 14 0v-1M12 19v3" },
+    { kind: "location", label: "Location", query: "geolocation",
+      icon: "M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11zM12 12.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z" },
+    { kind: "notifications", label: "Notifications", query: "notifications",
+      icon: "M6 16V11a6 6 0 0 1 12 0v5l2 2H4zM10 21a2 2 0 0 0 4 0" },
+    { kind: "motion", label: "Motion and compass", query: "accelerometer",
+      icon: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM15.5 8.5l-2 5-5 2 2-5z" },
+]
+
+fn permission_checklist_info(kind: str?) =
+    (permission_checklist_kinds | filter((k) => k.kind == kind))[0] ?? { kind: kind ?? "", label: kind ?? "This", query: null, icon: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z" }
+
+// What a browser says (permissions.query's state), in the checklist's words.
+fn permission_checklist_word(said: str?) -> str? = match said {
+    "granted" => "allowed"
+    "denied" => "refused"
+    "prompt" => "ask"
+    _ => null
+}
+
+// A new reading of a state. A browser may answer "prompt" after allowing for one call
+// (a camera allowed once), so "ask" takes no state from one that has been allowed.
+fn permission_checklist_merge(now: str, seen: str?) -> str {
+    if seen == null { return now == "checking" ? "ask" : now }
+    if now == "none" { return "none" }
+    seen == "ask" && now == "allowed" ? "allowed" : seen
+}
+
+// Whether a failure's message says the person or the system refused, not that nothing
+// came: the apps say "turned off", browsers NotAllowedError.
+fn permission_checklist_refusal(said: str) -> bool {
+    let t = lower(said)
+    contains(t, "turned off") || contains(t, "notallowed") || contains(t, "not allowed") || contains(t, "denied") || contains(t, "permission")
+}
+
+// The words on a row.
+fn permission_checklist_text(state: str) -> str = match state {
+    "allowed" => "Allowed"
+    "refused" => "Refused"
+    "none" => "Not available"
+    "checking" => "Checking"
+    _ => "Not asked yet"
+}
+
+// Where to go in a browser to undo a refusal, by what the browser is.
+fn permission_checklist_where(agent: str?, label: str) -> str {
+    let ua = lower(agent ?? "")
+    let name = lower(label)
+    if contains(ua, "iphone") || contains(ua, "ipad") { return `Turn ${name} on in Settings, under this browser, then come back.` }
+    if contains(ua, "android") { return `Tap the icon beside the address, then Permissions, and allow ${name}.` }
+    `Click the icon beside the address and allow ${name} for this site.`
+}
+
+// How many are allowed, of those that exist on this device.
+fn permission_checklist_tally(items: list, states) {
+    let seen = items | map((it) => get(states, get(it, "kind") ?? "", "checking"))
+    { allowed: len(seen | filter((s) => s == "allowed")), total: len(seen | filter((s) => s != "none")) }
+}
+
+// The required items not yet allowed.
+fn permission_checklist_missing(items: list, states) -> list =
+    items | filter((it) => get(it, "required") == true && get(states, get(it, "kind") ?? "", "checking") != "allowed")
+
+component PermissionChecklist(items: list = [], label_text: str = "Permissions", done_label: str = "Continue",
+                              notify_title: str = "Notifications are on", notify_text: str = "This is how a note from this app looks.",
+                              on_change = null, on_done = null, class: str? = null) {
+    style global permission_checklist_css
+    state states = items | reduce({}, (m, it) => set(m, get(it, "kind") ?? "", "checking"))
+    state native = false
+    state busy = ""
+    state agent = ""
+    let settings_trip = false       // the person went to Settings, so look again on the way back
+    let watched = []                // the browser's status objects, with what listens to each
+    let put = (kind: str, value: str) => {
+        if get(states, kind, "") != value {
+            states = set(states, kind, value)
+            on_change && on_change(states)
+        }
+    }
+    // Whether the device has the thing at all.
+    let exists = (kind: str) => {
+        let page = js("window")
+        let nav = js("navigator")
+        if kind == "camera" || kind == "microphone" { return nav.mediaDevices != null }
+        if kind == "location" { return native || nav.geolocation != null }
+        if kind == "notifications" { return native || page.Notification != null }
+        if kind == "motion" { return page.DeviceOrientationEvent != null }
+        false
+    }
+    // What the browser says now, with no prompt. iOS has no query for some, or none at all
+    // in the app: then the row keeps what asking last gave.
+    let look = (kind: str) => {
+        if !exists(kind) {
+            put(kind, "none")
+        } else {
+            // In the app these two go through the app, and the web view's own answer says nothing of it.
+            let own = native && (kind == "location" || kind == "notifications")
+            let got = own ? null : js("navigator.permissions.query", { name: permission_checklist_info(kind).query })
+            let word = got == null || is_err(got) ? null : permission_checklist_word(got.state)
+            put(kind, permission_checklist_merge(get(states, kind, "checking"), word))
+        }
+    }
+    let look_all = () => {
+        for it in items { look(get(it, "kind") ?? "") }
+    }
+    let ask = (kind: str) => {
+        if busy == "" {
+            busy = kind
+            if kind == "camera" || kind == "microphone" {
+                let stream = js("navigator.mediaDevices.getUserMedia", kind == "camera" ? { video: true } : { audio: true })
+                if is_err(stream) {
+                    put(kind, contains(str(stream), "NotFound") ? "none" : "refused")
+                } else {
+                    for t in js("Array.from", stream.getTracks()) { t.stop() }
+                    put(kind, "allowed")
+                }
+            }
+            if kind == "location" {
+                if native {
+                    let got = js("quilloNative.location")
+                    put(kind, is_err(got) && permission_checklist_refusal(str(got)) ? "refused" : "allowed")
+                } else {
+                    let code = js("Promise.resolve", js_new("Promise", (done) => {
+                        js("navigator.geolocation.getCurrentPosition", (_p) => { done(0) }, (e) => { done(e.code) }, { timeout: 15000, maximumAge: 600000 })
+                    }))
+                    // 1 is refused; 2 and 3 are "allowed, but no fix yet".
+                    put(kind, code == 1 || is_err(code) ? "refused" : "allowed")
+                }
+            }
+            if kind == "notifications" {
+                if native {
+                    let sent = js("quilloNative.notify", notify_title, notify_text, 1)
+                    put(kind, is_err(sent) ? "refused" : "allowed")
+                } else {
+                    let said = js("Notification.requestPermission")
+                    put(kind, is_err(said) ? "refused" : (permission_checklist_word(said) ?? "ask"))
+                }
+            }
+            if kind == "motion" {
+                // Called, not looked for: a field of a function stops the handler. Where there is no
+                // such call (all but iOS) `js` says it is not defined, and nothing needs asking.
+                let said = js("DeviceOrientationEvent.requestPermission")
+                if is_err(said) {
+                    put(kind, contains(str(said), "not defined") ? "allowed" : "refused")
+                } else {
+                    put(kind, permission_checklist_word(said) ?? "ask")
+                }
+            }
+            busy = ""
+        }
+    }
+    let back = (_e = null) => {
+        if js("document.visibilityState") == "visible" {
+            look_all()
+            // The app cannot read what Settings did to these with no prompt: asked again, only
+            // what was refused, it says at once. Notifications go to "ask", since asking sends one.
+            if settings_trip {
+                settings_trip = false
+                for it in items {
+                    let kind = get(it, "kind") ?? ""
+                    if get(states, kind, "") == "refused" {
+                        if kind == "location" && native { ask(kind) } else { put(kind, "ask") }
+                    }
+                }
+            }
+        }
+    }
+    let settings = () => {
+        settings_trip = true
+        js("quilloNative.openSettings")
+    }
+    let tally = permission_checklist_tally(items, states)
+    let missing = permission_checklist_missing(items, states)
+    <section class={ui_cls(["ui-permission-checklist", class])} aria-label={label_text}
+             @mount={() => {
+                 native = !is_err(js("quilloNative"))
+                 agent = js("navigator.userAgent")
+                 look_all()
+                 // A browser tells of a change itself; Settings is seen on coming back.
+                 for it in items {
+                     let kind = get(it, "kind") ?? ""
+                     let query = permission_checklist_info(kind).query
+                     if query != null {
+                         let status = js("navigator.permissions.query", { name: query })
+                         if !is_err(status) {
+                             let told = (_e) => { look(kind) }
+                             status.addEventListener("change", told)
+                             watched = watched + [{ status: status, told: told }]
+                         }
+                     }
+                 }
+                 let d = js("document")
+                 d.addEventListener("visibilitychange", back)
+                 js("window.addEventListener", "focus", back)
+                 js("window.addEventListener", "pageshow", back)
+                 () => {
+                     for w in watched { w.status.removeEventListener("change", w.told) }
+                     d.removeEventListener("visibilitychange", back)
+                     js("window.removeEventListener", "focus", back)
+                     js("window.removeEventListener", "pageshow", back)
+                 }
+             }}>
+        <ul.ui-permission-checklist-list>
+            {for it in items {
+                let kind = get(it, "kind") ?? ""
+                let info = permission_checklist_info(kind)
+                let name = get(it, "label") ?? info.label
+                let now = get(states, kind, "checking")
+                <li.ui-permission-checklist-row key={kind} data-kind={kind} data-state={now}>
+                    <span.ui-permission-checklist-icon aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                             stroke-linejoin="round"><path d={info.icon}/></svg>
+                    </span>
+                    <div.ui-permission-checklist-text>
+                        <h3>{name} <span.ui-permission-checklist-state>{permission_checklist_text(now)}</span>
+                            {get(it, "required") == true && <span.ui-permission-checklist-needed>Needed</span>}</h3>
+                        {get(it, "reason") != null && <p.ui-permission-checklist-reason>{it.reason}</p>}
+                        {now == "refused" && !native && <p.ui-permission-checklist-help>{permission_checklist_where(agent, name)}</p>}
+                        {now == "none" && <p.ui-permission-checklist-help>This device or browser does not have it.</p>}
+                    </div>
+                    {now == "ask" && <div.ui-permission-checklist-act>
+                        <Button size="lg" variant="soft" label={`Allow ${name}`} loading={busy == kind} on_click={() => { ask(kind) }}>Allow</Button>
+                    </div>}
+                    {now == "refused" && native && <div.ui-permission-checklist-act>
+                        <Button size="lg" variant="outline" label={`Open Settings for ${name}`} on_click={settings}>Open Settings</Button>
+                    </div>}
+                </li>
+            }}
+        </ul>
+        <div.ui-permission-checklist-foot>
+            <div>
+                <p.ui-permission-checklist-count role="status">{tally.allowed} of {tally.total} allowed</p>
+                {len(missing) > 0 && <p.ui-permission-checklist-missing>
+                    {(missing | map((it) => get(it, "label") ?? permission_checklist_info(get(it, "kind") ?? "").label) | join(", "))} needed to go on.
+                </p>}
+            </div>
+            <Button size="lg" full={true} disabled={len(missing) > 0} on_click={() => { on_done && on_done(states) }}>{done_label}</Button>
+        </div>
+    </section>
+}

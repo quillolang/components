@@ -1,0 +1,149 @@
+// DateWheels: month, day and year wheels that keep each other valid: there is no 31
+// February to reach, and a limit takes away the months and days past it. Each wheel is a
+// WheelPicker, so each has a real <select> under it for screen readers and keys. The form
+// gets one field, the date in ISO.
+//
+//   <DateWheels name="birthday" label="Birthday" value="1990-06-15" latest={today}/>
+//   <DateWheels label="Check-in" today={today} earliest={today} latest="2027-12-31" order="dmy"
+//               on_change={(d) => { checkin = d }}/>
+//
+// value: the date, "YYYY-MM-DD", and it moves the wheels when it changes. today: where
+// they start when value is empty or not a date, as it cannot be read while the server
+// renders; else they start on the earliest date. earliest, latest: the limits, "YYYY-MM-DD"
+// (1900-01-01 and 2100-12-31; the wrong way round, they are swapped; not a date, left out).
+// order: "mdy" (default), "dmy" or "ymd". months: twelve names, for another language;
+// weekdays: seven, Sunday first. rows: as in WheelPicker (5). label, name, disabled, class
+// as for every field. on_change(date): inside one of your components, given the ISO date
+// once a wheel has come to rest.
+//
+// A day that does not fit the new month goes to the month's last day and does not come
+// back: 31 January, then February, then March is 28 or 29 March, as on a phone.
+// On a wide container (440 px and up, past any phone held upright: a tablet or a pane) the date stands in a panel beside
+// the wheels.
+//
+// date_wheels_parse, date_wheels_fit, date_wheels_month_list, date_wheels_day_list and
+// date_wheels_weekday are the logic.
+
+import ui/theme.qwe use ui_cls
+import ui/wheel_picker.qwe use WheelPicker
+
+let date_wheels_month_names = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+let date_wheels_day_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+let date_wheels_css = css`
+.ui-date-wheels { container-type: inline-size; min-width: 0; font: 15px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-date-wheels-body { display: grid; gap: 10px; border: 0; margin: 0; padding: 0; min-width: 0; }
+.ui-date-wheels-set { display: grid; grid-template-columns: 1.7fr .8fr 1.1fr; gap: 4px; min-width: 0; }
+.ui-date-wheels-ymd .ui-date-wheels-set { grid-template-columns: 1.1fr 1.7fr .8fr; }
+.ui-date-wheels-dmy .ui-date-wheels-set { grid-template-columns: .8fr 1.7fr 1.1fr; }
+.ui-date-wheels-out { display: block; text-align: center; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-date-wheels-big { display: none; }
+@container (min-width: 440px) {
+  .ui-date-wheels-body { grid-template-columns: minmax(150px, 220px) minmax(0, 420px); justify-content: center; align-items: center; gap: 16px; }
+  .ui-date-wheels-out { padding: 18px 12px; border-radius: var(--ui-radius); background: var(--ui-subtle); }
+  .ui-date-wheels-big { display: block; font-size: 56px; line-height: 1.1; font-weight: 700; }
+  .ui-date-wheels-line { display: block; font-weight: 500; color: var(--ui-muted); }
+}
+`
+
+fn date_wheels_pad(n: int, width: int = 2) -> str {
+    let s = str(n)
+    len(s) >= width ? s : join(range(width - len(s)) | map((_i) => "0"), "") + s
+}
+
+fn date_wheels_days_in(y: int, m: int) -> int {
+    if m == 2 { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 ? 29 : 28 }
+    m == 4 || m == 6 || m == 9 || m == 11 ? 30 : 31
+}
+
+// "YYYY-MM-DD" as { y, m, d }, or null for anything that is not a real date.
+fn date_wheels_parse(text) {
+    if type_of(text) != "str" || !re.test(text, "^[0-9]{4}-[0-9]{2}-[0-9]{2}$") { return null }
+    let p = split(text, "-") | map((s) => int(s))
+    p[1] >= 1 && p[1] <= 12 && p[2] >= 1 && p[2] <= date_wheels_days_in(p[0], p[1]) ? { y: p[0], m: p[1], d: p[2] } : null
+}
+
+fn date_wheels_iso(p) -> str = `${date_wheels_pad(p.y, 4)}-${date_wheels_pad(p.m)}-${date_wheels_pad(p.d)}`
+
+fn date_wheels_rank(p) -> int = p.y * 10000 + p.m * 100 + p.d
+
+// The nearest date to y, m, d that is real and inside the limits, moving the day
+// only as far as it has to: a month too short takes its last day.
+fn date_wheels_fit(y: int, m: int, d: int, lo, hi) {
+    let days = date_wheels_days_in(y, m)
+    let p = { y: y, m: m, d: min([d, days]) }
+    date_wheels_rank(p) < date_wheels_rank(lo) ? lo : date_wheels_rank(p) > date_wheels_rank(hi) ? hi : p
+}
+
+// The months of year y inside the limits, as numbers.
+fn date_wheels_month_list(y: int, lo, hi) -> list =
+    range(y == lo.y ? lo.m : 1, (y == hi.y ? hi.m : 12) + 1)
+
+fn date_wheels_day_list(y: int, m: int, lo, hi) -> list =
+    range(y == lo.y && m == lo.m ? lo.d : 1, (y == hi.y && m == hi.m ? hi.d : date_wheels_days_in(y, m)) + 1)
+
+// The day of the week, 0 for Sunday (Sakamoto's method), so no date library is needed
+// while the wheels turn.
+fn date_wheels_weekday(y: int, m: int, d: int) -> int {
+    let shift = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+    let yy = m < 3 ? y - 1 : y
+    (yy + floor(yy / 4) - floor(yy / 100) + floor(yy / 400) + shift[m - 1] + d) % 7
+}
+
+// The limits as parts, the right way round.
+fn date_wheels_limits(earliest, latest) {
+    let lo = date_wheels_parse(earliest) ?? { y: 1900, m: 1, d: 1 }
+    let hi = date_wheels_parse(latest) ?? { y: 2100, m: 12, d: 31 }
+    date_wheels_rank(lo) > date_wheels_rank(hi) ? { lo: hi, hi: lo } : { lo: lo, hi: hi }
+}
+
+fn date_wheels_start(value, today, lo, hi) {
+    let p = date_wheels_parse(value) ?? date_wheels_parse(today) ?? lo
+    date_wheels_fit(p.y, p.m, p.d, lo, hi)
+}
+
+component DateWheels(value: str? = null, today: str? = null, earliest: str? = null, latest: str? = null, order: str = "mdy",
+                     months: list = date_wheels_month_names, weekdays: list = date_wheels_day_names, rows: int = 5, label: str = "Date",
+                     name: str? = null, disabled: bool = false, on_change = null, class: str? = null) {
+    style global date_wheels_css
+    let bounds = date_wheels_limits(earliest, latest)
+    let lo = bounds.lo
+    let hi = bounds.hi
+    let asked = date_wheels_iso(date_wheels_start(value, today, lo, hi))
+    state seen = asked
+    state cur = date_wheels_start(value, today, lo, hi)
+    if asked != seen {
+        seen = asked
+        cur = date_wheels_start(value, today, lo, hi)
+    }
+    let name_of = (m: int) => len(months) == 12 ? str(months[m - 1]) : date_wheels_month_names[m - 1]
+    let day_name = (i: int) => len(weekdays) == 7 ? str(weekdays[i]) : date_wheels_day_names[i]
+    let pick = (y: int, m: int, d: int) => {
+        let next = date_wheels_fit(y, m, d, lo, hi)
+        if next != cur {
+            cur = next
+            on_change && on_change(date_wheels_iso(next))
+        }
+    }
+    let month_opts = date_wheels_month_list(cur.y, lo, hi) | map((m) => { value: str(m), label: name_of(m) })
+    let parts = order == "dmy" ? ["d", "m", "y"] : order == "ymd" ? ["y", "m", "d"] : ["m", "d", "y"]
+    <div class={ui_cls(["ui-date-wheels", order == "dmy" && "ui-date-wheels-dmy", order == "ymd" && "ui-date-wheels-ymd", class])}>
+        <fieldset.ui-date-wheels-body aria-label={label}>
+            <output.ui-date-wheels-out aria-live="polite">
+                <span.ui-date-wheels-big aria-hidden="true">{cur.d}</span>
+                <span.ui-date-wheels-line>{day_name(date_wheels_weekday(cur.y, cur.m, cur.d))}, {name_of(cur.m)} {cur.d}, {cur.y}</span>
+            </output>
+            <div.ui-date-wheels-set>
+                {for part in parts => <div key={part}>
+                    {part == "m" ? <WheelPicker label="Month" rows={rows} disabled={disabled} value={cur.m} options={month_opts}
+                                                on_change={(v) => { pick(cur.y, int(v), cur.d) }}/>
+                     : part == "d" ? <WheelPicker label="Day" rows={rows} disabled={disabled} value={cur.d} options={date_wheels_day_list(cur.y, cur.m, lo, hi)}
+                                                  on_change={(v) => { pick(cur.y, cur.m, int(v)) }}/>
+                     : <WheelPicker label="Year" rows={rows} disabled={disabled} value={cur.y} options={range(lo.y, hi.y + 1)}
+                                    on_change={(v) => { pick(int(v), cur.m, cur.d) }}/>}
+                </div>}
+            </div>
+        </fieldset>
+        {name != null && <input type="hidden" name={name} value={date_wheels_iso(cur)}/>}
+    </div>
+}

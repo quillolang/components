@@ -1,0 +1,278 @@
+// QrScanner: reads a QR code through the camera with the browser's BarcodeDetector, with a
+// viewfinder and the torch where the phone has one. Where there is no BarcodeDetector
+// (Safari, so every iPhone), or the camera is refused, the code can be typed: entry by hand
+// is always on screen, as a person who cannot point a camera needs it anyway. What it reads
+// is only shown and handed to on_scan: a code is never opened by itself, since anyone can
+// stick one on a wall.
+//
+//   component Join() {
+//       state code = ""
+//       <QrScanner on_scan={(text) => { code = text }}/>
+//   }
+//
+// label: what opens the camera ("Scan a code"). entry_label: the field for typing it ("Or
+// type the code"). interval: milliseconds between looks at the picture (250). facing:
+// "environment" (the back camera, default) or "user". field: starts the typing field's id
+// ("qr-scanner"), to give each on a page its own. on_scan(text): inside one of your
+// components, given the code's text, from the camera or typed. It is called once a scan:
+// the camera closes, and "Scan again" opens it. Text is trimmed, and limited to 4096
+// characters, with control characters taken out.
+//
+// The camera is let go when a code is read, when the app leaves the screen and when the
+// component leaves the page.
+//
+// Needs Button: `import ui/button.qwe use Button`.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let qr_scanner_css = css`
+.ui-qr-scanner { container-type: inline-size; width: 100%; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-qr-scanner-body { display: grid; gap: 12px; }
+.ui-qr-scanner-frame {
+  position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 1; max-height: 70dvh; width: 100%; margin: 0 auto;
+  border-radius: var(--ui-radius); background: #111; color: #eee; text-align: center;
+}
+.ui-qr-scanner-frame video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.ui-qr-scanner-frame video[hidden] { display: none; }
+.ui-qr-scanner-msg { z-index: 1; max-width: 80%; margin: 0; padding: 12px; }
+/* The finder: a square of clear picture, the rest dimmed by its own shadow. */
+.ui-qr-scanner-finder { position: absolute; left: 50%; top: 50%; width: 62%; aspect-ratio: 1; transform: translate(-50%, -50%); border-radius: 12px; box-shadow: 0 0 0 999px rgba(0, 0, 0, .45); pointer-events: none; }
+.ui-qr-scanner-finder i { position: absolute; width: 28px; height: 28px; border: 0 solid #fff; }
+.ui-qr-scanner-finder i:nth-child(1) { left: 0; top: 0; border-width: 4px 0 0 4px; border-top-left-radius: 12px; }
+.ui-qr-scanner-finder i:nth-child(2) { right: 0; top: 0; border-width: 4px 4px 0 0; border-top-right-radius: 12px; }
+.ui-qr-scanner-finder i:nth-child(3) { left: 0; bottom: 0; border-width: 0 0 4px 4px; border-bottom-left-radius: 12px; }
+.ui-qr-scanner-finder i:nth-child(4) { right: 0; bottom: 0; border-width: 0 4px 4px 0; border-bottom-right-radius: 12px; }
+.ui-qr-scanner-finder b { position: absolute; left: 8px; right: 8px; top: 8px; height: 2px; background: var(--ui-accent); animation: ui-qr-scanner-sweep 2.4s ease-in-out infinite alternate; }
+@keyframes ui-qr-scanner-sweep { to { top: calc(100% - 10px); } }
+.ui-qr-scanner-side { display: grid; gap: 10px; align-content: start; }
+.ui-qr-scanner-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-qr-scanner-bar > * { flex: 1 1 auto; }
+.ui-qr-scanner-found { display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-qr-scanner-kind { color: var(--ui-muted); font-size: 12px; }
+.ui-qr-scanner-text { overflow-wrap: anywhere; font-weight: 500; }
+.ui-qr-scanner-entry { display: grid; gap: 6px; }
+.ui-qr-scanner-entry label { font-size: 13px; font-weight: 500; }
+.ui-qr-scanner-row { display: flex; gap: 8px; }
+.ui-qr-scanner-row input {
+  flex: 1; min-width: 0; height: 46px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 16px/1.2 var(--ui-font);
+}
+.ui-qr-scanner-row input:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-qr-scanner-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-qr-scanner-why { margin: 0; color: var(--ui-danger); font-size: 13px; }
+@container (min-width: 440px) {
+  .ui-qr-scanner-body { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 16px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-qr-scanner-finder b { animation: none; top: 50%; } }
+`
+
+// Text as it goes on: trimmed, no control characters, at most 4096 characters. It splits
+// once and joins, as a code may be long and this runs on each scan.
+fn qr_scanner_clean(text) -> str {
+    if text == null || is_err(text) { return "" }
+    let kept = split(str(text), "") | filter((c) => c >= " " && c != "\u{7F}")
+    trim(join(slice(kept, 0, 4096), ""))
+}
+
+// What a code seems to hold, to say so beside it.
+fn qr_scanner_kind(text: str) -> str {
+    let t = lower(slice(text, 0, 8))
+    if starts_with(t, "https://") || starts_with(t, "http://") { return "A link" }
+    if starts_with(t, "mailto:") { return "An email address" }
+    if starts_with(t, "tel:") { return "A phone number" }
+    if starts_with(t, "wifi:") { return "A Wi-Fi network" }
+    "Text"
+}
+
+fn qr_scanner_why(name) -> str = name == "NotAllowedError" || name == "SecurityError" ? "refused" : "none"
+
+fn qr_scanner_can_torch(caps) -> bool {
+    if caps == null || is_err(caps) { return false }
+    let t = get(caps, "torch", false)
+    t == true || (type_of(t) == "list" && contains(t, true))
+}
+
+component QrScanner(label: str = "Scan a code", entry_label: str = "Or type the code", interval: int = 250, facing: str = "environment",
+                    field: str = "qr-scanner", on_scan = null, class: str? = null) {
+    style global qr_scanner_css
+    state status = "idle"       // idle, starting, scanning, found, refused, none, no_detector
+    state stream = null
+    state track = null
+    state screen = null
+    state finder = null         // the detector
+    state busy = false
+    state code = ""
+    state typed = ""
+    state said = ""
+    state torch = "unknown"     // unknown, none, off, on
+    state settings = false
+    let release = () => {
+        if stream != null {
+            for t in js("Array.from", stream.getTracks()) { t.stop() }
+            stream = null
+            track = null
+        }
+        if screen != null { screen.srcObject = null }
+        torch = "unknown"
+    }
+    let found = (text: str) => {
+        release()
+        code = text
+        typed = ""
+        said = ""
+        status = "found"
+        if js("window").quilloNative != null { js("quilloNative.haptic", "success") }
+        on_scan && on_scan(text)
+    }
+    let look = () => {
+        if busy || finder == null || screen == null || screen.readyState < 2 { return null }
+        busy = true
+        let codes = js("Promise.resolve", finder.detect(screen))
+        busy = false
+        // It may have closed while the detector looked; a failed look is only one look.
+        if status == "scanning" && !is_err(codes) {
+            let hits = js("Array.from", codes)
+            let text = len(hits) > 0 ? qr_scanner_clean(hits[0].rawValue) : ""
+            if text != "" { found(text) }
+        }
+    }
+    if status == "scanning" { every(interval < 50 ? 50 : interval, look) }
+    let cannot = (kind: str, words: str) => {
+        release()
+        settings = kind == "refused" && js("window").quilloNative != null
+        said = words
+        status = kind
+    }
+    // A detector, or null: Chrome may have the class on a machine with no QR format.
+    let detector = () => {
+        let w = js("window")
+        if w.BarcodeDetector == null { return null }
+        // In Promises, as either may throw, which would stop the handler, not give an error value.
+        let kinds = js("Promise.resolve", js_new("Promise", (done) => { done(js("BarcodeDetector.getSupportedFormats")) }))
+        if is_err(kinds) || !contains(js("Array.from", kinds), "qr_code") { return null }
+        let d = js("Promise.resolve", js_new("Promise", (done) => { done(js_new("BarcodeDetector", { formats: ["qr_code"] })) }))
+        is_err(d) ? null : d
+    }
+    let open = () => {
+        if status == "starting" { return null }
+        said = ""
+        finder = detector()
+        if finder == null {
+            status = "no_detector"
+            return null
+        }
+        if js("navigator").mediaDevices == null {
+            cannot("none", "This page cannot reach a camera. Type the code instead.")
+            return null
+        }
+        status = "starting"
+        let got = js("Promise.resolve", js_new("Promise", (done) => {
+            done(js("navigator.mediaDevices.getUserMedia", { video: { facingMode: { ideal: facing }, width: { ideal: 1280 } }, audio: false }).then(
+                (s) => { stream: s, why: null }, (e) => { stream: null, why: e.name }))
+        }))
+        if got.stream == null {
+            let kind = qr_scanner_why(got.why)
+            cannot(kind, kind == "refused"
+                ? "The camera was not allowed. Allow it in Settings, or type the code."
+                : "No camera could be opened here. Type the code instead.")
+            return null
+        }
+        stream = got.stream
+        track = js("Array.from", stream.getVideoTracks())[0]
+        track.addEventListener("ended", (_e = null) => {
+            if status == "scanning" {
+                release()
+                said = "The camera stopped. Scan again to go on."
+                status = "idle"
+            }
+        })
+        screen.srcObject = stream
+        screen.play().catch((_ = null) => { said = "" })
+        status = "scanning"
+        let t = track
+        let caps = js("Promise.resolve", js_new("Promise", (done) => { done(t.getCapabilities != null ? t.getCapabilities() : null) }))
+        torch = qr_scanner_can_torch(caps) ? "off" : "none"
+    }
+    let close = () => {
+        release()
+        status = "idle"
+    }
+    let flip_torch = () => {
+        if track != null {
+            let want = torch != "on"
+            let took = js("Promise.resolve", js_new("Promise", (done) => {
+                done(track.applyConstraints({ advanced: [{ torch: want }] }).then((_ = null) => true, (_ = null) => false))
+            }))
+            if took == true { torch = want ? "on" : "off" } else { said = "The light would not change." }
+        }
+    }
+    let send = () => {
+        let text = qr_scanner_clean(typed)
+        if text == "" {
+            said = "Type the code first."
+        } else {
+            found(text)
+        }
+    }
+    <div class={ui_cls(["ui-qr-scanner", class])} data-state={status}
+         @mount={(_el) => {
+             let d = js("document")
+             let seen = (_e = null) => {
+                 if d.hidden && status == "scanning" {
+                     close()
+                     said = "The camera was closed while the app was away."
+                 }
+             }
+             d.addEventListener("visibilitychange", seen)
+             () => {
+                 d.removeEventListener("visibilitychange", seen)
+                 release()
+             }
+         }}>
+        <div.ui-qr-scanner-body>
+            <div.ui-qr-scanner-frame>
+                <video muted={true} playsinline={true} autoplay={true} hidden={status != "scanning"} aria-label="The camera's picture" @mount={(el) => { screen = el }}></video>
+                {status == "scanning" && <div.ui-qr-scanner-finder aria-hidden="true"><i></i><i></i><i></i><i></i><b></b></div>}
+                {status != "scanning" && <p.ui-qr-scanner-msg role="status">{match status {
+                    "starting" => "Asking for the camera…"
+                    "found" => "Code read."
+                    "refused" => "The camera is off."
+                    "none" => "No camera here."
+                    "no_detector" => "This browser cannot read codes from the camera."
+                    _ => "Point the camera at a QR code."
+                }}</p>}
+            </div>
+            <div.ui-qr-scanner-side>
+                {status == "found" && <div.ui-qr-scanner-found>
+                    <span.ui-qr-scanner-kind>{qr_scanner_kind(code)}</span>
+                    <span.ui-qr-scanner-text>{code}</span>
+                </div>}
+                <div.ui-qr-scanner-bar>
+                    {(status == "idle" || status == "starting") && <Button size="lg" disabled={status == "starting"} on_click={open}>{label}</Button>}
+                    {status == "found" && <Button size="lg" on_click={() => { code = ""; open() }}>Scan again</Button>}
+                    {(status == "refused" || status == "none") && <Button size="lg" variant="outline" tone="neutral" on_click={open}>Try again</Button>}
+                    {status == "refused" && settings && <Button size="lg" variant="outline" tone="neutral" on_click={() => { js("quilloNative.openSettings") }}>Open Settings</Button>}
+                    {status == "scanning" && (torch == "off" || torch == "on") && <button class="ui-btn ui-btn-lg ui-btn-outline ui-btn-neutral" type="button" aria-pressed={torch == "on" ? "true" : "false"} @click={flip_torch}>{torch == "on" ? "Torch off" : "Torch on"}</button>}
+                    {status == "scanning" && <Button size="lg" variant="outline" tone="neutral" on_click={close}>Close the camera</Button>}
+                </div>
+                {status == "scanning" && torch == "none" && <p.ui-qr-scanner-note>This camera has no light a page can reach.</p>}
+                <div.ui-qr-scanner-entry>
+                    <label for={`${field}-entry`}>{entry_label}</label>
+                    <div.ui-qr-scanner-row>
+                        <input id={`${field}-entry`} type="text" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="done"
+                               value={typed} @input={(e) => { typed = e.value }}
+                               @keydown={(e) => {
+                                   if e.key == "Enter" {
+                                       e.preventDefault()
+                                       send()
+                                   }
+                               }}/>
+                        <Button size="lg" variant="outline" on_click={send}>Use</Button>
+                    </div>
+                </div>
+                {said != "" && <p.ui-qr-scanner-why role="alert">{said}</p>}
+            </div>
+        </div>
+    </div>
+}

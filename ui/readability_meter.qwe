@@ -1,0 +1,305 @@
+// ReadabilityMeter: how hard a text is to read, worked out as it is typed: the Flesch
+// reading ease and Flesch-Kincaid grade, the counts of sentences, words and syllables,
+// the reading time, and the hardest sentences. A sentence does not end at "Dr.",
+// "e.g.", "J. Smith", "3.14", "1." at the start of a list line, or a full stop with a
+// small letter after it. Both scores are made for English, so a text in another script
+// or language is counted but not scored, and it says why; so is one with no words.
+// A text too short to mean much is scored, and it says that too.
+//
+//   <ReadabilityMeter value={post.body} name="body"/>
+//   <ReadabilityMeter wpm={230} hardest={5} on_change={(s) => { ease = s.ease }}/>
+//
+// value: the text to start with. name: the field's name ("text"), so a plain <form>
+// sends it. label: the field's label ("Text to score"). rows: the box's height in lines
+// (8). id: a prefix for its ids ("readability-meter"), unique on the page. wpm: words
+// read a minute (200). hardest: how many hard sentences to list (3; 0 hides them).
+// limit: the most characters scored (100000); past it, it scores the start and says
+// so. on_change(stats): inside one of your components, given the map below as it is
+// typed. class: more classes for its outer element.
+//
+// readability_meter_stats(text, wpm, hardest, limit) is the whole analysis, for a
+// program's own use: { words, sentences, syllables, characters, seconds, time, scored,
+// why, short, capped, ease, grade, band, tone, hard }, where ease and grade are
+// numbers and null when not scored, why says why not, and hard is a list of
+// { text, start, end, words, grade }. The pieces other text components share are here
+// too: readability_meter_words(text) gives each word's { text, start, end } (counting
+// characters), readability_meter_sentences(text) each sentence's,
+// readability_meter_syllables(word) a word's syllables, readability_meter_stop_words
+// the common words of each language, and readability_meter_language(words) the
+// language a text's words look like.
+
+import ui/theme.qwe use ui_cls
+
+let readability_meter_css = css`
+.ui-readability-meter { display: grid; gap: 14px; min-width: 0; max-width: 720px; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-readability-meter-field { display: grid; gap: 5px; min-width: 0; }
+.ui-readability-meter-field label { font-size: 13px; font-weight: 500; }
+.ui-readability-meter-field textarea { box-sizing: border-box; display: block; width: 100%; min-width: 0; padding: 9px 12px; resize: vertical; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.5 var(--ui-font); }
+.ui-readability-meter-field textarea:hover { border-color: var(--ui-strong); }
+.ui-readability-meter-field textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-readability-meter-score { display: grid; gap: 6px; padding: 14px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); --k: var(--ui-muted); }
+.ui-readability-meter-good { --k: var(--ui-success); }
+.ui-readability-meter-mid { --k: var(--ui-warning); }
+.ui-readability-meter-hard { --k: var(--ui-danger); }
+.ui-readability-meter-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; margin: 0; }
+.ui-readability-meter-ease { font-size: 30px; font-weight: 700; line-height: 1.1; color: var(--k); font-variant-numeric: tabular-nums; }
+.ui-readability-meter-band { font-weight: 600; }
+.ui-readability-meter-grade { color: var(--ui-muted); }
+.ui-readability-meter-bar { height: 8px; overflow: hidden; border-radius: 4px; background: var(--ui-border); }
+.ui-readability-meter-bar span { display: block; height: 100%; border-radius: 4px; background: var(--k); }
+.ui-readability-meter-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-readability-meter-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 10px; margin: 0; }
+.ui-readability-meter-stats div { min-width: 0; }
+.ui-readability-meter-stats dt { color: var(--ui-muted); font-size: 12px; }
+.ui-readability-meter-stats dd { margin: 0; font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-readability-meter-hardest { display: grid; gap: 6px; min-width: 0; }
+.ui-readability-meter-hardest h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.ui-readability-meter-hardest ol { display: grid; gap: 6px; margin: 0; padding: 0 0 0 20px; }
+.ui-readability-meter-hardest li { overflow-wrap: anywhere; }
+.ui-readability-meter-hardest small { display: block; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+`
+
+// Letters of every alphabet, as \w knows only ASCII. Scripts written without spaces
+// are kept apart: each of their characters counts as a word.
+let readability_meter_letter = "A-Za-zªµºÀ-ÖØ-öø-ʯ̀-ͯͰ-ϿЀ-ԯԱ-ևא-תؠ-ٟٮ-ۓऄ-෿ก-๎ກ-ໜḀ-῿가-힣"
+let readability_meter_cjk = "぀-ヿ㐀-䶿一-鿿豈-﫿"
+let readability_meter_word_re = `\\b(?:[A-Za-z]\\.)+[A-Za-z]\\b|[0-9]+(?:[.,:][0-9]+)+|[${readability_meter_letter}0-9]+(?:['’-][${readability_meter_letter}0-9]+)*|[${readability_meter_cjk}]`
+
+// Where a sentence may end: full stops with the quotes after them, then a space or the
+// end; the stops of Chinese and Japanese, which take no space; a blank line; and the
+// start of a line of a list, as its lines rarely have stops of their own. The counts
+// are there for the browser's patterns, which go back and try again: with a bare `+`
+// a page of dots takes minutes.
+let readability_meter_stop_re = "[.!?…]{1,8}[\"'”’»)\\]]{0,3}(?:\\s+|$)|[。！？｡]{1,8}[\"'”’」』）]{0,3}\\s*|\\n\\s*\\n\\s*|\\n[ \\t]*(?:[-*•]|[0-9]+[.)])[ \\t]"
+
+// Words whose full stop never ends a sentence.
+let readability_meter_abbreviations = "mr mrs ms mx dr prof rev gen col capt lt sgt st mt ft vs cf al approx dept fig figs eq nos vol pp ed eds e.g i.e eg ie u.s u.k u.n e.u"
+    | split(" ")
+
+// Each word of a text: { text, start, end }, counting characters.
+fn readability_meter_words(text: str) -> list = re.find_all(text, readability_meter_word_re)
+
+// Whether the stop found by `m` ends a sentence.
+fn readability_meter_ends(chars: list, m) -> bool {
+    let n = len(chars)
+    let mark = m.text[0]
+    if m.end >= n || mark == "\n" || contains("。！？｡", mark) { return true }
+    let after = chars[m.end]
+    if lower(after) == after && upper(after) != after { return false }
+    if mark != "." || len(trim(m.text)) > 1 { return true }
+    // The word before the full stop, from the characters, as a slice of a long text
+    // for each stop would cost the square of its length.
+    let from = m.start
+    while from > 0 && m.start - from < 16 && !re.test(chars[from - 1], "[\\s(\\[\"“‘]") { from -= 1 }
+    let word = join(slice(chars, from, m.start), "")
+    if contains(readability_meter_abbreviations, lower(word)) { return false }
+    if lower(word) == "no" && re.test(after, "[0-9]") { return false }
+    if word == "a.m" || word == "p.m" { return true }
+    if re.test(word, "^[A-HJ-Z]$") || re.test(word, "^(?:[A-Za-z]\\.)+[A-Za-z]$") { return false }
+    if re.test(word, "^[0-9]+$") {
+        // "1." opening a line numbers a list; "in 2026." ends a sentence.
+        let p = from - 1
+        while p >= 0 && (chars[p] == " " || chars[p] == "\t") { p -= 1 }
+        if p < 0 || chars[p] == "\n" { return false }
+    }
+    true
+}
+
+// Each sentence of a text: { text, start, end }, without the spaces around it.
+fn readability_meter_sentences(text: str) -> list {
+    if trim(text) == "" { return [] }
+    let chars = split(text, "")
+    let cuts = re.find_all(text, readability_meter_stop_re) | filter((m) => readability_meter_ends(chars, m)) | map((m) => m.text[0] == "\n" && trim(m.text) != "" ? m.start : m.end)
+    let bounds = [0, ...cuts, len(chars)]
+    let parts = for [a, b] in zip(bounds, drop(bounds, 1)) => {
+        let piece = join(slice(chars, a, b), "")
+        let t = trim(piece)
+        let lead = t == "" ? 0 : re.find(piece, "\\S").start
+        { text: t, start: a + lead, end: a + lead + len(t) }
+    }
+    parts | filter((p) => re.test(p.text, readability_meter_word_re))
+}
+
+// Words whose vowels the rule below miscounts.
+let readability_meter_odd_syllables = { area: 3, business: 2, create: 2, created: 3, every: 2, idea: 3, ideas: 3, people: 2, poem: 2, quiet: 2, science: 2, being: 2, doing: 2,
+                                        going: 2, seeing: 2, video: 3, radio: 3, real: 1, really: 2, reader: 2, readers: 2, naive: 2, "naïve": 2, chaos: 2, lion: 2, diet: 2 }
+
+// The syllables of a word, by the usual rule for English: groups of vowels, less a
+// silent ending. Right for most words, and close enough for a score; a number
+// counts as its digits said, up to four.
+fn readability_meter_syllables(word: str) -> int {
+    let w = re.replace(lower(word), "[’']", "")
+    if contains(w, "-") { return split(w, "-") | map(readability_meter_syllables) | sum() }
+    let odd = get(readability_meter_odd_syllables, w, null)
+    if odd != null { return odd }
+    let plain = re.replace(re.replace(re.replace(re.replace(re.replace(re.replace(w, "[àáâäãåæ]", "a"), "[èéêë]", "e"), "[ìíîï]", "i"), "[òóôöõøœ]", "o"), "[ùúûü]", "u"), "[ýÿ]", "y")
+    let letters = re.replace(plain, "[^a-z]", "")
+    if letters == "" { return max([1, min([len(re.replace(w, "[^0-9]", "")), 4])]) }
+    if len(letters) <= 3 { return 1 }
+    let stem = re.replace(re.replace(letters, "(?:[^laeiouy]es|[^td]ed|[^laeiouy]e)$", ""), "^y", "")
+    let groups = len(re.find_all(stem, "[aeiouy]+"))
+    max([groups, 1]) + (ends_with(w, "é") ? 1 : 0)
+}
+
+// The common words of each language: what a keyword is not, and how a language shows.
+let readability_meter_stop_words = {
+    en: "a about above after again against all also am an and any are aren't as at be because been before being below between both but by can can't cannot could couldn't did didn't do does doesn't doing don't down during each few for from further had hadn't has hasn't have haven't having he her here hers herself him himself his how i i'd i'll i'm i've if in into is isn't it it's its itself just let's me more most mustn't my myself no nor not now of off on once only or other ought our ours ourselves out over own same she should shouldn't so some such than that that's the their theirs them themselves then there there's these they they'd they'll they're they've this those through to too under until up us very was wasn't we we'd we'll we're we've were weren't what when where which while who whom why will with won't would wouldn't you you'd you'll you're you've your yours yourself yourselves",
+    es: "a al algo algunas algunos ante antes como con contra cual cuando de del desde donde durante e el ella ellas ellos en entre era eran es esa esas ese eso esos esta estaba estado estar estas este esto estos fue fueron ha había han hasta hay la las le les lo los más me mi mis mucho muy nada ni no nos nosotros o os otra otras otro otros para pero poco por porque que qué quien se sea ser si sí sin sobre son su sus también tan te tiene tienen todo todos tu tus un una uno unos y ya yo",
+    fr: "à au aussi aux avec avoir avons ayant c ce ceci cela celle celles celui ces cet cette ceux chez comme d dans de des donc du elle elles en entre est et été être eu eux fait il ils j je l la le les leur leurs lui m ma mais me même mes moi moins mon n ne ni nos notre nous on ont ou où par pas plus pour qu quand que quel quelle qui s sa sans se sera ses si son sont sous suis sur t ta te tes toi ton tous tout toute très tu un une vos votre vous y",
+    de: "ab aber alle allem allen aller alles als also am an auch auf aus bei beim bin bis bist da damit dann das dass dein deine dem den denn der des die dies diese diesem diesen dieser dieses doch dort du durch ein eine einem einen einer eines er es etwas euch euer für gegen habe haben hat hatte hier hin ich ihm ihn ihnen ihr ihre im in ist ja jede jedem jeden jeder jedes jetzt kann kein keine können mein meine mich mir mit muss nach nicht noch nun nur ob oder ohne sehr sein seine sich sie sind so sollte über um und uns unser unter vom von vor war waren was weil wenn wer werden wie wieder wir wird wo wurde zu zum zur",
+    pt: "a ao aos as até com como da das de dela delas dele deles depois do dos e ela elas ele eles em entre era essa essas esse esses esta está estão estas este estes eu foi foram há isso isto já lhe mais mas me mesmo meu meus minha muito na não nas nem no nos nós nossa nosso num numa o os ou para pela pelas pelo pelos por qual quando que quem se sem ser seu seus só sua suas também te tem têm um uma uns você vocês",
+    it: "a ad agli ai al alla alle allo anche ancora avere aveva c che chi ci come con cosa così cui da dal dalla dalle dei del della delle dello di dove due e è ed era erano essere fa gli ha hanno ho i il in io l la le lei li lo loro lui ma me mi mia mio molto ne nei nel nella nelle no noi non nostro o per perché più può quale quando quella quelle quello questa queste questi questo se sei si sia siamo sono su sua sue sui sul sulla suo suoi tra tu tutti tutto un una uno voi",
+}
+
+let readability_meter_language_names = { en: "English", es: "Spanish", fr: "French", de: "German", pt: "Portuguese", it: "Italian" }
+
+// Each language's common words as a set, so that a word costs one look.
+let readability_meter_stop_sets = reduce(keys(readability_meter_stop_words), {}, (acc, code) =>
+    set(acc, code, reduce(split(readability_meter_stop_words[code], " "), {}, (s, w) => set(s, w, true))))
+
+// Which language a list of words (lower case) looks like: { code, name, share }, the
+// share being how many are among its common words; null when none of them is.
+fn readability_meter_language(words: list) {
+    let n = len(words)
+    if n == 0 { return null }
+    let seen = for code in keys(readability_meter_stop_sets) {
+        let s = readability_meter_stop_sets[code]
+        { code, hits: count(words, (w) => has(s, w)) }
+    }
+    let best = reduce(seen, seen[0], (b, x) => x.hits > b.hits ? x : b)
+    best.hits == 0 ? null : { code: best.code, name: readability_meter_language_names[best.code], share: best.hits / n }
+}
+
+// How much of a text's letters are in each script, for saying why it is not scored:
+// null for a text mostly in the Latin alphabet, else the script's name.
+fn readability_meter_foreign_script(text: str) {
+    let size = (letters) => len(text) - len(re.replace(text, `[${letters}]+`, ""))
+    let latin = size("A-Za-zÀ-ɏḀ-ỿ")
+    let others = [["Chinese or Japanese", readability_meter_cjk], ["Korean", "가-힣"], ["Cyrillic", "Ѐ-ԯ"], ["Greek", "Ͱ-Ͽ"],
+                  ["Arabic", "ؠ-ۓ"], ["Hebrew", "א-ת"], ["Armenian", "Ա-և"], ["an Indian", "ऄ-෿"], ["Thai or Lao", "ก-ໜ"]]
+        | map((o) => { name: o[0], size: size(o[1]) })
+    let top = reduce(others, others[0], (b, x) => x.size > b.size ? x : b)
+    top.size > latin ? top.name : null
+}
+
+// A number with one decimal, the same on the server and in the browser, which write 70.0 differently.
+fn readability_meter_one(x) -> str {
+    let t = round(x * 10)
+    let a = abs(t)
+    `${t < 0 ? "-" : ""}${floor(a / 10)}.${a % 10}`
+}
+
+// The two formulas, for counts of words, sentences and syllables.
+fn readability_meter_ease(words: int, sentences: int, syllables: int) = 206.835 - 1.015 * (words / sentences) - 84.6 * (syllables / words)
+fn readability_meter_grade(words: int, sentences: int, syllables: int) = 0.39 * (words / sentences) + 11.8 * (syllables / words) - 15.59
+
+// Flesch's own names for the bands of the score.
+fn readability_meter_band(ease) {
+    if ease >= 90 { return { band: "Very easy", tone: "good" } }
+    if ease >= 80 { return { band: "Easy", tone: "good" } }
+    if ease >= 70 { return { band: "Fairly easy", tone: "good" } }
+    if ease >= 60 { return { band: "Plain English", tone: "good" } }
+    if ease >= 50 { return { band: "Fairly difficult", tone: "mid" } }
+    if ease >= 30 { return { band: "Difficult", tone: "mid" } }
+    { band: "Very difficult", tone: "hard" }
+}
+
+// How long `seconds` takes to read, in words.
+fn readability_meter_time(seconds: int) -> str {
+    if seconds == 0 { return "0 s" }
+    if seconds < 60 { return `${seconds} s` }
+    let m = floor(seconds / 60)
+    let s = seconds % 60
+    s == 0 ? `${m} min` : `${m} min ${s} s`
+}
+
+// Why a text cannot be scored, in a sentence; null when it can.
+fn readability_meter_refusal(text: str, words: list) {
+    if len(words) == 0 { return "There are no words to score." }
+    let script = readability_meter_foreign_script(text)
+    if script != null { return `Reading ease is worked out for English, and this text is mostly in ${script} script.` }
+    let plain = words | map((w) => re.replace(lower(w.text), "’", "'"))
+    let lang = readability_meter_language(plain)
+    // A short title may have no common word in it, so that alone needs some length.
+    let unsaid = count(plain, (w) => !re.test(w, "[aeiouyàáâäãåæèéêëìíîïòóôöõøœùúûüýÿ0-9]"))
+    if lang == null && (len(plain) >= 20 || unsaid * 2 > len(plain)) { return "Reading ease is worked out for English, and this does not look like English." }
+    if lang != null && lang.code != "en" && lang.share > 0.1 {
+        let english = count(plain, (w) => has(readability_meter_stop_sets.en, w))
+        if english / len(plain) < lang.share { return `Reading ease is worked out for English, and this looks like ${lang.name}.` }
+    }
+    null
+}
+
+// The whole analysis (see the top of the file). `limit` keeps a keystroke quick.
+fn readability_meter_stats(text: str, wpm: int = 200, hardest: int = 3, limit: int = 100000) {
+    let capped = len(text) > limit
+    let t = capped ? slice(text, 0, limit) : text
+    let found = readability_meter_words(t)
+    let sentences = readability_meter_sentences(t)
+    let words = len(found)
+    let seconds = ceil(words * 60 / (wpm < 1 ? 200 : wpm))
+    let base = { words, sentences: len(sentences), characters: len(t), seconds, time: readability_meter_time(seconds), capped,
+                 syllables: 0, scored: false, why: null, short: false, ease: null, grade: null, band: null, tone: "none", hard: [] }
+    if trim(t) == "" { return base }
+    let why = readability_meter_refusal(t, found)
+    if why != null { return { ...base, why } }
+    let per_word = found | map((w) => readability_meter_syllables(w.text))
+    let syllables = sum(per_word)
+    let ease = readability_meter_ease(words, len(sentences), syllables)
+    let grade = readability_meter_grade(words, len(sentences), syllables)
+    let rated = sentences | map((s) => {
+        let ws = readability_meter_words(s.text)
+        let syl = ws | map((w) => readability_meter_syllables(w.text)) | sum()
+        { ...s, words: len(ws), grade: readability_meter_grade(len(ws), 1, syl) }
+    })
+    let hard = hardest < 1 ? [] : take(reverse(sort_by(reverse(rated), (s) => s.grade)), hardest)
+    { ...base, ...readability_meter_band(ease), syllables, scored: true, short: words < 30 || len(sentences) < 3, ease, grade, hard }
+}
+
+component ReadabilityMeter(value: str = "", name: str = "text", label: str = "Text to score", rows: int = 8, id: str = "readability-meter", wpm: int = 200,
+                           hardest: int = 3, limit: int = 100000, on_change = null, class: str? = null) {
+    style global readability_meter_css
+    state text = value
+    let s = readability_meter_stats(text, wpm, hardest, limit)
+    let blank = trim(text) == ""
+    let grade_said = (g) => g < 1 ? "below grade 1" : `grade ${readability_meter_one(g)}`
+    let said = blank ? "Type or paste some text to score it."
+        : s.scored ? `Reading ease ${readability_meter_one(s.ease)}, ${lower(s.band)}, ${grade_said(s.grade)}.`
+        : s.why
+    <section class={ui_cls(["ui-readability-meter", class])} aria-labelledby={`${id}-said`}>
+        <div.ui-readability-meter-field>
+            <label for={`${id}-text`}>{label}</label>
+            <textarea id={`${id}-text`} name={name} rows={rows} value={text} @input={(e) => {
+                text = e.value
+                on_change && on_change(readability_meter_stats(e.value, wpm, hardest, limit))
+            }}></textarea>
+        </div>
+        <div class={ui_cls(["ui-readability-meter-score", `ui-readability-meter-${s.tone}`])}>
+            {s.scored && <p.ui-readability-meter-head aria-hidden="true">
+                <span.ui-readability-meter-ease>{readability_meter_one(s.ease)}</span>
+                <span.ui-readability-meter-band>{s.band}</span>
+                <span.ui-readability-meter-grade>{grade_said(s.grade)}</span>
+            </p>}
+            {s.scored && <div.ui-readability-meter-bar aria-hidden="true"><span style={`width: ${max([0, min([100, round(s.ease)])])}%`}></span></div>}
+            <p class={s.scored ? "ui-sr" : "ui-readability-meter-note"} id={`${id}-said`} aria-live="polite">{said}</p>
+            {s.scored && s.short && <p.ui-readability-meter-note>The text is short, so take this score as a rough guide: it needs 30 words and 3 sentences or more to mean much.</p>}
+            {s.capped && <p.ui-readability-meter-note>Only the first {format_number(limit, "en-US", 0)} characters were scored.</p>}
+        </div>
+        <dl.ui-readability-meter-stats>
+            <div><dt>Sentences</dt><dd>{s.sentences}</dd></div>
+            <div><dt>Words</dt><dd>{s.words}</dd></div>
+            <div><dt>Syllables</dt><dd>{s.scored ? s.syllables : "–"}</dd></div>
+            <div><dt>Reading time</dt><dd>{s.time}</dd></div>
+        </dl>
+        {len(s.hard) > 0 && <div.ui-readability-meter-hardest>
+            <h4>{len(s.hard) == 1 ? "Hardest sentence" : "Hardest sentences"}</h4>
+            <ol>
+                {for h in s.hard => <li key={h.start}>
+                    {h.text}
+                    <small>{h.words} {h.words == 1 ? "word" : "words"}, {grade_said(h.grade)}</small>
+                </li>}
+            </ol>
+        </div>}
+    </section>
+}

@@ -1,0 +1,335 @@
+// DecisionMatrix: options scored on weighted criteria, to a ranking that says how
+// firm it is. Each criterion is scaled to 0 to 1 across the options, cost criteria
+// the other way round, so that scores in dollars and scores out of ten can be added;
+// the weights are shares of their sum. Options that come out level are shown as
+// tied, not put in order by a rounding error. For each weight it works out how far
+// that weight must move, the others keeping their proportions, before another option
+// wins, or says that no weight on its own can do it.
+//
+//   <DecisionMatrix options={["Atlas", "Birch", "Cedar"]} scores={[[1200, 8], [900, 6], [1500, 9]]}
+//                   criteria={[{ name: "Price", weight: 40, cost: true }, { name: "Quality", weight: 60 }]}/>
+//   <DecisionMatrix options={names} criteria={criteria} scores={scores} on_change={(r) => { best = r.winners }}/>
+//
+// A criterion on which every option is the same separates nothing, and gives each
+// option the full score for it. Weights and scores may be any size, up to 15 digits;
+// the scores out of 100 are floats, and two options within 0.0000001 of a point are
+// tied.
+//
+// options: the options' names. criteria: each { name, weight, cost? }; cost: true means
+// lower is better. scores: a list per option of a number per criterion (a missing one
+// starts empty). The reader can edit all of it, and add and remove options and
+// criteria (up to 20 and 12). title: the heading ("Decision matrix"). id: a prefix for
+// its fields' ids ("decision-matrix"), unique on the page. The fields are named
+// option, criterion, weight, cost and score, in order, the score fields going along
+// each option; name: a prefix for those names. on_change(result): inside one of your
+// components, given { winners, tied, ranking } after each change, ranking being
+// { name, score, rank } best first, or null while something is missing.
+//
+// decision_matrix_solve(values, weights, costs) is the arithmetic, for a program's own
+// use, on a list per option of a number per criterion: it gives { shares, scaled,
+// totals, ranks, winners, tied, moves }, totals out of 100 and ranks that ties share.
+// A move is { criterion, from, to, rival }, shares from 0 to 1, or null when nothing
+// changes the winner.
+
+import ui/theme.qwe use ui_cls
+
+let decision_matrix_css = css`
+.ui-decision-matrix { display: grid; gap: 14px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-decision-matrix .ui-decision-matrix-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-decision-matrix-scroll { position: relative; min-width: 0; overflow-x: auto; }
+.ui-decision-matrix-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-decision-matrix-table { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-decision-matrix-table th, .ui-decision-matrix-table td { padding: 5px 6px; border-bottom: 1px solid var(--ui-border); text-align: left; vertical-align: top; font-weight: 400; }
+.ui-decision-matrix-table thead th { color: var(--ui-muted); font-size: 12px; white-space: nowrap; }
+.ui-decision-matrix-table .ui-decision-matrix-end { text-align: right; font-weight: 600; white-space: nowrap; }
+.ui-decision-matrix-head { display: grid; gap: 4px; min-width: 148px; }
+.ui-decision-matrix-input { box-sizing: border-box; width: 100%; min-width: 84px; height: 32px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-decision-matrix-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-decision-matrix-input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-decision-matrix-subtle { display: block; margin-top: 2px; color: var(--ui-muted); font-size: 12px; white-space: nowrap; }
+.ui-decision-matrix-check { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; white-space: nowrap; cursor: pointer; }
+.ui-decision-matrix-check input { margin: 0; accent-color: var(--ui-accent); }
+.ui-decision-matrix-best td, .ui-decision-matrix-best th { background: var(--ui-success-soft); }
+.ui-decision-matrix-button { min-height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 13px var(--ui-font); white-space: nowrap; cursor: pointer; }
+.ui-decision-matrix-button:hover:not(:disabled) { border-color: var(--ui-strong); }
+.ui-decision-matrix-button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-decision-matrix-button:disabled { opacity: .55; cursor: not-allowed; }
+.ui-decision-matrix-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-decision-matrix-live { display: grid; gap: 10px; min-width: 0; }
+.ui-decision-matrix-verdict { margin: 0; padding: 10px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-weight: 600; }
+.ui-decision-matrix-moves { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-decision-matrix-moves li { padding: 6px 0; border-bottom: 1px solid var(--ui-border); }
+.ui-decision-matrix-moves li:last-child { border-bottom: 0; }
+.ui-decision-matrix-moved { margin: 0; font-size: 13px; font-weight: 600; }
+.ui-decision-matrix-hint { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-decision-matrix-errors { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+`
+
+let decision_matrix_max_options = 20
+let decision_matrix_max_criteria = 12
+
+// A number as typed (commas allowed), null when it is not one.
+fn decision_matrix_read(text) {
+    let t = replace(trim(str(text ?? "")), ",", "")
+    if !re.test(t, "^[-+]?\\d{1,15}(\\.\\d{1,12})?$") { return null }
+    float(dec(t))
+}
+
+// A number with exactly `places` decimals, in whole numbers so that the server and
+// the browser write the same text.
+fn decision_matrix_num(v: num, places: int) -> str {
+    let scale = pow(10, places)
+    let units = round(abs(v) * scale)
+    let whole = floor(units / scale)
+    let frac = str(units - whole * scale)
+    `${v < 0 && units > 0 ? "-" : ""}${whole}${places == 0 ? "" : `.${repeat("0", places - len(frac))}${frac}`}`
+}
+
+fn decision_matrix_pct(share: num) -> str = `${decision_matrix_num(share * 100, 1)}%`
+
+// 1st, 2nd, 3rd, 11th.
+fn decision_matrix_ordinal(n: int) -> str {
+    let teen = n % 100 >= 11 && n % 100 <= 13
+    `${n}${teen ? "th" : (n % 10 == 1 ? "st" : (n % 10 == 2 ? "nd" : (n % 10 == 3 ? "rd" : "th")))}`
+}
+
+// One criterion's values on 0 to 1: the best is 1, the worst 0, in between in proportion.
+fn decision_matrix_scale(values: list, cost: bool) -> list {
+    let lo = min(values)
+    let hi = max(values)
+    if hi == lo { return values | map((_v) => 1) }
+    values | map((v) => (cost ? hi - v : v - lo) / (hi - lo))
+}
+
+// A total reduced to what counts as equal: the same key is a tie.
+fn decision_matrix_key(total: num) -> int = round(total * 10000000)
+
+// How far criterion c's share must go before option `win` stops being ahead of all the
+// others, the rest of the weights keeping their proportions: { criterion, from, to,
+// rival }, or null. An option's total is linear in that share: x n + (1 - x) r, n being
+// its scaled value and r its average on the other criteria; so against a rival the
+// lead is a straight line in x, and where it reaches 0 is worked out directly.
+fn decision_matrix_move(scaled: list, shares: list, totals: list, win: int, c: int) {
+    let w = shares[c]
+    if w >= 0.999999999 { return null }
+    let rest = (j: int) => (totals[j] - w * scaled[j][c]) / (1 - w)
+    let crossings = range(len(totals)) | filter((k) => k != win) | map((k) => {
+        let d0 = rest(win) - rest(k)
+        let d1 = scaled[win][c] - scaled[k][c]
+        let x = d0 == d1 ? null : d0 / (d0 - d1)
+        { rival: k, x }
+    }) | filter((o) => o.x != null && o.x >= 0 && o.x <= 1)
+    if len(crossings) == 0 { return null }
+    let near = first(sort_by(crossings, (o) => abs(o.x - w)))
+    { criterion: c, from: w, to: near.x, rival: near.rival }
+}
+
+fn decision_matrix_solve(values: list, weights: list, costs: list) -> map {
+    let count = len(costs)
+    let whole = sum(weights)
+    let shares = weights | map((w) => w / whole)
+    let columns = for c in range(count) => decision_matrix_scale(values | map((row) => row[c]), costs[c])
+    let scaled = for i in range(len(values)) => columns | map((col) => col[i])
+    let raw = scaled | map((row) => sum(for c in range(count) => row[c] * shares[c]))
+    let keys = raw | map(decision_matrix_key)
+    let ranks = keys | map((k) => 1 + len(keys | filter((o) => o > k)))
+    let winners = range(len(keys)) | filter((i) => ranks[i] == 1)
+    let moves = len(winners) != 1 ? [] : for c in range(count) => decision_matrix_move(scaled, shares, raw, winners[0], c)
+    { shares, scaled, totals: raw | map((t) => t * 100), ranks, winners, tied: len(winners) > 1, moves }
+}
+
+fn decision_matrix_start_criteria(criteria: list) -> list =
+    for i in range(min([len(criteria), decision_matrix_max_criteria])) {
+        let c = criteria[i]
+        { id: `c${i}`, name: str(c.name ?? ""), weight: c.weight == null ? "" : str(c.weight), cost: c.cost == true }
+    }
+
+fn decision_matrix_start_options(options: list, scores: list, count: int) -> list =
+    for i in range(min([len(options), decision_matrix_max_options])) {
+        let row = scores[i] ?? []
+        let cells = reduce(range(count), {}, (m, c) => set(m, `c${c}`, row[c] == null ? "" : str(row[c])))
+        { id: `o${i}`, name: str(options[i] ?? ""), cells }
+    }
+
+fn decision_matrix_name(text: str, fallback: str) -> str = filled(trim(text)) ?? fallback
+
+// What stops the sums, one sentence for each thing, the first dozen only.
+fn decision_matrix_problems(crit: list, opts: list) -> list {
+    let weight = for i in range(len(crit)) {
+        let c = crit[i]
+        let v = decision_matrix_read(c.weight)
+        let n = decision_matrix_name(c.name, `Criterion ${i + 1}`)
+        if v == null { [trim(c.weight) == "" ? `The weight of ${n} is empty.` : `The weight of ${n} must be a number, not "${trim(c.weight)}".`] }
+        else { v < 0 ? [`The weight of ${n} cannot be below 0.`] : [] }
+    }
+    let cell = for i in range(len(opts)) {
+        let o = opts[i]
+        for k in range(len(crit)) {
+            let t = trim(o.cells[crit[k].id] ?? "")
+            let where_at = `${decision_matrix_name(crit[k].name, `Criterion ${k + 1}`)} for ${decision_matrix_name(o.name, `Option ${i + 1}`)}`
+            decision_matrix_read(t) != null ? [] : [t == "" ? `${where_at} is empty.` : `${where_at} must be a number, not "${t}".`]
+        }
+    }
+    let found = flatten(weight) + flatten(flatten(cell))
+    let weights = crit | map((c) => decision_matrix_read(c.weight))
+    let none = len(found) == 0 && len(crit) > 0 && sum(weights) == 0
+    none ? ["At least one weight must be above 0."] : slice(found, 0, 12)
+}
+
+// A move as a sentence.
+fn decision_matrix_move_text(m, name: str, rival_of) -> str {
+    if m == null { return `${name}: no change to this weight alone changes the winner.` }
+    let up = m.to > m.from
+    `${name}: ${up ? "raise" : "lower"} it from ${decision_matrix_pct(m.from)} to ${decision_matrix_pct(m.to)} (${decision_matrix_num(abs(m.to - m.from) * 100, 1)} points) and ${rival_of(m.rival)} catches up.`
+}
+
+component DecisionMatrix(options: list = [], criteria: list = [], scores: list = [], title: str = "Decision matrix", id: str = "decision-matrix",
+                         name: str? = null, on_change = null, class: str? = null) {
+    style global decision_matrix_css
+    state crit = decision_matrix_start_criteria(criteria)
+    state opts = decision_matrix_start_options(options, scores, len(criteria))
+    state serial = len(options) + len(criteria)
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let problems = decision_matrix_problems(crit, opts)
+    let enough = len(crit) >= 1 && len(opts) >= 2
+    let ready = enough && len(problems) == 0
+    let solve_now = () => decision_matrix_solve(opts | map((o) => crit | map((c) => decision_matrix_read(o.cells[c.id]))),
+                                                crit | map((c) => decision_matrix_read(c.weight)), crit | map((c) => c.cost))
+    let r = ready ? solve_now() : null
+    let opt_name = (i: int) => decision_matrix_name(opts[i].name, `Option ${i + 1}`)
+    let crit_name = (i: int) => decision_matrix_name(crit[i].name, `Criterion ${i + 1}`)
+    let index_opts = range(len(opts))
+    let order = ready ? sort_by(index_opts, (i) => r.ranks[i]) : []
+    let tied_rank = (i: int) => len(r.ranks | filter((k) => k == r.ranks[i])) > 1
+    let verdict = () => {
+        let names = r.winners | map(opt_name) | join(" and ")
+        r.tied ? `${names} tie for first on ${decision_matrix_num(r.totals[r.winners[0]], 1)} out of 100.`
+               : `${names} wins on ${decision_matrix_num(r.totals[r.winners[0]], 1)} out of 100.`
+    }
+    let nearest = () => {
+        let real = r.moves | filter((m) => m != null)
+        len(real) == 0 ? null : first(sort_by(real, (m) => abs(m.to - m.from)))
+    }
+    let firmness = () => {
+        let n = nearest()
+        if n == null { return "No single weight can change the winner." }
+        let gap = abs(n.to - n.from) * 100
+        gap < 5 ? `A close call: moving ${crit_name(n.criterion)} by ${decision_matrix_num(gap, 1)} points changes the winner.`
+                : `The closest change is ${decision_matrix_num(gap, 1)} points on ${crit_name(n.criterion)}.`
+    }
+    let tell = () => {
+        if on_change != null {
+            if len(crit) < 1 || len(opts) < 2 || len(decision_matrix_problems(crit, opts)) > 0 { on_change(null) } else {
+                let s = solve_now()
+                let names = for i in range(len(opts)) => decision_matrix_name(opts[i].name, `Option ${i + 1}`)
+                on_change({ winners: s.winners | map((i) => names[i]), tied: s.tied,
+                            ranking: sort_by(range(len(names)), (i) => s.ranks[i]) | map((i) => ({ name: names[i], score: s.totals[i], rank: s.ranks[i] })) })
+            }
+        }
+    }
+    let edit_crit = (cid: str, field: str, value) => {
+        crit = crit | map((c) => c.id == cid ? set(c, field, value) : c)
+        tell()
+    }
+    let edit_opt = (oid: str, text: str) => {
+        opts = opts | map((o) => o.id == oid ? { ...o, name: text } : o)
+        tell()
+    }
+    let edit_cell = (oid: str, cid: str, text: str) => {
+        opts = opts | map((o) => o.id == oid ? { ...o, cells: set(o.cells, cid, text) } : o)
+        tell()
+    }
+    let add_crit = () => {
+        crit = push(crit, { id: `c${serial}`, name: "", weight: "1", cost: false })
+        serial += 1
+        tell()
+    }
+    let add_opt = () => {
+        opts = push(opts, { id: `o${serial}`, name: "", cells: {} })
+        serial += 1
+        tell()
+    }
+    let focus_add = (e) => { e.target.closest(".ui-decision-matrix").querySelector(".ui-decision-matrix-actions button").focus() }
+    let drop_crit = (e, cid: str) => {
+        focus_add(e)
+        crit = crit | filter((c) => c.id != cid)
+        tell()
+    }
+    let drop_opt = (e, oid: str) => {
+        focus_add(e)
+        opts = opts | filter((o) => o.id != oid)
+        tell()
+    }
+    <section class={ui_cls(["ui-decision-matrix", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-decision-matrix-title id={`${id}-title`}>{title}</h3>
+        <div.ui-decision-matrix-scroll tabindex="0" role="group" aria-label="Options by criteria">
+            <table.ui-decision-matrix-table>
+                <thead>
+                    <tr>
+                        <th scope="col">Option</th>
+                        {for i in range(len(crit)) {
+                            let c = crit[i]
+                            <th key={c.id} scope="col" data-crit={i}><div.ui-decision-matrix-head>
+                                <label.ui-sr for={`${id}-cn-${c.id}`}>Name of criterion {i + 1}</label>
+                                <input.ui-decision-matrix-input type="text" id={`${id}-cn-${c.id}`} name={named("criterion")} value={c.name} placeholder={`Criterion ${i + 1}`} autocomplete="off"
+                                       @input={(e) => { edit_crit(c.id, "name", e.value) }}/>
+                                <label.ui-decision-matrix-subtle for={`${id}-w-${c.id}`}>Weight{ready ? ` (${decision_matrix_pct(r.shares[i])})` : ""}</label>
+                                <input.ui-decision-matrix-input type="text" inputmode="decimal" id={`${id}-w-${c.id}`} name={named("weight")} value={c.weight} autocomplete="off"
+                                       aria-invalid={decision_matrix_read(c.weight) == null || decision_matrix_read(c.weight) < 0 ? "true" : null}
+                                       @input={(e) => { edit_crit(c.id, "weight", e.value) }}/>
+                                <label.ui-decision-matrix-check><input type="checkbox" name={named("cost")} value={c.id} checked={c.cost} @change={(e) => { edit_crit(c.id, "cost", e.checked) }}/> Cost: lower is better</label>
+                                <button.ui-decision-matrix-button type="button" aria-label={`Remove ${crit_name(i)}`} @click={(e) => { drop_crit(e, c.id) }}>Remove</button>
+                            </div></th>
+                        }}
+                        <th.ui-decision-matrix-end scope="col">Score</th>
+                        <th.ui-decision-matrix-end scope="col">Rank</th>
+                        <th scope="col"><span.ui-sr>Remove</span></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {for i in range(len(opts)) {
+                        let o = opts[i]
+                        <tr key={o.id} data-opt={i} class={ready && r.ranks[i] == 1 ? "ui-decision-matrix-best" : ""}>
+                            <th scope="row">
+                                <label.ui-sr for={`${id}-on-${o.id}`}>Name of option {i + 1}</label>
+                                <input.ui-decision-matrix-input type="text" id={`${id}-on-${o.id}`} name={named("option")} value={o.name} placeholder={`Option ${i + 1}`} autocomplete="off"
+                                       @input={(e) => { edit_opt(o.id, e.value) }}/>
+                            </th>
+                            {for k in range(len(crit)) {
+                                let c = crit[k]
+                                let t = o.cells[c.id] ?? ""
+                                <td key={c.id}>
+                                    <label.ui-sr for={`${id}-s-${o.id}-${c.id}`}>{crit_name(k)} for {opt_name(i)}</label>
+                                    <input.ui-decision-matrix-input type="text" inputmode="decimal" id={`${id}-s-${o.id}-${c.id}`} name={named("score")} value={t} autocomplete="off"
+                                           aria-invalid={decision_matrix_read(t) == null ? "true" : null} @input={(e) => { edit_cell(o.id, c.id, e.value) }}/>
+                                    {ready && <span.ui-decision-matrix-subtle data-k="scaled">{decision_matrix_num(r.scaled[i][k], 2)}</span>}
+                                </td>
+                            }}
+                            <td.ui-decision-matrix-end data-k="score">{ready ? decision_matrix_num(r.totals[i], 1) : ""}</td>
+                            <td.ui-decision-matrix-end data-k="rank">{ready ? `${tied_rank(i) ? "Tied " : ""}${decision_matrix_ordinal(r.ranks[i])}` : ""}</td>
+                            <td><button.ui-decision-matrix-button type="button" aria-label={`Remove ${opt_name(i)}`} @click={(e) => { drop_opt(e, o.id) }}>Remove</button></td>
+                        </tr>
+                    }}
+                </tbody>
+            </table>
+        </div>
+        <div.ui-decision-matrix-actions>
+            <button.ui-decision-matrix-button type="button" disabled={len(opts) >= decision_matrix_max_options} @click={add_opt}>Add an option</button>
+            <button.ui-decision-matrix-button type="button" disabled={len(crit) >= decision_matrix_max_criteria} @click={add_crit}>Add a criterion</button>
+        </div>
+        <div.ui-decision-matrix-live aria-live="polite">
+            {!enough && <p.ui-decision-matrix-hint>A decision needs at least two options and one criterion.</p>}
+            {enough && len(problems) > 0 && <ul.ui-decision-matrix-errors role="alert">{for p in problems => <li>{p}</li>}</ul>}
+            {ready && <p.ui-decision-matrix-verdict>{verdict()} {r.tied ? "" : firmness()}</p>}
+            {ready && !r.tied && <p.ui-decision-matrix-moved>How far each weight must move</p>}
+            {ready && !r.tied && <ul.ui-decision-matrix-moves>
+                {for c in range(len(crit)) => <li key={crit[c].id}>{decision_matrix_move_text(r.moves[c], crit_name(c), opt_name)}</li>}
+            </ul>}
+            {ready && r.tied && <p.ui-decision-matrix-hint>With a tie for first, any shift in the weights toward one of them decides it.</p>}
+            {ready && <p.ui-decision-matrix-hint>Order: {order | map((i) => `${opt_name(i)} ${decision_matrix_num(r.totals[i], 1)}`) | join(", ")}. A moved weight takes from the others in proportion.</p>}
+        </div>
+    </section>
+}

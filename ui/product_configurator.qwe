@@ -1,0 +1,350 @@
+// ProductConfigurator: builds a product from groups of options under rules. An
+// option can need others and rule others out: what clashes with the choices made
+// is disabled and says why, and a choice that breaks something already chosen goes
+// through, dropping what it broke and saying so, with a way back. The price follows
+// every change, each option showing what it would add or take off the choice it
+// replaces, and it says whether the configuration is valid or what is missing,
+// down to a required group nothing can be chosen from any more. Rules that can
+// never be met (options needing each other, a name that is not an option) are found
+// when it starts and reported, and those options stay off.
+//
+//   <ProductConfigurator base_price={999} selected={["i7"]} groups={[
+//       { id: "cpu", label: "Processor", required: true, options: [
+//           { id: "i5", label: "Core i5" }, { id: "i7", label: "Core i7", price: 300 }] },
+//       { id: "gfx", label: "Graphics", options: [
+//           { id: "rtx", label: "Discrete graphics", price: 250, requires: ["i7"], excludes: ["slim"] }] },
+//       { id: "extras", label: "Extras", multiple: true, most: 2, options: [
+//           { id: "slim", label: "Slim chassis", price: 120 }, { id: "dock", label: "Dock", price: 150 }] }]}/>
+//
+// groups: a list of { id, label, options, required?, multiple?, least?, most? }.
+// One choice unless multiple is true; required asks for one, least for that many,
+// most stops there; a group that is not required offers "None". options: a list of
+// { id, label, price?, requires?, excludes? }, ids unique across the groups; price a
+// number, decimal or text, 0 when left out, below 0 for a saving. requires: ids
+// that must all be chosen, an item that is itself a list being any one of those
+// (["i7", ["m16", "m32"]]). excludes: ids that cannot go with it, either way round.
+// At most 200 options are read, and it says so past that.
+// base_price: what the product costs before options. selected: the ids it starts
+// with, kept where the rules let them, and said where not. currency: ISO code
+// ("USD"). locale: how to write amounts (the program's). title: the heading
+// ("Build yours"). id: a prefix for its ids ("product-configurator"), unique on
+// the page. The fields are named by their group's id, so a form around it sends the
+// choices; name: a prefix for those names. on_change({ selected, total, valid,
+// missing, dropped }): inside one of your components, after each change; total a
+// decimal, missing a list of sentences, dropped those that came with the change.
+//
+// A program can check an order the same way: product_configurator_model(groups,
+// base_price, currency) reads the data, product_configurator_settle(model, ids)
+// gives what can stand of a list of ids, product_configurator_summary(model, picked)
+// the price and what is missing.
+
+import ui/theme.qwe use ui_cls
+
+let product_configurator_css = css`
+.ui-prodconf { display: grid; gap: 16px; min-width: 0; max-width: 680px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-prodconf .ui-prodconf-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-prodconf-group { display: grid; gap: 6px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-prodconf-group legend { padding: 0 0 4px; font-size: 13px; font-weight: 600; }
+.ui-prodconf-limit { color: var(--ui-muted); font-weight: 400; }
+.ui-prodconf-option { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 0 10px; align-items: center; padding: 8px 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); cursor: pointer; transition: border-color .15s, background-color .15s; }
+.ui-prodconf-option:hover { border-color: var(--ui-strong); }
+.ui-prodconf-option:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-prodconf-option input { margin: 0; accent-color: var(--ui-accent); }
+.ui-prodconf-on { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-prodconf-off { cursor: not-allowed; background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-prodconf-off:hover { border-color: var(--ui-border); }
+.ui-prodconf-name { min-width: 0; overflow-wrap: anywhere; }
+.ui-prodconf-cost { font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
+.ui-prodconf-why { grid-column: 2 / -1; font-size: 12px; color: var(--ui-muted); }
+.ui-prodconf-notes { display: grid; gap: 6px; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+.ui-prodconf-notes ul { margin: 0; padding-left: 18px; }
+.ui-prodconf-undo { justify-self: start; padding: 4px 10px; border: 1px solid currentColor; border-radius: var(--ui-radius-sm); background: transparent; color: inherit; font: 500 12px var(--ui-font); cursor: pointer; }
+.ui-prodconf-undo:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-prodconf-problems { margin: 0; padding: 10px 12px 10px 28px; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); color: var(--ui-danger); font-size: 13px; }
+.ui-prodconf-sum { display: grid; gap: 8px; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-prodconf-lines { display: grid; gap: 3px; margin: 0; padding: 0 0 8px; border-bottom: 1px solid var(--ui-border); list-style: none; font-size: 13px; }
+.ui-prodconf-lines li { display: flex; justify-content: space-between; gap: 12px; }
+.ui-prodconf-lines span:last-child { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-prodconf-total { display: flex; justify-content: space-between; gap: 12px; font-size: 16px; font-weight: 700; }
+.ui-prodconf-total span:last-child { color: var(--ui-accent); font-variant-numeric: tabular-nums; }
+.ui-prodconf-valid { margin: 0; color: var(--ui-success); font-size: 13px; font-weight: 600; }
+.ui-prodconf-missing { margin: 0; padding-left: 18px; color: var(--ui-danger); font-size: 13px; }
+@media (max-width: 420px) { .ui-prodconf { padding: 16px; } }
+@media (prefers-reduced-motion: reduce) { .ui-prodconf-option { transition: none; } }
+`
+
+// An amount as a decimal, 0 when left out, an error value when it cannot be read.
+fn product_configurator_amount(x) {
+    if x == null { return 0m }
+    let t = trim(str(x))
+    if t == "" { return 0m }
+    if !re.test(t, "^[+-]?\\d{1,12}(\\.\\d{1,8})?$") { return err("not an amount") }
+    dec(t)
+}
+
+// Any of these ids meets one requirement: an entry is an id or a list of them.
+fn product_configurator_any(entry) -> list = type_of(entry) == "list" ? entry | map((x) => str(x)) : [str(entry)]
+
+// An option's rules against another: exclusion works either way round.
+fn product_configurator_clash(a, b) -> bool = contains(a.excludes, b.id) || contains(b.excludes, a.id)
+
+// Options that can never be chosen: those not reached by adding, from nothing,
+// whatever has its requirements met. Options needing each other are never reached.
+fn product_configurator_dead(by, ids) {
+    let live = {}
+    let moved = true
+    while moved {
+        moved = false
+        for id in ids {
+            let o = by[id]
+            if !has(live, id) && o.priced && all(o.requires, (alts) => any(alts, (a) => has(live, a) && !product_configurator_clash(o, by[a]))) {
+                live = set(live, id, true)
+                moved = true
+            }
+        }
+    }
+    ids | filter((id) => !has(live, id))
+}
+
+// The product as data it can trust: { groups, by, ids, base, code, problems, dead },
+// `by` going from an option's id to it. What cannot be read goes in problems.
+fn product_configurator_model(groups, base_price, currency: str) {
+    let cap = 200
+    let problems = []
+    let asked = upper(trim(currency))
+    let known = !is_err(money.minor_units(asked))
+    let code = known ? asked : "USD"
+    if !known { problems = problems | push(`The currency "${currency}" is not known, so USD is used.`) }
+    let minor = money.minor_units(code)
+    let base_read = product_configurator_amount(base_price)
+    if is_err(base_read) { problems = problems | push("The base price is not an amount, so it counts as 0.") }
+    let by = {}
+    let ids = []
+    let tidy = []
+    let cut = false
+    for g in type_of(groups) == "list" ? groups : [] {
+        if type_of(g) != "map" || g.id == null || type_of(g.options) != "list" {
+            problems = problems | push("A group without an id or a list of options is left out.")
+        } else {
+            let gid = str(g.id)
+            let glabel = str(g.label ?? g.id)
+            let multi = g.multiple == true
+            let wanted = type_of(g.least) == "int" ? g.least : 0
+            let least = g.required == true && wanted < 1 ? 1 : wanted
+            let most = multi ? (type_of(g.most) == "int" ? g.most : null) : 1
+            let opts = []
+            for o in g.options {
+                if len(ids) >= cap {
+                    cut = true
+                } else if type_of(o) != "map" || o.id == null {
+                    problems = problems | push(`An option of ${glabel} has no id, so it is left out.`)
+                } else if has(by, str(o.id)) {
+                    problems = problems | push(`The id "${str(o.id)}" is used twice: the second is left out.`)
+                } else {
+                    let oid = str(o.id)
+                    let cost = product_configurator_amount(o.price)
+                    let label = str(o.label ?? o.id)
+                    if is_err(cost) { problems = problems | push(`${label} has a price that is not an amount, so it cannot be chosen.`) }
+                    let item = { id: oid, label, group: gid, group_label: glabel, multi, most, priced: !is_err(cost),
+                                 price: is_err(cost) ? 0m : round(cost, minor, "half_up"),
+                                 requires: type_of(o.requires) == "list" ? o.requires | map(product_configurator_any) : [],
+                                 excludes: type_of(o.excludes) == "list" ? o.excludes | map((x) => str(x)) : [] }
+                    by = set(by, oid, item)
+                    ids = ids | push(oid)
+                    opts = opts | push(item)
+                }
+            }
+            if least > len(opts) { problems = problems | push(`${glabel} asks for ${least} and has ${len(opts)}, so it can never be complete.`) }
+            tidy = tidy | push({ id: gid, label: glabel, multi, least, most, options: opts })
+        }
+    }
+    if cut { problems = problems | push(`Only the first ${cap} options are used.`) }
+    // Names that are not options: a requirement left with no way of being met stays,
+    // empty, which keeps its option off; an exclusion of nothing excludes nothing.
+    for id in ids {
+        let o = by[id]
+        let unknown = flatten(o.requires) + o.excludes | filter((x) => !has(by, x))
+        for x in unknown { problems = problems | push(`${o.label} names "${x}", which is not an option.`) }
+        by = set(by, id, merge(o, { requires: o.requires | map((alts) => alts | filter((a) => has(by, a))),
+                                    excludes: o.excludes | filter((x) => has(by, x)) }))
+    }
+    let dead = product_configurator_dead(by, ids)
+    let stuck = dead | filter((id) => by[id].priced) | map((id) => by[id].label)
+    if len(stuck) > 0 { problems = problems | push(`${join(stuck, ", ")} cannot be chosen: what ${len(stuck) == 1 ? "it needs" : "they need"} can never be met.`) }
+    { groups: tidy | map((g) => merge(g, { options: g.options | map((o) => by[o.id]) })), by, ids, code, problems,
+      base: is_err(base_read) ? 0m : round(base_read, minor, "half_up"), dead: reduce(dead, {}, (m, id) => set(m, id, true)) }
+}
+
+// The first requirement of `o` that `chosen` does not meet, as its options' names.
+fn product_configurator_unmet(model, o, chosen) {
+    let hole = o.requires | find((alts) => !any(alts, (a) => contains(chosen, a)))
+    if hole == null { return null }
+    hole | map((a) => model.by[a].label) | join(" or ")
+}
+
+// Why `o` cannot be chosen now, or null. A one-choice group's own choice does not
+// count against it: choosing this one replaces that.
+fn product_configurator_why(model, picked, o) {
+    if contains(picked, o.id) { return null }
+    if has(model.dead, o.id) { return o.priced ? "Cannot be chosen: what it needs can never be met" : "No price set" }
+    let rest = o.multi ? picked : picked | filter((p) => model.by[p].group != o.group)
+    let rival = rest | find((p) => product_configurator_clash(o, model.by[p]))
+    if rival != null { return `Not with ${model.by[rival].label}` }
+    let need = product_configurator_unmet(model, o, rest)
+    if need != null { return `Needs ${need}` }
+    let taken = picked | filter((p) => model.by[p].group == o.group) | len
+    if o.multi && o.most != null && taken >= o.most { return `At most ${o.most} in ${o.group_label}` }
+    null
+}
+
+// What of `picked` still stands, and what has to go, one after another, as one
+// dropped option can take another with it.
+fn product_configurator_fallout(model, picked) {
+    let kept = picked
+    let dropped = []
+    let moved = true
+    while moved {
+        moved = false
+        let hit = kept | find((p) => product_configurator_unmet(model, model.by[p], kept) != null)
+        if hit != null {
+            dropped = dropped | push({ id: hit, label: model.by[hit].label, need: product_configurator_unmet(model, model.by[hit], kept) })
+            kept = remove(kept, hit)
+            moved = true
+        }
+    }
+    { picked: kept, dropped }
+}
+
+// A change: gives { picked, dropped }, each dropped one with a sentence saying why.
+fn product_configurator_pick(model, picked, id: str, on: bool) {
+    let o = model.by[id]
+    let others = o.multi ? picked : picked | filter((p) => model.by[p].group != o.group)
+    let r = product_configurator_fallout(model, on ? others | filter((p) => p != id) | push(id) : remove(picked, id))
+    let cause = on ? `you chose ${o.label}` : `you took off ${o.label}`
+    { picked: r.picked, dropped: r.dropped | map((d) => merge(d, { text: `Dropped ${d.label}: it needs ${d.need}, and ${cause}.` })) }
+}
+
+// A one-choice group that is not required, set to None.
+fn product_configurator_clear(model, picked, group: str, label: str) {
+    let r = product_configurator_fallout(model, picked | filter((p) => model.by[p].group != group))
+    { picked: r.picked, dropped: r.dropped | map((d) => merge(d, { text: `Dropped ${d.label}: it needs ${d.need}, and you chose no ${label}.` })) }
+}
+
+// What can stand of a list of ids, however they are ordered: what is needed may
+// come after what needs it. { picked, dropped }, as sentences.
+fn product_configurator_settle(model, ids) {
+    let wanted = type_of(ids) == "list" ? unique(ids | map((x) => str(x))) : []
+    let picked = []
+    let moved = true
+    let fits = (o) => (o.multi || !any(picked, (p) => model.by[p].group == o.group)) && product_configurator_why(model, picked, o) == null
+    while moved {
+        moved = false
+        for id in wanted {
+            if has(model.by, id) && !contains(picked, id) && fits(model.by[id]) {
+                picked = picked | push(id)
+                moved = true
+            }
+        }
+    }
+    let said = (id) => {
+        if !has(model.by, id) { return `"${id}" is not an option.` }
+        let o = model.by[id]
+        let why = product_configurator_why(model, picked, o)
+        `Left out ${o.label}: ${why != null ? lower(slice(why, 0, 1)) + slice(why, 1) : `only one can be chosen in ${o.group_label}`}.`
+    }
+    { picked, dropped: wanted | filter((id) => !contains(picked, id)) | map(said) }
+}
+
+// The price and what is missing: { lines, total, missing, valid }.
+fn product_configurator_summary(model, picked) {
+    let lines = model.ids | filter((id) => contains(picked, id)) | map((id) => model.by[id])
+    let total = model.base + sum(lines | map((o) => o.price))
+    let missing = []
+    for g in model.groups {
+        let have = g.options | filter((o) => contains(picked, o.id)) | len
+        if have < g.least {
+            let shut = g.options | filter((o) => !contains(picked, o.id)) | map((o) => product_configurator_why(model, picked, o))
+            let open = shut | filter((w) => w == null) | len
+            if have + open < g.least {
+                missing = missing | push(`${g.label}: nothing can be chosen as things stand (${lower(first(shut | filter((w) => w != null)) ?? "no options")}).`)
+            } else {
+                missing = missing | push(g.multi ? `Choose ${g.least - have} more from ${g.label}.` : `Choose ${g.label}.`)
+            }
+        }
+    }
+    { lines, total, missing, valid: len(missing) == 0 }
+}
+
+component ProductConfigurator(groups = [], base_price = 0, selected = [], currency: str = "USD", locale: str? = null, title: str = "Build yours",
+                              id: str = "product-configurator", name: str? = null, on_change = null, class: str? = null) {
+    style global product_configurator_css
+    let model = product_configurator_model(groups, base_price, currency)
+    let start = product_configurator_settle(model, selected)
+    state picked = start.picked
+    state notes = start.dropped
+    state before = null
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let shown = (x) => {
+        let m = money.of(x, model.code, "half_up")
+        is_err(m) ? "a very large amount" : locale != null ? money.format(m, locale) : money.format(m)
+    }
+    let s = product_configurator_summary(model, picked)
+    let why = reduce(model.ids, {}, (m, i) => set(m, i, product_configurator_why(model, picked, model.by[i])))
+    // What choosing an option would add, against what it would replace.
+    let cost = (g, o) => {
+        if contains(picked, o.id) { return o.price == 0 ? "Included" : shown(o.price) }
+        let now = g.multi ? null : g.options | find((x) => contains(picked, x.id))
+        let d = o.price - (now != null ? now.price : 0m)
+        d == 0 ? (now != null ? "No change" : "Included") : d > 0 ? `+${shown(d)}` : `−${shown(0m - d)}`
+    }
+    let tell = (p, dropped) => {
+        if on_change != null {
+            let f = product_configurator_summary(model, p)
+            on_change({ selected: p, total: f.total, valid: f.valid, missing: f.missing, dropped })
+        }
+    }
+    let settle = (r) => {
+        let said = r.dropped | map((d) => d.text)
+        before = len(said) > 0 ? picked : null
+        notes = said
+        picked = r.picked
+        tell(r.picked, said)
+    }
+    <section class={ui_cls(["ui-prodconf", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-prodconf-title id={`${id}-title`}>{title}</h3>
+        {len(model.problems) > 0 && <ul.ui-prodconf-problems role="alert">{for p in model.problems => <li>{p}</li>}</ul>}
+        {len(model.groups) == 0 && <p.ui-prodconf-valid>Nothing to configure.</p>}
+        {for g in model.groups => <fieldset.ui-prodconf-group key={g.id}>
+            <legend>{g.label}{g.multi && g.most != null && <span.ui-prodconf-limit> (up to {g.most})</span>}{g.least > 0 && <span.ui-prodconf-limit> required</span>}</legend>
+            {!g.multi && g.least == 0 && <label class={ui_cls(["ui-prodconf-option", !any(g.options, (o) => contains(picked, o.id)) && "ui-prodconf-on"])}>
+                <input type="radio" name={named(g.id)} value="" checked={!any(g.options, (o) => contains(picked, o.id))}
+                       @change={(e) => { settle(product_configurator_clear(model, picked, g.id, g.label)) }}/>
+                <span.ui-prodconf-name>None</span>
+            </label>}
+            {for o in g.options => <label key={o.id} class={ui_cls(["ui-prodconf-option", contains(picked, o.id) && "ui-prodconf-on", get(why, o.id) != null && "ui-prodconf-off"])}>
+                <input type={g.multi ? "checkbox" : "radio"} name={named(g.id)} value={o.id} id={`${id}-${o.id}`} checked={contains(picked, o.id)} disabled={get(why, o.id) != null}
+                       aria-describedby={get(why, o.id) != null ? `${id}-${o.id}-why` : null} @change={(e) => { settle(product_configurator_pick(model, picked, o.id, e.checked)) }}/>
+                <span.ui-prodconf-name>{o.label}</span>
+                <span.ui-prodconf-cost>{cost(g, o)}</span>
+                {get(why, o.id) != null && <span.ui-prodconf-why id={`${id}-${o.id}-why`}>{get(why, o.id)}</span>}
+            </label>}
+        </fieldset>}
+        <div aria-live="polite">
+            {len(notes) > 0 && <div.ui-prodconf-notes>
+                <ul>{for n in notes => <li key={n}>{n}</li>}</ul>
+                {before != null && <button.ui-prodconf-undo type="button" @click={() => { picked = before; before = null; notes = []; tell(picked, []) }}>Put it back</button>}
+            </div>}
+        </div>
+        <div.ui-prodconf-sum aria-live="polite">
+            <ul.ui-prodconf-lines>
+                <li><span>Base price</span><span>{shown(model.base)}</span></li>
+                {for o in s.lines => <li key={o.id}><span>{o.label}</span><span>{o.price == 0 ? "Included" : shown(o.price)}</span></li>}
+            </ul>
+            <div.ui-prodconf-total><span>Total</span><span>{shown(s.total)}</span></div>
+            {s.valid && <p.ui-prodconf-valid>This configuration is valid.</p>}
+            {!s.valid && <ul.ui-prodconf-missing>{for m in s.missing => <li key={m}>{m}</li>}</ul>}
+        </div>
+    </section>
+}

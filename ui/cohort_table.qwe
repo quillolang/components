@@ -1,0 +1,235 @@
+// CohortTable: signup and activity events to a retention triangle: one row for each
+// week or month of signups, one column for each period after it, heat-coloured, as
+// percentages or as people, with a weighted average row. A period that has not ended
+// is blank and not 0, so a young cohort never looks as if everyone left; a real 0 is
+// written. Cohorts of nobody keep their row, so the months read in order.
+//
+//   <CohortTable events={events} today="2026-02-04"/>
+//   <CohortTable events={events} today={today} period="month" show="count" on_change={(v) => { seen = v }}/>
+//
+// Each user counts once in a period, however often they came. Period 0 is the week
+// or month of their signup, and holds everyone in the cohort. Weeks start on Monday.
+// The average weighs cohorts by their size, and leaves out those whose period has
+// not ended, so that a column's average is over the same people as its cells.
+//
+// events: each { user, date, event? }. date: "2026-01-05", or a date-time, of which the
+// date is taken. A user's signup is their first event with event "signup", else their
+// first event of any kind. Events with no user or no readable date, and those before
+// the signup or after today, are left out, and counted in a note under the table; so
+// are events past the first 20,000. today: the day the table is read, as a date; it is
+// a prop so that the server and the browser agree (left out, the last event's day).
+// period: "week" (the default) or "month"; show: "percent" (the default) or "count";
+// the reader can switch both, from fields named period and show, with name a prefix
+// for those names. In counts the last row totals each column. limit: the most period
+// columns (12). max_cohorts: the most rows, the latest kept (24). title: the heading
+// ("Retention by cohort"). id: a prefix for its ids ("cohort-table"), unique on the
+// page. on_change(view): inside one of your components, given { period, show, average }
+// after a switch, average being the fraction kept in each period, null where unknown.
+//
+// cohort_table_build(events, unit, today, limit, max_cohorts) is the work, for a
+// program's own use: { cohorts, periods, average, totals, users, left_out }, each cohort
+// { start, label, size, cells }, a cell being the people active, null when not ended.
+
+import ui/theme.qwe use ui_cls
+
+let cohort_table_css = css`
+.ui-cohort-table { display: grid; gap: 12px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-cohort-table .ui-cohort-table-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-cohort-table-bar { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 0; }
+.ui-cohort-table-group { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin: 0; padding: 0; border: 0; font-size: 13px; }
+.ui-cohort-table-group legend { float: left; margin-right: 6px; padding: 0; color: var(--ui-muted); }
+.ui-cohort-table-group label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.ui-cohort-table-group input { margin: 0; accent-color: var(--ui-accent); }
+.ui-cohort-table-scroll { position: relative; min-width: 0; overflow-x: auto; }
+.ui-cohort-table-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-cohort-table-table { border-collapse: separate; border-spacing: 2px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-cohort-table-table th { padding: 5px 8px; color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: right; white-space: nowrap; }
+.ui-cohort-table-table th:first-child { position: sticky; left: 0; background: var(--ui-surface); text-align: left; }
+.ui-cohort-table-table td { min-width: 52px; padding: 5px 8px; border-radius: 4px; text-align: right; white-space: nowrap; }
+.ui-cohort-table-size { color: var(--ui-muted); }
+.ui-cohort-table-open { background: repeating-linear-gradient(135deg, transparent 0 4px, color-mix(in srgb, var(--ui-border) 45%, transparent) 4px 5px); }
+.ui-cohort-table-average th, .ui-cohort-table-average td { border-top: 1px solid var(--ui-strong); font-weight: 600; }
+.ui-cohort-table-say { margin: 0; font-size: 13px; }
+.ui-cohort-table-note { margin: 0; color: var(--ui-muted); font-size: 12px; }
+.ui-cohort-table-warn { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+`
+
+let cohort_table_cap = 20000
+
+// A date as "YYYY-MM-DD", from a date or the start of a date-time; null when it is not one.
+fn cohort_table_day(v) {
+    let t = slice(trim(str(v ?? "")), 0, 10)
+    re.test(t, "^\\d{4}-\\d{2}-\\d{2}$") && date.valid(t, "date") ? t : null
+}
+
+fn cohort_table_start(day: str, unit: str) -> str =
+    unit == "month" ? date.start_of_month(day) : date.add_days(day, 1 - date.parts(day).weekday)
+
+// Which period after a cohort's start a day is in; also how many have ended by that day.
+fn cohort_table_period(start: str, day: str, unit: str) -> int {
+    if unit != "month" { return floor(date.days_between(start, day) / 7) }
+    let a = date.parts(start)
+    let b = date.parts(day)
+    (b.year - a.year) * 12 + b.month - a.month
+}
+
+fn cohort_table_after(start: str, unit: str, n: int) -> str =
+    unit == "month" ? date.add_months(start, n) : date.add_days(start, 7 * n)
+
+fn cohort_table_label(start: str, unit: str) -> str = date.format(start, unit == "month" ? "MMM YYYY" : "D MMM YYYY")
+
+// A user's events to { cohort, periods, early, late }, or null when they sign up after today.
+fn cohort_table_user(days: list, signup_days: list, unit: str, today: str) {
+    let signup = first(sort(len(signup_days) > 0 ? signup_days : days))
+    if signup > today { return null }
+    let cohort = cohort_table_start(signup, unit)
+    let kept = days | filter((d) => d >= signup && d <= today)
+    let seen = group_by(kept | map((d) => cohort_table_period(cohort, d, unit)), (p) => p)
+    { cohort, periods: keys(seen), early: len(days | filter((d) => d < signup)), late: len(days) - len(kept) - len(days | filter((d) => d < signup)) }
+}
+
+fn cohort_table_build(events: list, unit: str, today: str, limit: int = 12, max_cohorts: int = 24) -> map {
+    let taken = slice(events, 0, cohort_table_cap)
+    let read = taken | map((e) => {
+        let who = type_of(e) == "map" ? filled(trim(str(e.user ?? ""))) : null
+        let day = type_of(e) == "map" ? cohort_table_day(e.date) : null
+        who == null || day == null ? null : { who, day, signup: e.event == "signup" }
+    })
+    let good = read | filter((r) => r != null)
+    let by_user = group_by(good, (r) => r.who)
+    let users = values(by_user)
+        | map((rs) => cohort_table_user(rs | map((r) => r.day), rs | filter((r) => r.signup) | map((r) => r.day), unit, today))
+    let placed = users | filter((u) => u != null)
+    let left_out = { unread: len(taken) - len(good), early: sum(placed | map((u) => u.early)), late: sum(placed | map((u) => u.late)),
+                     future_users: len(users) - len(placed), over: len(events) - len(taken) }
+    if len(placed) == 0 { return { cohorts: [], periods: 0, average: [], totals: [], users: 0, left_out } }
+    let by_cohort = group_by(placed, (u) => u.cohort)
+    let starts = sort(keys(by_cohort))
+    let span = cohort_table_period(starts[0], starts[len(starts) - 1], unit) + 1
+    let every = (span > max_cohorts ? range(span - max_cohorts, span) : range(span)) | map((n) => cohort_table_after(starts[0], unit, n))
+    let periods = min([limit, cohort_table_period(every[0], today, unit)])
+    let cohorts = every | map((start) => {
+        let members = by_cohort[start] ?? []
+        let counts = group_by(flatten(members | map((m) => m.periods)), (p) => p)
+        let ended = cohort_table_period(start, today, unit)
+        { start, label: cohort_table_label(start, unit), size: len(members),
+          cells: for p in range(periods) => p >= ended ? null : len(counts[str(p)] ?? []) }
+    })
+    let columns = for p in range(periods) => cohorts | filter((c) => c.cells[p] != null && c.size > 0)
+    let totals = for p in range(periods) => sum(columns[p] | map((c) => c.cells[p]))
+    let average = for p in range(periods) {
+        let base = sum(columns[p] | map((c) => c.size))
+        base == 0 ? null : totals[p] / base
+    }
+    { cohorts, periods, average, totals, users: len(placed), left_out }
+}
+
+// A fraction as a percentage to one decimal, in whole numbers so that the server and
+// the browser write the same text.
+fn cohort_table_pct(x: num) -> str {
+    let tenths = round(x * 1000)
+    `${floor(tenths / 10)}.${tenths % 10}%`
+}
+
+fn cohort_table_heat(x: num) -> str = `background: color-mix(in srgb, var(--ui-accent) ${round(x * 50)}%, transparent)`
+
+fn cohort_table_plural(n: int, one: str, many: str) -> str = n == 1 ? `1 ${one}` : `${n} ${many}`
+
+// What was left out, in a sentence, or null when nothing was.
+fn cohort_table_left_out(o: map) -> str? {
+    let parts = [
+        o.unread > 0 ? `${cohort_table_plural(o.unread, "event", "events")} with no user or no readable date` : null,
+        o.early > 0 ? `${cohort_table_plural(o.early, "event", "events")} before a signup` : null,
+        o.late > 0 ? `${cohort_table_plural(o.late, "event", "events")} after today` : null,
+        o.future_users > 0 ? `${cohort_table_plural(o.future_users, "user", "users")} signing up after today` : null,
+        o.over > 0 ? `${cohort_table_plural(o.over, "event", "events")} past the first ${cohort_table_cap}` : null,
+    ] | filter((p) => p != null)
+    len(parts) == 0 ? null : `Left out: ${join(parts, ", ")}.`
+}
+
+// The first period after signup, in words: where most of a product's story is.
+fn cohort_table_summary(b: map, unit: str) -> str {
+    let word = unit == "month" ? "month" : "week"
+    let base = `${cohort_table_plural(b.users, "user", "users")} in ${cohort_table_plural(len(b.cohorts), "cohort", "cohorts")}.`
+    if b.periods < 2 || b.average[1] == null { return `${base} No ${word} after signup has ended yet.` }
+    let ready = b.cohorts | filter((c) => c.size > 0 && c.cells[1] != null)
+    let best = last(sort_by(ready, (c) => c.cells[1] / c.size))
+    let worst = first(sort_by(ready, (c) => c.cells[1] / c.size))
+    let spread = len(ready) < 2 || best.cells[1] * worst.size == worst.cells[1] * best.size ? ""
+        : ` Best ${best.label} at ${cohort_table_pct(best.cells[1] / best.size)}, lowest ${worst.label} at ${cohort_table_pct(worst.cells[1] / worst.size)}.`
+    `${base} ${cohort_table_pct(b.average[1])} came back in ${word} 1.${spread}`
+}
+
+// The last event's day, for when no `today` is given.
+fn cohort_table_last_day(events: list) -> str? {
+    let days = events | map((e) => type_of(e) == "map" ? cohort_table_day(e.date) : null) | filter((d) => d != null)
+    last(sort(days))
+}
+
+component CohortTable(events: list = [], today: str? = null, period: str = "week", show: str = "percent", limit: int = 12, max_cohorts: int = 24,
+                      title: str = "Retention by cohort", id: str = "cohort-table", name: str? = null, on_change = null, class: str? = null) {
+    style global cohort_table_css
+    state unit = period == "month" ? "month" : "week"
+    state shown_as = show == "count" ? "count" : "percent"
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let day = today == null ? cohort_table_last_day(events) : cohort_table_day(today)
+    let b = day == null ? null : cohort_table_build(events, unit, day, limit, max_cohorts)
+    let word = unit == "month" ? "Month" : "Week"
+    let has_rows = b != null && len(b.cohorts) > 0
+    let extra = b == null ? null : cohort_table_left_out(b.left_out)
+    let cell_text = (n: int, size: int) => shown_as == "count" ? str(n) : cohort_table_pct(n / size)
+    let tell = () => {
+        if on_change != null {
+            let d = today == null ? cohort_table_last_day(events) : cohort_table_day(today)
+            on_change({ period: unit, show: shown_as, average: d == null ? [] : cohort_table_build(events, unit, d, limit, max_cohorts).average })
+        }
+    }
+    <section class={ui_cls(["ui-cohort-table", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-cohort-table-title id={`${id}-title`}>{title}</h3>
+        <div.ui-cohort-table-bar>
+            <fieldset.ui-cohort-table-group>
+                <legend>Cohorts by</legend>
+                <label><input type="radio" name={named("period")} value="week" checked={unit == "week"} @change={() => { unit = "week"; tell() }}/> Week</label>
+                <label><input type="radio" name={named("period")} value="month" checked={unit == "month"} @change={() => { unit = "month"; tell() }}/> Month</label>
+            </fieldset>
+            <fieldset.ui-cohort-table-group>
+                <legend>Show</legend>
+                <label><input type="radio" name={named("show")} value="percent" checked={shown_as == "percent"} @change={() => { shown_as = "percent"; tell() }}/> Percent</label>
+                <label><input type="radio" name={named("show")} value="count" checked={shown_as == "count"} @change={() => { shown_as = "count"; tell() }}/> People</label>
+            </fieldset>
+        </div>
+        {today != null && day == null && <p.ui-cohort-table-warn role="alert">The date given as today cannot be read: "{today}".</p>}
+        {b != null && !has_rows && <p.ui-cohort-table-say aria-live="polite">No signups to show yet.</p>}
+        {b == null && today == null && <p.ui-cohort-table-say aria-live="polite">No events with a readable date.</p>}
+        {has_rows && <p.ui-cohort-table-say aria-live="polite">{cohort_table_summary(b, unit)}</p>}
+        {has_rows && <div.ui-cohort-table-scroll tabindex="0" role="group" aria-label="Retention table">
+            <table.ui-cohort-table-table>
+                <thead>
+                    <tr><th scope="col">Cohort</th><th scope="col">People</th>{for p in range(b.periods) => <th key={p} scope="col">{word} {p}</th>}</tr>
+                </thead>
+                <tbody>
+                    {for c in b.cohorts => <tr key={c.start} data-cohort={c.start}>
+                        <th scope="row">{c.label}</th>
+                        <td.ui-cohort-table-size data-k="size">{c.size}</td>
+                        {for p in range(b.periods) {
+                            let n = c.cells[p]
+                            n == null || c.size == 0
+                                ? <td key={p} data-p={p} class={n == null ? "ui-cohort-table-open" : ""}>{n == null ? <span.ui-sr>Not ended</span> : ""}</td>
+                                : <td key={p} data-p={p} style={cohort_table_heat(n / c.size)}>{cell_text(n, c.size)}</td>
+                        }}
+                    </tr>}
+                    <tr.ui-cohort-table-average data-cohort="average">
+                        <th scope="row">{shown_as == "count" ? "All cohorts" : "Weighted average"}</th>
+                        <td.ui-cohort-table-size data-k="size">{b.users}</td>
+                        {for p in range(b.periods) {
+                            let a = b.average[p]
+                            <td key={p} data-p={p}>{a == null ? "" : (shown_as == "count" ? str(b.totals[p]) : cohort_table_pct(a))}</td>
+                        }}
+                    </tr>
+                </tbody>
+            </table>
+        </div>}
+        {extra != null && <p.ui-cohort-table-note>{extra}</p>}
+    </section>
+}

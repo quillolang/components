@@ -1,0 +1,441 @@
+// WorkoutTimer: intervals of work and rest, for a phone propped against a wall. A large
+// countdown, felt as well as seen, with the screen kept on. Time is worked out from the
+// clock and never counted, so a screen that sleeps, or a phone that freezes the page, loses
+// nothing: on coming back it stands where it should, in whichever interval that is, and
+// says how long it was away. It says on screen what this phone cannot do.
+//
+//   <WorkoutTimer work={40} rest={20} rounds={8} warmup={60} title="Tabata"/>
+//
+//   component Run() {
+//       state kept = load_kept()        // a server fn: a phone app's localStorage lasts one launch
+//       <WorkoutTimer plan={[{ name: "Run", kind: "work", seconds: 300 }, { name: "Walk", kind: "rest", seconds: 60 }]}
+//                     saved={kept} on_change={(run) => { keep_it(run) }} on_finish={(s) => { log_it(s) }}/>
+//   }
+//
+// work, rest, cooldown, warmup: seconds of each (40, 20, 0, 0). rounds: how many times work
+// comes (8, and 99 at most); no rest follows the last. plan: the intervals by hand, in place of those: each
+// { kind, seconds, name? }, kind being "warmup", "work", "rest" or "cooldown"; an entry
+// without seconds is left out. title: above the countdown. saved: what on_change last gave,
+// to carry on after the page was made again, as a suspended app's can be.
+// on_change(run): inside one of your components, { at, stopped, over }, or null when it ended; called
+// on start, pause, resume, skip and the finish, as what is ticking needs no saving. on_phase(seg,
+// index): each new interval, as { kind, name, ms }. on_finish(summary): once, at the end, with
+// { ms, rounds, skipped }, where ms is the plan's length less what was skipped. class.
+//
+// While it runs a phone app holds the screen with quilloNative.keepAwake and feels each change
+// with quilloNative.haptic; a browser uses the Wake Lock and navigator.vibrate. iOS's browsers
+// have no vibration, so there the screen is all there is, and no page can buzz while
+// it is frozen: what the time did is told on coming back. Nothing here runs behind the lock screen.
+
+import ui/theme.qwe use ui_cls
+
+let workout_timer_css = css`
+.ui-wtimer { --t: var(--ui-accent); position: relative; container-type: inline-size; box-sizing: border-box; height: 100%; min-height: min(100dvh, 520px); overflow-y: auto; overscroll-behavior: contain;
+  color: var(--ui-fg); font: 15px/1.4 var(--ui-font); background: color-mix(in srgb, var(--t) 9%, var(--ui-bg)); transition: background .25s;
+  padding: max(14px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(14px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
+.ui-wtimer[data-kind="work"] { --t: var(--ui-danger); }
+.ui-wtimer[data-kind="rest"] { --t: var(--ui-success); }
+.ui-wtimer[data-kind="warmup"], .ui-wtimer[data-kind="cooldown"] { --t: var(--ui-info); }
+.ui-wtimer-in { display: flex; flex-direction: column; gap: 12px; min-height: 100%; }
+.ui-wtimer-main { display: flex; flex: 1; flex-direction: column; gap: 12px; min-width: 0; }
+.ui-wtimer-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.ui-wtimer-title { margin: 0; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.ui-wtimer-left { color: var(--ui-muted); font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-wtimer-face { position: relative; display: grid; flex: 1; place-items: center; min-height: 240px; }
+.ui-wtimer-ring { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); pointer-events: none; }
+.ui-wtimer-ring circle { fill: none; stroke-width: 3; }
+.ui-wtimer-ring-back { stroke: color-mix(in srgb, var(--t) 18%, transparent); }
+.ui-wtimer-ring-now { stroke: var(--t); stroke-linecap: round; transition: stroke-dasharray .2s linear; }
+.ui-wtimer-mid { position: relative; display: grid; justify-items: center; gap: 2px; text-align: center; }
+.ui-wtimer-phase { font-size: 20px; font-weight: 700; color: var(--t); }
+.ui-wtimer-clock { font-size: clamp(64px, min(24cqw, 22dvh), 170px); font-weight: 700; line-height: 1.05; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.ui-wtimer-soon .ui-wtimer-clock { color: var(--t); }
+.ui-wtimer-round { color: var(--ui-muted); font-size: 15px; }
+.ui-wtimer-next { color: var(--ui-muted); font-size: 14px; }
+.ui-wtimer-keys { display: grid; grid-template-columns: 1fr 1.6fr 1fr; gap: 10px; }
+.ui-wtimer-btn { min-height: 64px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg);
+  font: 600 16px/1.1 var(--ui-font); cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.ui-wtimer-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-wtimer-btn:disabled { opacity: .5; cursor: default; }
+.ui-wtimer-go { border-color: transparent; background: var(--t); color: var(--ui-bg); font-size: 20px; }
+.ui-wtimer[data-kind="done"] .ui-wtimer-go, .ui-wtimer[data-kind="ready"] .ui-wtimer-go { background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-wtimer-end { grid-column: 1 / -1; min-height: 48px; }
+.ui-wtimer-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-wtimer-note:empty { display: none; }
+.ui-wtimer-side { display: none; }
+.ui-wtimer-list { margin: 0; padding: 0; list-style: none; }
+.ui-wtimer-row { display: flex; justify-content: space-between; gap: 10px; padding: 8px 10px; border-radius: var(--ui-radius-sm); font-variant-numeric: tabular-nums; }
+.ui-wtimer-row[aria-current] { background: var(--t); color: var(--ui-bg); font-weight: 600; }
+.ui-wtimer-past { color: var(--ui-muted); text-decoration: line-through; }
+@media (hover: hover) { .ui-wtimer-btn:not(:disabled):not(.ui-wtimer-go):hover { background: var(--ui-subtle); } }
+/* Turned, or on a tablet: the face beside the intervals, as a phone on its side has no height for both. */
+@container (min-width: 620px) {
+  .ui-wtimer-in { flex-direction: row; gap: 20px; }
+  .ui-wtimer-side { position: relative; display: block; flex: none; width: min(36%, 300px); overflow-y: auto; overscroll-behavior: contain; max-height: calc(100dvh - 48px);
+    border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); padding: 6px; }
+  .ui-wtimer-clock { font-size: clamp(64px, min(15cqw, 26dvh), 170px); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-wtimer, .ui-wtimer-ring-now { transition: none; } }
+`
+
+let workout_timer_kinds = ["warmup", "work", "rest", "cooldown"]
+
+// Whole seconds from what was given: 0 for anything that is not a time, a day at most.
+fn workout_timer_secs(x) -> int {
+    let t = type_of(x)
+    if t != "int" && t != "float" { return 0 }
+    if x != x || x <= 0 { return 0 }
+    x > 86400 ? 86400 : round(x)
+}
+
+fn workout_timer_name(kind: str) -> str = match kind {
+    "warmup" => "Warm up"
+    "rest" => "Rest"
+    "cooldown" => "Cool down"
+    _ => "Work"
+}
+
+// The intervals from the four numbers. No rest after the last round, which would only be waiting.
+fn workout_timer_rounds(work, rest, rounds, warmup, cooldown) {
+    let n = workout_timer_secs(rounds)
+    let times = n > 99 ? 99 : n
+    let middle = for r in range(0, times) => r < times - 1 ? [{ kind: "work", seconds: work }, { kind: "rest", seconds: rest }] : [{ kind: "work", seconds: work }]
+    [{ kind: "warmup", seconds: warmup }] + flatten(middle) + [{ kind: "cooldown", seconds: cooldown }]
+}
+
+// The plan as it will run: each with its place, its length and where it starts, all in milliseconds.
+fn workout_timer_plan(plan, work, rest, rounds, warmup, cooldown) {
+    let asked = type_of(plan) == "list" ? take(plan, 300) : workout_timer_rounds(work, rest, rounds, warmup, cooldown)
+    let clean = asked | filter((s) => type_of(s) == "map" && workout_timer_secs(get(s, "seconds")) > 0)
+    let segs = for s in clean => {
+        let kind = contains(workout_timer_kinds, get(s, "kind")) ? s.kind : "work"
+        { kind, name: filled(get(s, "name")) ?? workout_timer_name(kind), ms: workout_timer_secs(s.seconds) * 1000 }
+    }
+    reduce(enumerate(segs), [], (out, p) => {
+        let from = len(out) > 0 ? last(out).from + last(out).ms : 0
+        out + [{ ...p[1], i: p[0], from }]
+    })
+}
+
+fn workout_timer_total(segs) -> int = len(segs) > 0 ? last(segs).from + last(segs).ms : 0
+
+// Where a time falls: which interval, how long is left of it, and whether it is all over.
+fn workout_timer_at(segs, ms: num) {
+    let e = ms < 0 ? 0 : ms
+    let s = find(segs, (x) => e < x.from + x.ms)
+    s == null ? { i: len(segs), left: 0, done: true } : { i: s.i, left: s.from + s.ms - e, done: false }
+}
+
+// As a clock reads, rounded up: a second that has begun still shows, and 0:00 is the end.
+fn workout_timer_clock(ms: num) -> str {
+    let all = ceil(ms / 1000)
+    let h = floor(all / 3600)
+    let m = floor((all % 3600) / 60)
+    let s = all % 60
+    let ss = s < 10 ? `0${s}` : `${s}`
+    if h > 0 { return `${h}:${m < 10 ? "0" : ""}${m}:${ss}` }
+    `${m}:${ss}`
+}
+
+// How long it has run, by the clock: paused, it stands at the pause. A clock set back cannot make it negative.
+fn workout_timer_elapsed(run, t: num) -> num {
+    if run == null { return 0 }
+    let e = (run.stopped ?? t) - run.at
+    e < 0 ? 0 : e
+}
+
+// What a kept run may be: anything else starts afresh, not with nonsense.
+fn workout_timer_run(saved) {
+    if type_of(saved) != "map" { return null }
+    let at = get(saved, "at")
+    let stopped = get(saved, "stopped")
+    if type_of(at) != "int" || at <= 0 { return null }
+    if stopped != null && (type_of(stopped) != "int" || stopped < at) { return null }
+    { at, stopped, over: get(saved, "over") == true }
+}
+
+// The time to stand at after Next or Back. Back in the first two seconds goes to the
+// one before, as on a music player; later it starts this one over.
+fn workout_timer_skip(segs, e: num, by: int) -> num {
+    let n = len(segs)
+    if n == 0 { return 0 }
+    let at = workout_timer_at(segs, e)
+    if by > 0 { return at.done ? workout_timer_total(segs) : segs[at.i].from + segs[at.i].ms }
+    let i = at.i >= n ? n - 1 : at.i
+    if at.done || e - segs[i].from > 2000 || i == 0 { return segs[i].from }
+    segs[i - 1].from
+}
+
+// Which round this is: a rest belongs to the round before it.
+fn workout_timer_round(segs, i: int) -> str {
+    let works = segs | filter((s) => s.kind == "work")
+    let upto = works | filter((s) => s.i <= i)
+    if len(works) == 0 { return `Interval ${i + 1} of ${len(segs)}` }
+    if len(upto) == 0 { return `${len(works)} rounds ahead` }
+    `Round ${len(upto)} of ${len(works)}`
+}
+
+fn workout_timer_rounds_done(segs, skipped) -> int {
+    let works = segs | filter((s) => s.kind == "work" && !contains(skipped, s.i))
+    len(works)
+}
+
+// The sentence for coming back after the page stood still.
+fn workout_timer_away(ms: num) -> str = `The screen was off for ${workout_timer_clock(ms)}. The time kept going.`
+
+component WorkoutTimer(work: int = 40, rest: int = 20, rounds: int = 8, warmup: int = 0, cooldown: int = 0, plan = null, title: str = "Workout",
+                       saved = null, on_change = null, on_phase = null, on_finish = null, class: str? = null) {
+    style global workout_timer_css
+    let segs = workout_timer_plan(plan, work, rest, rounds, warmup, cooldown)
+    let total = workout_timer_total(segs)
+    state run = workout_timer_run(saved)
+    state elapsed = workout_timer_elapsed(run, run != null ? run.at : 0)
+    state seen_i = 0         // the interval last felt
+    state seen_s = 0         // the second last felt
+    state looked = 0         // when it last read the clock, to see that the page stood still
+    state skipped = []       // intervals passed with Next
+    state over = run != null && run.over   // on_finish has been called, here or before the page was made again
+    state win = null
+    state box = null
+    state lock = null        // the browser's WakeLockSentinel
+    state awake = ""         // "", "app", "web", "away", "refused", "none"
+    state buzzes = true      // false: this browser has no vibration
+    state back_note = ""
+    state said = ""
+    let n = len(segs)
+    let pos = workout_timer_at(segs, elapsed)
+    let status = run == null ? "ready" : pos.done ? "done" : run.stopped != null ? "paused" : "running"
+    let seg = pos.done ? null : segs[pos.i]
+    let shown = n == 0 ? null : (seg ?? last(segs))
+    let upcoming = pos.i + 1 < n ? segs[pos.i + 1] : null
+    let part = seg != null ? round(pos.left * 100 / seg.ms, 1) : 0
+    let note = status == "running" ? match awake {
+        "app" => "The screen stays on."
+        "web" => "The screen stays on while this page shows."
+        "refused" => "The screen may dim: this phone said no. The time stays right."
+        "none" => "This browser cannot keep the screen on. The time stays right if it sleeps."
+        _ => ""
+    } : ""
+    let report = () => { on_change && on_change(run) }
+    let buzz = (kind: str, ms) => {
+        if win != null {
+            if win.quilloNative != null {
+                js("quilloNative.haptic", kind)
+            } else {
+                if buzzes && js("navigator.userActivation.hasBeenActive") == true { js("navigator.vibrate", ms) }
+            }
+        }
+    }
+    let lost = (_e = null) => {
+        if lock != null {
+            lock = null
+            awake = "away"
+        }
+    }
+    let hold_screen = () => {
+        if win != null {
+            if win.quilloNative != null {
+                awake = is_err(js("quilloNative.keepAwake", true)) ? "refused" : "app"
+            } else if win.navigator.wakeLock == null {
+                awake = "none"
+            } else {
+                let got = js("navigator.wakeLock.request", "screen")
+                if is_err(got) {
+                    awake = "refused"
+                } else if status != "running" {
+                    // Paused while the browser was answering.
+                    got.release()
+                } else {
+                    lock = got
+                    got.addEventListener("release", lost)
+                    awake = "web"
+                }
+            }
+        }
+    }
+    let let_go = () => {
+        if lock != null {
+            let l = lock
+            lock = null
+            l.removeEventListener("release", lost)
+            l.release()
+        }
+        if awake == "app" { js("quilloNative.keepAwake", false) }
+        awake = ""
+    }
+    let finish = () => {
+        if !over {
+            over = true
+            said = "Workout done."
+            let_go()
+            buzz("success", [120, 80, 120])
+            run = { ...run, over: true }
+            report()
+            let ran = total - sum(skipped | map((i) => segs[i].ms))
+            on_finish && on_finish({ ms: ran, rounds: workout_timer_rounds_done(segs, skipped), skipped: len(skipped) })
+        }
+    }
+    // Everything hangs on this: it reads the clock, and catches up on whatever has gone by.
+    let sync = (t: num) => {
+        if run != null {
+            let gap = looked > 0 ? t - looked : 0
+            looked = t
+            let e = workout_timer_elapsed(run, t)
+            let at = workout_timer_at(segs, e)
+            let stood_still = gap > 2500 && run.stopped == null
+            elapsed = e > total ? total : e
+            if stood_still { back_note = workout_timer_away(gap) }
+            let secs = ceil(at.left / 1000)
+            if at.done {
+                seen_i = at.i
+                finish()
+            } else if at.i != seen_i {
+                let now_seg = segs[at.i]
+                seen_i = at.i
+                seen_s = secs
+                if !stood_still { back_note = "" }
+                said = `${now_seg.name}, ${workout_timer_clock(at.left)}.`
+                if box != null {
+                    let list = box.querySelector(".ui-wtimer-side")
+                    js("requestAnimationFrame", (_t = null) => {
+                        let row = list.querySelector("[aria-current]")
+                        if row != null { list.scrollTop = row.offsetTop - list.clientHeight / 2 }
+                    })
+                }
+                buzz(now_seg.kind == "rest" ? "success" : "warning", now_seg.kind == "rest" ? [160] : [90, 60, 90])
+                on_phase && on_phase({ kind: now_seg.kind, name: now_seg.name, ms: now_seg.ms }, at.i)
+            } else if secs != seen_s {
+                seen_s = secs
+                if secs <= 3 && !stood_still && run.stopped == null { buzz("light", 12) }
+            }
+        }
+    }
+    let begin = () => {
+        let t = now()
+        run = { at: t, stopped: null, over: false }
+        elapsed = 0
+        seen_i = 0
+        seen_s = ceil(segs[0].ms / 1000)
+        looked = t
+        skipped = []
+        over = false
+        back_note = ""
+        said = `${segs[0].name}, ${workout_timer_clock(segs[0].ms)}.`
+        report()
+        on_phase && on_phase({ kind: segs[0].kind, name: segs[0].name, ms: segs[0].ms }, 0)
+        buzz("medium", 30)
+        hold_screen()
+    }
+    let press = () => {
+        if status == "running" {
+            run = { ...run, stopped: now() }
+            sync(run.stopped)
+            said = "Paused."
+            report()
+            let_go()
+        } else if status == "paused" {
+            let t = now()
+            run = { ...run, at: run.at + t - run.stopped, stopped: null }
+            looked = t
+            said = "Going on."
+            report()
+            hold_screen()
+        } else {
+            if n > 0 { begin() }
+        }
+    }
+    let move = (by: int) => {
+        let t = now()
+        let from = workout_timer_elapsed(run, t)
+        let to = workout_timer_skip(segs, from, by)
+        // Going back to an interval takes it off the list of those skipped.
+        let landing = workout_timer_at(segs, to).i
+        skipped = by > 0 ? (contains(skipped, pos.i) ? skipped : skipped + [pos.i]) : skipped | filter((i) => i < landing)
+        run = { ...run, at: (run.stopped ?? t) - to }
+        looked = t
+        sync(t)
+        // A move inside the same interval has no change of phase to show for it.
+        elapsed = workout_timer_elapsed(run, t)
+        report()
+    }
+    let finish_now = () => {
+        run = null
+        elapsed = 0
+        seen_i = 0
+        skipped = []
+        over = false
+        back_note = ""
+        said = "Ended."
+        report()
+    }
+    if status == "running" { every(200, () => { sync(now()) }) }
+    <section class={ui_cls(["ui-wtimer", status == "running" && pos.left <= 3000 && "ui-wtimer-soon", class])} aria-label={title}
+             data-kind={status == "ready" ? "ready" : status == "done" ? "done" : seg.kind} data-status={status}
+             @mount={(me) => {
+                 box = me
+                 let w = js("window")
+                 let d = js("document")
+                 win = w
+                 buzzes = w.navigator.vibrate != null
+                 let back = (_e = null) => {
+                     if d.visibilityState == "visible" {
+                         sync(now())
+                         if status == "running" && lock == null && awake != "app" { hold_screen() }
+                     }
+                 }
+                 d.addEventListener("visibilitychange", back)
+                 w.addEventListener("pageshow", back)
+                 if run != null {
+                     // Made again from what was kept: stand where the clock says, with no buzz for the way there.
+                     let at = workout_timer_at(segs, workout_timer_elapsed(run, now()))
+                     seen_i = at.i
+                     seen_s = ceil(at.left / 1000)
+                     sync(now())
+                     if status == "running" { hold_screen() }
+                 }
+                 () => {
+                     d.removeEventListener("visibilitychange", back)
+                     w.removeEventListener("pageshow", back)
+                     let_go()
+                 }
+             }}>
+        <div.ui-wtimer-in>
+            <div.ui-wtimer-main>
+                <div.ui-wtimer-head>
+                    <h2.ui-wtimer-title>{title}</h2>
+                    <span.ui-wtimer-left>{workout_timer_clock(total - elapsed)} left</span>
+                </div>
+                <div.ui-wtimer-face>
+                    <svg.ui-wtimer-ring viewBox="0 0 100 100" aria-hidden="true">
+                        <circle.ui-wtimer-ring-back cx="50" cy="50" r="47"/>
+                        <circle.ui-wtimer-ring-now cx="50" cy="50" r="47" pathLength="100" style={`stroke-dasharray: ${part} 100`}/>
+                    </svg>
+                    <div.ui-wtimer-mid>
+                        <span.ui-wtimer-phase>{status == "done" ? "Done" : shown != null ? shown.name : "Nothing to time"}</span>
+                        <span.ui-wtimer-clock role="timer" aria-label={`Time left in this interval`}>{seg != null ? workout_timer_clock(pos.left) : "0:00"}</span>
+                        <span.ui-wtimer-round>{status == "done" ? `${len(segs | filter((s) => s.kind == "work" && !contains(skipped, s.i)))} rounds` : n > 0 ? workout_timer_round(segs, pos.i) : ""}</span>
+                        <span.ui-wtimer-next>{upcoming != null ? `Next: ${upcoming.name}, ${workout_timer_clock(upcoming.ms)}` : ""}</span>
+                    </div>
+                </div>
+                <div.ui-wtimer-keys>
+                    <button.ui-wtimer-btn.ui-wtimer-prev type="button" disabled={status != "running" && status != "paused"} @click={() => { move(-1) }}>Back</button>
+                    // One button for all three, as what lies under a finger must not be swapped for another.
+                    <button.ui-wtimer-btn.ui-wtimer-go type="button" disabled={n == 0} @click={() => { press() }}>{status == "running" ? "Pause" : status == "paused" ? "Resume" : status == "done" ? "Again" : "Start"}</button>
+                    <button.ui-wtimer-btn.ui-wtimer-skip type="button" disabled={status != "running" && status != "paused"} @click={() => { move(1) }}>Next</button>
+                    {status == "paused" && <button.ui-wtimer-btn.ui-wtimer-end type="button" @click={() => { finish_now() }}>End workout</button>}
+                </div>
+                <p.ui-wtimer-note.ui-wtimer-back>{back_note}</p>
+                <p.ui-wtimer-note.ui-wtimer-awake>{note}</p>
+                <p.ui-wtimer-note.ui-wtimer-nobuzz>{win != null && win.quilloNative == null && !buzzes ? "No vibration in this browser: keep the screen in sight." : ""}</p>
+            </div>
+            <div.ui-wtimer-side>
+                <ol.ui-wtimer-list aria-label="Intervals">
+                    {for s in segs => <li key={s.i} class={ui_cls(["ui-wtimer-row", s.i < pos.i && "ui-wtimer-past"])} aria-current={s.i == pos.i && status != "ready" ? "step" : null}>
+                        <span>{s.name}</span><span>{workout_timer_clock(s.ms)}</span>
+                    </li>}
+                </ol>
+            </div>
+        </div>
+        <span.ui-sr role="status">{said}</span>
+    </section>
+}

@@ -1,0 +1,430 @@
+// PickList: picking an order in a warehouse. Lines come in walking order, up one aisle and
+// down the next, one big card at a time, each confirmed by a scan or a thumb in a glove.
+// A wrong item is caught at the shelf. What is not there is recorded as short, with a
+// reason, and the rest of the order goes on. Everything can be undone, and with no
+// connection the finished pick waits and goes later.
+//
+//   import ui/pick_list.qwe use PickList
+//
+//   <PickList title="Order 7719" store="7719" on_finish={(r) => send(r)} picks={[
+//       { id: "1", code: "4006381333931", name: "Marker pen", qty: 3, location: "A-12-3" },
+//       { id: "2", code: "5901234123457", name: "Notebook, A5", qty: 1, location: "B-07-2" },
+//   ]}/>
+//
+// picks: each { id, code, name, qty, location }. location: aisle, bay and level with hyphens,
+// A-12-3; aisles are walked in order, odd ones with the bays rising and even ones falling,
+// so no aisle is walked twice. A line with no location comes last.
+// reasons: the reasons a line can be short (Not on the shelf, Damaged, Not enough, Wrong
+// label). wedge, use_camera, gap, sound: as for ScanCountInput. title ("Pick list"). id: a
+// prefix for its ids.
+//
+// What must last: in the phone apps localStorage comes back empty, so give back `saved`
+// (what on_change gave) from your own store. store: a key to keep the pick under in this
+// browser's localStorage as well.
+//
+// on_change(saved): after each step, with { events, result, sent }. on_finish(result): when
+// Finish is pressed, and again when a connection comes back if it could not go; answer
+// false, an error, or a Promise of either to try again later. result: { title, lines: [{ id,
+// code, name, location, wanted, picked, short, reason }], units, wanted, shorts, at }.
+//
+// pick_list_walk(picks), pick_list_lines(picks, events), pick_list_current(lines, chosen) and
+// pick_list_scan(lines, current, code) are the plain logic.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/scan_count.qwe use ScanCountInput, scan_count_key
+
+let pick_list_css = css`
+.ui-picklist { --tap: 72px; display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-picklist h3 { margin: 0; font-size: 18px; }
+.ui-picklist-top { display: grid; gap: 4px; }
+.ui-picklist-count { margin: 0; font-weight: 600; }
+.ui-picklist-bar { display: block; height: 10px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-picklist-bar span { display: block; height: 100%; background: var(--ui-success); transition: width .2s; }
+.ui-picklist-cols { display: grid; gap: 12px; min-width: 0; }
+.ui-picklist-col { display: grid; gap: 12px; min-width: 0; align-content: start; }
+.ui-picklist-card { display: grid; gap: 6px; padding: 14px; border: 2px solid var(--ui-strong); border-radius: var(--ui-radius); background: var(--ui-surface); min-width: 0; }
+.ui-picklist-loc { margin: 0; font: 800 40px/1.1 var(--ui-mono); overflow-wrap: anywhere; }
+.ui-picklist-name { margin: 0; font-size: 19px; font-weight: 700; overflow-wrap: anywhere; }
+.ui-picklist-code { margin: 0; color: var(--ui-muted); font: 14px var(--ui-mono); overflow-wrap: anywhere; }
+.ui-picklist-qty { margin: 0; font: 700 26px var(--ui-mono); }
+.ui-picklist-next { margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-picklist-said { display: grid; align-content: center; min-height: 56px; margin: 0; padding: 8px 12px; border-left: 6px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-weight: 600; overflow-wrap: anywhere; }
+.ui-picklist-said[data-kind="good"] { border-color: var(--ui-success); background: var(--ui-success-soft); }
+.ui-picklist-said[data-kind="bad"] { border-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-picklist-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.ui-picklist-big, .ui-picklist-other { display: grid; place-items: center; min-height: var(--tap); padding: 0 10px; border: 2px solid transparent; border-radius: var(--ui-radius-sm); font: 700 19px/1.2 var(--ui-font); cursor: pointer; touch-action: manipulation; -webkit-user-select: none; user-select: none; }
+.ui-picklist-big { grid-column: 1 / -1; min-height: calc(var(--tap) + 16px); background: var(--ui-accent); color: var(--ui-accent-fg); font-size: 22px; }
+.ui-picklist-other { border-color: var(--ui-strong); background: var(--ui-surface); color: var(--ui-fg); }
+.ui-picklist-other[hidden] { display: none; }
+.ui-picklist-big:focus-visible, .ui-picklist-other:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-picklist-other:disabled { opacity: .5; cursor: default; }
+.ui-picklist-short { display: grid; gap: 8px; padding: 12px; border: 2px solid var(--ui-warning); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-picklist-short h4 { margin: 0; font-size: 16px; }
+.ui-picklist-found { display: flex; align-items: center; justify-content: center; gap: 12px; }
+.ui-picklist-found b { min-width: 60px; text-align: center; font: 700 28px var(--ui-mono); }
+.ui-picklist-step { display: grid; place-items: center; width: var(--tap); height: var(--tap); padding: 0; border: 2px solid var(--ui-strong); border-radius: var(--ui-radius-sm); background: var(--ui-bg); color: var(--ui-fg); font: 700 30px var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-picklist-step:disabled { opacity: .4; cursor: default; }
+.ui-picklist-step:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-picklist-reasons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-picklist-reason { position: relative; display: grid; place-items: center; min-height: 56px; padding: 4px 8px; border: 2px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-bg); font-weight: 600; text-align: center; cursor: pointer; }
+.ui-picklist-reason input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.ui-picklist-reason:has(input:checked) { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-picklist-reason:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-picklist-rows { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; min-width: 0; }
+.ui-picklist-row { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; align-items: center; gap: 8px; box-sizing: border-box; width: 100%; min-height: 56px; padding: 6px 10px; border: 1px solid var(--ui-border); border-left: 5px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.3 var(--ui-font); text-align: left; cursor: pointer; touch-action: manipulation; content-visibility: auto; contain-intrinsic-size: auto 58px; }
+.ui-picklist-row:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-picklist-row[aria-current="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-picklist-row[data-state="done"] { border-left-color: var(--ui-success); opacity: .75; }
+.ui-picklist-row[data-state="short"] { border-left-color: var(--ui-danger); }
+.ui-picklist-row[data-state="skipped"] { border-left-color: var(--ui-warning); }
+.ui-picklist-row b { font-family: var(--ui-mono); overflow-wrap: anywhere; }
+.ui-picklist-row span { min-width: 0; overflow-wrap: anywhere; }
+.ui-picklist-row small { color: var(--ui-muted); font: 500 13px var(--ui-mono); white-space: nowrap; }
+.ui-picklist-end { display: grid; gap: 8px; padding: 14px; border: 2px solid var(--ui-strong); border-radius: var(--ui-radius); }
+.ui-picklist-end h4 { margin: 0; font-size: 18px; }
+.ui-picklist-end p { margin: 0; }
+.ui-picklist-end ul { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; font-weight: 600; }
+.ui-picklist-note { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); font-size: 14px; }
+@container (min-width: 640px) {
+  .ui-picklist-cols { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+  .ui-picklist-loc { font-size: 52px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-picklist-bar span { transition: none; } }
+`
+
+let pick_list_reasons = ["Not on the shelf", "Damaged", "Not enough", "Wrong label"]
+
+// Where a line is: { aisle, bay, level }, the parts of A-12-3, or null when it has no place.
+fn pick_list_place(location) {
+    let t = trim(str(location ?? ""))
+    if t == "" { return null }
+    let parts = split(t, "-")
+    let number = (x) => x != null && re.test(x, "^[0-9]{1,6}$") ? int(x) : 0
+    { aisle: upper(parts[0]), bay: number(len(parts) > 1 ? parts[1] : null), level: number(len(parts) > 2 ? parts[2] : null) }
+}
+
+// An aisle as something that sorts: number-named aisles by their number, 9 before 10.
+fn pick_list_aisle_key(a: str) -> str {
+    if !re.test(a, "^[0-9]{1,6}$") { return a }
+    join(for _i in range(0, 6 - len(a)) => "0", "") + a
+}
+
+// The lines in the order to walk them: up the first aisle, down the next, and so on, each
+// bay from the lowest level up. A list's sort is stable, so equal places keep their order.
+fn pick_list_walk(picks: list) -> list {
+    let good = picks | filter((p) => type_of(p) == "map" && get(p, "id") != null)
+    let placed = good | map((p) => ({ p: p, at: pick_list_place(get(p, "location")) }))
+    let aisles = placed | filter((x) => x.at != null) | map((x) => x.at.aisle) | unique() | sort_by((a) => pick_list_aisle_key(a))
+    let rank = (x) => {
+        if x.at == null { return [1, 0, 0, 0] }
+        let i = aisles | index_of(x.at.aisle)
+        [0, i, i % 2 == 0 ? x.at.bay : 0 - x.at.bay, x.at.level]
+    }
+    let ranked = placed | map((x) => ({ p: x.p, r: rank(x) }))
+    // Numbers in text, padded, as a list is not a sort key that works in the browser.
+    let key = (r) => join(r | map((n) => {
+        let v = 1000000 + n
+        str(v)
+    }), "-")
+    sort_by(ranked, (x) => key(x.r)) | map((x) => x.p)
+}
+
+fn pick_list_count(x) -> int = type_of(x) == "int" && x > 0 ? x : (type_of(x) == "float" && x > 0 ? floor(x) : 1)
+
+// The lines with what has been done to them, in walking order. Events are the record: a pick
+// adds, a short ends a line at what was found, a skip puts it off. Undo takes the last event.
+// Each line: { id, code, name, location, wanted, picked, short, reason, skipped, state },
+// state being "open", "skipped", "done" or "short".
+fn pick_list_lines(picks: list, events: list) -> list {
+    let groups = group_by(events, (e) => str(e.line))
+    pick_list_walk(picks) | map((p) => {
+        let mine = get(groups, str(p.id), [])
+        let wanted = pick_list_count(get(p, "qty"))
+        let ended = mine | filter((e) => e.kind == "short")
+        let last = len(ended) > 0 ? ended[len(ended) - 1] : null
+        let picked = last != null ? last.found : mine | filter((e) => e.kind == "pick") | reduce(0, (a, e) => a + e.qty)
+        let skipped = len(mine) > 0 && mine[len(mine) - 1].kind == "skip"
+        { id: str(p.id), code: str(get(p, "code") ?? ""), name: str(get(p, "name") ?? p.id), location: str(get(p, "location") ?? ""), wanted: wanted, picked: picked,
+          short: last != null ? wanted - picked : 0, reason: last != null ? last.reason : null, skipped: skipped,
+          state: last != null ? "short" : (picked >= wanted ? "done" : (skipped ? "skipped" : "open")) }
+    })
+}
+
+fn pick_list_open(l) -> bool = l.state == "open" || l.state == "skipped"
+
+// The line to work on: the one chosen if it is still open, else the first open one, else the
+// first skipped, so what was put off comes round again.
+fn pick_list_current(lines: list, chosen) {
+    let picked = chosen != null ? lines | find((l) => l.id == chosen && pick_list_open(l)) : null
+    if picked != null { return picked }
+    let next = lines | find((l) => l.state == "open")
+    next != null ? next : lines | find((l) => l.state == "skipped")
+}
+
+// What a scanned code means: { kind, line }, kind being "right" (the current line), "other" (an
+// open line, but not this one), "full" (its line is done) or "wrong".
+fn pick_list_scan(lines: list, current, code) -> map {
+    let k = scan_count_key(code)
+    let matches = lines | filter((l) => l.code != "" && scan_count_key(l.code) == k)
+    if current != null && (matches | any((l) => l.id == current.id)) { return { kind: "right", line: current } }
+    let open = matches | filter((l) => pick_list_open(l))
+    if len(open) > 0 { return { kind: "other", line: open[0] } }
+    len(matches) > 0 ? { kind: "full", line: matches[0] } : { kind: "wrong", line: null }
+}
+
+// What goes to on_finish.
+fn pick_list_result(title: str, lines: list, at) -> map {
+    { title: title, at: at, wanted: lines | reduce(0, (a, l) => a + l.wanted), units: lines | reduce(0, (a, l) => a + l.picked), shorts: lines | filter((l) => l.short > 0) | len(),
+      lines: lines | map((l) => ({ id: l.id, code: l.code, name: l.name, location: l.location, wanted: l.wanted, picked: l.picked, short: l.short, reason: l.reason })) }
+}
+
+// What saved or a store gave back, keeping only events that make sense.
+fn pick_list_restore(s) -> map {
+    let raw = type_of(s) == "map" && type_of(get(s, "events")) == "list" ? s.events : []
+    { events: raw | filter((e) => type_of(e) == "map" && get(e, "line") != null && type_of(get(e, "kind")) == "str"),
+      result: type_of(s) == "map" ? get(s, "result") : null, sent: type_of(s) == "map" && get(s, "sent") == true }
+}
+
+fn pick_list_keep(name: str, text: str) {
+    js_new("Promise", (done) => {
+        js("localStorage.setItem", name, text)
+        done(true)
+    }).then((_ok = null) => true, (_e = null) => false)
+}
+
+fn pick_list_kept(name: str) {
+    js_new("Promise", (done) => {
+        let text = js("localStorage.getItem", name)
+        let v = text == null ? null : json.parse(text)
+        done(is_err(v) ? null : v)
+    }).then((v = null) => v, (_e = null) => null)
+}
+
+component PickList(picks: list = [], title: str = "Pick list", reasons: list = pick_list_reasons, wedge: bool = false, use_camera: bool = true, gap: int = 1500, sound: bool = true,
+                   saved: map? = null, store: str? = null, id: str = "ui-picklist", on_change = null, on_finish = null, class: str? = null) {
+    style global pick_list_css
+    state events = pick_list_restore(saved).events
+    state result = pick_list_restore(saved).result
+    state sent = pick_list_restore(saved).sent
+    state chosen = null      // a line the person went to, out of the walking order
+    state said = "Ready to pick."
+    state kind = "idle"
+    state shorting = false
+    state found = 0
+    state why = ""
+    state online = true
+    state sending = false
+    let lines = pick_list_lines(picks, events)
+    let current = pick_list_current(lines, chosen)
+    let open_lines = lines | filter((l) => pick_list_open(l))
+    let line_done = len(lines) - len(open_lines)
+    let units = lines | reduce(0, (a, l) => a + l.picked)
+    let wanted = lines | reduce(0, (a, l) => a + l.wanted)
+    let after = current != null ? open_lines | filter((l) => l.id != current.id && l.state == "open") : []
+    let told = () => {
+        let s = { events: events, result: result, sent: sent }
+        on_change && on_change(s)
+        if store != null { js("Promise.resolve", pick_list_keep(`ui-picklist-${store}`, json.stringify(s))) }
+    }
+    let felt = (good) => {
+        let w = js("window")
+        if w.quilloNative != null {
+            js("quilloNative.haptic", good ? "success" : "warning")
+        } else if js("navigator").vibrate != null {
+            js("navigator").vibrate(good ? 30 : [40, 60, 40])
+        }
+    }
+    let event = (e) => { events = events + [set(e, "at", now())] }
+    let say_pick = (l, by) => {
+        let total = l.picked + by
+        said = total >= l.wanted ? `${l.name}: all ${l.wanted} picked.` : `${l.name}: ${total} of ${l.wanted}.`
+        kind = "good"
+    }
+    let take = (l, by, how) => {
+        event({ kind: "pick", line: l.id, qty: by, how: how })
+        say_pick(l, by)
+        shorting = false
+        if l.picked + by >= l.wanted && chosen == l.id { chosen = null }
+        told()
+    }
+    let scanned = (code, how) => {
+        if current == null { return false }
+        let s = pick_list_scan(lines, current, code)
+        if s.kind == "right" {
+            take(current, 1, how)
+            return true
+        }
+        if s.kind == "other" {
+            chosen = s.line.id
+            take(s.line, 1, how)
+            said = `${said} It was out of order, at ${s.line.location}.`
+            return true
+        }
+        said = s.kind == "full" ? `${s.line.name} is already done. Do not pick more.` : `Wrong item: ${code}. You need ${current.name}.`
+        kind = "bad"
+        false
+    }
+    let undo = () => {
+        if len(events) > 0 {
+            let e = events[len(events) - 1]
+            events = slice(events, 0, len(events) - 1)
+            chosen = str(e.line)
+            let l = pick_list_lines(picks, events) | find((x) => x.id == str(e.line))
+            said = `Undone: ${l != null ? l.name : "the last step"}.`
+            kind = "idle"
+            shorting = false
+            told()
+        }
+    }
+    let flush = () => {
+        if result != null && !sent && !sending && online && on_finish != null {
+            sending = true
+            let r = js("Promise.resolve", on_finish(result))
+            sending = false
+            if r == false || is_err(r) {
+                said = "It could not be sent yet. It is kept here and will be tried again."
+                kind = "bad"
+            } else {
+                sent = true
+            }
+            told()
+        }
+    }
+    <section class={ui_cls(["ui-picklist", class])}
+             @mount={(_el) => {
+                 let w = js("window")
+                 online = js("navigator").onLine != false
+                 if saved == null && store != null {
+                     let back = js("Promise.resolve", pick_list_kept(`ui-picklist-${store}`))
+                     if back != null {
+                         let s = pick_list_restore(back)
+                         if len(s.events) > 0 {
+                             events = s.events
+                             result = s.result
+                             sent = s.sent
+                             said = "Pick picked up where it was left."
+                         }
+                     }
+                 }
+                 let up = (_e = null) => {
+                     online = true
+                     flush()
+                 }
+                 let down = (_e = null) => { online = false }
+                 w.addEventListener("online", up)
+                 w.addEventListener("offline", down)
+                 flush()
+                 () => {
+                     w.removeEventListener("online", up)
+                     w.removeEventListener("offline", down)
+                 }
+             }}>
+        <div.ui-picklist-top>
+            <h3>{title}</h3>
+            <p.ui-picklist-count>{line_done} of {len(lines)} lines, {units} of {wanted} units</p>
+            <span.ui-picklist-bar role="progressbar" aria-label="Lines done" aria-valuemin="0" aria-valuemax={len(lines)} aria-valuenow={line_done}><span style={`width: ${len(lines) > 0 ? floor(line_done * 100 / len(lines)) : 0}%`}></span></span>
+        </div>
+        {!online && <p.ui-picklist-note>No connection. Picking goes on; nothing is lost.</p>}
+        <div.ui-picklist-cols>
+            <div.ui-picklist-col>
+                <p.ui-picklist-said data-kind={kind} role="status">{said}</p>
+                {current != null && <div.ui-picklist-card>
+                    <p.ui-picklist-loc>{current.location != "" ? current.location : "No location"}</p>
+                    <p.ui-picklist-name>{current.name}</p>
+                    <p.ui-picklist-code>{current.code}</p>
+                    <p.ui-picklist-qty>{current.picked} of {current.wanted}</p>
+                    <p.ui-picklist-next>{len(after) > 0 ? `Then ${after[0].location != "" ? after[0].location : after[0].name}` : "Last line"}</p>
+                </div>}
+                {current != null && <div.ui-picklist-btns>
+                    <button.ui-picklist-big type="button" @click={() => {
+                        take(current, 1, "tap")
+                        felt(true)
+                    }}>Picked one</button>
+                    <button.ui-picklist-other type="button" hidden={current.wanted - current.picked < 2} @click={() => {
+                        take(current, current.wanted - current.picked, "tap")
+                        felt(true)
+                    }}>All {current.wanted - current.picked}</button>
+                    <button.ui-picklist-other type="button" @click={() => {
+                        found = current.picked
+                        why = ""
+                        shorting = !shorting
+                    }}>Short</button>
+                    <button.ui-picklist-other type="button" disabled={len(after) == 0} @click={() => {
+                        event({ kind: "skip", line: current.id })
+                        chosen = null
+                        said = `${current.name} put off until the end.`
+                        kind = "idle"
+                        shorting = false
+                        told()
+                    }}>Skip</button>
+                    <button.ui-picklist-other type="button" disabled={len(events) == 0} @click={undo}>Undo</button>
+                </div>}
+                {current != null && shorting && <div.ui-picklist-short>
+                    <h4>How many did you find?</h4>
+                    <div.ui-picklist-found>
+                        <button.ui-picklist-step type="button" aria-label="One fewer found" disabled={found <= 0} @click={() => { found -= 1 }}>−</button>
+                        <b>{found}</b>
+                        <button.ui-picklist-step type="button" aria-label="One more found" disabled={found >= current.wanted - 1} @click={() => { found += 1 }}>+</button>
+                    </div>
+                    <fieldset.ui-picklist-reasons aria-label="Why">
+                        {for r in reasons => <label class="ui-picklist-reason" key={str(r)}>
+                            <input type="radio" name={`${id}-reason`} value={str(r)} checked={why == str(r)} @change={() => { why = str(r) }}/>
+                            {str(r)}
+                        </label>}
+                    </fieldset>
+                    <div.ui-picklist-btns>
+                        <button.ui-picklist-other type="button" disabled={why == ""} @click={() => {
+                            let name = current.name
+                            let n = current.wanted - found
+                            event({ kind: "short", line: current.id, found: found, reason: why })
+                            shorting = false
+                            chosen = null
+                            said = `${name}: ${n} short, ${lower(why)}.`
+                            kind = "bad"
+                            told()
+                            felt(false)
+                        }}>Record short</button>
+                        <button.ui-picklist-other type="button" @click={() => { shorting = false }}>Cancel</button>
+                    </div>
+                </div>}
+                {current != null && <ScanCountInput id={`${id}-in`} label="Scan the item" use_camera={use_camera} wedge={wedge} gap={gap} sound={sound} on_scan={scanned}/>}
+                {current == null && <div.ui-picklist-end>
+                    <h4>{sent ? "Pick sent" : (result != null ? (on_finish != null ? "Waiting to send" : "Pick finished") : "All lines done")}</h4>
+                    <p>{units} of {wanted} units picked.</p>
+                    {(lines | any((l) => l.short > 0)) && <ul>
+                        {for l in lines | filter((x) => x.short > 0) => <li key={l.id}>{l.name}: {l.short} short, {lower(str(l.reason))}</li>}
+                    </ul>}
+                    {result == null && <button.ui-picklist-big type="button" @click={() => {
+                        result = pick_list_result(title, lines, now())
+                        said = !online && on_finish != null ? "No connection. It is kept here and goes when there is one." : "Pick finished."
+                        kind = "good"
+                        told()
+                        flush()
+                    }}>Finish pick</button>}
+                    {result != null && !sent && online && on_finish != null && <Button size="lg" variant="outline" loading={sending} on_click={flush}>Try again</Button>}
+                    {result == null && <button.ui-picklist-other type="button" disabled={len(events) == 0} @click={undo}>Undo</button>}
+                </div>}
+            </div>
+            <div.ui-picklist-col>
+                <ol.ui-picklist-rows aria-label="Lines, in walking order">
+                    {for l in lines => <li key={l.id}>
+                        <button.ui-picklist-row type="button" data-state={l.state} aria-current={current != null && current.id == l.id ? "true" : null}
+                                @click={() => {
+                                    if pick_list_open(l) {
+                                        chosen = l.id
+                                        shorting = false
+                                        said = `Going to ${l.location != "" ? l.location : l.name}.`
+                                        kind = "idle"
+                                    }
+                                }}>
+                            <b>{l.location != "" ? l.location : "None"}</b>
+                            <span>{l.name}</span>
+                            <small>{l.state == "short" ? `${l.short} short` : (l.state == "skipped" ? "Later" : `${l.picked}/${l.wanted}`)}</small>
+                        </button>
+                    </li>}
+                </ol>
+            </div>
+        </div>
+    </section>
+}

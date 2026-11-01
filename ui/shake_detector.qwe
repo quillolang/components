@@ -1,0 +1,173 @@
+// ShakeDetector: notices the phone being shaken, for undo, for a new shuffle, for
+// reporting a bug, and always beside a button that does the same, since a shake is out of
+// reach for a person with the phone on a stand, on a desk, or in a hand that does not
+// shake. A shake here is a run of hard jolts that change direction, so a bump, a step or a
+// car going over a kerb is not one. After one, it waits a moment before it can be
+// another. iOS asks once with a tap: the button to turn it on shows only where needed.
+//
+//   <ShakeDetector label="Undo" on_shake={(how) => { undo() }}/>
+//   <ShakeDetector label="Shuffle" threshold={18} say="Shake for a new order"/>
+//
+// label: the button that does the same ("Do it"). say: what the card asks for ("Shake
+// the phone, or use the button"). threshold: how hard each jolt must be, in m/s² beyond
+// gravity (12: a brisk shake; walking is about 4). jolts: how many, changing direction, make
+// a shake (3). within: milliseconds they must all fall in (900). rest: milliseconds after a
+// shake before another can count (1000). enabled: motion counts (true); while it is
+// false it says so, and the button still works. on_shake(how): inside one of your
+// components, called with "motion" or "button".
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let shake_detector_css = css`
+.ui-shake { container-type: inline-size; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-shake-card { display: grid; gap: 10px; padding: 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-shake-card[data-hit] { animation: ui-shake-hit .4s ease-out; }
+.ui-shake-say { margin: 0; font-weight: 500; }
+.ui-shake-meter { height: 8px; border-radius: 999px; overflow: hidden; background: var(--ui-subtle); }
+.ui-shake-fill { height: 100%; width: 100%; border-radius: inherit; background: var(--ui-accent); transform: scaleX(0); transform-origin: left; }
+.ui-shake-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-shake-note:empty { display: none; }
+/* One above the other: side by side, the main button would widen into the other's place as it goes, under the same finger. */
+.ui-shake-bar { display: flex; flex-direction: column; gap: 8px; }
+@keyframes ui-shake-hit { 25% { transform: translateX(-5px); } 60% { transform: translateX(4px); } }
+@media (prefers-reduced-motion: reduce) { .ui-shake-card[data-hit] { animation: none; } }
+/* With room, the words and the meter on one side, the buttons on the other. */
+@container (min-width: 420px) {
+  .ui-shake-card { grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 16px; }
+  .ui-shake-bar { grid-column: 2; grid-row: 1 / span 3; align-self: start; }
+}
+`
+
+fn shake_detector_num(x) = (type_of(x) == "int" || type_of(x) == "float") && math.isfinite(x)
+
+// Before the first sample.
+fn shake_detector_new() = { ready: false, gx: 0, gy: 0, gz: 0, hx: 0, hy: 0, hz: 0, jolts: [], at: -1000000, strength: 0, shook: false }
+
+// One sample in, the next state out. Gravity is what stays: a slow average of each axis,
+// taken off to leave what the hand did. iOS and Android point this axis opposite ways,
+// which does not matter here, as only a change of direction counts. A jolt is a sample
+// past the threshold pointing against the jolt before it (their dot product is
+// negative), so a long push is one jolt however long it lasts. A shake is `need` jolts
+// within `within` ms, and none counts for `rest` ms after one.
+fn shake_detector_step(st, x, y, z, t, threshold, need, within, rest) {
+    if !shake_detector_num(x) || !shake_detector_num(y) || !shake_detector_num(z) || !shake_detector_num(t) {
+        { ...st, shook: false }
+    } else if !st.ready {
+        { ...st, ready: true, gx: x, gy: y, gz: z, shook: false }
+    } else {
+        let gx = st.gx + (x - st.gx) * 0.08
+        let gy = st.gy + (y - st.gy) * 0.08
+        let gz = st.gz + (z - st.gz) * 0.08
+        let ax = x - gx
+        let ay = y - gy
+        let az = z - gz
+        let strength = sqrt(ax * ax + ay * ay + az * az)
+        let recent = st.jolts | filter((j) => t - j <= within)
+        let against = ax * st.hx + ay * st.hy + az * st.hz < 0 || len(recent) == 0
+        if t - st.at < rest || strength < threshold || !against {
+            { ...st, gx: gx, gy: gy, gz: gz, jolts: recent, strength: strength, shook: false }
+        } else {
+            let jolts = recent | push(t)
+            let shook = len(jolts) >= need
+            { ...st, gx: gx, gy: gy, gz: gz, hx: ax, hy: ay, hz: az, jolts: shook ? [] : jolts, at: shook ? t : st.at, strength: strength, shook: shook }
+        }
+    }
+}
+
+// How full the meter is, 0 to 1: the threshold is a full bar.
+fn shake_detector_fill(strength, threshold) = threshold > 0 ? min([1, max([0, strength / threshold])]) : 0
+
+// What the note says for a state.
+fn shake_detector_note(status) = match status {
+    "tap" => "This phone asks before a page can feel motion."
+    "refused" => "Motion was refused. Allow Motion and Orientation access, or use the button."
+    "none" => "No motion sensor here. Use the button."
+    "off" => "Not listening for a shake."
+    _ => ""
+}
+
+component ShakeDetector(label: str = "Do it", say: str = "Shake the phone, or use the button", threshold: num = 12, jolts: int = 3, within: int = 900,
+                        rest: int = 1000, enabled: bool = true, on_shake = null, class: str? = null) {
+    style global shake_detector_css
+    state status = "wait"    // wait, tap, on, refused, none
+    state count = 0
+    state hit = false
+    state st = shake_detector_new()
+    state fill = null        // the meter's element
+    state ears = false       // listening, so that it is never done twice
+    state heard = false      // a real reading has come
+    state silent = false     // the clock for a phone that never says anything
+    let fire = (how) => {
+        count += 1
+        hit = true
+        on_shake && on_shake(how)
+    }
+    if hit { every(450, () => { hit = false }) }
+
+    // The sensor's own speed, up to 60 a second: nothing here may touch state that shows.
+    let moved = (e) => {
+        let a = e.accelerationIncludingGravity
+        if a == null || a.x == null {
+            // Chrome on a computer sends one empty event, and that is the answer.
+            if !heard { status = "none" }
+        } else {
+            heard = true
+            silent = false
+            if status != "on" { status = "on" }
+            st = shake_detector_step(st, a.x, a.y, a.z, e.timeStamp, threshold, jolts, within, rest)
+            if fill != null { fill.style.transform = `scaleX(${shake_detector_fill(st.strength, threshold)})` }
+            if st.shook && enabled { fire("motion") }
+        }
+    }
+    let hush = () => {
+        if ears {
+            ears = false
+            js("window.removeEventListener", "devicemotion", moved)
+        }
+        silent = false
+    }
+    let listen = () => {
+        if !ears {
+            ears = true
+            st = shake_detector_new()
+            heard = false
+            status = "on"
+            silent = true
+            js("window.addEventListener", "devicemotion", moved)
+        }
+    }
+    // iOS gives no way to tell whether it needs asking but to ask. Called with no tap it
+    // says so by failing, and the button appears; where nothing asks, the name is missing.
+    let start = (tapped) => {
+        let ok = js("DeviceMotionEvent.requestPermission")
+        if is_err(ok) && !contains(ok.error, "not defined") {
+            hush()
+            status = tapped ? "refused" : "tap"
+        } else if ok == "denied" {
+            hush()
+            status = "refused"
+        } else {
+            hush()
+            listen()
+        }
+    }
+    // Some browsers send nothing at all, so no reading in this long means no sensor.
+    if silent { every(2500, () => { if !heard { silent = false; hush(); status = "none" } }) }
+
+    <div class={ui_cls(["ui-shake", class])} @mount={(_el) => {
+        start(false)
+        () => { hush() }
+    }}>
+        <div.ui-shake-card data-hit={hit ? "" : null}>
+            <p.ui-shake-say>{say}</p>
+            <div.ui-shake-meter role="presentation"><div.ui-shake-fill @mount={(el) => { fill = el }}></div></div>
+            <p.ui-shake-note role="status">{hit ? `Shake ${count}` : shake_detector_note(enabled ? status : "off")}</p>
+            <div.ui-shake-bar>
+                <Button size="lg" class="ui-shake-do" on_click={() => { fire("button") }}>{label}</Button>
+                {(status == "tap" || status == "refused" || status == "none") && <Button size="lg" variant="outline" class="ui-shake-start"
+                    on_click={() => { start(true) }}>{status == "tap" ? "Turn on shake" : "Try again"}</Button>}
+            </div>
+        </div>
+    </div>
+}

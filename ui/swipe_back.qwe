@@ -1,0 +1,243 @@
+// SwipeBack: a screen a finger pulls away from the left edge to go back, as on an
+// iPhone. The screen follows the finger with the previous one peeking behind it; let
+// go early and it springs back, go far enough or flick and it finishes and goes back.
+// The Back button at its top does the same for keys and screen readers, as does
+// Alt + Left. In a right-to-left page it pulls from the right edge.
+//
+//   import ui/swipe_back.qwe use SwipeBack
+//
+//   component Thread(previous: str) {
+//       state open = true
+//       <SwipeBack title="Ana" back_label={`Back to ${previous}`} behind={<InboxScreen/>}
+//                  enabled={open} on_back={() => { open = false }}>
+//           <Messages/>
+//       </SwipeBack>
+//   }
+//
+// children: the screen. It sits in a scroller of its own, which keeps moving up and
+// down from the edge too. title: shown in its bar. back_label: the button's name for
+// screen readers ("Back"). back_text: the words beside the button's arrow (none).
+// behind: the previous screen, as HTML, shown only during a swipe (nothing by
+// default, a plain background then). edge: how near the edge a swipe starts, in pixels
+// (24; 32 in a pane 600 px wide or more). enabled: false turns off the swipe and hides
+// the button, for the first screen. on_back(): called once it has gone back; make the
+// previous screen the current one there. on_progress(share): called during a swipe
+// with how far across it is, 0 to 1, and with 0 on a spring back; a function that sets
+// a state here runs on each move, so keep it light. The box takes the size of its
+// parent, which needs a height.
+//
+// In a pane as wide as a tablet's, half way across would be a long reach, so 200 px
+// is enough. A screen's left edge is the system's in two places: Safari on an iPhone
+// keeps it for its own Back, and Android's gesture navigation for its own, where the
+// Back button is the way. In Quillo's iOS app it reaches the page.
+
+import ui/theme.qwe use ui_cls
+
+let swipe_back_css = css`
+.ui-swipeback {
+  position: relative; display: block; width: 100%; height: 100%; min-height: 0; overflow: hidden; overscroll-behavior-x: contain; touch-action: pan-y pinch-zoom;
+  background: var(--ui-subtle); color: var(--ui-fg); font: 15px/1.5 var(--ui-font); container-type: inline-size;
+}
+.ui-swipeback-behind, .ui-swipeback-front { position: absolute; inset: 0; }
+.ui-swipeback-behind { visibility: hidden; overflow: hidden; background: var(--ui-bg); }
+.ui-swipeback-on .ui-swipeback-behind { visibility: visible; will-change: transform; }
+.ui-swipeback-scrim { position: absolute; inset: 0; opacity: 0; background: var(--ui-overlay); pointer-events: none; }
+.ui-swipeback-front { display: flex; flex-direction: column; background: var(--ui-bg); }
+.ui-swipeback-on .ui-swipeback-front { will-change: transform; box-shadow: var(--ui-shadow-lg); user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-swipeback-settling .ui-swipeback-front, .ui-swipeback-settling .ui-swipeback-behind { transition: transform .26s cubic-bezier(.2, .8, .2, 1); }
+.ui-swipeback-settling .ui-swipeback-scrim { transition: opacity .26s cubic-bezier(.2, .8, .2, 1); }
+.ui-swipeback-bar {
+  display: flex; flex: none; align-items: center; gap: 2px; min-height: 48px; padding: env(safe-area-inset-top) max(4px, env(safe-area-inset-right)) 0 max(4px, env(safe-area-inset-left));
+  border-bottom: 1px solid var(--ui-border); background: var(--ui-surface);
+}
+.ui-swipeback-title { flex: 1; min-width: 0; margin: 0; overflow: hidden; font-size: 17px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-swipeback-back {
+  display: inline-flex; flex: none; align-items: center; min-width: 44px; height: 44px; padding: 0 8px 0 4px; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-accent); font: inherit; cursor: pointer;
+}
+.ui-swipeback-back svg { width: 26px; height: 26px; }
+.ui-swipeback-back:dir(rtl) svg { transform: scaleX(-1); }
+.ui-swipeback-back:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-swipeback-back:hover { background: var(--ui-subtle); } }
+/* pan-y: the page keeps up and down; what goes sideways comes to the handlers here. Said again on the scroller, as it stops counting at one. */
+.ui-swipeback-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; touch-action: pan-y pinch-zoom; }
+@media (prefers-reduced-motion: reduce) {
+  .ui-swipeback-settling .ui-swipeback-front, .ui-swipeback-settling .ui-swipeback-behind, .ui-swipeback-settling .ui-swipeback-scrim { transition: none; }
+}
+`
+
+// How far is far enough: half the screen, or 200 px where that would be a long reach.
+fn swipe_back_reach(width: num) -> num = width * 0.5 < 200 ? width * 0.5 : 200
+
+// Speed at release in px/ms, from the last sample kept. A finger that stopped for a
+// moment before lifting has no speed, whatever it did before.
+fn swipe_back_speed(from_x: num, from_t: num, x: num, t: num, now: num) -> num {
+    if now - t > 90 || t <= from_t { return 0 }
+    (x - from_x) / (t - from_t)
+}
+
+// Does a release finish the swipe? dx is how far, across a screen so wide, at speed.
+// Coming back towards the edge cancels, however far along; a flick finishes from
+// anywhere past the first 24 px.
+fn swipe_back_finishes(dx: num, width: num, speed: num) -> bool {
+    if dx <= 0 || speed < -0.1 { return false }
+    dx >= swipe_back_reach(width) || (speed >= 0.4 && dx >= 24)
+}
+
+// How much of the way across, 0 to 1, kept in that range for any input.
+fn swipe_back_share(dx: num, width: num) -> num {
+    if width <= 0 || dx <= 0 { return 0 }
+    dx >= width ? 1 : dx / width
+}
+
+// What the swipe does to the two screens, at a share of the way.
+fn swipe_back_paint(front, behind, scrim, share: num, width: num, sign: num) {
+    let peek = (width * 0.3 < 120 ? width * 0.3 : 120) * (1 - share)
+    front.style.transform = `translate3d(${share * width * sign}px, 0, 0)`
+    behind.style.transform = `translate3d(${-peek * sign}px, 0, 0)`
+    scrim.style.opacity = `${0.6 * (1 - share)}`
+}
+
+fn swipe_back_still(win) -> bool = win.matchMedia("(prefers-reduced-motion: reduce)").matches
+
+fn swipe_back_clear(front, behind, scrim) {
+    front.style.transform = ""
+    behind.style.transform = ""
+    scrim.style.opacity = ""
+}
+
+component SwipeBack(title: str = "", back_label: str = "Back", back_text: str? = null, behind = null, edge: num = 24,
+                    enabled: bool = true, on_back = null, on_progress = null, class: str? = null, children) {
+    style global swipe_back_css
+    state win = null           // the window, so a handler has nothing to wait for
+    state box = null
+    state front = null
+    state under = null
+    state scrim = null
+    state g = null             // the finger: { sx, sy, fx, ft, x, t, on, sign }
+    state showing = false      // the screen behind shows: from the lock until it settles
+    state settling = null      // "back" or "stay", while the transition runs
+    let width = () => box.clientWidth
+    let finish = () => {
+        let done = settling
+        if done != null {
+            settling = null
+            showing = false
+            swipe_back_clear(front, under, scrim)
+            if done == "back" { on_back && on_back() }
+        }
+    }
+    // Quiet: no transition to wait for when motion is turned down or nothing moved.
+    let settle = (how: str) => {
+        let sign = g != null ? g.sign : 1
+        g = null
+        settling = how
+        showing = true
+        if swipe_back_still(win) {
+            finish()
+        } else {
+            swipe_back_paint(front, under, scrim, how == "back" ? 1 : 0, width(), sign)
+            on_progress && on_progress(how == "back" ? 1 : 0)
+        }
+    }
+    // The button's way: the same slide, from where the screen stands.
+    let go_back = () => {
+        if enabled && settling == null && g == null {
+            let sign = win.getComputedStyle(box).direction == "rtl" ? -1 : 1
+            showing = true
+            settling = "back"
+            if swipe_back_still(win) {
+                finish()
+            } else {
+                // From where it stands to the far side: a frame apart, or there is no transition.
+                swipe_back_paint(front, under, scrim, 0, width(), sign)
+                win.requestAnimationFrame(() => { swipe_back_paint(front, under, scrim, 1, width(), sign) })
+            }
+        }
+    }
+    // The end of a transition may never come (a hidden page, a screen that left).
+    if settling != null { every(420, finish) }
+    <div class={ui_cls(["ui-swipeback", showing && "ui-swipeback-on", settling != null && "ui-swipeback-settling", class])}
+         @mount={(el) => {
+             win = js("window")
+             box = el
+         }}
+         @pointerdown={(e) => {
+             // A second finger: a pinch or a mistake, not a swipe.
+             if g != null && !e.isPrimary {
+                 if g.on { settle("stay") } else { g = null }
+             }
+             if enabled && settling == null && g == null && e.isPrimary && e.button == 0 {
+                 let sign = win.getComputedStyle(box).direction == "rtl" ? -1 : 1
+                 let r = box.getBoundingClientRect()
+                 let from_edge = sign > 0 ? e.clientX - r.left : r.right - e.clientX
+                 let reach = r.width >= 600 && edge < 32 ? 32 : edge
+                 if from_edge >= 0 && from_edge <= reach {
+                     g = { sx: e.clientX, sy: e.clientY, fx: e.clientX, ft: e.timeStamp, x: e.clientX, t: e.timeStamp, on: false, sign: sign, id: e.pointerId }
+                 }
+             }
+         }}
+         @pointermove={(e) => {
+             if g != null && e.pointerId == g.id {
+                 let dx = (e.clientX - g.sx) * g.sign
+                 let dy = e.clientY - g.sy
+                 if !g.on && abs(dx) + abs(dy) >= 10 {
+                     // Locked to one axis once: up and down is the scroller's.
+                     if dx <= abs(dy) {
+                         g = null
+                     } else {
+                         g = { ...g, on: true }
+                         showing = true
+                         box.setPointerCapture(e.pointerId)
+                     }
+                 }
+                 if g != null && g.on {
+                     let keep = e.timeStamp - g.t > 40
+                     g = { ...g, fx: keep ? g.x : g.fx, ft: keep ? g.t : g.ft, x: e.clientX, t: e.timeStamp }
+                     let share = swipe_back_share(dx, width())
+                     swipe_back_paint(front, under, scrim, share, width(), g.sign)
+                     on_progress && on_progress(share)
+                 }
+             }
+         }}
+         @pointerup={(e) => {
+             if g != null && e.pointerId == g.id {
+                 if g.on {
+                     let dx = (e.clientX - g.sx) * g.sign
+                     let speed = swipe_back_speed(g.fx, g.ft, g.x, g.t, e.timeStamp) * g.sign
+                     settle(swipe_back_finishes(dx, width(), speed) ? "back" : "stay")
+                 } else {
+                     g = null
+                 }
+             }
+         }}
+         @pointercancel={(e) => {
+             // The system took the gesture: nothing was meant, so nothing happens.
+             if g != null && e.pointerId == g.id {
+                 if g.on { settle("stay") } else { g = null }
+             }
+         }}
+         @keydown={(e) => {
+             if e.altKey && e.key == "ArrowLeft" {
+                 e.preventDefault()
+                 go_back()
+             }
+         }}>
+        <div.ui-swipeback-behind aria-hidden="true" inert="" @mount={(el) => { under = el }}>
+            {behind}
+            <div.ui-swipeback-scrim @mount={(el) => { scrim = el }}></div>
+        </div>
+        <div.ui-swipeback-front @mount={(el) => { front = el }}
+             @transitionend={(e) => { if e.propertyName == "transform" && e.target.isSameNode(front) { finish() } }}>
+            <div.ui-swipeback-bar>
+                {enabled && <button.ui-swipeback-back type="button" aria-label={back_label} @click={go_back}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"
+                         stroke-linejoin="round" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
+                    {back_text != null && <span>{back_text}</span>}
+                </button>}
+                <h2.ui-swipeback-title>{title}</h2>
+            </div>
+            <div.ui-swipeback-body tabindex="-1">{children}</div>
+        </div>
+    </div>
+}

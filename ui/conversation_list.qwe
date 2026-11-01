@@ -1,0 +1,404 @@
+// ConversationList: the first screen of a chat app. Pinned chats stand at the top, then
+// the rest by their last message; each shows its unread count, whether it is muted, who
+// is typing, and how long ago, worked out from a `now` you give, so the server and the
+// browser agree. Swipe a row left to archive it: a short pull shows the Archive
+// button and stays, a long pull or a flick archives at once, a pull too short
+// springs back, and an Undo stands at the bottom for five seconds. The button at
+// each row's end does the same for keys and for those who cannot swipe. In a wide
+// pane the list stands beside the open chat.
+//
+//   <ConversationList now={clock} chats={rooms} on_open={(id) => { navigate(`/chat/${id}`) }}
+//                     on_archive={(id) => { archive_room(id) }} on_undo={(id) => { restore_room(id) }}/>
+//
+// chats: a list of { id, name, last?, at?, unread?, muted?, pinned?, typing?, src? }.
+// last: the last message. at: its time, an ISO date-time or milliseconds. unread: a
+// count (over 99 shows 99+). typing: true, or a name ("Ada"), shown in place of the last
+// message. src: a picture over the initials. Chats with no id are left out.
+// now: the time to count from, as `at`; a prop, so it is the same on server and browser
+// (pass a state you move on for times that keep up). zone: minutes the viewer's clock
+// is ahead of UTC, for where "today" ends (0). empty: what shows with no chats
+// ("No conversations"). archive_text, undo_text: the words ("Archive", "Undo").
+// selected: the id open at the start, marked in a wide pane. label: what screen readers
+// call the list ("Conversations"). id, class: on the outer element.
+// on_open(id), on_archive(id), on_undo(id): inside one of your components.
+// pane: true when children are given: they fill the wide pane beside the list. Left
+// false, the pane shows the open chat's name and last message. (A flag and not a test
+// of children: given none, the server has empty html and the browser null, so a test
+// of it differs between them, and the pane would be lost as the page is taken up.)
+
+import ui/theme.qwe use ui_cls
+import ui/avatar.qwe use Avatar
+
+let conversation_list_css = css`
+.ui-convlist { position: relative; container-type: inline-size; box-sizing: border-box; height: 100%; overflow: hidden; background: var(--ui-bg); color: var(--ui-fg); font: 16px/1.3 var(--ui-font); }
+.ui-convlist-split { display: grid; grid-template-columns: minmax(0, 1fr); height: 100%; }
+.ui-convlist-list { position: relative; min-height: 0; margin: 0; padding: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior-y: contain; list-style: none; }
+.ui-convlist-row { position: relative; overflow: hidden; border-bottom: 1px solid var(--ui-border); }
+/* pan-y: the page keeps the up and down scroll; only sideways comes to the handlers. */
+.ui-convlist-front { position: relative; z-index: 1; display: flex; align-items: stretch; background: var(--ui-bg); touch-action: pan-y; transition: transform .24s cubic-bezier(.2, .8, .2, 1); will-change: transform; }
+.ui-convlist-dragging { transition: none; -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+.ui-convlist-open > .ui-convlist-front { transform: translateX(-96px); }
+.ui-convlist-open-chat { display: flex; align-items: center; flex: 1; gap: 12px; box-sizing: border-box; min-width: 0; min-height: 72px; padding: 8px 4px 8px max(16px, env(safe-area-inset-left)); border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.ui-convlist-open-chat:active { background: color-mix(in srgb, var(--ui-fg) 7%, transparent); }
+.ui-convlist-front:has(> [aria-current="true"]) { background: var(--ui-accent-soft); }
+.ui-convlist-open-chat:focus-visible, .ui-convlist-more:focus-visible, .ui-convlist-archive:focus-visible, .ui-convlist-undo:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-convlist-body { flex: 1; min-width: 0; }
+.ui-convlist-line { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.ui-convlist-name { flex: 0 1 auto; min-width: 0; overflow: hidden; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.ui-convlist-fresh .ui-convlist-name { font-weight: 700; }
+.ui-convlist-icon { flex: none; align-self: center; width: 14px; height: 14px; color: var(--ui-muted); }
+.ui-convlist-time { flex: none; margin-left: auto; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-convlist-fresh .ui-convlist-time { color: var(--ui-accent); font-weight: 600; }
+.ui-convlist-muted .ui-convlist-time { color: var(--ui-muted); font-weight: 400; }
+.ui-convlist-last { flex: 1; min-width: 0; color: var(--ui-muted); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-convlist-fresh .ui-convlist-last { color: var(--ui-fg); }
+.ui-convlist-typing { display: inline-flex; align-items: center; gap: 5px; flex: 1; min-width: 0; color: var(--ui-accent); font-size: 14px; font-style: italic; }
+.ui-convlist-dots { display: inline-flex; gap: 3px; }
+.ui-convlist-dots i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: ui-convlist-blink 1.2s infinite both; }
+.ui-convlist-dots i:nth-child(2) { animation-delay: .2s; }
+.ui-convlist-dots i:nth-child(3) { animation-delay: .4s; }
+@keyframes ui-convlist-blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+.ui-convlist-badge { flex: none; min-width: 22px; padding: 2px 6px; box-sizing: border-box; border-radius: 999px; background: var(--ui-accent); color: var(--ui-accent-fg); font: 600 12px/18px var(--ui-font); text-align: center; font-variant-numeric: tabular-nums; }
+.ui-convlist-muted .ui-convlist-badge { background: var(--ui-strong); color: var(--ui-fg); }
+.ui-convlist-more { flex: none; align-self: stretch; width: 44px; min-height: 44px; padding: 0; border: 0; background: transparent; color: var(--ui-muted); cursor: pointer; touch-action: pan-y; }
+.ui-convlist-more svg { width: 20px; height: 20px; }
+.ui-convlist-back { position: absolute; inset: 0 0 0 auto; display: flex; visibility: hidden; }
+.ui-convlist-open > .ui-convlist-back, .ui-convlist-dragging + .ui-convlist-back { visibility: visible; }
+.ui-convlist-archive { width: 96px; min-height: 44px; padding: 0; border: 0; background: var(--ui-info); color: #fff; font: 600 14px/1 var(--ui-font); cursor: pointer; transition: width .16s; }
+/* Past the point where letting go archives, the button says so by taking the whole row. */
+.ui-convlist-back[data-armed] { left: 0; }
+.ui-convlist-back[data-armed] .ui-convlist-archive { flex: 1; width: auto; background: var(--ui-success); text-align: right; padding-right: 24px; }
+.ui-convlist-toast { position: absolute; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); z-index: 4; display: flex; align-items: center; gap: 8px; padding: 2px 4px 2px 14px; border-radius: var(--ui-radius); background: var(--ui-fg); color: var(--ui-bg); font-size: 15px; box-shadow: var(--ui-shadow-lg); }
+.ui-convlist-toast span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-convlist-undo { flex: none; min-width: 60px; min-height: 44px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm); background: none; color: inherit; font: 700 15px/1 var(--ui-font); cursor: pointer; }
+.ui-convlist-none { margin: 40px 16px; color: var(--ui-muted); text-align: center; }
+.ui-convlist-pane { display: none; }
+@container (min-width: 640px) {
+  .ui-convlist-split { grid-template-columns: 320px minmax(0, 1fr); }
+  .ui-convlist-list { border-right: 1px solid var(--ui-border); }
+  .ui-convlist-pane { display: block; min-width: 0; padding: 20px; overflow-y: auto; }
+  .ui-convlist-pane h3 { margin: 0 0 6px; font: 600 18px/1.3 var(--ui-font); }
+  .ui-convlist-pane p { margin: 0; color: var(--ui-muted); }
+  .ui-convlist-toast { right: auto; width: 296px; }
+}
+@media (hover: hover) { .ui-convlist-open-chat:hover { background: color-mix(in srgb, var(--ui-fg) 4%, transparent); } }
+@media (prefers-reduced-motion: reduce) {
+  .ui-convlist-front, .ui-convlist-archive { transition: none; }
+  .ui-convlist-dots i { animation: none; opacity: .7; }
+}
+`
+
+let conversation_list_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+let conversation_list_days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+// A time as milliseconds: milliseconds as they are, or an ISO text read. Anything else is null.
+fn conversation_list_ms(t) {
+    let kind = type_of(t)
+    if kind == "int" || kind == "float" { return t }
+    kind == "str" && date.valid(t) ? date.ms(t) : null
+}
+
+// A day number as "3 Oct", or "3 Oct 2025" from another year, worked out with no
+// locale. (Howard Hinnant's days-to-civil.)
+fn conversation_list_day_text(day: int, this_year: int) -> str {
+    let z = day + 719468
+    let era = floor(z / 146097)
+    let doe = z - era * 146097
+    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+    let mp = floor((5 * doy + 2) / 153)
+    let d = doy - floor((153 * mp + 2) / 5) + 1
+    let m = mp < 10 ? mp + 3 : mp - 9
+    let y = yoe + era * 400 + (m <= 2 ? 1 : 0)
+    let text = `${d} ${conversation_list_months[m - 1]}`
+    y == this_year ? text : `${text} ${y}`
+}
+
+// The year a day number falls in, for the test above.
+fn conversation_list_year(day: int) -> int {
+    let z = day + 719468
+    let era = floor(z / 146097)
+    let doe = z - era * 146097
+    let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+    let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+    let mp = floor((5 * doy + 2) / 153)
+    yoe + era * 400 + (mp >= 10 ? 1 : 0)
+}
+
+// How long ago, short, as a list of chats shows it: now, 5m, 3h, Yesterday, Mon, 3 Oct.
+// Days are the viewer's, `zone` minutes off UTC. A time ahead of the clock is now.
+fn conversation_list_ago(at, clock, zone: int = 0) -> str {
+    let a = conversation_list_ms(at)
+    let b = conversation_list_ms(clock)
+    if a == null || b == null { return "" }
+    let gap = b - a
+    if gap < 60000 { return "now" }
+    if gap < 3600000 { return `${floor(gap / 60000)}m` }
+    let shift = zone * 60000
+    let day_a = floor((a + shift) / 86400000)
+    let day_b = floor((b + shift) / 86400000)
+    let days = day_b - day_a
+    if days == 0 { return `${floor(gap / 3600000)}h` }
+    if days == 1 { return "Yesterday" }
+    if days < 7 { return conversation_list_days[(day_a % 7 + 11) % 7] }
+    conversation_list_day_text(day_a, conversation_list_year(day_b))
+}
+
+fn conversation_list_unread(n) -> int {
+    let kind = type_of(n)
+    kind == "int" || kind == "float" ? max([0, floor(n)]) : 0
+}
+
+fn conversation_list_badge(n: int) -> str = n > 99 ? "99+" : str(n)
+
+// The chats that can be shown, an id once, pinned first, then the latest first; no time goes last.
+fn conversation_list_sorted(chats) -> list {
+    let all_of = type_of(chats) == "list" ? chats | filter((c) => type_of(c) == "map" && get(c, "id") != null) : []
+    // By place, not by value: two maps equal in every field are still the same id twice.
+    let parts = group_by(enumerate(all_of), (p) => str(p[1].id))
+    let given = enumerate(all_of) | filter((p) => get(parts, str(p[1].id), [])[0][0] == p[0]) | map((p) => p[1])
+    let stamped = given | map((c) => { c, t: conversation_list_ms(get(c, "at")) ?? 0 })
+    let pins = stamped | filter((s) => get(s.c, "pinned", false) == true)
+    let rest = stamped | filter((s) => get(s.c, "pinned", false) != true)
+    let order = (xs) => sort_by(xs, (s) => -s.t) | map((s) => s.c)
+    order(pins) + order(rest)
+}
+
+// What a release does. x: how far the row stands, 0 or below; speed: px/ms, negative
+// to the left; width: the row's; reveal: the actions' width. A long pull or a flick
+// archives; a flick back closes; a pull past half the actions keeps them showing.
+fn conversation_list_release(x: num, speed: num, width: num, reveal: num) -> str {
+    if x <= -width * 0.6 { return "archive" }
+    if speed <= -0.6 && x <= -40 { return "archive" }
+    if speed >= 0.3 { return "close" }
+    x <= -reveal / 2 ? "reveal" : "close"
+}
+
+// Where a row stands under the finger: any way left, and only a little to the right.
+fn conversation_list_follow(x: num) -> num = x > 0 ? x / 4 : x
+
+// What a screen reader hears for a row.
+fn conversation_list_say(c, ago: str) -> str {
+    let n = conversation_list_unread(get(c, "unread"))
+    let typing = get(c, "typing")
+    let parts = [str(get(c, "name") ?? ""), get(c, "pinned", false) == true ? "pinned" : "", get(c, "muted", false) == true ? "muted" : "",
+                 n > 0 ? `${n} unread` : "", typing != null && typing != false ? (typing == true ? "typing" : `${typing} is typing`) : str(get(c, "last") ?? ""), ago]
+    parts | filter((p) => p != "") | join(", ")
+}
+
+fn conversation_list_haptic(kind: str) {
+    let felt = js("quilloNative.haptic", kind)
+    if is_err(felt) && js("navigator.userActivation.hasBeenActive") == true { js("navigator.vibrate", 8) }
+}
+
+component ConversationList(chats = [], now = null, zone: int = 0, selected = null, empty: str = "No conversations", archive_text: str = "Archive", undo_text: str = "Undo",
+                           label: str = "Conversations", pane: bool = false, on_open = null, on_archive = null, on_undo = null, id: str? = null, class: str? = null, children) {
+    style global conversation_list_css
+    state gone = []
+    state showing = null          // the row with its button showing
+    state current = selected
+    state toast = null
+    state from_keys = false
+    state still = false
+    // The gesture: kept here as the pointer moves, shown by transform, committed at release.
+    state g_el = null
+    state g_lock = ""
+    state g_sx = 0
+    state g_sy = 0
+    state g_base = 0
+    state g_x = 0
+    state g_lx = 0
+    state g_lt = 0
+    state g_speed = 0
+    state g_armed = false
+    state g_moved = false
+    let rows = conversation_list_sorted(chats) | filter((c) => !contains(gone, c.id))
+    let chat_of = (the_id) => rows | find((c) => c.id == the_id)
+    let open_chat = chat_of(current)
+    let stop_drag = () => {
+        if g_el != null {
+            g_el.classList.remove("ui-convlist-dragging")
+            g_el.style.transform = ""
+            let back = g_el.nextElementSibling
+            if back != null { back.removeAttribute("data-armed") }
+        }
+        g_el = null
+        g_lock = ""
+        g_armed = false
+    }
+    let archive = (c, row, keys: bool) => {
+        let done = () => {
+            gone = gone + [c.id]
+            if current == c.id { current = null }
+            from_keys = keys
+            toast = c
+            on_archive && on_archive(c.id)
+        }
+        showing = null
+        if row != null && !still {
+            // The row leaves by the left, and those below close the gap.
+            let tall = row.offsetHeight
+            let front = row.firstElementChild
+            front.style.transform = "translateX(-100%)"
+            let a = row.animate([{ height: `${tall}px` }, { height: "0px" }], { duration: 200, delay: 140, easing: "ease", fill: "forwards" })
+            a.addEventListener("finish", done)
+            a.addEventListener("cancel", done)
+        } else {
+            done()
+        }
+    }
+    if toast != null { every(5000, () => { toast = null }) }
+    <div class={ui_cls(["ui-convlist", class])} id={id}
+         @mount={(el) => { still = js("matchMedia", "(prefers-reduced-motion: reduce)").matches }}
+         @keydown={(e) => {
+             if e.key == "Escape" && showing != null {
+                 let row = e.target.closest(".ui-convlist-row")
+                 showing = null
+                 if row != null { row.querySelector(".ui-convlist-more").focus() }
+             }
+         }}>
+        <div.ui-convlist-split>
+            {len(rows) == 0
+                ? <p.ui-convlist-none>{empty}</p>
+                : <ul.ui-convlist-list aria-label={label}
+                      @pointerdown={(e) => {
+                          g_moved = false
+                          let front = e.target.closest(".ui-convlist-front")
+                          if front != null && e.button == 0 {
+                              g_el = front
+                              g_lock = ""
+                              g_sx = e.clientX
+                              g_sy = e.clientY
+                              g_lx = e.clientX
+                              g_lt = e.timeStamp
+                              g_speed = 0
+                              g_base = front.parentElement.classList.contains("ui-convlist-open") ? -96 : 0
+                              g_x = g_base
+                          }
+                      }}
+                      @pointermove={(e) => {
+                          if g_el != null {
+                              let dx = e.clientX - g_sx
+                              let dy = e.clientY - g_sy
+                              if g_lock == "" && dx * dx + dy * dy >= 100 {
+                                  g_lock = abs(dx) > abs(dy) ? "x" : "y"
+                                  if g_lock == "x" {
+                                      g_el.setPointerCapture(e.pointerId)
+                                      g_el.classList.add("ui-convlist-dragging")
+                                      g_moved = true
+                                  }
+                              }
+                              if g_lock == "x" {
+                                  let t = e.timeStamp
+                                  if t > g_lt { g_speed = (e.clientX - g_lx) / (t - g_lt) }
+                                  g_lx = e.clientX
+                                  g_lt = t
+                                  g_x = conversation_list_follow(g_base + dx)
+                                  g_el.style.transform = `translateX(${g_x}px)`
+                                  let armed = g_x <= -g_el.offsetWidth * 0.6
+                                  if armed != g_armed {
+                                      g_armed = armed
+                                      let back = g_el.nextElementSibling
+                                      if armed { back.setAttribute("data-armed", "") } else { back.removeAttribute("data-armed") }
+                                      conversation_list_haptic("selection")
+                                  }
+                              }
+                          }
+                      }}
+                      @pointerup={(e) => {
+                          if g_el != null && g_lock == "x" {
+                              let front = g_el
+                              let row = front.parentElement
+                              let the_id = row.dataset.id
+                              let c = rows | find((x) => str(x.id) == the_id)
+                              let what = conversation_list_release(g_x, g_speed, front.offsetWidth, 96)
+                              stop_drag()
+                              if what == "archive" && c != null {
+                                  archive(c, row, false)
+                              } else {
+                                  showing = what == "reveal" && c != null ? c.id : null
+                              }
+                          } else {
+                              stop_drag()
+                          }
+                      }}
+                      @pointercancel={() => { stop_drag() }}>
+                    {for c in rows => {
+                        let n = conversation_list_unread(get(c, "unread"))
+                        let ago = conversation_list_ago(get(c, "at"), now, zone)
+                        let typing = get(c, "typing")
+                        let is_typing = typing != null && typing != false
+                        let name = str(get(c, "name") ?? "")
+                        <li key={str(c.id)} data-id={str(c.id)}
+                            class={ui_cls(["ui-convlist-row", showing == c.id && "ui-convlist-open", n > 0 && "ui-convlist-fresh", get(c, "muted", false) == true && "ui-convlist-muted"])}>
+                            <div.ui-convlist-front>
+                                <button.ui-convlist-open-chat type="button" aria-label={conversation_list_say(c, ago)} aria-current={current == c.id ? "true" : null}
+                                        @click={() => {
+                                            if g_moved {
+                                                g_moved = false
+                                            } else if showing != null {
+                                                showing = null
+                                            } else {
+                                                current = c.id
+                                                on_open && on_open(c.id)
+                                            }
+                                        }}>
+                                    <Avatar name={name} src={get(c, "src")} size="lg"/>
+                                    <span.ui-convlist-body>
+                                        <span.ui-convlist-line>
+                                            <span.ui-convlist-name>{name}</span>
+                                            {get(c, "pinned", false) == true && <svg.ui-convlist-icon data-pin viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M14 3l7 7-3 1-3 5-1.500 1.500L11 14l-6 6-1-1 6-6-3.500-3.500L8 8l5-3z"/></svg>}
+                                            {get(c, "muted", false) == true && <svg.ui-convlist-icon data-mute viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4zM17 9l5 5M22 9l-5 5"/></svg>}
+                                            <span.ui-convlist-time>{ago}</span>
+                                        </span>
+                                        <span.ui-convlist-line>
+                                            {is_typing
+                                                ? <span.ui-convlist-typing><span.ui-convlist-dots aria-hidden="true"><i></i><i></i><i></i></span>{typing == true ? "typing" : `${typing} is typing`}</span>
+                                                : <span.ui-convlist-last>{str(get(c, "last") ?? "")}</span>}
+                                            {n > 0 && <span.ui-convlist-badge>{conversation_list_badge(n)}</span>}
+                                        </span>
+                                    </span>
+                                </button>
+                                <button.ui-convlist-more type="button" aria-label={`Actions for ${name}`} aria-expanded={showing == c.id ? "true" : "false"}
+                                        @click={(e) => {
+                                            if g_moved {
+                                                g_moved = false
+                                            } else if showing == c.id {
+                                                showing = null
+                                            } else {
+                                                showing = c.id
+                                                // Hidden until the row opens, and what is hidden cannot take focus.
+                                                let to = e.target.closest(".ui-convlist-row").querySelector(".ui-convlist-archive")
+                                                js("requestAnimationFrame", (_t = null) => { to.focus() })
+                                            }
+                                        }}>
+                                    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.800"/><circle cx="12" cy="12" r="1.800"/><circle cx="19" cy="12" r="1.800"/></svg>
+                                </button>
+                            </div>
+                            <div.ui-convlist-back>
+                                <button.ui-convlist-archive type="button" @click={(e) => { archive(c, e.target.closest(".ui-convlist-row"), true) }}>{archive_text}</button>
+                            </div>
+                        </li>
+                    }}
+                  </ul>}
+            {pane
+                ? <aside.ui-convlist-pane aria-label="Open conversation">{children}</aside>
+                : <aside.ui-convlist-pane aria-label="Open conversation">
+                    {open_chat != null
+                        ? <div><h3>{str(get(open_chat, "name") ?? "")}</h3><p>{str(get(open_chat, "last") ?? "")}</p></div>
+                        : <p>Choose a conversation</p>}
+                  </aside>}
+        </div>
+        {toast != null && <div.ui-convlist-toast role="status">
+            <span>Archived {str(get(toast, "name") ?? "")}</span>
+            <button.ui-convlist-undo type="button"
+                    @mount={(el) => { if from_keys { el.focus() } }}
+                    @click={() => {
+                        let the_id = toast.id
+                        gone = remove(gone, the_id)
+                        toast = null
+                        on_undo && on_undo(the_id)
+                    }}>{undo_text}</button>
+        </div>}
+    </div>
+}

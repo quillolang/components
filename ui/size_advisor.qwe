@@ -1,0 +1,321 @@
+// SizeAdvisor: takes body measurements in centimetres or inches and a size chart for
+// each kind of garment, and recommends a size for each, saying how it fits measure
+// by measure. A size is sure when every measurement falls inside it. Between two
+// sizes, in a gap in the chart or where measurements point different ways, the
+// preference decides: snug takes the smaller, relaxed the larger, and regular the
+// one that misses by least, going up on a tie. A body past the chart gets the
+// nearest size and is told so, a chart can be in other units than the reader, and
+// a number that only makes sense in the other unit is pointed out. Switching unit
+// keeps the exact measurement, so going to inches and back changes nothing.
+//
+//   <SizeAdvisor unit="cm" charts={[
+//       { id: "shirt", label: "Shirt", unit: "cm", sizes: [
+//           { name: "S", chest: [86, 91], waist: [71, 76] },
+//           { name: "M", chest: [94, 99], waist: [79, 84] }] },
+//       { id: "jeans", label: "Jeans", unit: "in", sizes: [
+//           { name: "30", waist: "30-31" }, { name: "32", waist: "32-33" }] }]}/>
+//
+// charts: a list of { id, label, unit, sizes }: unit "cm" (the default) or "in" for
+// the chart's own figures; sizes in order, smallest first, each { name, ... } with a
+// [low, high] pair, text "low-high" or one number for each measure. measures: a
+// list of { id, label } naming the fields and their order; left out, one for each
+// measure the charts use, labelled from its id. values: where the fields start, a
+// map from measure to a number, in `unit`. unit: "cm" or "in" for the fields ("cm");
+// the reader can switch it. fit: "snug", "regular" (the default) or "relaxed"; the
+// reader can switch it. title: the heading ("Find your size"). id: a prefix for
+// its ids ("size-advisor"), unique on the page. The fields are named after their
+// measure, with unit and fit, so a form around it sends them; name: a prefix for
+// those names, which two on one page need to keep their radios apart. on_change({ unit, fit, sizes, advice }): inside one of your components,
+// after each change: sizes a map from chart id to the size's name (null for none),
+// advice what size_advisor_advise gives for each chart.
+//
+// size_advisor_model(charts, measures) reads the data, and size_advisor_advise(chart,
+// body, fit) advises for a program's own use, with body in centimetres as decimals.
+// It gives { id, label, size, sure, between, past, rows, used, missing }.
+
+import ui/theme.qwe use ui_cls
+
+let size_advisor_css = css`
+.ui-sizeadv { display: grid; gap: 14px; min-width: 0; max-width: 680px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-sizeadv .ui-sizeadv-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-sizeadv-controls { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+.ui-sizeadv-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin: 0; padding: 0; border: 0; }
+.ui-sizeadv-choice legend { float: left; margin-right: 8px; padding: 0; font-size: 13px; font-weight: 500; }
+.ui-sizeadv-choice label { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; cursor: pointer; }
+.ui-sizeadv-choice input { margin: 0; accent-color: var(--ui-accent); }
+.ui-sizeadv-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px 12px; }
+.ui-sizeadv-field { display: grid; gap: 4px; min-width: 0; align-content: start; }
+.ui-sizeadv-field label { font-size: 13px; font-weight: 500; }
+.ui-sizeadv-box { box-sizing: border-box; display: flex; align-items: center; gap: 6px; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); transition: border-color .15s, box-shadow .15s; }
+.ui-sizeadv-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-sizeadv-box input { flex: 1; width: 0; min-width: 0; height: 100%; padding: 0; border: 0; outline: none; background: transparent; color: var(--ui-fg); font: 14px var(--ui-font); text-align: right; font-variant-numeric: tabular-nums; }
+.ui-sizeadv-box span { flex: none; color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-sizeadv-bad .ui-sizeadv-box { border-color: var(--ui-danger); }
+.ui-sizeadv-error { margin: 0; color: var(--ui-danger); font-size: 12px; }
+.ui-sizeadv-hint { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+.ui-sizeadv-switch { padding: 3px 10px; border: 1px solid currentColor; border-radius: var(--ui-radius-sm); background: transparent; color: inherit; font: 500 12px var(--ui-font); cursor: pointer; }
+.ui-sizeadv-switch:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-sizeadv-results { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.ui-sizeadv-card { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 14px; padding: 12px 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-sizeadv-size { grid-row: span 3; display: grid; place-items: center; min-width: 52px; min-height: 52px; padding: 0 8px; border-radius: var(--ui-radius-sm); background: var(--ui-accent-soft); color: var(--ui-accent); font-size: 18px; font-weight: 700; }
+.ui-sizeadv-none { background: var(--ui-surface); color: var(--ui-muted); }
+.ui-sizeadv-garment { font-weight: 650; }
+.ui-sizeadv-say { color: var(--ui-fg); font-size: 13px; }
+.ui-sizeadv-fit { display: flex; flex-wrap: wrap; gap: 2px 12px; margin: 0; padding: 0; list-style: none; font-size: 12px; color: var(--ui-muted); }
+.ui-sizeadv-tight { color: var(--ui-danger); }
+.ui-sizeadv-loose { color: var(--ui-warning); }
+.ui-sizeadv-good { color: var(--ui-success); }
+.ui-sizeadv-problems { margin: 0; padding: 8px 12px 8px 26px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 12px; }
+@media (max-width: 420px) { .ui-sizeadv { padding: 16px; } }
+@media (prefers-reduced-motion: reduce) { .ui-sizeadv-box { transition: none; } }
+`
+
+// A figure above 0 as a decimal, null when blank, an error value when it is not one.
+fn size_advisor_read(x) {
+    let t = trim(str(x ?? ""))
+    if t == "" { return null }
+    if !re.test(t, "^[0-9]{1,6}(\\.[0-9]{1,6})?$") { return err("is not a number") }
+    dec(t)
+}
+
+fn size_advisor_to_cm(x, unit: str) = unit == "in" ? x * 2.54m : x
+fn size_advisor_from_cm(x, unit: str) = unit == "in" ? x / 2.54m : x
+
+// A chart's [low, high], "low-high" or one number, in centimetres, or null.
+fn size_advisor_range(x, unit: str) {
+    let parts = type_of(x) == "list" ? x : re.split(str(x ?? ""), "\\s*[-–]\\s*")
+    if len(parts) < 1 || len(parts) > 2 { return null }
+    let lo = size_advisor_read(parts[0])
+    let hi = size_advisor_read(parts[len(parts) - 1])
+    if lo == null || hi == null || is_err(lo) || is_err(hi) || lo > hi { return null }
+    { lo: size_advisor_to_cm(lo, unit), hi: size_advisor_to_cm(hi, unit) }
+}
+
+// A measure's label from its id: "inside_leg" is "Inside leg".
+fn size_advisor_label(id: str) -> str {
+    let t = re.replace(id, "[_-]+", " ")
+    upper(slice(t, 0, 1)) + slice(t, 1)
+}
+
+// The charts as data it can trust: { measures, charts, problems }, every figure in cm.
+fn size_advisor_model(charts, measures) {
+    let problems = []
+    let tidy = []
+    let named = type_of(measures) == "list" ? measures | filter((m) => type_of(m) == "map" && m.id != null) | map((m) => { id: str(m.id), label: str(m.label ?? size_advisor_label(str(m.id))) }) : []
+    let found = named
+    for c in type_of(charts) == "list" ? take(charts, 30) : [] {
+        if type_of(c) != "map" || c.id == null || type_of(c.sizes) != "list" || len(c.sizes) == 0 {
+            problems = problems | push("A chart without an id or sizes is left out.")
+        } else {
+            let unit = c.unit == "in" ? "in" : "cm"
+            let label = str(c.label ?? c.id)
+            let sizes = []
+            for s in take(c.sizes, 40) {
+                if type_of(s) != "map" || s.name == null {
+                    problems = problems | push(`A size of ${label} has no name, so it is left out.`)
+                } else {
+                    let ranges = {}
+                    for k in keys(s) {
+                        if k != "name" {
+                            let r = size_advisor_range(s[k], unit)
+                            if r == null {
+                                problems = problems | push(`${label} ${str(s.name)}: the ${k} figures cannot be read, so they are left out.`)
+                            } else {
+                                ranges = set(ranges, k, r)
+                                if !any(found, (m) => m.id == k) { found = found | push({ id: k, label: size_advisor_label(k) }) }
+                            }
+                        }
+                    }
+                    sizes = sizes | push({ name: str(s.name), ranges })
+                }
+            }
+            if len(sizes) == 0 {
+                problems = problems | push(`${label} has no sizes it can read, so it is left out.`)
+            } else {
+                let ids = unique(flatten(sizes | map((s) => keys(s.ranges))))
+                tidy = tidy | push({ id: str(c.id), label, sizes, ids })
+            }
+        }
+    }
+    { measures: found, charts: tidy, problems }
+}
+
+// How far a body figure is outside a range: below 0 loose, above 0 tight, 0 fits.
+fn size_advisor_miss(v, r) {
+    if v > r.hi { return v - r.hi }
+    if v < r.lo { return v - r.lo }
+    0m
+}
+
+// Worst misses of a size: { tight, loose } as amounts of 0 or more.
+fn size_advisor_worst(size, used, body) {
+    let misses = used | filter((m) => has(size.ranges, m)) | map((m) => size_advisor_miss(body[m], size.ranges[m]))
+    { tight: max(misses + [0m]), loose: 0m - min(misses + [0m]) }
+}
+
+// The whole of the advice for one chart: see the top of the file.
+fn size_advisor_advise(chart, body, fit: str) {
+    let used = chart.ids | filter((m) => get(body, m) != null)
+    let missing = chart.ids | filter((m) => get(body, m) == null)
+    let base = { id: chart.id, label: chart.label, used, missing, size: null, sure: false, between: null, past: null, rows: [] }
+    if len(used) == 0 { return base }
+    let n = len(chart.sizes)
+    let worst = chart.sizes | map((s) => size_advisor_worst(s, used, body))
+    // A size with none of these figures says nothing either way.
+    let at = range(n) | filter((i) => any(used, (m) => has(chart.sizes[i].ranges, m)))
+    let no_tight = at | filter((i) => worst[i].tight == 0)
+    let no_loose = at | filter((i) => worst[i].loose == 0)
+    let above = len(no_tight) == 0
+    let below = len(no_loose) == 0
+    let low = above ? last(at) : first(no_tight)
+    let high = below ? first(at) : last(no_loose)
+    // low is the smallest that is not tight and high the largest that is not loose:
+    // low past high means no size does both, and those from high to low are the choice.
+    let first_i = low < high ? low : high
+    let last_i = low < high ? high : low
+    let centre = (i) => {
+        let s = chart.sizes[i]
+        sum(used | filter((m) => has(s.ranges, m)) | map((m) => abs(body[m] * 2 - s.ranges[m].lo - s.ranges[m].hi))) + 0m
+    }
+    let score = (i) => low < high ? centre(i) : max([worst[i].tight, worst[i].loose])
+    let regular = reduce(at | filter((i) => i >= first_i && i <= last_i), first_i, (b, i) => score(i) <= score(b) ? (low < high && score(i) == score(b) ? b : i) : b)
+    let pick = fit == "snug" ? first_i : fit == "relaxed" ? last_i : regular
+    let size = chart.sizes[pick]
+    let rows = used | filter((m) => has(size.ranges, m)) | map((m) => ({ id: m, by: size_advisor_miss(body[m], size.ranges[m]) }))
+    merge(base, { size: size.name, sure: first_i == last_i && !above && !below, rows,
+                  between: first_i != last_i ? [chart.sizes[first_i].name, chart.sizes[last_i].name] : null,
+                  past: above ? "above" : below ? "below" : null, overlap: low < high })
+}
+
+// Figures that only make sense in the other unit: the unit to suggest, or null.
+fn size_advisor_other_unit(model, m: str, v, unit: str) {
+    let ranges = flatten(model.charts | map((c) => c.sizes | filter((s) => has(s.ranges, m)) | map((s) => s.ranges[m])))
+    if len(ranges) == 0 { return null }
+    let lo = min(ranges | map((r) => r.lo))
+    let hi = max(ranges | map((r) => r.hi))
+    let in_cm = size_advisor_to_cm(v, unit)
+    let flipped = unit == "cm" ? v * 2.54m : v
+    let near = (x) => x * 10 >= lo * 7 && x * 10 <= hi * 13
+    if near(in_cm) || !near(flipped) { return null }
+    unit == "cm" ? "in" : "cm"
+}
+
+fn size_advisor_body(texts, unit: str, measures) {
+    reduce(measures, {}, (b, m) => {
+        let r = size_advisor_read(texts[m.id])
+        set(b, m.id, r == null || is_err(r) || r == 0 || size_advisor_to_cm(r, unit) > 400 ? null : size_advisor_to_cm(r, unit))
+    })
+}
+
+component SizeAdvisor(charts = [], measures = null, values = null, unit: str = "cm", fit: str = "regular", title: str = "Find your size", id: str = "size-advisor",
+                      name: str? = null, on_change = null, class: str? = null) {
+    style global size_advisor_css
+    let model = size_advisor_model(charts, measures)
+    let start_unit = unit == "in" ? "in" : "cm"
+    let start = reduce(model.measures, {}, (t, m) => set(t, m.id, type_of(values) == "map" ? str(get(values, m.id) ?? "") : ""))
+    state texts = start
+    state body = size_advisor_body(start, start_unit, model.measures)
+    state shown_unit = start_unit
+    state pref = fit == "snug" || fit == "relaxed" ? fit : "regular"
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let advice = model.charts | map((c) => size_advisor_advise(c, body, pref))
+    let label_of = (i: str) => (model.measures | find((m) => m.id == i)).label
+    let length = (x) => `${str(round(size_advisor_from_cm(abs(x), shown_unit), 1, "half_up"))} ${shown_unit}`
+    let field_error = (i: str) => {
+        let r = size_advisor_read(texts[i])
+        if r == null { return null }
+        if is_err(r) { return `${label_of(i)} ${r.error}.` }
+        if r == 0 { return `${label_of(i)} must be more than 0.` }
+        if size_advisor_to_cm(r, shown_unit) > 400 { return `${label_of(i)} is too large to be a measurement.` }
+        null
+    }
+    let doubts = model.measures | filter((m) => get(body, m.id) != null && field_error(m.id) == null)
+        | filter((m) => size_advisor_other_unit(model, m.id, size_advisor_read(texts[m.id]), shown_unit) != null)
+    let other = shown_unit == "cm" ? "in" : "cm"
+    let other_word = shown_unit == "cm" ? "inches" : "centimetres"
+    let tell = (b, u: str, p: str) => {
+        if on_change != null {
+            let a = model.charts | map((c) => size_advisor_advise(c, b, p))
+            on_change({ unit: u, fit: p, advice: a, sizes: reduce(a, {}, (m, x) => set(m, x.id, x.size)) })
+        }
+    }
+    let edit = (i: str, text: str) => {
+        let t = set(texts, i, text)
+        let b = size_advisor_body(t, shown_unit, model.measures)
+        texts = t
+        body = b
+        tell(b, shown_unit, pref)
+    }
+    // The measurements stay; only how they are written changes.
+    let convert = (u: str) => {
+        texts = reduce(model.measures, texts, (t, m) => {
+            let cm = get(body, m.id)
+            cm == null ? t : set(t, m.id, str(round(size_advisor_from_cm(cm, u), 1, "half_up")))
+        })
+        shown_unit = u
+        tell(body, u, pref)
+    }
+    // The numbers stay and were in the other unit all along.
+    let retake = () => {
+        let b = size_advisor_body(texts, other, model.measures)
+        body = b
+        shown_unit = other
+        tell(b, other, pref)
+    }
+    let say = (a) => {
+        if a.size == null { return `Add ${a.missing | map((m) => lower(label_of(m))) | join(" or ")} to get a size.` }
+        let tail = len(a.missing) > 0 ? ` Based on ${a.used | map((m) => lower(label_of(m))) | join(", ")}: add ${a.missing | map((m) => lower(label_of(m))) | join(" and ")} to be surer.` : ""
+        if a.past == "above" { return `Above this chart: ${a.size} is the largest, and it will be tight.${tail}` }
+        if a.past == "below" { return `Below this chart: ${a.size} is the smallest, and it will be loose.${tail}` }
+        if a.between != null && a.overlap == true { return `Both ${a.between[0]} and ${a.between[1]} fit. For a ${pref} fit, ${a.size}.${tail}` }
+        if a.between != null { return `Between ${a.between[0]} and ${a.between[1]}. For a ${pref} fit, ${a.size}.${tail}` }
+        `${a.size} fits.${tail}`
+    }
+    let fit_text = (r) => r.by == 0 ? "fits" : r.by > 0 ? `${length(r.by)} tight` : `${length(r.by)} loose`
+    <section class={ui_cls(["ui-sizeadv", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-sizeadv-title id={`${id}-title`}>{title}</h3>
+        {len(model.problems) > 0 && <ul.ui-sizeadv-problems>{for p in model.problems => <li>{p}</li>}</ul>}
+        <div.ui-sizeadv-controls>
+            <fieldset.ui-sizeadv-choice>
+                <legend>Measure in</legend>
+                <label><input type="radio" name={named("unit")} value="cm" checked={shown_unit == "cm"} @change={(e) => { convert("cm") }}/> cm</label>
+                <label><input type="radio" name={named("unit")} value="in" checked={shown_unit == "in"} @change={(e) => { convert("in") }}/> inches</label>
+            </fieldset>
+            <fieldset.ui-sizeadv-choice>
+                <legend>Fit</legend>
+                {for f in ["snug", "regular", "relaxed"] => <label key={f}><input type="radio" name={named("fit")} value={f} checked={pref == f}
+                    @change={(e) => { pref = f; tell(body, shown_unit, f) }}/> {upper(slice(f, 0, 1)) + slice(f, 1)}</label>}
+            </fieldset>
+        </div>
+        <div.ui-sizeadv-fields>
+            {for m in model.measures => <div key={m.id} class={ui_cls(["ui-sizeadv-field", field_error(m.id) != null && "ui-sizeadv-bad"])}>
+                <label for={`${id}-${m.id}`}>{m.label}</label>
+                <div.ui-sizeadv-box>
+                    <input type="text" inputmode="decimal" id={`${id}-${m.id}`} name={named(m.id)} value={texts[m.id]} autocomplete="off" aria-invalid={field_error(m.id) != null ? "true" : null}
+                           aria-describedby={field_error(m.id) != null ? `${id}-${m.id}-error` : null} @input={(e) => { edit(m.id, e.value) }}/>
+                    <span aria-hidden="true">{shown_unit}</span>
+                </div>
+                {field_error(m.id) != null && <p.ui-sizeadv-error id={`${id}-${m.id}-error`}>{field_error(m.id)}</p>}
+            </div>}
+        </div>
+        <div aria-live="polite">
+            {len(doubts) > 0 && <p.ui-sizeadv-hint>
+                <span>{doubts | map((m) => m.label) | join(", ")} {len(doubts) == 1 ? "looks" : "look"} like {other_word}.</span>
+                <button.ui-sizeadv-switch type="button" @click={() => { retake() }}>Read these as {other_word}</button>
+            </p>}
+        </div>
+        {len(model.charts) == 0 && <p.ui-sizeadv-error role="alert">No size chart to go by.</p>}
+        <ul.ui-sizeadv-results aria-live="polite">
+            {for a in advice => <li.ui-sizeadv-card key={a.id}>
+                <span class={ui_cls(["ui-sizeadv-size", a.size == null && "ui-sizeadv-none"])}>{a.size ?? "?"}</span>
+                <span.ui-sizeadv-garment>{a.label}</span>
+                <span.ui-sizeadv-say>{say(a)}</span>
+                <ul.ui-sizeadv-fit>
+                    {for r in a.rows => <li key={r.id} class={r.by == 0 ? "ui-sizeadv-good" : r.by > 0 ? "ui-sizeadv-tight" : "ui-sizeadv-loose"}>{label_of(r.id)}: {fit_text(r)}</li>}
+                </ul>
+            </li>}
+        </ul>
+    </section>
+}

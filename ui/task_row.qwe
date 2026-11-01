@@ -1,0 +1,466 @@
+// TaskRow: one task on a phone. A round check finishes it, and in TaskRowList the row then
+// moves smoothly to the Completed part, which on a tablet is a column of its own. Swiped
+// right it shows when it is due (Today, Tomorrow, Pick a day), swiped left Delete, and a long
+// swipe left deletes at once. More on the row, or Delete on it from a keyboard, gives
+// the same, so no swipe is ever the only way. Subtasks open under it, and the check's ring
+// shows how many are done. It says "2 days late", "Today", "Friday" from the day it is given.
+//
+//   component Today() {
+//       <TaskRowList tasks={tasks} today="2026-11-01"
+//                    on_toggle={(id, done) => { save_done(id, done) }}
+//                    on_due={(id, due) => { save_due(id, due) }}
+//                    on_delete={(id) => { remove(id) }}/>
+//   }
+//   <TaskRow task={{ id: 1, title: "Pay rent", due: "2026-11-03" }} today="2026-11-01"/>
+//
+// TaskRow: task: { id, title, done?, due? ("YYYY-MM-DD"), priority? ("high", "medium", "low"),
+// list?, subtasks?: [{ id, title, done? }] }, followed when it changes. today: "YYYY-MM-DD",
+// for the words about the due day; left out, the server's day when it renders. class.
+// on_toggle(id, done), on_due(id, due) with due null when cleared, on_delete(id),
+// on_subtask(id, sub_id, done): inside one of your components; ids as text.
+// TaskRowList: tasks, each as above, an id seen twice left out; followed when it changes.
+// today, the same four callbacks, on_restore(id) when a delete is undone. label: the open
+// part's name ("To do"). done_label: the finished part's name ("Completed"). empty_text:
+// what shows with nothing open. undo_seconds: how long a delete can be undone (5), and the
+// row's on_delete comes when it runs out, so a task undone was never deleted. class.
+
+import ui/theme.qwe use ui_cls
+
+let task_row_css = css`
+.ui-task-row { position: relative; color: var(--ui-fg); font: 15px/1.35 var(--ui-font); background: var(--ui-surface); }
+.ui-task-row-clip { position: relative; overflow: hidden; }
+.ui-task-row-under { position: absolute; top: 0; bottom: 0; display: flex; visibility: hidden; }
+.ui-task-row-under-due { left: 0; }
+.ui-task-row-under-del { right: 0; }
+.ui-task-row[data-way="due"] .ui-task-row-under-due, .ui-task-row[data-way="del"] .ui-task-row-under-del { visibility: visible; }
+.ui-task-row-act { display: grid; place-items: center; min-width: 64px; min-height: 44px; padding: 0 6px; border: 0; background: var(--ui-info); color: #fff; font: 600 13px/1.2 var(--ui-font); cursor: pointer; }
+.ui-task-row-act + .ui-task-row-act { background: color-mix(in srgb, var(--ui-info) 82%, #000); }
+.ui-task-row-act + .ui-task-row-act + .ui-task-row-act { background: color-mix(in srgb, var(--ui-info) 66%, #000); }
+.ui-task-row-act-del { min-width: 88px; background: var(--ui-danger); }
+.ui-task-row-act:focus-visible { outline: 2px solid #fff; outline-offset: -4px; }
+.ui-task-row-front { position: relative; display: flex; align-items: center; gap: 4px; min-height: 60px; padding: 4px 4px 4px 6px; background: var(--ui-surface);
+  touch-action: pan-y; transition: transform .22s cubic-bezier(.2, .8, .2, 1); }
+.ui-task-row-moving { transition: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-task-row-check { position: relative; display: grid; flex: none; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ui-strong); cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.ui-task-row-check:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-task-row-check[data-priority="high"] { color: var(--ui-danger); }
+.ui-task-row-check[data-priority="medium"] { color: var(--ui-warning); }
+.ui-task-row-check[data-priority="low"] { color: var(--ui-info); }
+.ui-task-row-ring { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%;
+  background: conic-gradient(var(--ui-success) calc(var(--done, 0) * 1turn), currentColor 0); transition: transform .18s; }
+.ui-task-row-ring::before { content: ""; grid-area: 1 / 1; width: 21px; height: 21px; border-radius: 50%; background: var(--ui-surface); transition: transform .2s cubic-bezier(.2, .8, .2, 1), background .15s; }
+.ui-task-row-ring svg { grid-area: 1 / 1; z-index: 1; width: 16px; height: 16px; color: #fff; opacity: 0; transform: scale(.4); transition: opacity .12s, transform .2s cubic-bezier(.2, 1.4, .4, 1); }
+.ui-task-row-check[aria-checked="true"] .ui-task-row-ring { background: var(--ui-success); }
+.ui-task-row-check[aria-checked="true"] .ui-task-row-ring::before { background: var(--ui-success); }
+.ui-task-row-check[aria-checked="true"] svg { opacity: 1; transform: none; }
+.ui-task-row-text { flex: 1; min-width: 0; padding: 4px 0; }
+/* Inline, so the line through it stops where the words do. */
+.ui-task-row-title { overflow-wrap: anywhere; -webkit-box-decoration-break: clone; box-decoration-break: clone; background: linear-gradient(currentColor, currentColor) 0 56% / 0 1px no-repeat; transition: background-size .24s, color .2s; }
+.ui-task-row-done .ui-task-row-title { background-size: 100% 1px; color: var(--ui-muted); }
+.ui-task-row-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; color: var(--ui-muted); font-size: 13px; }
+.ui-task-row-due[data-tone="late"] { color: var(--ui-danger); font-weight: 600; }
+.ui-task-row-due[data-tone="today"] { color: var(--ui-success); font-weight: 600; }
+.ui-task-row-icon { display: grid; flex: none; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: pointer; }
+.ui-task-row-icon svg { width: 20px; height: 20px; transition: transform .18s; }
+.ui-task-row-icon[aria-expanded="true"] svg { transform: rotate(180deg); }
+.ui-task-row-icon:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-task-row-count { flex: none; min-width: 44px; min-height: 44px; padding: 0 6px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-task-row-count:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-task-row-more { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 10px 12px 50px; }
+.ui-task-row-more button, .ui-task-row-date { min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-task-row-date { min-width: 44px; max-width: 100%; }
+.ui-task-row-more button[data-tone="danger"] { border-color: transparent; background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-task-row-more :focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-task-row-subs { margin: 0; padding: 0 10px 8px 50px; list-style: none; }
+.ui-task-row-sub { display: flex; align-items: center; gap: 2px; min-height: 44px; }
+.ui-task-row-sub .ui-task-row-ring { width: 22px; height: 22px; }
+.ui-task-row-sub .ui-task-row-ring::before { width: 18px; height: 18px; }
+.ui-task-row-sub .ui-task-row-ring svg { width: 13px; height: 13px; }
+.ui-task-row-sub-done { color: var(--ui-muted); text-decoration: line-through; }
+.ui-task-row-gone { max-height: 0; opacity: 0; overflow: hidden; }
+
+.ui-task-rows { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.35 var(--ui-font); }
+.ui-task-rows-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; margin: 0; padding: 0; list-style: none; }
+.ui-task-rows-item { min-width: 0; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-task-rows-head { padding: 14px 6px 6px; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font: 600 13px/1.3 var(--ui-font); background: transparent; }
+.ui-task-rows-head[data-part="open"] { display: none; }
+.ui-task-rows-none { padding: 22px 12px; color: var(--ui-muted); text-align: center; }
+.ui-task-rows-bar { position: sticky; bottom: max(8px, env(safe-area-inset-bottom)); z-index: 2; display: flex; align-items: center; gap: 8px; min-height: 52px; margin-top: 10px; padding: 4px 6px 4px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-fg); color: var(--ui-bg); box-shadow: var(--ui-shadow); }
+.ui-task-rows-bar span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-task-rows-undo { min-width: 64px; min-height: 44px; padding: 0 10px; border: 0; background: transparent; color: inherit; font: 700 14px/1 var(--ui-font); text-decoration: underline; cursor: pointer; }
+.ui-task-rows-undo:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+/* On a tablet the finished ones stand in their own column, so a row crosses over. */
+@container (min-width: 640px) {
+  .ui-task-rows-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-auto-flow: row dense; column-gap: 24px; align-items: start; }
+  .ui-task-rows-item[data-part="open"], .ui-task-rows-head[data-part="open"], .ui-task-rows-none { grid-column: 1; }
+  .ui-task-rows-item[data-part="done"], .ui-task-rows-head[data-part="done"] { grid-column: 2; }
+  .ui-task-rows-head[data-part="open"] { display: block; }
+}
+@media (hover: hover) {
+  .ui-task-row-icon:hover, .ui-task-row-count:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+  .ui-task-row-more button:hover { background: var(--ui-subtle); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-task-row-front, .ui-task-row-title, .ui-task-row-ring, .ui-task-row-ring::before, .ui-task-row-ring svg, .ui-task-row-icon svg { transition: none; }
+}
+`
+
+fn task_row_subs_clean(items) {
+    if type_of(items) != "list" { return [] }
+    let named = items | filter((s) => type_of(s) == "map" && get(s, "title") != null)
+    let all = enumerate(named) | map((p) => ({ id: get(p[1], "id") != null ? str(p[1].id) : `_${p[0]}`, title: str(p[1].title), done: get(p[1], "done") == true }))
+    let ids = all | map((s) => s.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// A task as the row shows it: anything missing or wrong is left out, so bad data never stops a list.
+fn task_row_clean(t) {
+    if type_of(t) != "map" { return { id: "", title: "Untitled", done: false, due: null, priority: null, list: null, subtasks: [] } }
+    let due = get(t, "due")
+    let level = get(t, "priority")
+    {
+        id: get(t, "id") != null ? str(t.id) : "",
+        title: get(t, "title") != null && str(t.title) != "" ? str(t.title) : "Untitled",
+        done: get(t, "done") == true,
+        due: type_of(due) == "str" && date.valid(due, "date") ? due : null,
+        priority: contains(["high", "medium", "low"], level) ? level : null,
+        list: get(t, "list") != null ? str(t.list) : null,
+        subtasks: task_row_subs_clean(get(t, "subtasks")),
+    }
+}
+
+// The words for a due day, and how much it matters.
+fn task_row_due(due, today: str) {
+    if due == null { return null }
+    let n = date.days_between(today, due)
+    if n == 0 { return { text: "Today", tone: "today" } }
+    if n == 1 { return { text: "Tomorrow", tone: "soon" } }
+    if n == -1 { return { text: "Yesterday", tone: "late" } }
+    if n < 0 { return { text: `${-n} days late`, tone: "late" } }
+    if n < 7 { return { text: date.format(due, "dddd"), tone: "soon" } }
+    if slice(due, 0, 4) == slice(today, 0, 4) { return { text: date.format(due, "ddd D MMM"), tone: "later" } }
+    { text: date.format(due, "D MMM YYYY"), tone: "later" }
+}
+
+// The Monday after today's week.
+fn task_row_next_week(today: str) -> str = date.add_days(today, 8 - date.weekday(today))
+
+// The share of subtasks done, for the ring; 0 with none.
+fn task_row_share(subs: list) {
+    if len(subs) == 0 { return 0 }
+    len(subs | filter((s) => s.done)) / len(subs)
+}
+
+fn task_row_axis(dx: num, dy: num, slop: num) -> str {
+    if abs(dx) < slop && abs(dy) < slop { return "" }
+    abs(dx) > abs(dy) ? "x" : "y"
+}
+
+// Past the width of what it shows, a drag right pulls harder and harder.
+fn task_row_pull(x: num, stop: num) -> num = x > stop ? stop + (x - stop) * 0.3 : x
+
+// Where a release leaves the row: "", "due", "del" or "gone". x is its place (right positive)
+// and v the finger's speed, in px per ms. A throw back the way it came shuts it, from anywhere.
+fn task_row_rest(x: num, v: num, width: num) -> str {
+    if x < 0 {
+        if abs(x) >= width * 0.6 { return "gone" }
+        if v > 0.35 { return "" }
+        if v < -0.35 && abs(x) >= 24 { return "del" }
+        return abs(x) >= 48 ? "del" : ""
+    }
+    if v < -0.35 { return "" }
+    if v > 0.35 && x >= 24 { return "due" }
+    x >= 64 ? "due" : ""
+}
+
+fn task_row_sample(s, pos: num, at: num) {
+    let dt = at - s.at
+    dt < 32 ? s : { pos, at, v: (pos - s.pos) / dt }
+}
+
+fn task_row_speed(s, pos: num, at: num, moved: num) -> num {
+    if at - moved > 80 { return 0 }
+    let dt = at - s.at
+    let since = dt >= 8 ? (pos - s.pos) / dt : 0
+    abs(since) > abs(s.v) ? since : s.v
+}
+
+// The tasks of a list, each id once.
+fn task_row_list_clean(tasks) {
+    if type_of(tasks) != "list" { return [] }
+    let all = enumerate(tasks) | map((p) => {
+        let t = task_row_clean(p[1])
+        t.id != "" ? t : { ...t, id: `_${p[0]}` }
+    })
+    let ids = all | map((t) => t.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+component TaskRow(task = null, today: str = "", on_toggle = null, on_due = null, on_delete = null, on_subtask = null, class: str? = null) {
+    style global task_row_css
+    state day = date.valid(today, "date") ? today : date.today()
+    state cur = task_row_clean(task)
+    state rest = ""          // "", "due" or "del": what a swipe left showing
+    state more = false
+    state subs_open = false
+    state gone = false
+    state root = null
+    state front = null
+    state g = null
+    // Following the prop, so a list above can change the row; on its own a row keeps its changes.
+    cur = task_row_clean(task)
+    let words = task_row_due(cur.due, day)
+    let share = task_row_share(cur.subtasks)
+    let done_subs = len(cur.subtasks | filter((s) => s.done))
+    let name = cur.title
+    let rest_at = (to: str) => {
+        rest = to
+        root.dataset.way = to
+        front.style.transform = to == "due" ? "translateX(192px)" : to == "del" ? "translateX(-88px)" : ""
+    }
+    let set_due = (d) => {
+        cur = { ...cur, due: d }
+        more = false
+        rest_at("")
+        on_due && on_due(cur.id, d)
+    }
+    let remove = () => {
+        gone = true
+        more = false
+        rest_at("")
+        on_delete && on_delete(cur.id)
+    }
+    let toggle = () => {
+        let now = !cur.done
+        cur = { ...cur, done: now }
+        on_toggle && on_toggle(cur.id, now)
+        if now { js("quilloNative.haptic", "success") }
+    }
+    let toggle_sub = (sid: str) => {
+        let was = find(cur.subtasks, (s) => s.id == sid)
+        let now = !(was.done)
+        cur = { ...cur, subtasks: cur.subtasks | map((s) => s.id == sid ? { ...s, done: now } : s) }
+        on_subtask && on_subtask(cur.id, sid, now)
+    }
+    <div class={ui_cls(["ui-task-row", cur.done && "ui-task-row-done", gone && "ui-task-row-gone", class])} data-way=""
+         @mount={(me) => {
+             root = me
+             front = me.querySelector(".ui-task-row-front")
+             // Touching anything else shuts a row left open, as a phone's lists do.
+             let d = js("document")
+             let away = (e) => { if rest != "" && !root.contains(e.target) { rest_at("") } }
+             d.addEventListener("pointerdown", away)
+             () => { d.removeEventListener("pointerdown", away) }
+         }}
+         @keydown={(e) => {
+             if e.key == "Escape" && rest != "" { rest_at("") }
+             if e.key == "Escape" && more { more = false }
+         }}>
+        <div.ui-task-row-clip>
+            <div.ui-task-row-under.ui-task-row-under-due aria-hidden={rest == "due" ? null : "true"}>
+                <button.ui-task-row-act type="button" tabindex={rest == "due" ? null : "-1"} @click={() => { set_due(day) }}>Today</button>
+                <button.ui-task-row-act type="button" tabindex={rest == "due" ? null : "-1"} @click={() => { set_due(date.add_days(day, 1)) }}>Tomorrow</button>
+                <button.ui-task-row-act type="button" tabindex={rest == "due" ? null : "-1"} @click={() => { rest_at(""); more = true }}>Pick a day</button>
+            </div>
+            <div.ui-task-row-under.ui-task-row-under-del aria-hidden={rest == "del" ? null : "true"}>
+                <button.ui-task-row-act.ui-task-row-act-del type="button" tabindex={rest == "del" ? null : "-1"} @click={remove}>Delete</button>
+            </div>
+            <div.ui-task-row-front
+                 @pointerdown={(e) => {
+                     let free = e.isPrimary && e.button == 0 && e.target.closest("button, a, input") == null
+                     g = free ? { pid: e.pointerId, x: e.clientX, y: e.clientY, on: false, at: 0, shift: 0, base: rest == "due" ? 192 : rest == "del" ? -88 : 0, moved: e.timeStamp, s: { pos: e.clientX, at: e.timeStamp, v: 0 } } : null
+                 }}
+                 @pointermove={(e) => {
+                     if g != null && e.pointerId == g.pid {
+                         let dx = e.clientX - g.x
+                         if !g.on {
+                             let way = task_row_axis(dx, e.clientY - g.y, 8)
+                             if way == "y" { g = null }
+                             if way == "x" {
+                                 front.setPointerCapture(e.pointerId)
+                                 front.classList.add("ui-task-row-moving")
+                                 g = { ...g, on: true, shift: dx > 0 ? 8 : -8 }
+                             }
+                         }
+                         if g != null && g.on {
+                             let x = task_row_pull(g.base + dx - g.shift, 192)
+                             front.style.transform = `translateX(${x}px)`
+                             root.dataset.way = x > 0 ? "due" : x < 0 ? "del" : ""
+                             g = { ...g, at: x, moved: e.timeStamp, s: task_row_sample(g.s, e.clientX, e.timeStamp) }
+                         }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     if g != null && e.pointerId == g.pid {
+                         let was = g
+                         g = null
+                         if was.on {
+                             front.classList.remove("ui-task-row-moving")
+                             let w = root.offsetWidth
+                             let to = task_row_rest(was.at, task_row_speed(was.s, e.clientX, e.timeStamp, was.moved), w)
+                             if to == "gone" { remove() } else { rest_at(to) }
+                         } else if rest != "" {
+                             rest_at("")
+                         }
+                     }
+                 }}
+                 @pointercancel={(e) => {
+                     if g != null && e.pointerId == g.pid {
+                         let was = g
+                         g = null
+                         front.classList.remove("ui-task-row-moving")
+                         rest_at(was.base > 0 ? "due" : was.base < 0 ? "del" : "")
+                     }
+                 }}>
+                <button.ui-task-row-check type="button" role="checkbox" aria-checked={cur.done ? "true" : "false"} aria-label={`Done: ${name}`}
+                        data-priority={cur.priority} @click={toggle}
+                        @keydown={(e) => { if e.key == "Delete" { e.preventDefault(); remove() } }}>
+                    <span.ui-task-row-ring style={`--done: ${share}`}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+                    </span>
+                </button>
+                <div.ui-task-row-text>
+                    <span.ui-task-row-title>{name}</span>
+                    <span.ui-task-row-meta>
+                        {words != null && <span.ui-task-row-due data-tone={cur.done ? "later" : words.tone}>{words.text}</span>}
+                        {cur.list != null && <span>{cur.list}</span>}
+                    </span>
+                </div>
+                {len(cur.subtasks) > 0 && <button.ui-task-row-count type="button" aria-expanded={subs_open ? "true" : "false"}
+                        aria-label={`Subtasks of ${name}, ${done_subs} of ${len(cur.subtasks)} done`}
+                        @click={() => { subs_open = !subs_open }}>{done_subs}/{len(cur.subtasks)}</button>}
+                <button.ui-task-row-icon type="button" aria-expanded={more ? "true" : "false"} aria-label={`More for ${name}`}
+                        @click={() => { more = !more }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+                </button>
+            </div>
+        </div>
+        {more && <div.ui-task-row-more role="group" aria-label={`Due day and delete for ${name}`}>
+            <button type="button" @click={() => { set_due(day) }}>Today</button>
+            <button type="button" @click={() => { set_due(date.add_days(day, 1)) }}>Tomorrow</button>
+            <button type="button" @click={() => { set_due(task_row_next_week(day)) }}>Next week</button>
+            <input.ui-task-row-date type="date" aria-label="Pick a due day" value={cur.due != null ? cur.due : ""}
+                   @change={(e) => {
+                       let v = e.value
+                       if date.valid(v, "date") { set_due(v) }
+                   }}/>
+            {cur.due != null && <button type="button" @click={() => { set_due(null) }}>No day</button>}
+            <button type="button" data-tone="danger" @click={remove}>Delete</button>
+        </div>}
+        {subs_open && <ul.ui-task-row-subs>
+            {for s in cur.subtasks => <li.ui-task-row-sub key={s.id}>
+                <button.ui-task-row-check type="button" role="checkbox" aria-checked={s.done ? "true" : "false"} aria-label={`Done: ${s.title}`}
+                        @click={() => { toggle_sub(s.id) }}>
+                    <span.ui-task-row-ring>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+                    </span>
+                </button>
+                <span class={s.done ? "ui-task-row-sub-done" : null}>{s.title}</span>
+            </li>}
+        </ul>}
+    </div>
+}
+
+component TaskRowList(tasks = [], today: str = "", label: str = "To do", done_label: str = "Completed", empty_text: str = "Nothing to do.", undo_seconds: int = 5,
+                      on_toggle = null, on_due = null, on_delete = null, on_subtask = null, on_restore = null, class: str? = null) {
+    style global task_row_css
+    state rows = task_row_list_clean(tasks)
+    state away = []          // ids deleted and still able to come back
+    state shelved = rows | filter((t) => t.done) | map((t) => t.id)     // those standing in the finished part
+    state soon = false       // a move is waiting for the check's own animation
+    state undo = null        // { id, at, title }
+    state said = ""
+    state box = null
+    rows = task_row_list_clean(tasks)
+    let present = rows | filter((t) => !contains(away, t.id))
+    let todo = present | filter((t) => !contains(shelved, t.id))
+    let finished = present | filter((t) => contains(shelved, t.id))
+    let lines = todo + (len(finished) > 0 ? [{ id: "_head", head: true }] : []) + finished
+    let spots = () => js("Array.from", box.querySelectorAll(".ui-task-rows-item")) | map((el) => {
+        let r = el.getBoundingClientRect()
+        { el, x: r.left, y: r.top }
+    })
+    // Rows move in one step and are then played back from where they were, so the list keeps a
+    // single order and a row crosses from one part to the other without being made again.
+    let settle = () => {
+        soon = false
+        let before = spots()
+        let calm = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+        shelved = rows | filter((t) => t.done) | map((t) => t.id)
+        js("requestAnimationFrame", (_t = null) => {
+            if !calm {
+                for b in before {
+                    let r = b.el.getBoundingClientRect()
+                    let dx = b.x - r.left
+                    let dy = b.y - r.top
+                    if abs(dx) > 1 || abs(dy) > 1 {
+                        b.el.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: "none" }], { duration: 280, easing: "cubic-bezier(.2, .8, .2, 1)" })
+                    }
+                }
+            }
+        })
+    }
+    if soon { every(340, settle) }
+    let finish_delete = () => {
+        if undo != null {
+            let id = undo.id
+            undo = null
+            on_delete && on_delete(id)
+        }
+    }
+    let tick = () => {
+        if undo != null && js("Date.now") - undo.at >= undo_seconds * 1000 { finish_delete() }
+    }
+    if undo != null { every(200, tick) }
+    let restore = () => {
+        if undo != null {
+            let id = undo.id
+            let title = undo.title
+            undo = null
+            away = away | filter((x) => x != id)
+            said = `${title} is back.`
+            on_restore && on_restore(id)
+        }
+    }
+    <div class={ui_cls(["ui-task-rows", class])}
+         @mount={(me) => {
+             box = me
+             // Leaving the page makes a delete final.
+             () => { if undo != null { on_delete && on_delete(undo.id) } }
+         }}>
+        <ul.ui-task-rows-grid>
+            <li.ui-task-rows-head data-part="open">{label} ({len(todo)})</li>
+            {len(todo) == 0 && <li.ui-task-rows-none>{empty_text}</li>}
+            {for t in lines => <li class={get(t, "head") == true ? "ui-task-rows-head" : "ui-task-rows-item"} key={t.id} data-id={t.id}
+                                   data-part={get(t, "head") == true || contains(shelved, t.id) ? "done" : "open"}>
+                {get(t, "head") == true ? <span>{done_label} ({len(finished)})</span> : <TaskRow task={t} today={today}
+                         on_toggle={(id, now) => {
+                             rows = rows | map((x) => x.id == id ? { ...x, done: now } : x)
+                             said = now ? "Finished." : "Back to do."
+                             soon = true
+                             on_toggle && on_toggle(id, now)
+                         }}
+                         on_due={(id, due) => {
+                             rows = rows | map((x) => x.id == id ? { ...x, due } : x)
+                             on_due && on_due(id, due)
+                         }}
+                         on_subtask={(id, sid, now) => {
+                             rows = rows | map((x) => x.id == id ? { ...x, subtasks: x.subtasks | map((s) => s.id == sid ? { ...s, done: now } : s) } : x)
+                             on_subtask && on_subtask(id, sid, now)
+                         }}
+                         on_delete={(id) => {
+                             finish_delete()
+                             let was = find(rows, (x) => x.id == id)
+                             away = away + [id]
+                             undo = { id, title: was.title, at: js("Date.now") }
+                         }}/>}
+            </li>}
+        </ul>
+        <div role="status" aria-live="polite">
+            {undo != null ? <div.ui-task-rows-bar>
+                <span>{undo.title} deleted</span>
+                <button.ui-task-rows-undo type="button" aria-label={`Undo: ${undo.title} deleted`} @click={restore}>Undo</button>
+            </div> : <span.ui-sr>{said}</span>}
+        </div>
+    </div>
+}

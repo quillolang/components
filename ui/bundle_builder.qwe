@@ -1,0 +1,273 @@
+// BundleBuilder: a bundle picked item by item from groups, each with the fewest and
+// most it takes, at a discount that grows with the number of items. It keeps the
+// best tier reached (a fixed amount off can beat a later percentage), says what
+// the cheapest way to the next tier is and what that does to the total, which can
+// fall, and says when no tier further on can be reached. The saving is against
+// buying the items alone. Amounts are decimals: the discount is rounded half up to
+// the cent once, and each line's share of the total is allocated so the lines add
+// up to it exactly.
+//
+//   <BundleBuilder selected={["tee"]} tiers={[{ count: 3, percent: 5 }, { count: 5, off: 20 }]} groups={[
+//       { id: "tops", label: "Tops", least: 1, most: 2, items: [
+//           { id: "tee", name: "Tee", price: 19.99 }, { id: "hoodie", name: "Hoodie", price: 49 }] },
+//       { id: "socks", label: "Socks", most: 3, items: [{ id: "ankle", name: "Ankle socks", price: 4.99 }] }]}/>
+//
+// groups: a list of { id, label, items, least?, most? }: least is the fewest to
+// choose (0), most the largest number (all of them). items: a list of { id, name,
+// price }, ids unique across the groups, price a number, decimal or text of 0 or
+// more. tiers: a list of { count, percent } or { count, off }: from `count` items, a
+// percentage off or an amount off (never more than the bundle comes to). selected:
+// the ids it starts with, as far as the groups' limits allow. currency: ISO code
+// ("USD"). locale: how to write amounts (the program's). title: the heading ("Build
+// a bundle"). id: a prefix for its ids ("bundle-builder"), unique on the page. The
+// boxes are named by their group's id, so a form around it sends the choices;
+// name: a prefix for those names. on_change(quote): inside one of your components,
+// given bundle_builder_quote's map after each change. At most 200 items are read.
+//
+// bundle_builder_model(groups, tiers, currency) reads the data and
+// bundle_builder_quote(model, picked) gives { lines, count, subtotal, tier, discount,
+// total, saving, complete, missing }, with each line's { id, name, price, net }, for
+// a program to price an order the same way; bundle_builder_next(model, picked) gives
+// the hint, or null.
+
+import ui/theme.qwe use ui_cls
+
+let bundle_builder_css = css`
+.ui-bundlebuild { display: grid; gap: 16px; min-width: 0; max-width: 680px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-bundlebuild .ui-bundlebuild-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-bundlebuild-tiers { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-bundlebuild-tiers li { padding: 3px 10px; border: 1px solid var(--ui-border); border-radius: 999px; color: var(--ui-muted); font-size: 12px; font-weight: 500; }
+.ui-bundlebuild-tiers .ui-bundlebuild-reached { border-color: var(--ui-success); color: var(--ui-success); }
+.ui-bundlebuild-tiers .ui-bundlebuild-now { border-color: var(--ui-success); background: var(--ui-success-soft); color: var(--ui-success); font-weight: 650; }
+.ui-bundlebuild-group { display: grid; gap: 6px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-bundlebuild-group legend { display: block; width: 100%; padding: 0 0 4px; font-size: 13px; font-weight: 600; }
+.ui-bundlebuild-rule { color: var(--ui-muted); font-weight: 400; }
+.ui-bundlebuild-short .ui-bundlebuild-rule { color: var(--ui-danger); }
+.ui-bundlebuild-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 0 10px; align-items: center; padding: 8px 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); cursor: pointer; transition: border-color .15s, background-color .15s; }
+.ui-bundlebuild-item:hover { border-color: var(--ui-strong); }
+.ui-bundlebuild-item:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-bundlebuild-item input { margin: 0; accent-color: var(--ui-accent); }
+.ui-bundlebuild-on { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-bundlebuild-full { cursor: not-allowed; background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-bundlebuild-full:hover { border-color: var(--ui-border); }
+.ui-bundlebuild-name { min-width: 0; overflow-wrap: anywhere; }
+.ui-bundlebuild-price { font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-bundlebuild-why { grid-column: 2 / -1; color: var(--ui-muted); font-size: 12px; }
+.ui-bundlebuild-hint { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-info-soft); color: var(--ui-info); font-size: 13px; }
+.ui-bundlebuild-problems { margin: 0; padding: 10px 12px 10px 28px; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); color: var(--ui-danger); font-size: 13px; }
+.ui-bundlebuild-sum { display: grid; gap: 4px; margin: 0; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-bundlebuild-sum div { display: flex; justify-content: space-between; gap: 16px; }
+.ui-bundlebuild-sum dd { margin: 0; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+.ui-bundlebuild-total { padding-top: 6px; border-top: 1px solid var(--ui-border); font-size: 16px; font-weight: 700; }
+.ui-bundlebuild-total dd { color: var(--ui-accent); font-weight: 700; }
+.ui-bundlebuild-saving { color: var(--ui-success); }
+.ui-bundlebuild-state { margin: 0; font-size: 13px; font-weight: 600; color: var(--ui-success); }
+.ui-bundlebuild-missing { margin: 0; padding-left: 18px; color: var(--ui-danger); font-size: 13px; }
+@media (max-width: 420px) { .ui-bundlebuild { padding: 16px; } }
+@media (prefers-reduced-motion: reduce) { .ui-bundlebuild-item { transition: none; } }
+`
+
+// A number of 0 or more as a decimal, or null.
+fn bundle_builder_read(x) {
+    let t = trim(str(x ?? ""))
+    if !re.test(t, "^\\d{1,12}(\\.\\d{1,8})?$") { return null }
+    dec(t)
+}
+
+// The bundle as data it can trust: { groups, by, ids, tiers, code, minor, problems }.
+fn bundle_builder_model(groups, tiers, currency: str) {
+    let cap = 200
+    let problems = []
+    let asked = upper(trim(currency))
+    let known = !is_err(money.minor_units(asked))
+    let code = known ? asked : "USD"
+    if !known { problems = problems | push(`The currency "${currency}" is not known, so USD is used.`) }
+    let minor = money.minor_units(code)
+    let by = {}
+    let ids = []
+    let tidy = []
+    let cut = false
+    for g in type_of(groups) == "list" ? groups : [] {
+        if type_of(g) != "map" || g.id == null || type_of(g.items) != "list" {
+            problems = problems | push("A group without an id or a list of items is left out.")
+        } else {
+            let gid = str(g.id)
+            let glabel = str(g.label ?? g.id)
+            let items = []
+            for i in g.items {
+                if len(ids) >= cap {
+                    cut = true
+                } else if type_of(i) != "map" || i.id == null {
+                    problems = problems | push(`An item of ${glabel} has no id, so it is left out.`)
+                } else if has(by, str(i.id)) {
+                    problems = problems | push(`The id "${str(i.id)}" is used twice: the second is left out.`)
+                } else if bundle_builder_read(i.price) == null {
+                    problems = problems | push(`${str(i.name ?? i.id)} has no price of 0 or more, so it is left out.`)
+                } else {
+                    let item = { id: str(i.id), name: str(i.name ?? i.id), group: gid, price: round(bundle_builder_read(i.price), minor, "half_up") }
+                    by = set(by, item.id, item)
+                    ids = ids | push(item.id)
+                    items = items | push(item)
+                }
+            }
+            let least = type_of(g.least) == "int" && g.least > 0 ? g.least : 0
+            let most = type_of(g.most) == "int" && g.most >= 0 ? g.most : len(items)
+            if least > most || least > len(items) { problems = problems | push(`${glabel} asks for ${least} and takes ${most < len(items) ? most : len(items)}, so it can never be complete.`) }
+            tidy = tidy | push({ id: gid, label: glabel, least, most, items })
+        }
+    }
+    if cut { problems = problems | push(`Only the first ${cap} items are used.`) }
+    let good = []
+    for t in type_of(tiers) == "list" ? tiers : [] {
+        let count = type_of(t) == "map" ? t.count : null
+        let pc = type_of(t) == "map" ? bundle_builder_read(t.percent) : null
+        let off = type_of(t) == "map" ? bundle_builder_read(t.off) : null
+        if type_of(count) != "int" || count < 1 || (pc == null && off == null) || (pc != null && pc > 100) {
+            problems = problems | push(`A tier is left out: ${json.stringify(t)} needs a count, and a percent up to 100 or an amount off.`)
+        } else {
+            good = good | push({ count, percent: pc, off: off == null ? null : round(off, minor, "half_up") })
+        }
+    }
+    { groups: tidy, by, ids, code, minor, problems, tiers: sort_by(good, (t) => t.count) }
+}
+
+// What a tier takes off an amount, rounded once, and never more than the amount.
+fn bundle_builder_off(tier, subtotal, minor: int) {
+    if tier.percent != null { return round(subtotal * tier.percent / 100, minor, "half_up") }
+    tier.off > subtotal ? subtotal : tier.off
+}
+
+// Why an item cannot be added, or null: only its group's limit can stop it.
+fn bundle_builder_full(model, picked, item) {
+    if contains(picked, item.id) { return null }
+    let g = model.groups | find((x) => x.id == item.group)
+    let have = picked | filter((p) => model.by[p].group == g.id) | len
+    have >= g.most ? `${g.label} is full at ${g.most}: take one off to swap` : null
+}
+
+// The price of a choice: see the top of the file. Each line's net is its share of
+// the total, by price; an item at 0 stays at 0 and takes no cent of the remainder.
+fn bundle_builder_quote(model, picked) {
+    let chosen = model.ids | filter((id) => contains(picked, id)) | map((id) => model.by[id])
+    let count = len(chosen)
+    let subtotal = sum(chosen | map((o) => o.price)) + 0m
+    let reached = model.tiers | filter((t) => t.count <= count)
+    let scored = reached | map((t) => ({ tier: t, off: bundle_builder_off(t, subtotal, model.minor) }))
+    // The best tier, not the last: on equal discounts the larger count, as sort_by is stable.
+    let best = last(sort_by(scored, (s) => s.off))
+    let discount = best != null ? best.off : 0m
+    let total = subtotal - discount
+    let paying = chosen | filter((o) => o.price > 0)
+    let shares = len(paying) > 0 ? money.allocate(money.of(total, model.code), paying | map((o) => o.price)) : []
+    let net_of = reduce(enumerate(paying), {}, (m, p) => set(m, p[1].id, shares[p[0]].amount))
+    let missing = model.groups | filter((g) => (picked | filter((p) => has(model.by, p) && model.by[p].group == g.id) | len) < g.least)
+        | map((g) => `Choose ${g.least - (picked | filter((p) => has(model.by, p) && model.by[p].group == g.id) | len)} more from ${g.label}.`)
+    { lines: chosen | map((o) => merge(o, { net: get(net_of, o.id, 0m) })), count, subtotal, tier: best != null ? best.tier : null,
+      discount, total, saving: discount, percent: subtotal > 0 ? round(discount * 100 / subtotal, 1, "half_up") : 0m,
+      complete: len(missing) == 0 && count > 0, missing }
+}
+
+// The n cheapest items that can still go in, each group keeping to its limit: a
+// greedy choice is the cheapest here, as the limits only cap each group.
+fn bundle_builder_cheapest(model, picked, n: int) {
+    let rooms = reduce(model.groups, {}, (m, g) => set(m, g.id, g.most - (picked | filter((p) => model.by[p].group == g.id) | len)))
+    let open = sort_by(model.ids | filter((id) => !contains(picked, id)) | map((id) => model.by[id]), (o) => o.price)
+    let out = []
+    for o in open {
+        if len(out) < n && rooms[o.group] > 0 {
+            rooms = set(rooms, o.group, rooms[o.group] - 1)
+            out = out | push(o)
+        }
+    }
+    out
+}
+
+// The next tier worth reaching, by its cheapest way there: { tier, adds, need, total,
+// change }, or { blocked: tier, most } when the rest are out of reach, or null.
+fn bundle_builder_next(model, picked) {
+    let q = bundle_builder_quote(model, picked)
+    let most = q.count + len(bundle_builder_cheapest(model, picked, len(model.ids)))
+    for t in model.tiers {
+        if t.count > q.count {
+            if t.count > most { return { blocked: t, most } }
+            let adds = bundle_builder_cheapest(model, picked, t.count - q.count)
+            let after = bundle_builder_quote(model, picked + (adds | map((o) => o.id)))
+            if after.discount > q.discount {
+                return { tier: t, adds, need: len(adds), total: after.total, change: after.total - q.total, discount: after.discount }
+            }
+        }
+    }
+    null
+}
+
+// What can stand of the ids given: an item stays while its group has room.
+fn bundle_builder_settle(model, ids) {
+    let picked = []
+    for x in type_of(ids) == "list" ? ids : [] {
+        let id = str(x)
+        if has(model.by, id) && !contains(picked, id) && bundle_builder_full(model, picked, model.by[id]) == null {
+            picked = picked | push(id)
+        }
+    }
+    picked
+}
+
+component BundleBuilder(groups = [], tiers = [], selected = [], currency: str = "USD", locale: str? = null, title: str = "Build a bundle",
+                        id: str = "bundle-builder", name: str? = null, on_change = null, class: str? = null) {
+    style global bundle_builder_css
+    let model = bundle_builder_model(groups, tiers, currency)
+    state picked = bundle_builder_settle(model, selected)
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let shown = (x) => {
+        let m = money.of(x, model.code, "half_up")
+        is_err(m) ? "a very large amount" : locale != null ? money.format(m, locale) : money.format(m)
+    }
+    let q = bundle_builder_quote(model, picked)
+    let hint = bundle_builder_next(model, picked)
+    let tier_text = (t) => t.percent != null ? `${str(t.percent)}% off` : `${shown(t.off)} off`
+    let rule = (g) => g.least > 0 && g.least == g.most ? `choose ${g.least}` : g.least > 0 ? `choose ${g.least} to ${g.most}` : `up to ${g.most}`
+    let have = (g) => picked | filter((p) => model.by[p].group == g.id) | len
+    let adds_text = (h) => h.adds | map((o) => `${o.name} (${shown(o.price)})`) | join(", ")
+    let hint_text = () => {
+        if hint == null { return null }
+        if has(hint, "blocked") { return `The ${hint.blocked.count}-item tier is out of reach: this bundle holds at most ${hint.most}.` }
+        let what = `Add ${hint.need} more for ${tier_text(hint.tier)}: ${adds_text(hint)} is the cheapest way there`
+        hint.change < 0 ? `${what}, and it brings the total down by ${shown(0m - hint.change)}, to ${shown(hint.total)}.` : `${what}, for ${shown(hint.change)} more, ${shown(hint.total)} in all.`
+    }
+    let toggle = (i: str, on: bool) => {
+        let next = on ? picked | push(i) : remove(picked, i)
+        picked = next
+        if on_change != null { on_change(merge(bundle_builder_quote(model, next), { selected: next })) }
+    }
+    <section class={ui_cls(["ui-bundlebuild", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-bundlebuild-title id={`${id}-title`}>{title}</h3>
+        {len(model.problems) > 0 && <ul.ui-bundlebuild-problems role="alert">{for p in model.problems => <li>{p}</li>}</ul>}
+        {len(model.tiers) > 0 && <ul.ui-bundlebuild-tiers aria-label="Discount tiers">
+            {for t in model.tiers => <li class={ui_cls([q.tier != null && q.tier.count == t.count && "ui-bundlebuild-now", t.count <= q.count && "ui-bundlebuild-reached"])}>{t.count} items: {tier_text(t)}</li>}
+        </ul>}
+        {for g in model.groups => <fieldset key={g.id} class={ui_cls(["ui-bundlebuild-group", have(g) < g.least && "ui-bundlebuild-short"])}>
+            <legend>{g.label} <span.ui-bundlebuild-rule>({rule(g)}, {have(g)} chosen)</span></legend>
+            {for o in g.items => <label key={o.id} class={ui_cls(["ui-bundlebuild-item", contains(picked, o.id) && "ui-bundlebuild-on", bundle_builder_full(model, picked, o) != null && "ui-bundlebuild-full"])}>
+                <input type="checkbox" name={named(g.id)} value={o.id} id={`${id}-${o.id}`} checked={contains(picked, o.id)} disabled={bundle_builder_full(model, picked, o) != null}
+                       aria-describedby={bundle_builder_full(model, picked, o) != null ? `${id}-${o.id}-why` : null} @change={(e) => { toggle(o.id, e.checked) }}/>
+                <span.ui-bundlebuild-name>{o.name}</span>
+                <span.ui-bundlebuild-price>{shown(o.price)}</span>
+                {bundle_builder_full(model, picked, o) != null && <span.ui-bundlebuild-why id={`${id}-${o.id}-why`}>{bundle_builder_full(model, picked, o)}</span>}
+            </label>}
+        </fieldset>}
+        <div aria-live="polite">
+            {hint_text() != null && <p.ui-bundlebuild-hint>{hint_text()}</p>}
+        </div>
+        <dl.ui-bundlebuild-sum aria-live="polite">
+            <div><dt>Bought alone</dt><dd>{shown(q.subtotal)}</dd></div>
+            {q.discount > 0 && <div.ui-bundlebuild-saving><dt>Bundle saving ({tier_text(q.tier)})</dt><dd><span aria-hidden="true">−</span><span.ui-sr>minus </span>{shown(q.discount)}</dd></div>}
+            <div.ui-bundlebuild-total><dt>Bundle total</dt><dd>{shown(q.total)}</dd></div>
+            {q.discount > 0 && <div.ui-bundlebuild-saving><dt>You save</dt><dd>{shown(q.saving)} ({str(q.percent)}%)</dd></div>}
+        </dl>
+        {q.complete && <p.ui-bundlebuild-state>Your bundle is complete.</p>}
+        {!q.complete && len(q.missing) > 0 && <ul.ui-bundlebuild-missing>{for m in q.missing => <li key={m}>{m}</li>}</ul>}
+        {!q.complete && len(q.missing) == 0 && <p.ui-bundlebuild-state>Choose an item to start.</p>}
+    </section>
+}

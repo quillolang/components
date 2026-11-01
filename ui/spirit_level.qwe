@@ -1,0 +1,296 @@
+// SpiritLevel: a level in the hand. Lying on a surface, a bubble floats in a circle; stood
+// on an edge against a shelf or a picture frame, a tube shows how far off true the edge is.
+// A surface is rarely quite true, nor the phone's case, so "Set zero" takes the present
+// tilt as level. It is felt when it reaches level. Where there is no sensor, it says so.
+//
+//   <SpiritLevel/>
+//   <SpiritLevel tolerance={0.25} on_level={(on) => { ready = on }}/>
+//
+// tolerance: how many degrees count as level (0.5). It stays level until twice that, so
+// it does not flicker on the line. range: the degrees that take the bubble to the
+// edge (10). haptic: felt on reaching level (true), through the app, else vibrate.
+// on_level(on, reading): inside one of your components, called as it becomes level or stops
+// being, with { mode, x, y }: mode "flat" or "edge", x and y in degrees after the zero. x is
+// positive with the right side down, y with the top up; on an edge, x is how far from true.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let spirit_level_css = css`
+.ui-spirit { container-type: inline-size; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-spirit-in { display: grid; gap: 12px; justify-items: center; }
+.ui-spirit-dial { position: relative; width: min(100%, 260px); aspect-ratio: 1; border: 2px solid var(--ui-strong); border-radius: 50%; background: var(--ui-subtle); overflow: hidden; }
+.ui-spirit-dial::before, .ui-spirit-dial::after { content: ""; position: absolute; background: var(--ui-strong); }
+.ui-spirit-dial::before { left: 50%; top: 0; bottom: 0; width: 1px; }
+.ui-spirit-dial::after { top: 50%; left: 0; right: 0; height: 1px; }
+/* A fixed size, not a share of the dial: it marks the bubble being home, and the bubble does not grow. */
+.ui-spirit-ring { position: absolute; left: 50%; top: 50%; width: 68px; height: 68px; margin: -34px 0 0 -34px; border: 2px solid var(--ui-muted); border-radius: 50%; }
+.ui-spirit-tube { position: relative; width: min(100%, 300px); height: 64px; border: 2px solid var(--ui-strong); border-radius: 32px; background: var(--ui-subtle); overflow: hidden; }
+.ui-spirit-tube::before, .ui-spirit-tube::after { content: ""; position: absolute; top: 0; bottom: 0; width: 2px; background: var(--ui-muted); }
+.ui-spirit-tube::before { left: calc(50% - 30px); }
+.ui-spirit-tube::after { left: calc(50% + 30px); }
+.ui-spirit-bubble { position: absolute; left: 50%; top: 50%; width: 52px; height: 52px; margin: -26px 0 0 -26px; border-radius: 50%; will-change: transform;
+  background: color-mix(in srgb, var(--ui-warning) 55%, transparent); border: 2px solid var(--ui-warning); }
+.ui-spirit[data-level] .ui-spirit-bubble { background: color-mix(in srgb, var(--ui-success) 55%, transparent); border-color: var(--ui-success); }
+.ui-spirit-side { display: grid; gap: 12px; justify-items: center; min-width: 0; }
+.ui-spirit-read { display: grid; gap: 2px; justify-items: center; text-align: center; }
+.ui-spirit-big { font: 600 28px/1.15 var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-spirit-say { margin: 0; color: var(--ui-muted); }
+.ui-spirit-say:empty { display: none; }
+.ui-spirit-bar { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+/* With room, the readings stand beside the dial, not under it. */
+@container (min-width: 420px) {
+  .ui-spirit-in { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: center; column-gap: 20px; }
+  /* A bigger dial reads finer: the same degree moves the bubble further. Held to the height, for a phone on its side. */
+  .ui-spirit-dial { width: min(100%, 420px, 70dvh); }
+  .ui-spirit-tube { width: 100%; }
+}
+`
+
+fn spirit_level_num(x) = (type_of(x) == "int" || type_of(x) == "float") && math.isfinite(x)
+
+// Which way is down, as a length-one arrow in the device's own axes: x to its right, y to
+// its top, z out of its screen. This is the top row of the rotation the Device
+// Orientation spec defines, and it needs no alpha, so no compass.
+fn spirit_level_down(beta, gamma) {
+    let b = math.radians(beta)
+    let g = math.radians(gamma)
+    { x: math.sin(g) * math.cos(b), y: -math.sin(b), z: -math.cos(g) * math.cos(b) }
+}
+
+// Lying down or stood on an edge. It takes a clear lean past 45° to change over, so a
+// phone held at the halfway mark keeps to one.
+fn spirit_level_mode(d, was) {
+    let up = abs(d.z)
+    let side = max([abs(d.x), abs(d.y)])
+    if was == "edge" {
+        up > side * 1.2 ? "flat" : "edge"
+    } else {
+        side > up * 1.2 ? "edge" : "flat"
+    }
+}
+
+// How far off true, in degrees. Lying down: x and y, each way. Stood up: how far the
+// phone is turned in its own plane from the nearest of its four edges being down.
+fn spirit_level_read(beta, gamma, was) {
+    if !spirit_level_num(beta) || !spirit_level_num(gamma) {
+        null
+    } else {
+        let d = spirit_level_down(beta, gamma)
+        let mode = spirit_level_mode(d, was)
+        if mode == "flat" {
+            let z = max([abs(d.z), 0.000001])
+            { mode: mode, x: math.degrees(math.atan2(d.x, z)), y: math.degrees(math.atan2(-d.y, z)) }
+        } else {
+            let turned = math.degrees(math.atan2(d.x, -d.y))
+            { mode: mode, x: turned - 90 * round(turned / 90), y: 0 }
+        }
+    }
+}
+
+// A reading with its zero taken off. Each mode has its own zero, as they are different
+// measurements. Zero stays in the device's axes, so turning the screen does not spoil it.
+fn spirit_level_zeroed(r, zeros) {
+    let z = get(zeros, r.mode, { x: 0, y: 0 })
+    { mode: r.mode, x: r.x - z.x, y: r.y - z.y }
+}
+
+// Eases a reading towards the new one, to take out the shake of a hand; a change of mode
+// jumps, as the two do not measure the same thing.
+fn spirit_level_ease(old, r, f) {
+    if old == null || old.mode != r.mode {
+        r
+    } else {
+        { mode: r.mode, x: old.x + (r.x - old.x) * f, y: old.y + (r.y - old.y) * f }
+    }
+}
+
+// Whether it is level, given whether it was: in at the tolerance, out at twice it.
+fn spirit_level_is_level(r, was, tolerance) {
+    let limit = was ? tolerance * 2 : tolerance
+    abs(r.x) <= limit && abs(r.y) <= limit
+}
+
+// A bubble rises, so it goes to the high side. Then the device's axes are turned to
+// the screen's, by the angle the system says the screen is turned. Pixels from the middle,
+// y down, held inside `travel`.
+fn spirit_level_bubble(r, range, travel, angle) {
+    let scale = travel / max([range, 0.1])
+    let a = math.radians(angle)
+    let dx = -r.x * scale
+    let dy = r.y * scale
+    let sx = dx * math.cos(a) - dy * math.sin(a)
+    let sy = dx * math.sin(a) + dy * math.cos(a)
+    let far = sqrt(sx * sx + sy * sy)
+    let keep = far > travel ? travel / far : 1
+    { x: sx * keep, y: -sy * keep }
+}
+
+// Tenths of a degree, without a minus sign on nothing.
+fn spirit_level_deg(x) {
+    let v = round(abs(x), 1)
+    `${format_number(v, "en-US", 1)}°`
+}
+
+// What to do about it, for a person who cannot see the bubble.
+fn spirit_level_words(r, level) {
+    if r == null {
+        ""
+    } else if level {
+        "Level"
+    } else if r.mode == "edge" {
+        r.x > 0 ? `Turn ${spirit_level_deg(r.x)} left` : `Turn ${spirit_level_deg(r.x)} right`
+    } else {
+        let x = abs(r.x) < 0.05 ? "" : (r.x > 0 ? `Right side ${spirit_level_deg(r.x)} low` : `Left side ${spirit_level_deg(r.x)} low`)
+        let y = abs(r.y) < 0.05 ? "" : (r.y > 0 ? `Bottom ${spirit_level_deg(r.y)} low` : `Top ${spirit_level_deg(r.y)} low`)
+        x != "" && y != "" ? `${x}, ${y}` : `${x}${y}`
+    }
+}
+
+fn spirit_level_note(status) = match status {
+    "tap" => "This phone asks before a page can feel its tilt."
+    "refused" => "Motion was refused. Allow Motion and Orientation access to use the level."
+    "none" => "There is no motion sensor here, so this cannot work as a level. Try it on a phone."
+    _ => ""
+}
+
+component SpiritLevel(tolerance: num = 0.5, range: num = 10, haptic: bool = true, on_level = null, class: str? = null) {
+    style global spirit_level_css
+    state status = "wait"    // wait, tap, on, refused, none
+    state mode = "flat"      // follows the reading: state, as it picks what shows
+    state zeros = {}         // { flat: { x, y }, edge: { x, y } }
+    state level = false
+    state words = ""         // what the reading says, changed only when it reads differently
+    state big = "0.0°"
+    state turn = 0           // the screen's angle
+    state now = null         // the last eased reading, before the zero is shown
+    state raw = null         // the last, without the zero
+    state bubble = null
+    state ears = false
+    state heard = false
+    state silent = false
+    state began = 0          // when readings began: "Set zero" takes the place of the button that started them
+
+    let felt = () => {
+        if haptic {
+            let r = js("quilloNative.haptic", "success")
+            if is_err(r) { js("navigator.vibrate", 15) }
+        }
+    }
+    let place = () => {
+        if bubble != null && now != null {
+            let box = bubble.parentElement
+            let wide = now.mode == "edge"
+            let travel = box.clientWidth / 2 - 30
+            let p = spirit_level_bubble(now, range, travel, wide ? 0 : turn)
+            bubble.style.transform = `translate(${round(p.x, 1)}px, ${wide ? 0 : round(p.y, 1)}px)`
+        }
+    }
+    let show = () => {
+        let was = level
+        let on = spirit_level_is_level(now, was, tolerance)
+        level = on
+        words = spirit_level_words(now, on)
+        big = spirit_level_deg(sqrt(now.x * now.x + now.y * now.y))
+        if on != was {
+            if on { felt() }
+            on_level && on_level(on, now)
+        }
+    }
+    let tilted = (e) => {
+        let r = spirit_level_read(e.beta, e.gamma, mode)
+        if r == null {
+            if !heard { status = "none" }
+        } else {
+            heard = true
+            silent = false
+            if status != "on" {
+                status = "on"
+                began = js("Date.now")
+            }
+            raw = r
+            mode = r.mode
+            now = spirit_level_ease(now, spirit_level_zeroed(r, zeros), 0.35)
+            place()
+            show()
+        }
+    }
+    let hush = () => {
+        if ears {
+            ears = false
+            js("window.removeEventListener", "deviceorientation", tilted)
+        }
+        silent = false
+    }
+    let listen = () => {
+        hush()
+        ears = true
+        heard = false
+        status = "on"
+        began = js("Date.now")
+        silent = true
+        now = null
+        js("window.addEventListener", "deviceorientation", tilted)
+    }
+    // As in ShakeDetector: only asking tells whether it needs asking.
+    let start = (tapped) => {
+        let ok = js("DeviceOrientationEvent.requestPermission")
+        if is_err(ok) && !contains(ok.error, "not defined") {
+            hush()
+            status = tapped ? "refused" : "tap"
+        } else if ok == "denied" {
+            hush()
+            status = "refused"
+        } else {
+            listen()
+        }
+    }
+    if silent { every(2500, () => { if !heard { hush(); status = "none" } }) }
+    let note = spirit_level_note(status)
+    <div class={ui_cls(["ui-spirit", class])} data-level={level ? "" : null} data-mode={mode} @mount={(_el) => {
+        let so = js("screen.orientation")
+        let turned = (_e = null) => {
+            turn = is_err(so) ? 0 : (so.angle ?? 0)
+            place()
+        }
+        if !is_err(so) && so != null { so.addEventListener("change", turned) }
+        turned()
+        start(false)
+        () => {
+            hush()
+            if !is_err(so) && so != null { so.removeEventListener("change", turned) }
+        }
+    }}>
+        <div.ui-spirit-in>
+            <div class={mode == "edge" ? "ui-spirit-tube" : "ui-spirit-dial"} role="img" aria-label={words == "" ? "Level" : words}>
+                {mode == "flat" && <div.ui-spirit-ring></div>}
+                <div.ui-spirit-bubble @mount={(el) => { bubble = el; place() }}></div>
+            </div>
+            <div.ui-spirit-side>
+            <div.ui-spirit-read>
+                <span.ui-spirit-big>{big}</span>
+                <span.ui-spirit-say role="status">{note != "" ? note : words}</span>
+            </div>
+            <div.ui-spirit-bar>
+                {(status == "tap" || status == "refused" || status == "none") && <Button size="lg" class="ui-spirit-start"
+                    on_click={() => { start(true) }}>{status == "tap" ? "Turn on the level" : "Try again"}</Button>}
+                {status == "on" && <Button size="lg" variant="outline" class="ui-spirit-zero" disabled={raw == null} on_click={() => {
+                    // The second tap of a double tap on "Try again" lands here, and would zero a tilt nobody looked at.
+                    if js("Date.now") - began > 700 {
+                        zeros = set(zeros, raw.mode, { x: raw.x, y: raw.y })
+                        now = spirit_level_zeroed(raw, zeros)
+                        place()
+                        show()
+                    }
+                }}>Set zero</Button>}
+                {status == "on" && len(keys(zeros)) > 0 && <Button size="lg" variant="ghost" class="ui-spirit-clear" on_click={() => {
+                    zeros = {}
+                    now = raw
+                    place()
+                    show()
+                }}>Clear zero</Button>}
+            </div>
+            </div>
+        </div>
+    </div>
+}

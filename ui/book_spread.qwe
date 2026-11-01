@@ -1,0 +1,355 @@
+// BookSpread: a reader for a tablet. One column upright and a two-page spread turned, by the
+// room it has, so it works in Split View too. Pages turn by swipe, by a tap near an edge, by
+// button or by key. Where the reader is is kept as a place in the text and not as a page
+// number, so turning the tablet or changing the type size leaves the same words at the top
+// of the page, though the page numbers change.
+//
+//   import ui/book_spread.qwe use BookSpread
+//
+//   component Reader(book) {
+//       state place = load_place(book.id)
+//       <div style="height: 100dvh">
+//           <BookSpread blocks={book.blocks} title={book.title} position={place}
+//                       on_position={(p) => { save_place(book.id, p) }}/>
+//       </div>
+//   }
+//
+// blocks: the text, each { text, kind? }, kind "h" being a heading, or plain text for a paragraph.
+// What has no text is left out. title: shown in the bar. position: where to open, as
+// on_position gave it: { block, offset, quote }. quote is the words there, so a place still
+// holds if the text has been edited: when the block no longer has them at that offset, the
+// nearest block that does is used. size: the type's size in pixels (19), and the bar's two
+// buttons change it from 14 to 30. label: its name for screen readers. class.
+// on_position(p): inside one of your components, called after each turn with { block, offset,
+// quote, percent, page, pages }. Keep block, offset and quote; page and pages hold only for
+// this size and shape of screen.
+//
+// Keys, on the page: the left and right arrows, Page Up, Page Down and Space turn; Home and
+// End go to the ends. A tap in the outer quarter of either side turns, and the middle is left
+// for selecting text. Offsets count as the browser's text does, in UTF-16 units.
+
+import ui/theme.qwe use ui_cls
+
+let book_spread_css = css`
+.ui-book-spread { position: relative; box-sizing: border-box; display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 320px; color: var(--ui-fg); background: var(--ui-bg); font-family: var(--ui-font); }
+.ui-book-spread-bar { display: flex; align-items: center; gap: 4px; flex: none; min-height: 48px; padding: 2px max(8px, env(safe-area-inset-right)) 2px max(8px, env(safe-area-inset-left)); border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-book-spread-title { flex: 1; min-width: 0; overflow: hidden; font-size: 14px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-book-spread-btn { min-width: 44px; min-height: 44px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 500 14px var(--ui-font); cursor: pointer; }
+.ui-book-spread-btn:disabled { color: var(--ui-muted); opacity: .5; cursor: default; }
+.ui-book-spread-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-book-spread-btn:not(:disabled):hover { background: var(--ui-subtle); } }
+.ui-book-spread-view { position: relative; flex: 1; min-height: 0; margin: 20px max(28px, env(safe-area-inset-right)) 8px max(28px, env(safe-area-inset-left)); overflow-x: hidden; overflow-y: auto; outline: none; touch-action: pan-y pinch-zoom; font-size: var(--size); line-height: 1.6; }
+.ui-book-spread-ready { overflow: hidden; }
+.ui-book-spread-view:focus-visible { box-shadow: 0 0 0 2px var(--ui-accent); }
+.ui-book-spread-flow { column-fill: auto; will-change: transform; }
+.ui-book-spread-para { margin: 0 0 .8em; orphans: 2; widows: 2; }
+.ui-book-spread-head { margin: 0 0 .7em; font-size: 1.3em; font-weight: 700; line-height: 1.25; break-after: avoid; }
+.ui-book-spread-turning { transition: transform .22s cubic-bezier(.2, .8, .2, 1); }
+.ui-book-spread-swiping { user-select: none; -webkit-user-select: none; }
+.ui-book-spread-gutter { position: absolute; top: 48px; bottom: 28px; left: 50%; width: 1px; background: var(--ui-border); pointer-events: none; }
+.ui-book-spread-foot { display: flex; justify-content: space-between; flex: none; padding: 2px max(28px, env(safe-area-inset-right)) calc(6px + env(safe-area-inset-bottom)) max(28px, env(safe-area-inset-left)); color: var(--ui-muted); font: 13px/1.4 var(--ui-font); font-variant-numeric: tabular-nums; }
+@media (prefers-reduced-motion: reduce) { .ui-book-spread-turning { transition: none; } }
+`
+
+// The text as { text, heading }, with what has none left out.
+fn book_spread_clean(blocks) -> list {
+    if type_of(blocks) != "list" { return [] }
+    let shaped = blocks | map((b) => {
+        if type_of(b) == "str" { return { text: b, heading: false } }
+        if type_of(b) == "map" && type_of(get(b, "text")) == "str" { return { text: b.text, heading: get(b, "kind") == "h" } }
+        null
+    })
+    shaped | filter((b) => b != null && trim(b.text) != "")
+}
+
+// One column or two: two when the room is wider than tall and each page keeps a readable width.
+fn book_spread_columns(width: num, height: num) -> int {
+    width > height && width >= 640 ? 2 : 1
+}
+
+// The first page of the last screen, for this many pages shown this many at a time.
+fn book_spread_last(pages: int, cols: int) -> int {
+    floor((max([pages, 1]) - 1) / cols) * cols
+}
+
+// A page as the first page of the screen that shows it, kept in the book.
+fn book_spread_align(page: int, cols: int, pages: int) -> int {
+    max([0, min([floor(page / cols) * cols, book_spread_last(pages, cols)])])
+}
+
+// A swipe let go after dx pixels in ms: 1 for the next screen, -1 for the last, 0 to spring back.
+fn book_spread_turn(dx: num, ms: num, width: num) -> int {
+    let speed = abs(dx) / max([ms, 1])
+    if abs(dx) >= width * 0.25 || (abs(dx) >= 30 && speed >= 0.5) { return dx < 0 ? 1 : -1 }
+    0
+}
+
+// What a tap at x does: the outer quarters turn, and the middle does nothing.
+fn book_spread_edge(x: num, left: num, width: num) -> int {
+    if x < left + width * 0.25 { return -1 }
+    x > left + width * 0.75 ? 1 : 0
+}
+
+// How far through the text a place is, in whole percent.
+fn book_spread_percent(lengths: list, block: int, offset: int) -> int {
+    let total = sum(lengths)
+    if total == 0 { return 0 }
+    let before = sum(slice(lengths, 0, max([0, block])))
+    min([100, floor((before + offset) * 100 / total)])
+}
+
+// A saved place in this text: as given while the words are there, else the nearest block that
+// has them, else the same block as near as it can be.
+fn book_spread_resolve(texts: list, place) {
+    let n = len(texts)
+    if n == 0 || type_of(place) != "map" { return { block: 0, offset: 0 } }
+    let b = get(place, "block")
+    let o = get(place, "offset")
+    let block = type_of(b) == "int" ? max([0, min([b, n - 1])]) : 0
+    let offset = type_of(o) == "int" ? max([0, o]) : 0
+    let quote = get(place, "quote")
+    if type_of(quote) != "str" || quote == "" { return { block, offset: min([offset, len(texts[block])]) } }
+    if type_of(b) == "int" && b == block && slice(texts[block], offset, offset + len(quote)) == quote { return { block, offset } }
+    let holding = range(0, n) | filter((i) => contains(texts[i], quote))
+    if len(holding) == 0 { return { block, offset: min([offset, len(texts[block])]) } }
+    let nearest = min(holding | map((i) => abs(i - block)))
+    let at = (holding | filter((i) => abs(i - block) == nearest))[0]
+    { block: at, offset: len(split(texts[at], quote)[0]) }
+}
+
+// The left of the character at offset in a block's text, or null where it takes no room, as a
+// space broken off at the end of a column does not.
+fn book_spread_char_left(doc, node, offset: int) {
+    let r = doc.createRange()
+    r.setStart(node, offset)
+    r.setEnd(node, offset + 1)
+    let rects = r.getClientRects()
+    rects.length > 0 ? rects[0].left : null
+}
+
+// The first words on the page whose left edge is at `left` on the screen: { block, offset,
+// quote }. Blocks and characters run from left to right through the columns, so both are
+// found by halving, and a long book costs little.
+fn book_spread_find(flow, doc, left: num) {
+    let els = flow.querySelectorAll("[data-i]")
+    let n = els.length
+    if n == 0 { return { block: 0, offset: 0, quote: "" } }
+    let lo = 0
+    let hi = n - 1
+    while lo < hi {
+        let mid = floor((lo + hi) / 2)
+        let rects = els[mid].getClientRects()
+        let end_at = rects.length > 0 ? rects[rects.length - 1].right : left
+        if end_at > left + 1 { hi = mid } else { lo = mid + 1 }
+    }
+    let el = els[lo]
+    let node = el.firstChild
+    let size = node.length
+    let start = el.getClientRects()[0].left
+    let a = 0
+    if start < left - 1 {
+        let b = size - 1
+        while a < b {
+            let mid = floor((a + b) / 2)
+            let at = book_spread_char_left(doc, node, mid)
+            if at != null && at >= left - 1 { b = mid } else { a = mid + 1 }
+        }
+    }
+    let r = doc.createRange()
+    r.setStart(node, a)
+    r.setEnd(node, min([a + 40, size]))
+    { block: lo, offset: a, quote: r.toString() }
+}
+
+// The page a place falls on, for pages `step` wide.
+fn book_spread_page_of(flow, doc, place, step: num) -> int {
+    let els = flow.querySelectorAll("[data-i]")
+    if els.length == 0 { return 0 }
+    let el = els[max([0, min([place.block, els.length - 1])])]
+    let node = el.firstChild
+    let origin = flow.getBoundingClientRect().left
+    let offset = min([place.offset, node.length - 1])
+    let at = offset > 0 ? book_spread_char_left(doc, node, offset) : null
+    let rects = el.getClientRects()
+    if at == null && rects.length == 0 { return 0 }
+    let x = at ?? rects[0].left
+    floor((x - origin + 1) / step)
+}
+
+component BookSpread(blocks = [], title: str = "", position = null, size: int = 19, label: str = "Book", on_position = null, class: str? = null) {
+    style global book_spread_css
+    let text = book_spread_clean(blocks)
+    let texts = text | map((b) => b.text)
+    let lengths = texts | map((t) => len(t))
+    state win = null
+    state doc = null
+    state pane = null
+    state flow = null
+    state ready = false
+    state at = 0               // the first page showing
+    state pages = 1
+    state cols = 1
+    state type_size = max([14, min([size, 30])])
+    state percent = 0
+    state said = ""
+    state g_step = 1
+    state g_place = book_spread_resolve(book_spread_clean(blocks) | map((b) => b.text), position)
+    state g_swipe = null       // { id, x, y, t, locked }
+    let sit = () => { flow.style.transform = `translateX(${-at * g_step}px)` }
+    // What is at the top of the page now becomes the place kept.
+    let note_place = () => {
+        // From the flow's own edge: while a turn glides, it and the text are in step and the pane is not.
+        let place = book_spread_find(flow, doc, flow.getBoundingClientRect().left + at * g_step)
+        g_place = place
+        percent = at >= book_spread_last(pages, cols) && pages > 1 ? 100 : book_spread_percent(lengths, place.block, place.offset)
+        on_position && on_position({ ...place, percent, page: at + 1, pages })
+    }
+    let go = (to: int) => {
+        let next = book_spread_align(to, cols, pages)
+        flow.classList.add("ui-book-spread-turning")
+        if next != at {
+            at = next
+            sit()
+            note_place()
+            said = `Page ${at + 1} of ${pages}.`
+        } else {
+            sit()
+        }
+    }
+    // The columns for the room there is. Nothing here reads the page number: it comes from the
+    // place in the text, which is what stays true when the room or the type changes.
+    let lay_out = () => {
+        g_swipe = null
+        // Off the page or hidden, as in a closed tab panel, there is no room to measure.
+        if pane.clientWidth == 0 || pane.clientHeight == 0 { return null }
+        flow.classList.remove("ui-book-spread-turning")
+        flow.classList.remove("ui-book-spread-swiping")
+        let w = pane.clientWidth
+        let n = book_spread_columns(w, pane.clientHeight)
+        let gap = 48
+        let cw = floor((w - gap * (n - 1)) / n)
+        cols = n
+        g_step = cw + gap
+        flow.style.width = `${cw * n + gap * (n - 1)}px`
+        flow.style.height = `${pane.clientHeight}px`
+        flow.style.columnWidth = `${cw}px`
+        flow.style.columnGap = `${gap}px`
+        flow.style.transform = "none"
+        pages = max([1, ceil((flow.scrollWidth + gap) / g_step - 0.01)])
+        at = book_spread_align(book_spread_page_of(flow, doc, g_place, g_step), n, pages)
+        sit()
+        percent = book_spread_percent(lengths, g_place.block, g_place.offset)
+    }
+    let resize_type = (by: int) => {
+        type_size = max([14, min([type_size + by, 30])])
+        // A style on the parent, read after the page has taken it.
+        js("requestAnimationFrame", (_t = null) => { lay_out() })
+    }
+    let spring = () => {
+        flow.classList.remove("ui-book-spread-swiping")
+        flow.classList.add("ui-book-spread-turning")
+        sit()
+    }
+    <div class={ui_cls(["ui-book-spread", class])} role="group" aria-label={label}>
+        <div.ui-book-spread-bar>
+            <button.ui-book-spread-btn type="button" aria-label="Last page" disabled={at == 0} @click={() => { go(at - cols) }}>Back</button>
+            <span.ui-book-spread-title>{title}</span>
+            <button.ui-book-spread-btn type="button" aria-label="Smaller type" disabled={type_size <= 14} @click={() => { resize_type(-2) }}>A-</button>
+            <button.ui-book-spread-btn type="button" aria-label="Larger type" disabled={type_size >= 30} @click={() => { resize_type(2) }}>A+</button>
+            <button.ui-book-spread-btn type="button" aria-label="Next page" disabled={at >= book_spread_last(pages, cols)} @click={() => { go(at + cols) }}>Next</button>
+        </div>
+        // Sizes go on this parent. The flow inside is what a swipe moves, so it takes no style={...}:
+        // what the markup writes there would be written over what the handlers set.
+        <div class={ui_cls(["ui-book-spread-view", ready && "ui-book-spread-ready"])} tabindex="0" role="group" aria-label={`${title != "" ? title : label}, page ${at + 1} of ${pages}`}
+             style={`--size: ${type_size}px`}
+             @mount={(me) => {
+                 win = js("window")
+                 doc = js("document")
+                 pane = me
+                 flow = me.querySelector(".ui-book-spread-flow")
+                 ready = true
+                 lay_out()
+                 let ro = js_new("ResizeObserver", () => { lay_out() })
+                 ro.observe(me)
+                 // A web font arriving moves every line.
+                 js("Promise.resolve", doc.fonts.ready)
+                 lay_out()
+                 () => ro.disconnect()
+             }}
+             @pointerdown={(e) => {
+                 if e.button == 0 && g_swipe == null {
+                     g_swipe = { id: e.pointerId, x: e.clientX, y: e.clientY, t: e.timeStamp, locked: false }
+                 }
+             }}
+             @pointermove={(e) => {
+                 if g_swipe != null && e.pointerId == g_swipe.id {
+                     let dx = e.clientX - g_swipe.x
+                     let dy = e.clientY - g_swipe.y
+                     // A mouse selects text; a finger or a pen turns the page.
+                     if !g_swipe.locked && e.pointerType != "mouse" && abs(dx) > 10 && abs(dx) > abs(dy) {
+                         g_swipe = { ...g_swipe, locked: true }
+                         pane.setPointerCapture(e.pointerId)
+                         flow.classList.remove("ui-book-spread-turning")
+                         flow.classList.add("ui-book-spread-swiping")
+                     }
+                     if g_swipe.locked {
+                         let end = (dx > 0 && at == 0) || (dx < 0 && at >= book_spread_last(pages, cols))
+                         flow.style.transform = `translateX(${-at * g_step + (end ? dx * 0.25 : dx)}px)`
+                     }
+                 }
+             }}
+             @pointerup={(e) => {
+                 if g_swipe != null && e.pointerId == g_swipe.id {
+                     let s = g_swipe
+                     g_swipe = null
+                     let dx = e.clientX - s.x
+                     let dy = e.clientY - s.y
+                     let ms = e.timeStamp - s.t
+                     if s.locked {
+                         flow.classList.remove("ui-book-spread-swiping")
+                         let by = book_spread_turn(dx, ms, pane.clientWidth)
+                         if by != 0 { go(at + by * cols) } else { spring() }
+                     } else if abs(dx) + abs(dy) < 10 && ms < 500 && win.getSelection().isCollapsed {
+                         let r = pane.getBoundingClientRect()
+                         let by = book_spread_edge(e.clientX, r.left, r.width)
+                         if by != 0 { go(at + by * cols) }
+                     }
+                 }
+             }}
+             @pointercancel={(e) => {
+                 if g_swipe != null && e.pointerId == g_swipe.id {
+                     let s = g_swipe
+                     g_swipe = null
+                     if s.locked { spring() }
+                 }
+             }}
+             @keydown={(e) => {
+                 let to = match e.key {
+                     "ArrowRight" => at + cols
+                     "PageDown" => at + cols
+                     " " => at + cols
+                     "ArrowLeft" => at - cols
+                     "PageUp" => at - cols
+                     "Home" => 0
+                     "End" => pages
+                     _ => -1000
+                 }
+                 if to != -1000 {
+                     e.preventDefault()
+                     go(to)
+                 }
+             }}>
+            <div.ui-book-spread-flow>
+                // One element either way: a row that is a `? :` of two cannot always be removed.
+                {for p in enumerate(text) => <div key={p[0]} data-i={p[0]} class={p[1].heading ? "ui-book-spread-head" : "ui-book-spread-para"} role={p[1].heading ? "heading" : null} aria-level={p[1].heading ? "3" : null}>{p[1].text}</div>}
+                {len(text) == 0 && <div.ui-book-spread-para>Nothing to read yet.</div>}
+            </div>
+        </div>
+        {cols == 2 && <span.ui-book-spread-gutter aria-hidden="true"></span>}
+        <div.ui-book-spread-foot>
+            <span>{cols == 2 && at + 2 <= pages ? `Pages ${at + 1} and ${at + 2} of ${pages}` : `Page ${at + 1} of ${pages}`}</span>
+            <span>{percent}%</span>
+        </div>
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

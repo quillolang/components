@@ -1,0 +1,217 @@
+// AdaptiveDialog: one piece of content, two shapes. Where the window is narrow it is a sheet
+// from the bottom that a finger can drag away; where there is room it is a dialog in the
+// middle of the screen. It changes while open, on rotation or when Split View changes the
+// window, with what is in it, what was typed, its scroll and focus all kept, as it is
+// the same element. It is the browser's own <dialog>: focus stays in it and comes back.
+//
+//   import ui/adaptive_dialog.qwe use AdaptiveDialog
+//
+//   <AdaptiveDialog title="Rename" trigger="Rename">
+//       <TextInput label="Name" name="name"/>
+//   </AdaptiveDialog>
+//   <AdaptiveDialog title="Delete this?" open={asking} footer={<Button on_click={go}>Delete</Button>}
+//                   on_close={() => { asking = false }}> ... </AdaptiveDialog>
+//
+// title: its heading, and its name for screen readers. trigger: the text of a button that
+// opens it. Inside one of your components, open it from your own state instead: open={...}
+// and on_close(). breakpoint: under how many pixels of width it is a sheet (600). width: how
+// wide the dialog may be, in pixels (520). dismissable: a tap outside, or dragging the
+// sheet off, closes it (true). footer: buttons kept in view at its foot: HTML, so it needs
+// AdaptiveDialog inside one of your components. on_close(): called when it has closed.
+// children: what it holds.
+//
+// The width asked about is the window's and not the nearest container's: a <dialog> stands
+// over the whole window, wherever in the page it was written, and in Split View the window
+// is the app's own part of the screen. The equal of the drag is the Close button, Escape and
+// the phone's back gesture.
+
+import ui/button.qwe use Button
+import ui/bottom_sheet.qwe use bottom_sheet_track, bottom_sheet_track_move, bottom_sheet_speed, bottom_sheet_rubber, bottom_sheet_dismissed, bottom_sheet_back, bottom_sheet_keyboard_watch
+
+let adaptive_dialog_css = css`
+html:has(.ui-adaptive-dialog[open]) { overflow: hidden; }
+.ui-adaptive-dialog-host { display: contents; }
+.ui-adaptive-dialog {
+  position: fixed; inset: 0 0 var(--ui-adaptive-dialog-kb, 0px) 0; box-sizing: border-box; flex-direction: column;
+  width: min(var(--ui-adaptive-dialog-w, 520px), calc(100vw - 32px)); max-width: none; height: fit-content; max-height: calc(100dvh - var(--ui-adaptive-dialog-kb, 0px) - 32px);
+  margin: auto; padding: 0; overflow: hidden; border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 4px);
+  background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 15px/1.5 var(--ui-font); overscroll-behavior: contain;
+  opacity: 0; transform: scale(.96);
+  transition: transform .24s cubic-bezier(.22, 1, .36, 1), opacity .18s, overlay .24s allow-discrete, display .24s allow-discrete;
+}
+.ui-adaptive-dialog[open] { display: flex; opacity: 1; transform: none; }
+@starting-style { .ui-adaptive-dialog[open] { opacity: 0; transform: scale(.96); } }
+.ui-adaptive-dialog::backdrop { background: var(--ui-overlay); }
+.ui-adaptive-dialog-sheet {
+  inset: auto 0 var(--ui-adaptive-dialog-kb, 0px) 0; width: 100%; max-height: calc(100dvh - var(--ui-adaptive-dialog-kb, 0px) - max(12px, env(safe-area-inset-top)));
+  margin: 0; border-width: 1px 0 0; border-radius: calc(var(--ui-radius) + 8px) calc(var(--ui-radius) + 8px) 0 0;
+  box-shadow: var(--ui-shadow-lg), 0 120px 0 0 var(--ui-surface); opacity: 1; transform: translateY(100%);
+}
+.ui-adaptive-dialog-sheet[open] { transform: translateY(0); }
+@starting-style { .ui-adaptive-dialog-sheet[open] { opacity: 1; transform: translateY(100%); } }
+.ui-adaptive-dialog-grip { display: none; flex: none; align-items: center; justify-content: center; height: 24px; touch-action: none; }
+.ui-adaptive-dialog-grip span { width: 40px; height: 5px; border-radius: 999px; background: var(--ui-strong); }
+.ui-adaptive-dialog-sheet .ui-adaptive-dialog-grip { display: flex; }
+.ui-adaptive-dialog-head { display: flex; align-items: center; gap: 8px; flex: none; padding: 8px 8px 8px 20px; border-bottom: 1px solid var(--ui-border); }
+.ui-adaptive-dialog-sheet .ui-adaptive-dialog-head { padding-top: 0; touch-action: none; -webkit-touch-callout: none; user-select: none; }
+.ui-adaptive-dialog-head h2 { flex: 1; min-width: 0; margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; }
+.ui-adaptive-dialog-close {
+  display: grid; place-items: center; flex: none; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); cursor: pointer;
+}
+@media (hover: hover) { .ui-adaptive-dialog-close:hover { background: var(--ui-subtle); color: var(--ui-fg); } }
+.ui-adaptive-dialog-close:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-adaptive-dialog-close svg { width: 18px; height: 18px; }
+.ui-adaptive-dialog-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px 20px 20px; }
+.ui-adaptive-dialog-body > :first-child { margin-top: 0; }
+.ui-adaptive-dialog-body > :last-child { margin-bottom: 0; }
+.ui-adaptive-dialog-foot { display: flex; justify-content: flex-end; gap: 8px; flex: none; padding: 12px 20px; border-top: 1px solid var(--ui-border); }
+.ui-adaptive-dialog-sheet .ui-adaptive-dialog-foot, .ui-adaptive-dialog-sheet .ui-adaptive-dialog-body:last-child { padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+@media (prefers-reduced-motion: reduce) { .ui-adaptive-dialog { transition: none; } }
+`
+
+// A sheet under the breakpoint; a breakpoint that makes no sense is taken as 600.
+fn adaptive_dialog_is_sheet(width: num, breakpoint) {
+    let at = (type_of(breakpoint) == "int" || type_of(breakpoint) == "float") && breakpoint > 0 ? breakpoint : 600
+    width < at
+}
+
+component AdaptiveDialog(title: str, trigger: str? = null, open: bool = false, breakpoint: num = 600, width: int = 520,
+                         dismissable: bool = true, footer = null, on_close = null, children) {
+    style global adaptive_dialog_css
+    state dlg = null
+    state body = null
+    state win = null
+    state sheet = false
+    state track = null
+    state zone = null           // "handle" or "body", then "drag"
+    state moved = false
+    state undo_back = null
+    state undo_kb = null
+    let shut = () => { dlg.close() }
+    let spring = () => {
+        dlg.style.removeProperty("transform")
+        dlg.style.removeProperty("transition")
+    }
+    let choose = (_e) => {
+        let is_sheet = adaptive_dialog_is_sheet(win.innerWidth, breakpoint)
+        // Turned in the middle of a drag: the finger is no longer moving this shape.
+        if is_sheet != sheet && zone == "drag" { spring() }
+        if is_sheet != sheet {
+            track = null
+            zone = null
+        }
+        sheet = is_sheet
+    }
+    let forget = () => {
+        win.removeEventListener("resize", choose)
+        undo_kb && undo_kb()
+        undo_kb = null
+        undo_back && undo_back()
+        undo_back = null
+    }
+    let show = () => {
+        choose(null)
+        dlg.showModal()
+        win.addEventListener("resize", choose)
+        undo_kb = bottom_sheet_keyboard_watch(win, (px) => { dlg.style.setProperty("--ui-adaptive-dialog-kb", `${px}px`) })
+        undo_back = bottom_sheet_back(win, shut)
+    }
+    if open && dlg != null && !dlg.open { show() }
+    if !open && dlg != null && dlg.open && trigger == null { shut() }
+    let moving = (e) => {
+        if track != null {
+            track = bottom_sheet_track_move(track, e.clientX, e.clientY, e.timeStamp)
+            if track.lock == "x" && zone != "drag" {
+                track = null
+                zone = null
+            }
+            if track != null && track.lock == "y" {
+                if zone == "body" && (track.y < track.y0 || body.scrollTop > 0) {
+                    track = null
+                    zone = null
+                } else {
+                    if zone != "drag" {
+                        zone = "drag"
+                        moved = true
+                        dlg.setPointerCapture(e.pointerId)
+                        dlg.style.transition = "none"
+                    }
+                    let dy = track.y - track.y0
+                    let y = dy >= 0 ? (dismissable ? dy : bottom_sheet_rubber(dy, 60)) : 0 - bottom_sheet_rubber(0 - dy, 60)
+                    dlg.style.transform = `translateY(${round(y, 2)}px)`
+                }
+            }
+        }
+    }
+    let ended = (e) => {
+        if track != null && zone == "drag" {
+            let leave = dismissable && bottom_sheet_dismissed(track.y - track.y0, dlg.offsetHeight, bottom_sheet_speed(track, "y", e.timeStamp))
+            spring()
+            if leave { shut() }
+        }
+        track = null
+        zone = null
+    }
+    let cancelled = () => {
+        if zone == "drag" { spring() }
+        track = null
+        zone = null
+    }
+    // The width is on the host, which nothing here touches by hand: the dialog's own style
+    // holds where it stands, and an attribute that follows a prop is rewritten whole.
+    <div.ui-adaptive-dialog-host style={`--ui-adaptive-dialog-w: ${width}px`}>
+        {trigger != null && <Button variant="outline" size="lg" on_click={show}>{trigger}</Button>}
+        <dialog class={sheet ? "ui-adaptive-dialog ui-adaptive-dialog-sheet" : "ui-adaptive-dialog"} aria-label={title}
+                @mount={(el) => {
+                    // win first: giving dlg a value sets off the `if open` above.
+                    win = js("window")
+                    dlg = el
+                    if open && !dlg.open { show() }
+                    // Taken off the page while open, it must not leave anything on the window.
+                    () => { forget() }
+                }}
+                @close={() => {
+                    forget()
+                    track = null
+                    zone = null
+                    spring()
+                    dlg.style.removeProperty("--ui-adaptive-dialog-kb")
+                    on_close && on_close()
+                }}
+                @click={(e) => {
+                    let box = dlg.getBoundingClientRect()
+                    let outside = e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom
+                    if dismissable && e.target.isSameNode(dlg) && !moved && outside { shut() }
+                    moved = false
+                }}
+                @pointerdown={(e) => {
+                    let t = e.target
+                    let on_handle = t.closest(".ui-adaptive-dialog-grip, .ui-adaptive-dialog-head") != null && t.closest(".ui-adaptive-dialog-close") == null
+                    let on_body = t.closest(".ui-adaptive-dialog-body") != null
+                    moved = false
+                    // Only a sheet moves, and a mouse in its body selects text.
+                    if sheet && e.button == 0 && (on_handle || (on_body && e.pointerType == "touch")) {
+                        track = bottom_sheet_track(e.clientX, e.clientY, e.timeStamp)
+                        zone = on_handle ? "handle" : "body"
+                    }
+                }}
+                @pointermove={moving}
+                @pointerup={ended}
+                @pointercancel={cancelled}
+                @touchmove={(e) => {
+                    if zone == "drag" && e.cancelable { e.preventDefault() }
+                }}>
+            <div.ui-adaptive-dialog-grip aria-hidden="true"><span></span></div>
+            <div.ui-adaptive-dialog-head>
+                <h2>{title}</h2>
+                <button.ui-adaptive-dialog-close type="button" aria-label="Close" @click={shut}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                         aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div.ui-adaptive-dialog-body @mount={(el) => { body = el }}>{children}</div>
+            {footer != null && <div.ui-adaptive-dialog-foot>{footer}</div>}
+        </dialog>
+    </div>
+}

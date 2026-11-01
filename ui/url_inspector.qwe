@@ -1,0 +1,556 @@
+// UrlInspector: takes a URL apart and puts it back. It splits it into scheme, user, host,
+// port, path, query and fragment, shows the query as a table to edit, and rebuilds the
+// URL with what needs encoding encoded and what was fine left as written. It flags
+// tracking parameters (and takes them out at a press), text encoded twice, bad percent
+// escapes, a password in the URL and hosts that mix alphabets, shows punycode both ways
+// (münchen.de is xn--mnchen-3ya.de), and copes with what is not an absolute URL: it says
+// so of a relative one and resolves it against a base, and says what is wrong with an
+// invalid one, by part.
+//
+//   <UrlInspector url="https://example.com/a?utm_source=x&id=7#top"/>
+//   <UrlInspector url="../img/a.png" base="https://example.com/blog/post/" on_change={(r) => { clean = r.rebuilt }}/>
+//
+// url: the URL it starts with. base: what a relative URL is resolved against; it gets a
+// field when the URL is relative. title: its heading. id: a prefix for its ids, unique on
+// the page. name: the field's name ("url"; the base's is <name>_base). tracking: more
+// parameter names to flag, as a list. on_change(result): inside one of your components,
+// given { url, rebuilt, kind, valid, tracking } after a change, tracking being how many
+// are flagged. class: more classes for its outer element.
+//
+// url_inspector_parse(text) gives the parts: { kind ("absolute", "relative", "scheme-
+// relative", "opaque", "invalid" or "empty"), scheme, user, password, host, host_ascii,
+// host_unicode, port, path, query, fragment, problems, notes }; url_inspector_rows(query)
+// the rows; url_inspector_rebuild(parts, rows) the URL; url_inspector_resolve(base, ref)
+// RFC 3986's resolution; url_inspector_to_ascii(host) and url_inspector_to_unicode(host)
+// punycode. Host names are lowered and encoded by RFC 3492, without the rest of UTS 46.
+
+import ui/theme.qwe use ui_cls
+
+let url_inspector_css = css`
+.ui-url-insp { display: grid; gap: 12px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-url-insp .ui-url-insp-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-url-insp-field { display: grid; gap: 5px; min-width: 0; }
+.ui-url-insp-field label { font-size: 13px; font-weight: 500; }
+.ui-url-insp-input { box-sizing: border-box; width: 100%; height: 34px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 13px var(--ui-mono); }
+.ui-url-insp-input:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-url-insp-input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-url-insp-kind { margin: 0; font-weight: 600; }
+.ui-url-insp-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-url-insp-list li { padding: 6px 10px; border-left: 4px solid var(--ui-warning); border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); overflow-wrap: anywhere; }
+.ui-url-insp-list.ui-url-insp-bad li { border-left-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-url-insp-parts { display: grid; gap: 2px; margin: 0; font-size: 13px; }
+.ui-url-insp-part { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 12px; }
+.ui-url-insp-parts dt { color: var(--ui-muted); }
+.ui-url-insp-parts dd { margin: 0; font-family: var(--ui-mono); overflow-wrap: anywhere; }
+.ui-url-insp-scroll { position: relative; overflow-x: auto; }
+.ui-url-insp-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-url-insp table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-url-insp caption { padding: 0 0 6px; text-align: left; font-weight: 600; }
+.ui-url-insp th, .ui-url-insp td { padding: 4px 6px 4px 0; border-bottom: 1px solid var(--ui-border); text-align: left; vertical-align: middle; }
+.ui-url-insp thead th { color: var(--ui-muted); font-weight: 500; }
+.ui-url-insp td .ui-url-insp-input { min-width: 110px; }
+.ui-url-insp-flag { display: inline-block; margin: 1px 4px 1px 0; padding: 0 6px; border-radius: 999px; background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 11px; font-weight: 600; white-space: nowrap; }
+.ui-url-insp-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-url-insp-btn { height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1 var(--ui-font); white-space: nowrap; cursor: pointer; }
+.ui-url-insp-btn:hover { background: var(--ui-subtle); }
+.ui-url-insp-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-url-insp-out { margin: 0; padding: 8px 10px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font: 13px/1.5 var(--ui-mono); overflow-wrap: anywhere; }
+.ui-url-insp-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+`
+
+let url_inspector_most = 20000
+let url_inspector_most_rows = 500
+let url_inspector_re = "^(?:([^:/?#]+):)?(?://([^/?#]*))?([^?#]*)(?:\\?([^#]*))?(?:#(.*))?$"
+let url_inspector_hier = ["http", "https", "ws", "wss", "ftp", "ftps"]
+let url_inspector_ports = { http: "80", https: "443", ws: "80", wss: "443", ftp: "21" }
+let url_inspector_track_names = ["gclid", "gclsrc", "dclid", "gbraid", "wbraid", "fbclid", "msclkid", "mc_cid", "mc_eid", "igshid", "yclid", "twclid", "ttclid", "li_fat_id", "_hsenc", "_hsmi", "vero_id", "mkt_tok", "ref_src", "s_cid", "spm", "_ga", "_gl"]
+let url_inspector_digits = "abcdefghijklmnopqrstuvwxyz0123456789"
+let url_inspector_hex = "0123456789abcdef"
+
+fn url_inspector_hex_value(c: str) = index_of(url_inspector_hex, lower(c))
+
+// A code point as text: JSON's escapes are the only way Quillo has to make a character
+// from its number.
+fn url_inspector_escape(u: int) -> str {
+    let h = (n: int) => slice(url_inspector_hex, n, n + 1)
+    `\\u${h(floor(u / 4096))}${h(floor(u / 256) % 16)}${h(floor(u / 16) % 16)}${h(u % 16)}`
+}
+
+fn url_inspector_char(cp: int) -> str {
+    if cp < 65536 { return json.parse(`"${url_inspector_escape(cp)}"`) }
+    let v = cp - 65536
+    json.parse(`"${url_inspector_escape(55296 + floor(v / 1024))}${url_inspector_escape(56320 + v % 1024)}"`)
+}
+
+// The bytes of `%41%42`.
+fn url_inspector_bytes(run: str) -> list =
+    for i in 0..floor(len(run) / 3) => url_inspector_hex_value(run[i * 3 + 1]) * 16 + url_inspector_hex_value(run[i * 3 + 2])
+
+let url_inspector_ascii = join(range(32, 127) | map(url_inspector_char), "")
+
+// A character's number, by the only road there is: a table for ASCII, which url_encode
+// may leave alone, and its percent escapes for the rest.
+fn url_inspector_code(c: str) -> int {
+    let at = index_of(url_inspector_ascii, c)
+    if at != null { return at + 32 }
+    let b = url_inspector_bytes(url_encode(c))
+    if len(b) == 1 { return b[0] }
+    if len(b) == 2 { return (b[0] - 192) * 64 + b[1] - 128 }
+    if len(b) == 3 { return (b[0] - 224) * 4096 + (b[1] - 128) * 64 + b[2] - 128 }
+    (b[0] - 240) * 262144 + (b[1] - 128) * 4096 + (b[2] - 128) * 64 + b[3] - 128
+}
+
+// Bytes as UTF-8: { text, bad (some were not) }. Bad ones become U+FFFD.
+fn url_inspector_utf8(bytes: list) -> map {
+    let parts = []
+    let bad = false
+    let n = len(bytes)
+    let i = 0
+    while i < n {
+        let b = bytes[i]
+        let need = b < 128 ? 0 : (b >= 194 && b <= 223 ? 1 : (b >= 224 && b <= 239 ? 2 : (b >= 240 && b <= 244 ? 3 : -1)))
+        let cp = need == 0 ? b : (need == 1 ? b - 192 : (need == 2 ? b - 224 : b - 240))
+        let ok = need >= 0
+        let j = 1
+        while ok && j <= need {
+            let c = i + j < n ? bytes[i + j] : 0
+            if c < 128 || c > 191 { ok = false } else { cp = cp * 64 + c - 128; j += 1 }
+        }
+        if ok && ((need == 2 && (cp < 2048 || (cp >= 55296 && cp <= 57343))) || (need == 3 && (cp < 65536 || cp > 1114111))) { ok = false }
+        if ok {
+            parts = push(parts, url_inspector_char(cp))
+            i += need + 1
+        } else {
+            parts = push(parts, "\u{FFFD}")
+            bad = true
+            i += 1
+        }
+    }
+    { text: join(parts, ""), bad }
+}
+
+// Percent escapes read, `+` as a space in a query: { text, bad_escape, bad_utf8, twice }.
+// twice: what came out still looks escaped, so the text was encoded two times.
+fn url_inspector_decode(raw: str, plus: bool) -> map {
+    let spaced = plus ? replace(raw, "+", " ") : raw
+    let bad_utf8 = false
+    let text = re.replace(spaced, "(?:%[0-9A-Fa-f]{2})+", (m) => {
+        let r = url_inspector_utf8(url_inspector_bytes(m.text))
+        if r.bad { bad_utf8 = true }
+        r.text
+    })
+    let bad_escape = any(re.find_all(spaced, "%[0-9A-Fa-f]{2}|%.{0,2}", "s"), (m) => !re.test(m.text, "^%[0-9A-Fa-f]{2}$"))
+    { text, bad_escape, bad_utf8, twice: re.test(raw, "%25[0-9A-Fa-f]{2}") }
+}
+
+// Text with what a URL cannot hold encoded, and valid escapes and legal characters as
+// they are. `allowed` is a class of what else may stay.
+fn url_inspector_keep(text: str, allowed: str) -> str =
+    re.replace(text, `%[0-9A-Fa-f]{2}|[^A-Za-z0-9._~!$&'()*+,;=:@${allowed}-]`, (m) => len(m.text) == 3 && starts_with(m.text, "%") ? m.text : url_encode(m.text))
+
+// ---- Punycode, RFC 3492 ----------------------------------------------------
+
+fn url_inspector_adapt(delta0: int, points: int, first: bool) -> int {
+    let delta = floor((first ? floor(delta0 / 700) : floor(delta0 / 2)))
+    delta = delta + floor(delta / points)
+    let k = 0
+    while delta > 455 {
+        delta = floor(delta / 35)
+        k += 36
+    }
+    k + floor(36 * delta / (delta + 38))
+}
+
+fn url_inspector_threshold(k: int, bias: int) -> int = k <= bias ? 1 : (k >= bias + 26 ? 26 : k - bias)
+
+// A label's code points from what follows `xn--`, or null if it cannot be.
+fn url_inspector_puny_decode(input: str) {
+    let chars = split(input, "")
+    let dash = -1
+    for p in enumerate(chars) { if p[1] == "-" { dash = p[0] } }
+    let basic = dash < 0 ? [] : take(chars, dash)
+    if any(basic, (c) => !re.test(c, "^[\\x00-\\x7f]$")) { return null }
+    let output = basic | map((c) => url_inspector_code(c))
+    let rest = drop(chars, dash + 1)
+    let n = 128
+    let i = 0
+    let bias = 72
+    let pos = 0
+    let total = len(rest)
+    while pos < total {
+        let old = i
+        let w = 1
+        let k = 36
+        let going = true
+        while going {
+            if pos >= total { return null }
+            let digit = index_of(url_inspector_digits, lower(rest[pos]))
+            pos += 1
+            if digit == null { return null }
+            i = i + digit * w
+            let t = url_inspector_threshold(k, bias)
+            if digit < t { going = false } else {
+                w = w * (36 - t)
+                k += 36
+            }
+            if i > 2000000000 { return null }
+        }
+        let size = len(output) + 1
+        bias = url_inspector_adapt(i - old, size, old == 0)
+        n = n + floor(i / size)
+        i = i % size
+        if n > 1114111 || (n >= 55296 && n <= 57343) { return null }
+        output = take(output, i) + [n] + drop(output, i)
+        i += 1
+    }
+    // Control characters, and a label with nothing to encode, decode by the letter of
+    // the RFC, but no name is made of them.
+    if any(output, (c) => c >= 128 && c < 160) || all(output, (c) => c < 128) { return null }
+    output
+}
+
+// What goes after `xn--` for a label of code points.
+fn url_inspector_puny_encode(cps: list) -> str {
+    let basic = cps | filter((c) => c < 128)
+    let out = basic | map((c) => url_inspector_char(c))
+    let b = len(basic)
+    let h = b
+    if b > 0 { out = push(out, "-") }
+    let n = 128
+    let delta = 0
+    let bias = 72
+    let total = len(cps)
+    while h < total {
+        let m = min(cps | filter((c) => c >= n))
+        delta = delta + (m - n) * (h + 1)
+        n = m
+        for c in cps {
+            if c < n { delta += 1 }
+            if c == n {
+                let q = delta
+                let k = 36
+                let going = true
+                while going {
+                    let t = url_inspector_threshold(k, bias)
+                    if q < t { going = false } else {
+                        let d = t + (q - t) % (36 - t)
+                        out = push(out, slice(url_inspector_digits, d, d + 1))
+                        q = floor((q - t) / (36 - t))
+                        k += 36
+                    }
+                }
+                out = push(out, slice(url_inspector_digits, q, q + 1))
+                bias = url_inspector_adapt(delta, h + 1, h == b)
+                delta = 0
+                h += 1
+            }
+        }
+        delta += 1
+        n += 1
+    }
+    join(out, "")
+}
+
+// A host in ASCII, each label that needs it as xn--.
+fn url_inspector_to_ascii(host: str) -> str =
+    join(split(lower(host), ".") | map((label) => re.test(label, "^[\\x00-\\x7f]*$") ? label
+        : `xn--${url_inspector_puny_encode(split(label, "") | map((c) => url_inspector_code(c)))}`), ".")
+
+// A host for reading, each xn-- label decoded; a label that will not decode stays.
+fn url_inspector_to_unicode(host: str) -> str =
+    join(split(host, ".") | map((label) => {
+        if !starts_with(lower(label), "xn--") { return label }
+        let d = url_inspector_puny_decode(slice(label, 4, len(label)))
+        d == null ? label : join(d | map((c) => url_inspector_char(c)), "")
+    }), ".")
+
+// ---- The URL ----------------------------------------------------------------
+
+// Trouble with a host: text for each.
+fn url_inspector_host_problems(host: str) -> list {
+    let out = []
+    if re.test(host, "[\\s<>\"\\\\^`{|}%]") { out = push(out, `The host "${host}" holds a character a host cannot: a space, or one of < > " \\ ^ \` { | } %.`) }
+    if len(host) > 253 { out = push(out, "The host is longer than the 253 characters a name can have.") }
+    for label in split(host, ".") {
+        if len(label) > 63 { out = push(out, `The host part "${slice(label, 0, 20)}…" is longer than the 63 characters a part can have.`) }
+    }
+    if contains(host, "..") || starts_with(host, ".") { out = push(out, `The host "${host}" has an empty part between dots.`) }
+    for label in split(host, ".") {
+        if starts_with(lower(label), "xn--") && url_inspector_puny_decode(slice(label, 4, len(label))) == null { out = push(out, `The host part "${label}" is not valid punycode.`) }
+    }
+    out
+}
+
+// A host that mixes alphabets can pass for another: аpple.com with a Cyrillic а.
+fn url_inspector_mixed(unicode_host: str) -> str? {
+    let found = find(split(unicode_host, "."), (l) => re.test(l, "[a-zA-Z]") && re.test(l, "[Ѐ-ӿͰ-Ͽ]"))
+    found == null ? null : `The host part "${found}" mixes Latin with Cyrillic or Greek letters, which can pass for another name.`
+}
+
+// Authority text into its parts, and what is wrong with it.
+fn url_inspector_authority(a: str) -> map {
+    let at = re.find_all(a, "@")
+    let info = len(at) > 0 ? slice(a, 0, at[-1].start) : null
+    let rest = len(at) > 0 ? slice(a, at[-1].end, len(a)) : a
+    let colon = info == null ? null : index_of(info, ":")
+    let user = info == null ? null : (colon == null ? info : slice(info, 0, colon))
+    let password = colon == null ? null : slice(info, colon + 1, len(info))
+    let v6 = re.find(rest, "^(\\[[^\\]]*\\])(?::(.*))?$")
+    let plain = v6 == null ? re.find(rest, "^([^:]*)(?::([^:]*))?$") : null
+    let open_bracket = v6 == null && starts_with(rest, "[")
+    let host = open_bracket ? rest : (v6 != null ? v6.groups[0] : (plain != null ? plain.groups[0] : slice(rest, 0, index_of(rest, ":"))))
+    let port = open_bracket ? null : (v6 != null ? v6.groups[1] : (plain != null ? plain.groups[1] : null))
+    let problems = []
+    if open_bracket { problems = push(problems, `The host "${rest}" opens a [ and never closes it.`) }
+    if v6 != null && !re.test(v6.groups[0], "^\\[[0-9A-Fa-f:.]+\\]$") { problems = push(problems, `${v6.groups[0]} is not an IPv6 address.`) }
+    if v6 == null && !open_bracket && plain == null { problems = push(problems, `The host "${rest}" has more than one colon. An IPv6 address needs [ ].`) }
+    if port != null && port != "" {
+        let bad = !re.test(port, "^\\d{1,5}$") || int(port) > 65535
+        if bad { problems = push(problems, `The port "${port}" is not a number from 0 to 65535.`) }
+    }
+    { user, password, host, port: port == "" ? null : port, problems: v6 != null || open_bracket || plain == null ? problems : problems + url_inspector_host_problems(host) }
+}
+
+// Reads a URL. See the top of the file.
+fn url_inspector_parse(text: str) -> map {
+    let parts = { raw: text, kind: "empty", scheme: null, user: null, password: null, host: null, host_ascii: null, host_unicode: null, port: null, path: "", query: null, fragment: null, problems: [], notes: [] }
+    let t = trim(text)
+    if t == "" { return parts }
+    if len(t) > url_inspector_most { return { ...parts, kind: "invalid", problems: [`This is ${format_number(len(t), "en-US", 0)} characters, past the ${format_number(url_inspector_most, "en-US", 0)} it will read.`] } }
+    let notes = t != text ? ["Space around the URL is left out."] : []
+    let problems = []
+    let inner = re.test(t, "[\\t\\n\\r]")
+    if inner { notes = push(notes, "Tabs and line breaks inside it are left out, as browsers do.") }
+    let s = re.replace(t, "[\\t\\n\\r]", "")
+    let m = re.find(s, url_inspector_re, "s")
+    let g = m.groups
+    let scheme_raw = g[0]
+    let good_scheme = scheme_raw != null && re.test(scheme_raw, "^[A-Za-z][A-Za-z0-9+.-]*$")
+    if scheme_raw != null && !good_scheme && g[1] != null {
+        return { ...parts, kind: "invalid", path: g[2] ?? "", problems: [`"${scheme_raw}" cannot be a scheme: it starts with a letter, then letters, digits, + . or -.`], notes }
+    }
+    // host:8080/path reads as the scheme "host", which is never what was meant.
+    if good_scheme && g[1] == null && re.test(g[2] ?? "", "^\\d{1,5}(/|$)") && !contains(url_inspector_hier, lower(scheme_raw)) {
+        return { ...parts, kind: "invalid", problems: [`This reads as the scheme "${scheme_raw}", but looks like a host and port. Add https:// in front.`], notes }
+    }
+    let scheme = good_scheme ? lower(scheme_raw) : null
+    let path = scheme_raw != null && !good_scheme ? `${scheme_raw}:${g[2] ?? ""}` : (g[2] ?? "")
+    let authority = g[1]
+    if contains(s, "\\") { problems = push(problems, "It holds a backslash, which a URL does not: browsers read it as /, others do not.") }
+    if scheme != null && authority == null && contains(url_inspector_hier, scheme) {
+        return { ...parts, kind: "invalid", scheme, path, problems: problems + [`${scheme} needs // after the colon: ${scheme}://${re.replace(path, "^/+", "")}`], notes }
+    }
+    if scheme != null && authority == null {
+        if scheme == "javascript" { notes = push(notes, "This runs script when followed. Never put one from a visitor in a link.") }
+        return { ...parts, kind: "opaque", scheme, path, query: g[3], fragment: g[4], problems, notes }
+    }
+    let kind = scheme != null ? "absolute" : (authority != null ? "scheme-relative" : "relative")
+    let a = authority != null ? url_inspector_authority(authority) : { user: null, password: null, host: null, port: null, problems: [] }
+    if authority != null && (a.host ?? "") == "" && contains(url_inspector_hier, scheme ?? "http") { problems = push(problems, "There is no host after the //.") }
+    problems = problems + a.problems
+    if kind == "relative" && re.test(path, "^[a-z0-9-]+(\\.[a-z0-9-]+)*\\.[a-z]{2,}(/|$)", "i") { notes = push(notes, `This is a relative path. If ${split(path, "/")[0]} is a host, add https:// in front.`) }
+    let host_ascii = a.host == null ? null : (starts_with(a.host, "[") ? lower(a.host) : url_inspector_to_ascii(a.host))
+    let host_unicode = host_ascii == null ? null : url_inspector_to_unicode(host_ascii)
+    if a.password != null { notes = push(notes, "It holds a password, which anyone who sees the URL can read.") }
+    let mixed = host_unicode == null ? null : url_inspector_mixed(host_unicode)
+    if mixed != null { notes = push(notes, mixed) }
+    if a.port != null && get(url_inspector_ports, scheme ?? "") == a.port { notes = push(notes, `Port ${a.port} is what ${scheme} uses anyway, so it can go.`) }
+    if url_inspector_decode(path, false).twice { notes = push(notes, "The path looks encoded twice: it has %25 before an escape.") }
+    if url_inspector_decode(path, false).bad_escape { problems = push(problems, "The path has a % that does not start an escape.") }
+    if re.test(path, "\\s") { notes = push(notes, "The path holds a space, which the rebuilt URL encodes.") }
+    { ...parts, kind: len(problems) > 0 ? "invalid" : kind, scheme, user: a.user, password: a.password, host: a.host, host_ascii, host_unicode, port: a.port, path, query: g[3], fragment: g[4], problems, notes }
+}
+
+// Whether a parameter is a tracking one.
+fn url_inspector_is_tracking(key: str, extra: list) -> bool {
+    let k = lower(key)
+    starts_with(k, "utm_") || contains(url_inspector_track_names, k) || contains(extra | map((x) => lower(x)), k)
+}
+
+// The query's rows: { id, key, value, eq (had an =), raw (the text as it came, so an
+// unedited row is not re-encoded), flags }. A list made by pieces, past the limit left.
+fn url_inspector_rows(query, first_id: int = 0) -> list {
+    if query == null || query == "" { return [] }
+    let pieces = take(split(query, "&") | filter((p) => p != ""), url_inspector_most_rows)
+    enumerate(pieces) | map((p) => {
+        let at = index_of(p[1], "=")
+        let raw_key = at == null ? p[1] : slice(p[1], 0, at)
+        let raw_value = at == null ? "" : slice(p[1], at + 1, len(p[1]))
+        let k = url_inspector_decode(raw_key, true)
+        let v = url_inspector_decode(raw_value, true)
+        { id: first_id + p[0], key: k.text, value: v.text, eq: at != null, raw: p[1],
+          twice: k.twice || v.twice, bad_escape: k.bad_escape || v.bad_escape, bad_utf8: k.bad_utf8 || v.bad_utf8 }
+    })
+}
+
+fn url_inspector_flags(r: map, extra: list) -> list =
+    [url_inspector_is_tracking(r.key, extra) ? "tracking" : null, r.twice ? "encoded twice" : null, r.bad_escape ? "bad escape" : null, r.bad_utf8 ? "not UTF-8" : null,
+     r.key == "" ? "no name" : null] | filter((f) => f != null)
+
+fn url_inspector_row_text(r: map) -> str {
+    if r.raw != null { return url_inspector_keep(r.raw, "/?") }
+    r.eq ? `${url_encode(r.key)}=${url_encode(r.value)}` : url_encode(r.key)
+}
+
+// The URL again, from the parts and the rows, encoded.
+fn url_inspector_rebuild(parts: map, rows: list) -> str {
+    let scheme = parts.scheme != null ? `${parts.scheme}:` : ""
+    let info = parts.user == null ? "" : `${url_inspector_keep(parts.user, "")}${parts.password != null ? `:${url_inspector_keep(parts.password, "")}` : ""}@`
+    let port = parts.port != null ? `:${parts.port}` : ""
+    let authority = parts.host != null ? `//${info}${parts.host_ascii}${port}` : ""
+    let path = url_inspector_keep(parts.path, "/")
+    let q = join(rows | map(url_inspector_row_text), "&")
+    let query = len(rows) > 0 ? `?${q}` : (parts.query != null && parts.kind == "opaque" ? `?${parts.query}` : "")
+    let fragment = parts.fragment != null ? `#${url_inspector_keep(parts.fragment, "/?")}` : ""
+    `${scheme}${authority}${path}${query}${fragment}`
+}
+
+// RFC 3986 section 5.2.4.
+fn url_inspector_dots(path: str) -> str {
+    let segs = split(path, "/")
+    let out = []
+    let n = len(segs)
+    for p in enumerate(segs) {
+        let s = p[1]
+        let last = p[0] == n - 1
+        if s == ".." {
+            if len(out) > 1 { out = slice(out, 0, len(out) - 1) }
+            if last { out = push(out, "") }
+        } else if s == "." {
+            if last { out = push(out, "") }
+        } else {
+            out = push(out, s)
+        }
+    }
+    join(out, "/")
+}
+
+// RFC 3986 section 5.2.2: ref against an absolute base, or null if base is not one.
+fn url_inspector_resolve(base: str, ref: str) -> str? {
+    let b = url_inspector_parse(base)
+    if b.kind != "absolute" { return null }
+    let g = re.find(re.replace(trim(ref), "[\\t\\n\\r]", ""), url_inspector_re, "s").groups
+    let auth = (a: str) => `${b.scheme}://${a}`
+    let tail = (q, f) => `${q != null ? `?${q}` : ""}${f != null ? `#${f}` : ""}`
+    if g[0] != null { return `${lower(g[0])}:${g[1] != null ? `//${g[1]}` : ""}${url_inspector_dots(g[2] ?? "")}${tail(g[3], g[4])}` }
+    if g[1] != null { return `${auth(g[1])}${url_inspector_dots(g[2] ?? "")}${tail(g[3], g[4])}` }
+    let here = re.find(trim(base), url_inspector_re, "s").groups
+    let base_path = here[2] ?? ""
+    let path = g[2] ?? ""
+    if path == "" { return `${auth(here[1])}${base_path}${tail(g[3] ?? here[3], g[4])}` }
+    if starts_with(path, "/") { return `${auth(here[1])}${url_inspector_dots(path)}${tail(g[3], g[4])}` }
+    let cut = re.find_all(base_path, "/")
+    let dir = len(cut) == 0 ? "/" : slice(base_path, 0, cut[-1].end)
+    `${auth(here[1])}${url_inspector_dots(`${dir}${path}`)}${tail(g[3], g[4])}`
+}
+
+fn url_inspector_kind_text(kind: str) -> str = match kind {
+    "absolute" => "An absolute URL"
+    "relative" => "A relative URL: it needs a base to lead anywhere"
+    "scheme-relative" => "A scheme-relative URL: it takes http or https from the page"
+    "opaque" => "A URL with no host"
+    "invalid" => "Not a valid URL"
+    _ => ""
+}
+
+view UrlInspectorPart(label: str, part: str, value: str) =
+    <div.ui-url-insp-part><dt>{label}</dt><dd data-part={part}>{value}</dd></div>
+
+component UrlInspector(url: str = "", base: str = "", title: str = "URL inspector", id: str = "url-inspector", name: str = "url", tracking = [], on_change = null, class: str? = null) {
+    style global url_inspector_css
+    state text = url
+    state base_text = base
+    let first = url_inspector_parse(url)
+    state rows = url_inspector_rows(first.query)
+    state next = 1000
+    state copied = ""
+    let p = url_inspector_parse(text)
+    let usable = p.kind != "empty" && p.kind != "invalid"
+    let rebuilt = usable ? url_inspector_rebuild(p, rows) : ""
+    let resolved = usable && (p.kind == "relative" || p.kind == "scheme-relative") && trim(base_text) != "" ? url_inspector_resolve(base_text, rebuilt) : null
+    let base_bad = usable && (p.kind == "relative" || p.kind == "scheme-relative") && trim(base_text) != "" && resolved == null
+    let flagged = rows | filter((r) => url_inspector_is_tracking(r.key, tracking))
+    let cut_rows = len(split(p.query ?? "", "&")) > url_inspector_most_rows
+    let tell = () => {
+        if on_change != null {
+            let q = url_inspector_parse(text)
+            let ok = q.kind != "empty" && q.kind != "invalid"
+            on_change({ url: text, rebuilt: ok ? url_inspector_rebuild(q, rows) : null, kind: q.kind, valid: ok, tracking: count(rows, (r) => url_inspector_is_tracking(r.key, tracking)) })
+        }
+    }
+    let typed = (e) => {
+        text = e.value
+        rows = url_inspector_rows(url_inspector_parse(e.value).query)
+        copied = ""
+        tell()
+    }
+    let edit = (r, field: str, v: str) => {
+        rows = rows | map((x) => x.id == r.id ? (field == "key" ? { ...x, key: v, raw: null, eq: true, twice: false, bad_escape: false, bad_utf8: false } : { ...x, value: v, raw: null, eq: true, twice: false, bad_escape: false, bad_utf8: false }) : x)
+        copied = ""
+        tell()
+    }
+    let copy = () => {
+        js("navigator.clipboard.writeText", rebuilt).then((_ = null) => { copied = "Copied" }, (_ = null) => { copied = "Could not copy: select the text instead" })
+    }
+    <section class={ui_cls(["ui-url-insp", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-url-insp-title id={`${id}-title`}>{title}</h3>
+        <div.ui-url-insp-field>
+            <label for={`${id}-url`}>URL</label>
+            <input.ui-url-insp-input type="text" inputmode="url" id={`${id}-url`} name={name} value={text} spellcheck="false" autocomplete="off" placeholder="https://example.com/path?a=1#top"
+                   aria-invalid={p.kind == "invalid" ? "true" : null} @input={typed}/>
+        </div>
+        {p.kind == "empty" && <p.ui-url-insp-note>Paste a URL to take it apart.</p>}
+        {p.kind != "empty" && <p.ui-url-insp-kind data-kind={p.kind} aria-live="polite">{url_inspector_kind_text(p.kind)}</p>}
+        {len(p.problems) > 0 && <ul class="ui-url-insp-list ui-url-insp-bad" role="alert">{for x in p.problems => <li key={x}>{x}</li>}</ul>}
+        {len(p.notes) > 0 && <ul.ui-url-insp-list aria-label="Notes">{for x in p.notes => <li key={x}>{x}</li>}</ul>}
+        {usable && (p.kind == "relative" || p.kind == "scheme-relative") && <div.ui-url-insp-field>
+            <label for={`${id}-base`}>Base URL</label>
+            <input.ui-url-insp-input type="text" inputmode="url" id={`${id}-base`} name={`${name}_base`} value={base_text} spellcheck="false" autocomplete="off" placeholder="https://example.com/page/"
+                   aria-invalid={base_bad ? "true" : null} @input={(e) => { base_text = e.value }}/>
+        </div>}
+        {base_bad && <p.ui-url-insp-note role="alert">The base must be an absolute URL.</p>}
+        {usable && <dl.ui-url-insp-parts>
+            {p.scheme != null && <UrlInspectorPart label="Scheme" part="scheme" value={p.scheme}/>}
+            {p.user != null && <UrlInspectorPart label="User" part="user" value={p.user}/>}
+            {p.password != null && <UrlInspectorPart label="Password" part="password" value={p.password}/>}
+            {p.host != null && <UrlInspectorPart label="Host" part="host" value={p.host_ascii}/>}
+            {p.host != null && p.host_unicode != p.host_ascii && <UrlInspectorPart label="Reads as" part="unicode" value={p.host_unicode}/>}
+            {p.port != null && <UrlInspectorPart label="Port" part="port" value={p.port}/>}
+            {p.path != "" && <UrlInspectorPart label="Path" part="path" value={p.path}/>}
+            {p.path != "" && url_inspector_decode(p.path, false).text != p.path && <UrlInspectorPart label="Path, decoded" part="decoded" value={url_inspector_decode(p.path, false).text}/>}
+            {p.fragment != null && <UrlInspectorPart label="Fragment" part="fragment" value={p.fragment}/>}
+        </dl>}
+        {usable && p.kind != "opaque" && <div.ui-url-insp-field>
+            {len(rows) > 0 && <div.ui-url-insp-scroll tabindex="0" role="region" aria-label="Query parameters">
+                <table>
+                    <caption>{`Query: ${len(rows)} ${len(rows) == 1 ? "parameter" : "parameters"}`}</caption>
+                    <thead><tr><th scope="col">Name</th><th scope="col">Value</th><th scope="col">Flags</th><th scope="col"><span.ui-sr>Remove</span></th></tr></thead>
+                    <tbody>
+                        {for r in rows => <tr key={str(r.id)}>
+                            <td><input.ui-url-insp-input type="text" name={`${name}_key`} aria-label={`Name of parameter ${r.key}`} value={r.key} spellcheck="false" autocomplete="off" @input={(e) => { edit(r, "key", e.value) }}/></td>
+                            <td><input.ui-url-insp-input type="text" name={`${name}_value`} aria-label={`Value of ${r.key}`} value={r.value} spellcheck="false" autocomplete="off" @input={(e) => { edit(r, "value", e.value) }}/></td>
+                            <td data-flags>{for f in url_inspector_flags(r, tracking) => <span.ui-url-insp-flag key={f}>{f}</span>}</td>
+                            <td><button.ui-url-insp-btn type="button" aria-label={`Remove ${r.key}`} @click={() => { rows = remove(rows, r); tell() }}>Remove</button></td>
+                        </tr>}
+                    </tbody>
+                </table>
+            </div>}
+            {cut_rows && <p.ui-url-insp-note>{`Only the first ${url_inspector_most_rows} parameters are read.`}</p>}
+            <div.ui-url-insp-actions>
+                <button.ui-url-insp-btn type="button" data-add @click={() => { rows = push(rows, { id: next, key: "", value: "", eq: true, raw: null, twice: false, bad_escape: false, bad_utf8: false }); next += 1; tell() }}>Add parameter</button>
+                {len(flagged) > 0 && <button.ui-url-insp-btn type="button" data-strip @click={() => { rows = rows | filter((r) => !url_inspector_is_tracking(r.key, tracking)); tell() }}>{`Remove ${len(flagged)} tracking ${len(flagged) == 1 ? "parameter" : "parameters"}`}</button>}
+            </div>
+        </div>}
+        {usable && <div.ui-url-insp-field>
+            <span.ui-sr id={`${id}-rebuilt-label`}>Rebuilt URL</span>
+            <p.ui-url-insp-out data-rebuilt aria-labelledby={`${id}-rebuilt-label`}>{rebuilt}</p>
+            {resolved != null && <p.ui-url-insp-note>Resolves to <span data-resolved>{resolved}</span></p>}
+            <div.ui-url-insp-actions>
+                <button.ui-url-insp-btn type="button" data-copy @click={copy}>Copy</button>
+                <span.ui-url-insp-note aria-live="polite">{copied}</span>
+            </div>
+        </div>}
+    </section>
+}

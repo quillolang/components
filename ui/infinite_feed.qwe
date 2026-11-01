@@ -1,0 +1,369 @@
+// InfiniteFeed: a long feed that loads pages as you near the end, and stays light
+// however long it grows, as only the rows near the screen are on the page, with
+// empty space of the right height above and below. It shows when it is loading, offers
+// a retry on a failure, and says when the list has ended. Open an item and come
+// back, or turn the phone, and it is where you left it: same item at the same
+// place. In a wide pane rows stand in two columns. Rows may be any height: each is
+// measured as it shows, and the feed holds still while that happens.
+//
+//   <InfiniteFeed id="news" first={front_page} height="100%" page_size={20}
+//                 load={(page) => feed_page(page)} on_open={(it) => { navigate(`/story/${it.id}`) }}/>
+//
+// load(page): inside one of your components, gives the items of a page, counting from
+// `start`: a `server fn`, a call that waits, or plain data. It may give a list, or
+// { items, more } (more: false says that was the last), or an error value, which
+// shows the retry; so does anything else, or a call that throws. An empty list
+// ends the feed, and so does a short one if page_size is set.
+// first: the items the server shows, the first page, so the feed works and reads
+// before any script. start: the page after `first` (2; 1 with no `first`).
+// id: the outer element's id, and the name of its place in the session's storage; give each feed its own ("ui-infeed").
+// keep: minutes to remember the place, items and all (30); 0, never. It is kept for
+// the tab, or the app, while it stays open: a new launch starts afresh.
+// row(item): the markup for an item; left out, a row of item.title, item.text, item.meta.
+// item_height: the height to assume for a row not yet seen, in pixels (96). over: rows
+// kept on the page beyond the screen each way (6). ahead: pixels before the end to start
+// the next page (900). column: the narrowest column; a pane wide enough for two gets
+// two (320). height: how tall it stands, a CSS length ("100dvh"); "100%" fills a
+// parent with a height. loading_text, failed_text, retry_text, end_text, empty: the words
+// ("Loading", "That did not load", "Try again", "You're all caught up", "Nothing here").
+// label: what screen readers call the feed ("Feed"). class: on the outer element.
+// on_open(item): a tap on a row, once the place is saved, so it may leave the page.
+//
+// Items need an `id` for a page that overlaps the last to be cleaned of what is already
+// shown, and for rows to keep their elements as the window moves. A failure is tried again
+// by the button, or by itself when the phone comes back online. Above about 2 MB of
+// items the session's storage is not used, and that feed starts afresh on return.
+
+import ui/theme.qwe use ui_cls
+
+let infinite_feed_css = css`
+.ui-infeed { position: relative; box-sizing: border-box; overflow: hidden; background: var(--ui-bg); color: var(--ui-fg); font: 16px/1.35 var(--ui-font); }
+.ui-infeed-scroll { position: relative; box-sizing: border-box; height: 100%; overflow-y: auto; overflow-anchor: none; overscroll-behavior-y: contain; outline: none; }
+.ui-infeed-scroll:focus-visible { box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-infeed-rows { display: grid; grid-template-columns: repeat(var(--cols, 1), minmax(0, 1fr)); }
+.ui-infeed-item { min-width: 0; }
+.ui-infeed-row { display: flex; flex-direction: column; justify-content: flex-start; box-sizing: border-box; width: 100%; height: 100%; min-height: 56px; padding: 12px max(16px, env(safe-area-inset-right)) 12px max(16px, env(safe-area-inset-left)); border: 0; border-bottom: 1px solid var(--ui-border); background: transparent; color: inherit; font: inherit; text-align: left; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+button.ui-infeed-row { cursor: pointer; }
+button.ui-infeed-row:active { background: color-mix(in srgb, var(--ui-fg) 8%, transparent); }
+.ui-infeed-row:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-infeed-title { display: block; font-weight: 600; }
+.ui-infeed-text { display: block; margin-top: 2px; color: var(--ui-muted); font-size: 15px; overflow-wrap: anywhere; }
+.ui-infeed-meta { display: block; margin-top: 4px; color: var(--ui-muted); font-size: 13px; }
+.ui-infeed-foot { display: grid; justify-items: center; gap: 8px; min-height: 72px; padding: 16px 16px calc(16px + env(safe-area-inset-bottom)); box-sizing: border-box; color: var(--ui-muted); font-size: 14px; text-align: center; }
+.ui-infeed-spin { width: 22px; height: 22px; border: 2px solid color-mix(in srgb, var(--ui-accent) 22%, transparent); border-top-color: var(--ui-accent); border-radius: 50%; animation: ui-infeed-turn .75s linear infinite; }
+.ui-infeed-retry { min-height: 46px; padding: 0 18px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-accent); font: 600 15px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-infeed-retry:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@keyframes ui-infeed-turn { to { transform: rotate(360deg); } }
+@media (hover: hover) { button.ui-infeed-row:hover { background: color-mix(in srgb, var(--ui-fg) 4%, transparent); } }
+@media (prefers-reduced-motion: reduce) { .ui-infeed-spin { animation: none; border-color: var(--ui-accent); } }
+`
+
+// Where each line of rows starts, from the heights, with the end last.
+fn infinite_feed_tops(heights: list) -> list {
+    let at = 0
+    let out = for h in heights => {
+        let was = at
+        at = at + h
+        was
+    }
+    out + [at]
+}
+
+// How many lines n items make.
+fn infinite_feed_lines(n: int, cols: int) -> int = ceil(n / max([cols, 1]))
+
+// The line at a scroll position: the last that starts at or above it. Binary, as this runs on each scroll.
+fn infinite_feed_line(tops: list, y: num) -> int {
+    let lo = 0
+    let hi = max([0, len(tops) - 2])
+    while lo < hi {
+        let mid = ceil((lo + hi) / 2)
+        if tops[mid] <= y { lo = mid } else { hi = mid - 1 }
+    }
+    lo
+}
+
+// The lines to have on the page: those in view and `over` beyond. What is there stays
+// until the view comes within half of `over` of its edge, so a scroll does not
+// remake rows on each frame.
+fn infinite_feed_window(tops: list, y: num, tall: num, over: int, from_now: int, to_now: int) -> map {
+    let n = len(tops) - 1
+    let a = infinite_feed_line(tops, y)
+    let b = infinite_feed_line(tops, y + tall)
+    let slack = floor(over / 2)
+    if from_now <= max([0, a - slack]) && to_now >= min([n, b + slack + 1]) { return { from: from_now, to: to_now } }
+    { from: max([0, a - over]), to: min([n, b + over + 1]) }
+}
+
+// What an item is known by, or null.
+fn infinite_feed_key(it) {
+    let kind = type_of(it)
+    if kind == "map" { return get(it, "id") }
+    kind == "str" || kind == "int" ? it : null
+}
+
+// What arrives after what is shown, without what is already there.
+fn infinite_feed_merge(have: list, more: list) -> list {
+    let known = have | filter((x) => infinite_feed_key(x) != null)
+    let seen = group_by(known, (x) => str(infinite_feed_key(x)))
+    let fresh = more | filter((x) => x != null) | filter((x) => infinite_feed_key(x) == null || !has(seen, str(infinite_feed_key(x))))
+    // By place, not by value: two maps equal in every field are still the same id twice.
+    let placed = enumerate(fresh)
+    let inside = group_by(placed | filter((p) => infinite_feed_key(p[1]) != null), (p) => str(infinite_feed_key(p[1])))
+    have + (placed | filter((p) => infinite_feed_key(p[1]) == null || get(inside, str(infinite_feed_key(p[1])), [])[0][0] == p[0]) | map((p) => p[1]))
+}
+
+// What a load gave: { ok, items, done }. Anything that is not a page is a failure.
+fn infinite_feed_read(got, page_size: int) -> map {
+    let kind = type_of(got)
+    if kind == "list" { return { ok: true, items: got, done: len(got) == 0 || (page_size > 0 && len(got) < page_size) } }
+    if kind == "map" && type_of(get(got, "items")) == "list" {
+        let items = get(got, "items")
+        return { ok: true, items, done: len(items) == 0 || get(got, "more") == false }
+    }
+    { ok: false, items: [], done: false }
+}
+
+// A saved place, if it is one, and not older than `minutes`.
+fn infinite_feed_saved(text, clock: int, minutes: int) {
+    if type_of(text) != "str" || text == "" { return null }
+    let s = json.parse(text) ?? null
+    if type_of(s) != "map" || type_of(get(s, "items")) != "list" || type_of(get(s, "heights")) != "list" { return null }
+    let at = get(s, "at")
+    if type_of(at) != "int" && type_of(at) != "float" { return null }
+    clock - at > minutes * 60000 ? null : s
+}
+
+// How many columns a width holds, at most two.
+fn infinite_feed_cols(width: num, column: int) -> int = width >= column * 2 ? 2 : 1
+
+// Storage can refuse: full, or blocked in a private window. `js` throws what the
+// browser throws, so a Promise's first step catches it. It runs at once, and
+// nothing waits for it, as a page going away cannot wait.
+fn infinite_feed_store(key: str, text: str?) {
+    js_new("Promise", (res, rej) => {
+        if text == null { res(js("sessionStorage.removeItem", key)) } else { res(js("sessionStorage.setItem", key, text)) }
+    }).catch((_e) => null)
+}
+
+// Sets the scroll, and goes on each frame until it holds: rows and space set in the same
+// breath are not drawn yet, so the browser would stop it at the old end.
+fn infinite_feed_hold(box, y: num, tries: int) {
+    box.scrollTop = y
+    if tries > 0 && abs(box.scrollTop - y) > 1 {
+        js("requestAnimationFrame", (_t = null) => { infinite_feed_hold(box, y, tries - 1) })
+    }
+}
+
+view InfiniteFeedRow(it) =
+    [<span.ui-infeed-title>{type_of(it) == "map" ? str(get(it, "title") ?? "") : str(it)}</span>,
+     type_of(it) == "map" && get(it, "text") != null ? <span.ui-infeed-text>{it.text}</span> : null,
+     type_of(it) == "map" && get(it, "meta") != null ? <span.ui-infeed-meta>{it.meta}</span> : null]
+
+component InfiniteFeed(load = null, first = [], start: int? = null, page_size: int = 0, id: str = "ui-infeed", keep: int = 30, row = null, item_height: int = 96, over: int = 6, ahead: int = 900,
+                       column: int = 320, height: str = "100dvh", loading_text: str = "Loading", failed_text: str = "That did not load", retry_text: str = "Try again",
+                       end_text: str = "You're all caught up", empty: str = "Nothing here", label: str = "Feed", on_open = null, class: str? = null) {
+    style global infinite_feed_css
+    state items = infinite_feed_merge([], type_of(first) == "list" ? first : [])
+    state page = (start ?? (type_of(first) == "list" && len(first) > 0 ? 2 : 1)) - 1
+    state status = "idle"       // idle, loading, failed or done
+    state cols = 1
+    state tall_guess = item_height
+    state heights = for _x in infinite_feed_merge([], type_of(first) == "list" ? first : []) => item_height
+    state tops = infinite_feed_tops(for _x in infinite_feed_merge([], type_of(first) == "list" ? first : []) => item_height)
+    state from_line = 0
+    state to_line = min([len(infinite_feed_merge([], type_of(first) == "list" ? first : [])), 14 + over])
+    state box = null
+    state rows_el = null
+    state width_now = 0
+    state y_now = 0
+    state anchor = 0            // the item at the top of the view
+    state anchor_off = 0        // how far into its line the view starts
+    state arrived = 0           // pages that have come
+    let n = len(items)
+    let shown = slice(items, from_line * cols, to_line * cols)
+    let above = from_line < len(tops) ? tops[from_line] : 0
+    let below = len(tops) > 0 ? tops[len(tops) - 1] - tops[min([to_line, len(tops) - 1])] : 0
+    let key = `ui-infeed:${id}`
+    let save = () => {
+        if keep > 0 && n > 0 {
+            let text = json.stringify({ at: now(), items, page, done: status == "done", y: y_now, cols, heights })
+            infinite_feed_store(key, len(text) <= 2000000 ? text : null)
+        }
+    }
+    // Every line on the page is measured, and what is above the view moves the view
+    // by as much, so what is being read holds still.
+    let measure = () => {
+        if rows_el != null && box != null && len(heights) > 0 {
+            let cells = js("Array.from", rows_el.children)
+            let lines = cells | filter((c) => int(c.dataset.i) % cols == 0)
+            let found = lines | map((c) => { line: floor(int(c.dataset.i) / cols), h: c.offsetHeight })
+            let real = found | filter((f) => f.h > 0 && f.line < len(heights) && abs(f.h - heights[f.line]) > 0.5)
+            if len(real) > 0 {
+                let by = group_by(real, (f) => str(f.line))
+                let view_line = infinite_feed_line(tops, box.scrollTop)
+                let shift = real | filter((f) => f.line < view_line) | map((f) => f.h - heights[f.line]) | sum()
+                let next = for [i, h] in enumerate(heights) => has(by, str(i)) ? get(by, str(i), [])[0].h : h
+                let seen = found | filter((f) => f.h > 0) | map((f) => f.h)
+                if len(seen) > 0 { tall_guess = round(sum(seen) / len(seen)) }
+                heights = next
+                tops = infinite_feed_tops(next)
+                if shift != 0 { infinite_feed_hold(box, box.scrollTop + shift, 8) }
+            }
+        }
+    }
+    let more = () => {
+        if status == "idle" && load != null {
+            status = "loading"
+            let next_page = page + 1
+            // A Promise's first step, so a load that throws comes back as an error value.
+            let got = js("Promise.resolve", js_new("Promise", (res, rej) => { res(load(next_page)) }))
+            let page_read = infinite_feed_read(got, page_size)
+            if page_read.ok {
+                page = next_page
+                let merged = infinite_feed_merge(items, page_read.items)
+                let lines_now = infinite_feed_lines(len(merged), cols)
+                let extra = for _i in range(0, max([0, lines_now - len(heights)])) => tall_guess
+                items = merged
+                heights = take(heights, lines_now) + extra
+                tops = infinite_feed_tops(heights)
+                status = page_read.done ? "done" : "idle"
+                arrived = arrived + 1
+            } else {
+                status = "failed"
+            }
+        }
+    }
+    // Where the view stands: which rows should be on the page, and whether to load.
+    let update = () => {
+        if box != null {
+            let y = box.scrollTop
+            let view_h = box.clientHeight
+            y_now = y
+            if len(tops) > 1 {
+                let line = infinite_feed_line(tops, y)
+                anchor = line * cols
+                anchor_off = y - tops[line]
+                let w = infinite_feed_window(tops, y, view_h, over, from_line, to_line)
+                if w.from != from_line || w.to != to_line {
+                    from_line = w.from
+                    to_line = w.to
+                    js("requestAnimationFrame", (_t = null) => { measure() })
+                }
+            }
+            if box.scrollHeight - (y + view_h) < ahead { more() }
+        }
+    }
+    // The new rows may belong on the page now, and the end may still be near. (`more` cannot
+    // call `update`, written after it, so a statement that follows a state does.)
+    if arrived > 0 { js("requestAnimationFrame", (_t = null) => { update() }) }
+    // A new width: rows change height and the columns may change. The item at the top stays there.
+    let resized = () => {
+        if box != null && box.clientWidth != width_now {
+            let keep_i = anchor
+            let keep_off = anchor_off
+            width_now = box.clientWidth
+            cols = infinite_feed_cols(width_now, column)
+            let lines_now = infinite_feed_lines(n, cols)
+            heights = for _i in range(0, lines_now) => tall_guess
+            tops = infinite_feed_tops(heights)
+            let line = min([max([lines_now - 1, 0]), floor(keep_i / cols)])
+            let w = { from: max([0, line - over]), to: min([lines_now, line + 14 + over]) }
+            from_line = w.from
+            to_line = w.to
+            js("requestAnimationFrame", (_t = null) => {
+                measure()
+                if line < len(tops) { infinite_feed_hold(box, tops[line] + keep_off, 8) }
+                update()
+            })
+        }
+    }
+    let restore = (s) => {
+        items = s.items
+        page = s.page
+        status = s.done == true ? "done" : "idle"
+        let lines_now = infinite_feed_lines(len(s.items), cols)
+        heights = get(s, "cols") == cols && len(s.heights) == lines_now ? s.heights : for _i in range(0, lines_now) => tall_guess
+        tops = infinite_feed_tops(heights)
+        let line = infinite_feed_line(tops, s.y)
+        from_line = max([0, line - over])
+        to_line = min([lines_now, line + 14 + over])
+        y_now = s.y
+        js("requestAnimationFrame", (_t = null) => {
+            infinite_feed_hold(box, s.y, 8)
+            update()
+        })
+    }
+    <div class={ui_cls(["ui-infeed", class])} id={id} style={`height: ${height}`}
+         @mount={(el) => {
+             let w = el.ownerDocument.defaultView
+             let doc = el.ownerDocument
+             let hide = () => { if doc.visibilityState == "hidden" { save() } }
+             let back_on = () => { if status == "failed" { status = "idle"; update() } }
+             w.addEventListener("pagehide", save)
+             w.addEventListener("online", back_on)
+             doc.addEventListener("visibilitychange", hide)
+             () => {
+                 save()
+                 w.removeEventListener("pagehide", save)
+                 w.removeEventListener("online", back_on)
+                 doc.removeEventListener("visibilitychange", hide)
+             }
+         }}>
+        <div.ui-infeed-scroll tabindex="0" role="feed" aria-label={label} aria-busy={status == "loading" ? "true" : "false"}
+             @mount={(el) => {
+                 // Before any state is set: code that reads it could run during the wait.
+                 // Storage throws when blocked, and a throw would stop this whole @mount.
+                 let text = keep > 0 ? js("Promise.resolve", js_new("Promise", (res, rej) => { res(js("window.sessionStorage.getItem", key)) })) : null
+                 box = el
+                 rows_el = el.querySelector(".ui-infeed-rows")
+                 if load == null { status = "done" }
+                 width_now = el.clientWidth
+                 cols = infinite_feed_cols(width_now, column)
+                 if cols != 1 {
+                     heights = for _i in range(0, infinite_feed_lines(n, cols)) => tall_guess
+                     tops = infinite_feed_tops(heights)
+                     to_line = min([len(heights), 14 + over])
+                 }
+                 let saved = infinite_feed_saved(text, now(), keep)
+                 if saved != null { restore(saved) }
+                 js("requestAnimationFrame", (_t = null) => {
+                     measure()
+                     update()
+                 })
+                 let ro = js_new("ResizeObserver", () => {
+                     resized()
+                     measure()
+                 })
+                 ro.observe(el)
+                 ro.observe(rows_el)
+                 () => ro.disconnect()
+             }}
+             @scroll={() => { update() }}>
+            <div.ui-infeed-above style={`height: ${above}px`}></div>
+            <div.ui-infeed-rows style={`--cols: ${cols}`}>
+                {for [i, it] in enumerate(shown) => {
+                    let at = from_line * cols + i
+                    <article.ui-infeed-item key={str(infinite_feed_key(it) ?? `at-${at}`)} data-i={at} aria-posinset={at + 1} aria-setsize={status == "done" ? n : -1}>
+                        {row != null
+                            ? row(it)
+                            : (on_open != null
+                                ? <button.ui-infeed-row type="button" @click={() => { save(); on_open(it) }}><InfiniteFeedRow it={it}/></button>
+                                : <div.ui-infeed-row><InfiniteFeedRow it={it}/></div>)}
+                    </article>
+                }}
+            </div>
+            <div.ui-infeed-below style={`height: ${below}px`}></div>
+            <div.ui-infeed-foot>
+                {status == "loading" && <span.ui-infeed-spin aria-hidden="true"></span>}
+                {status == "loading" && <span role="status">{loading_text}</span>}
+                {status == "failed" && <span role="alert">{failed_text}</span>}
+                {status == "failed" && <button.ui-infeed-retry type="button" @click={() => {
+                    status = "idle"
+                    more()
+                }}>{retry_text}</button>}
+                {status == "done" && <span role="status">{n == 0 ? empty : end_text}</span>}
+            </div>
+        </div>
+    </div>
+}

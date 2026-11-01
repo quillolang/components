@@ -1,0 +1,366 @@
+// QuickTransfer: send money to someone recent in three moves: a face in the row, an amount
+// on the keypad, a slide across. The amount is checked against the balance and the limits as
+// it is typed, each saying which and how much, and the slide does not go until it passes. On a
+// tablet the people stand in a column beside the keypad.
+//
+//   import ui/quick_transfer.qwe use QuickTransfer
+//
+//   component Pay() {
+//       <QuickTransfer balance={2481.07m} per_transfer={1000m} daily_left={750m}
+//                      people={[{ id: "ana", name: "Ana Reyes" }, { id: "joe", name: "Joe Park", note: "Rent" }]}
+//                      on_send={(t) => send_transfer(t.to, t.amount)}/>
+//   }
+//
+// people: each { id, name, note }: a short line under the name. balance: what can be spent.
+// per_transfer: the most in one transfer. daily_left: what is left of today's limit. Leave
+// either out for no such limit. currency ("USD"), locale. on_send(transfer): { to, name, amount,
+// currency, text }, amount a decimal; it may wait for a server fn. An error value or false
+// says it failed, keeping what was typed; a map with `message` says why. A transfer that must
+// not happen twice is `idempotent` on your server: this stops a second press, but only the
+// server can stop a retry. on_done(): the person finished with the result.
+//
+// quick_transfer_press(text, k, places), quick_transfer_check(text, ...) and
+// quick_transfer_initials(name) are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/price.qwe use price_text
+import ui/button.qwe use Button
+
+let quick_transfer_css = css`
+.ui-qtransfer { display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 14px/1.4 var(--ui-font); }
+.ui-qtransfer-cols { display: grid; gap: 12px; min-width: 0; }
+.ui-qtransfer-who { min-width: 0; }
+.ui-qtransfer-who h3 { margin: 0 0 6px; color: var(--ui-muted); font-size: 13px; font-weight: 600; }
+/* The row scrolls by itself, sideways, and leaves the page's up and down alone. */
+.ui-qtransfer-people {
+  display: flex; gap: 6px; margin: 0; padding: 2px; overflow-x: auto; overscroll-behavior-x: contain; scroll-snap-type: x proximity; list-style: none; scrollbar-width: none; touch-action: pan-x pan-y;
+}
+.ui-qtransfer-people::-webkit-scrollbar { display: none; }
+.ui-qtransfer-people li { flex: none; scroll-snap-align: start; }
+.ui-qtransfer-person {
+  display: grid; justify-items: center; gap: 4px; width: 76px; min-height: 84px; padding: 6px 2px; border: 2px solid transparent; border-radius: var(--ui-radius); background: transparent; color: var(--ui-fg);
+  font: 12px/1.25 var(--ui-font); cursor: pointer; touch-action: manipulation;
+}
+.ui-qtransfer-person[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-qtransfer-person:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-qtransfer-face { display: grid; place-items: center; width: 46px; height: 46px; border-radius: 50%; background: var(--ui-accent); color: var(--ui-accent-fg); font-size: 15px; font-weight: 700; }
+.ui-qtransfer-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-qtransfer-sub { display: none; color: var(--ui-muted); }
+.ui-qtransfer-pay { display: grid; gap: 10px; min-width: 0; }
+.ui-qtransfer-amount { margin: 0; font-size: min(40px, 11cqw); font-weight: 700; line-height: 1.15; text-align: center; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-qtransfer-amount-none { color: var(--ui-muted); }
+.ui-qtransfer-check { min-height: 20px; margin: 0; color: var(--ui-muted); font-size: 13px; text-align: center; }
+.ui-qtransfer-check-bad { color: var(--ui-danger); }
+.ui-qtransfer-pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; outline: none; border-radius: var(--ui-radius); }
+.ui-qtransfer-pad:focus-visible { box-shadow: var(--ui-focus); }
+.ui-qtransfer-key {
+  height: 54px; padding: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 600 22px/1 var(--ui-font);
+  font-variant-numeric: tabular-nums; cursor: pointer; touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ui-qtransfer-key:active { background: var(--ui-subtle); }
+.ui-qtransfer-key:disabled { opacity: .35; cursor: default; }
+.ui-qtransfer-key:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+/* The slide: the fill shows how far it has come, the thumb is what the finger holds. */
+.ui-qtransfer-slide {
+  position: relative; height: 58px; overflow: hidden; border-radius: 999px; background: var(--ui-accent-soft); color: var(--ui-fg);
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ui-qtransfer-slide-off { background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-qtransfer-fill { position: absolute; inset: 0; background: var(--ui-accent); opacity: .25; transform: scaleX(0); transform-origin: 0 50%; transition: transform .22s cubic-bezier(.2, .8, .2, 1); }
+.ui-qtransfer-words { position: absolute; inset: 0 12px 0 66px; display: grid; place-items: center; font-weight: 600; pointer-events: none; text-align: center; font-size: 14px; line-height: 1.2; }
+.ui-qtransfer-thumb {
+  position: absolute; top: 4px; left: 4px; width: 50px; height: 50px; padding: 0; border: 0; border-radius: 50%; background: var(--ui-accent); color: var(--ui-accent-fg); font: 700 22px/1 var(--ui-font);
+  cursor: grab; touch-action: none; transition: transform .22s cubic-bezier(.2, .8, .2, 1);
+}
+.ui-qtransfer-thumb:disabled { background: var(--ui-strong); cursor: default; }
+.ui-qtransfer-thumb:focus-visible { outline: 3px solid var(--ui-accent); outline-offset: 2px; }
+.ui-qtransfer-sliding .ui-qtransfer-thumb, .ui-qtransfer-sliding .ui-qtransfer-fill { transition: none; cursor: grabbing; }
+.ui-qtransfer-other { display: grid; gap: 8px; justify-items: center; }
+.ui-qtransfer-other p { margin: 0; text-align: center; }
+.ui-qtransfer-other div { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.ui-qtransfer-done { display: grid; gap: 10px; justify-items: center; padding: 24px 12px; text-align: center; }
+.ui-qtransfer-done h3 { margin: 0; color: var(--ui-success); font-size: 22px; }
+.ui-qtransfer-done p { margin: 0; color: var(--ui-muted); }
+.ui-qtransfer-fail { margin: 0; color: var(--ui-danger); text-align: center; }
+.ui-qtransfer-empty { margin: 0; padding: 16px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius); color: var(--ui-muted); text-align: center; }
+@container (min-width: 600px) {
+  .ui-qtransfer-cols { grid-template-columns: minmax(200px, 1fr) minmax(0, 1.4fr); gap: 24px; align-items: start; }
+  .ui-qtransfer-people { display: grid; gap: 4px; overflow: visible; max-height: 460px; overflow-y: auto; scroll-snap-type: none; }
+  .ui-qtransfer-person { grid-template-columns: 46px minmax(0, 1fr); grid-template-rows: auto auto; justify-items: start; align-items: center; column-gap: 10px; width: 100%; min-height: 60px; padding: 6px 10px; font-size: 15px; text-align: left; }
+  .ui-qtransfer-face { grid-row: span 2; }
+  .ui-qtransfer-sub { display: block; font-size: 12px; }
+  .ui-qtransfer-key { height: 62px; }
+}
+@media (hover: hover) {
+  .ui-qtransfer-key:hover:not(:disabled) { background: var(--ui-subtle); }
+  .ui-qtransfer-person:hover { background: var(--ui-subtle); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-qtransfer-thumb, .ui-qtransfer-fill { transition: none; } }
+`
+
+// A person's face when there is no picture: the first letters of the first and last names.
+fn quick_transfer_initials(name) -> str {
+    let words = split(trim(str(name ?? "")), " ") | filter((w) => w != "")
+    if len(words) == 0 { return "?" }
+    let firsts = [words[0], words[len(words) - 1]] | map((w) => upper(split(w, "")[0]))
+    len(words) == 1 ? firsts[0] : firsts | join("")
+}
+
+// Decimal places a currency has, and 2 for a code that is not one.
+fn quick_transfer_places(currency: str) -> int {
+    let p = money.minor_units(currency)
+    is_err(p) ? 2 : p
+}
+
+// The text after a key: a digit, "." or "back". No leading zeros, one point, no more decimals
+// than the currency has, and at most nine digits before the point, so a stray finger cannot
+// make a number no money can be. Keys that would do nothing leave the text as it is.
+fn quick_transfer_press(text: str, k: str, places: int) -> str {
+    if k == "back" { return slice(text, 0, max([0, len(text) - 1])) }
+    let parts = split(text, ".")
+    let has_point = len(parts) > 1
+    if k == "." {
+        if has_point || places == 0 { return text }
+        return text == "" ? "0." : text + "."
+    }
+    if !re.test(k, "^[0-9]$") { return text }
+    if has_point { return len(parts[1]) >= places ? text : text + k }
+    if text == "0" { return k }
+    len(text) >= 9 ? text : text + k
+}
+
+// The amount typed as a decimal, or null for nothing, or nothing above zero.
+fn quick_transfer_amount(text: str) {
+    if text == "" || text == "0." { return null }
+    let d = dec(text)
+    if is_err(d) || d <= 0m { return null }
+    d
+}
+
+// The first thing against an amount: { ok, message }. All amounts are decimals or null.
+fn quick_transfer_check(text: str, balance, per_transfer, daily_left, currency: str = "USD", locale: str? = null) -> map {
+    let amt = quick_transfer_amount(text)
+    let cash = (v) => price_text(v, currency, locale)
+    if amt == null { return { ok: false, bad: false, message: "Enter an amount" } }
+    if balance != null && amt > dec(balance) { return { ok: false, bad: true, message: `More than your balance of ${cash(dec(balance))}` } }
+    if per_transfer != null && amt > dec(per_transfer) { return { ok: false, bad: true, message: `Over the limit of ${cash(dec(per_transfer))} a transfer` } }
+    if daily_left != null && amt > dec(daily_left) { return { ok: false, bad: true, message: `Only ${cash(dec(daily_left))} left of today's limit` } }
+    { ok: true, bad: false, message: balance != null ? `${cash(dec(balance) - amt)} left after this` : "" }
+}
+
+// Whether a release sends: nearly all the way, or a flick past half way, the speed in px/ms.
+fn quick_transfer_slid(moved: num, room: num, speed: num) -> bool = room > 0 && (moved >= room * 0.85 || (moved >= room * 0.5 && speed >= 0.8))
+
+// The last few points of a drag, for the speed at the release.
+fn quick_transfer_trail(trail: list, x: num, at_ms: num) -> list {
+    let all = trail + [{ x: x, at: at_ms }]
+    slice(all, max([0, len(all) - 6]), len(all))
+}
+
+fn quick_transfer_speed(trail: list, x: num, at_ms: num) -> num {
+    let old = trail | filter((p) => at_ms - p.at >= 16 && at_ms - p.at <= 120)
+    if len(old) == 0 { return 0 }
+    (x - old[0].x) / (at_ms - old[0].at)
+}
+
+// The answer to a send: a message when it failed, null when it went.
+fn quick_transfer_failed(r) -> str? {
+    if is_err(r) { return "The transfer did not go. Nothing was sent." }
+    if r == false { return "The transfer did not go. Nothing was sent." }
+    if type_of(r) == "map" && get(r, "ok", true) == false { return str(get(r, "message", "The transfer did not go. Nothing was sent.")) }
+    null
+}
+
+component QuickTransfer(people: list = [], balance = null, per_transfer = null, daily_left = null, currency: str = "USD", locale: str? = null,
+                        label: str = "Quick transfer", on_send = null, on_done = null) {
+    style global quick_transfer_css
+    state to = null          // the chosen person's id
+    state text = ""          // the amount as typed
+    state phase = "edit"     // edit, sending, sent
+    state failed = ""
+    state asking = false     // the way without sliding is open
+    state until = 0          // a release that finished something ignores clicks until this time
+    state grab = null        // where the finger went down on the thumb
+    state axis = null
+    state trail = []
+    state keyed = 0          // how far the arrow keys have brought the thumb, 0 to 4
+    state slide_el = null
+    state thumb_el = null
+    state fill_el = null
+    let places = quick_transfer_places(currency)
+    let check = quick_transfer_check(text, balance, per_transfer, daily_left, currency, locale)
+    let who = people | find((p) => p.id == to)
+    let ready = check.ok && who != null
+    let sum_text = quick_transfer_amount(text) == null ? price_text(0m, currency, locale) : price_text(quick_transfer_amount(text), currency, locale)
+    let words = ready ? `Slide to send ${sum_text} to ${who.name}` : who == null ? "Choose who to send to" : "Enter an amount"
+    let room = () => slide_el.clientWidth - thumb_el.offsetWidth - 8
+    let put = (x: num) => {
+        thumb_el.style.transform = `translateX(${x}px)`
+        fill_el.style.transform = `scaleX(${(x + thumb_el.offsetWidth) / slide_el.clientWidth})`
+        thumb_el.setAttribute("aria-valuenow", str(round(x * 100 / max([1, room()]))))
+    }
+    let home = () => {
+        keyed = 0
+        if thumb_el != null {
+            thumb_el.style.transform = ""
+            fill_el.style.transform = ""
+            thumb_el.setAttribute("aria-valuenow", "0")
+            slide_el.classList.remove("ui-qtransfer-sliding")
+        }
+    }
+    let press_key = (k: str) => {
+        if phase == "edit" {
+            text = quick_transfer_press(text, k, places)
+            failed = ""
+            asking = false
+            home()
+        }
+    }
+    let settle = (r) => {
+        let bad = quick_transfer_failed(r)
+        until = now() + 400
+        if bad == null {
+            phase = "sent"
+        } else {
+            phase = "edit"
+            failed = bad
+            home()
+        }
+    }
+    let send = () => {
+        if phase == "edit" && ready {
+            phase = "sending"
+            failed = ""
+            asking = false
+            if on_send == null {
+                settle(true)
+            } else {
+                let r = on_send({ to: who.id, name: who.name, amount: quick_transfer_amount(text), currency: currency, text: sum_text })
+                if type_of(r) == "promise" { r.then(settle, (_e = null) => { settle(false) }) } else { settle(r) }
+            }
+        }
+    }
+    let again = () => {
+        // The tap's finger may be lifting on this button, as it took the slide's place.
+        if now() >= until {
+            phase = "edit"
+            text = ""
+            to = null
+            home()
+            on_done && on_done()
+        }
+    }
+    let finish = (e) => {
+        if grab != null && e.pointerId == grab.id {
+            let dx = e.clientX - grab.x
+            let speed = quick_transfer_speed(trail, e.clientX, e.timeStamp)
+            let was = axis
+            grab = null
+            axis = null
+            slide_el.classList.remove("ui-qtransfer-sliding")
+            let moved = max([0, min([dx, room()])])
+            if e.type == "pointerup" && was == "x" && ready && quick_transfer_slid(moved, room(), speed) {
+                put(room())
+                send()
+            } else {
+                home()
+            }
+        }
+    }
+    if phase == "edit" && !ready && keyed > 0 { home() }
+    <section.ui-qtransfer aria-label={label}>
+        {len(people) == 0 && <p.ui-qtransfer-empty>No recent people yet.</p>}
+        {phase == "sent"
+            ? <div.ui-qtransfer-done role="status">
+                <h3>Sent</h3>
+                <p>{sum_text} to {who != null ? who.name : ""}</p>
+                <Button size="lg" on_click={again}>Send another</Button>
+            </div>
+            : <div.ui-qtransfer-cols>
+                <div.ui-qtransfer-who>
+                    <h3>Send to</h3>
+                    <ul.ui-qtransfer-people>
+                        {for p in people => <li key={p.id}>
+                            <button.ui-qtransfer-person type="button" aria-pressed={to == p.id ? "true" : "false"} aria-label={p.name} disabled={phase != "edit"}
+                                    @click={() => {
+                                        to = to == p.id ? null : p.id
+                                        failed = ""
+                                        asking = false
+                                        home()
+                                    }}>
+                                <span.ui-qtransfer-face aria-hidden="true">{quick_transfer_initials(p.name)}</span>
+                                <span.ui-qtransfer-name>{p.name}</span>
+                                {p.note != null && <span.ui-qtransfer-sub>{p.note}</span>}
+                            </button>
+                        </li>}
+                    </ul>
+                </div>
+                <div.ui-qtransfer-pay>
+                    <p class={ui_cls(["ui-qtransfer-amount", text == "" && "ui-qtransfer-amount-none"])} aria-live="polite">{sum_text}</p>
+                    <p class={ui_cls(["ui-qtransfer-check", check.bad && "ui-qtransfer-check-bad"])} role={check.bad ? "alert" : null}>{check.message}</p>
+                    <div.ui-qtransfer-pad role="group" aria-label="Amount" tabindex="0"
+                         @keydown={(e) => {
+                             let k = e.key == "Backspace" ? "back" : e.key
+                             if k == "back" || k == "." || re.test(k, "^[0-9]$") {
+                                 e.preventDefault()
+                                 press_key(k)
+                             }
+                         }}>
+                        {for k in ["1", "2", "3", "4", "5", "6", "7", "8", "9"] => <button.ui-qtransfer-key key={k} type="button" @click={() => { press_key(k) }}>{k}</button>}
+                        <button.ui-qtransfer-key type="button" aria-label="Decimal point" disabled={places == 0} @click={() => { press_key(".") }}>.</button>
+                        <button.ui-qtransfer-key type="button" @click={() => { press_key("0") }}>0</button>
+                        <button.ui-qtransfer-key type="button" aria-label="Delete" @click={() => { press_key("back") }}>⌫</button>
+                    </div>
+                    {failed != "" && <p.ui-qtransfer-fail role="alert">{failed}</p>}
+                    <div class={ui_cls(["ui-qtransfer-slide", !ready && "ui-qtransfer-slide-off"])} @mount={(el) => { slide_el = el }}>
+                        <span.ui-qtransfer-fill aria-hidden="true" @mount={(el) => { fill_el = el }}></span>
+                        <span.ui-qtransfer-words>{phase == "sending" ? "Sending…" : words}</span>
+                        <button.ui-qtransfer-thumb type="button" role="slider" aria-label={words} aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" disabled={!ready || phase != "edit"}
+                                @mount={(el) => { thumb_el = el }}
+                                @pointerdown={(e) => {
+                                    if e.button == 0 && ready && phase == "edit" && grab == null {
+                                        thumb_el.setPointerCapture(e.pointerId)
+                                        grab = { x: e.clientX, y: e.clientY, id: e.pointerId }
+                                        trail = quick_transfer_trail([], e.clientX, e.timeStamp)
+                                        axis = null
+                                    }
+                                }}
+                                @pointermove={(e) => {
+                                    if grab != null && e.pointerId == grab.id {
+                                        let dx = e.clientX - grab.x
+                                        let dy = e.clientY - grab.y
+                                        if axis == null && (abs(dx) > 6 || abs(dy) > 6) {
+                                            axis = abs(dx) >= abs(dy) ? "x" : "y"
+                                            if axis == "x" { slide_el.classList.add("ui-qtransfer-sliding") }
+                                        }
+                                        if axis == "x" {
+                                            put(max([0, min([dx, room()])]))
+                                            trail = quick_transfer_trail(trail, e.clientX, e.timeStamp)
+                                        }
+                                    }
+                                }}
+                                @pointerup={finish}
+                                @pointercancel={finish}
+                                @blur={() => { if grab == null { home() } }}
+                                @keydown={(e) => {
+                                    if ready && phase == "edit" && (e.key == "ArrowRight" || e.key == "ArrowLeft") {
+                                        e.preventDefault()
+                                        keyed = max([0, min([keyed + (e.key == "ArrowRight" ? 1 : -1), 4])])
+                                        put(room() * keyed / 4)
+                                        if keyed == 4 { send() }
+                                    }
+                                }}>›</button>
+                    </div>
+                    {ready && phase == "edit" && <div.ui-qtransfer-other>
+                        {asking
+                            ? <div>
+                                <p>Send {sum_text} to {who.name}?</p>
+                                <Button size="lg" on_click={send}>Yes, send it</Button>
+                                <Button size="lg" variant="ghost" on_click={() => { asking = false }}>Not now</Button>
+                            </div>
+                            : <Button size="lg" variant="ghost" on_click={() => { asking = true }}>Send without sliding</Button>}
+                    </div>}
+                </div>
+            </div>}
+    </section>
+}

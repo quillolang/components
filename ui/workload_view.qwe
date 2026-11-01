@@ -1,0 +1,337 @@
+// WorkloadView: people by weeks, each cell the assignments that week against the
+// person's capacity, marked over or under. It then says what to do about it: for each
+// overload, which assignment to move to whom, keeping skills (a task that needs a skill
+// only goes to someone who has it), picking the move that clears the most overload
+// with the least shuffling, and saying plainly when no one can take the work. Moves are
+// applied with a button, or by hand from a list that offers only those with the skill.
+//
+//   <WorkloadView weeks={["2026-11-02", "2026-11-09"]}
+//       people={[{ id: "ana", name: "Ana", capacity: 40, skills: ["go"] }, { id: "ben", name: "Ben", skills: ["go", "sql"] }]}
+//       assignments={[{ id: 1, title: "API", person: "ana", week: "2026-11-02", hours: 48, skill: "go" }]}
+//       on_move={(change) => { save(change) }}/>
+//
+// people: a list of { id, name?, capacity?, skills?, weeks? }. capacity: hours a week (40);
+// weeks: hours in particular weeks instead, as a map from week to hours, for leave. weeks:
+// the columns, each a date or any name. assignments: a list of { id, title?, person, week,
+// hours, skill? }. under: the percent of capacity below which a week counts as under
+// allocated (50). title: the heading. id: a prefix for its ids, unique on the page.
+// name: the field a form gets the assignments in, as JSON ("assignments"). on_move(change):
+// inside one of your components, after each move, with { assignment, title, week, hours,
+// from, to }, hours a decimal and from and to the people's ids.
+//
+// workload_view_load(people, weeks, items, under) is the arithmetic: { cells, problems }.
+// workload_view_suggest(people, weeks, items, under) gives { moves, stuck }: moves in
+// the order to make them, each with the hours before and after, and for what cannot be
+// moved, why. Hours are decimals, so 7.5 and 0.1 add up exactly. What it reads is capped
+// at 300 people by 104 weeks by 5,000 assignments.
+
+import ui/theme.qwe use ui_cls
+
+let workload_view_css = css`
+.ui-workload-view { display: grid; gap: 12px; min-width: 0; padding: 18px 20px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-workload-view .ui-workload-view-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-workload-view-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-workload-view-wrap { position: relative; overflow-x: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-workload-view-wrap:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-workload-view-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-workload-view-table th, .ui-workload-view-table td { padding: 8px 10px; border-bottom: 1px solid var(--ui-border); text-align: left; vertical-align: top; }
+.ui-workload-view-table thead th { background: var(--ui-subtle); font-weight: 600; white-space: nowrap; }
+.ui-workload-view-table tbody th { position: sticky; left: 0; background: var(--ui-surface); font-weight: 600; white-space: nowrap; }
+.ui-workload-view-table tbody th small { display: block; color: var(--ui-muted); font-weight: 400; }
+.ui-workload-view-cell { min-width: 170px; }
+.ui-workload-view-load { display: flex; justify-content: space-between; gap: 8px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-workload-view-bar { display: block; height: 6px; margin: 4px 0 6px; overflow: hidden; border-radius: 3px; background: var(--ui-subtle); }
+.ui-workload-view-bar i { display: block; height: 100%; background: var(--ui-accent); }
+.ui-workload-view-over { background: var(--ui-danger-soft); }
+.ui-workload-view-over .ui-workload-view-load { color: var(--ui-danger); }
+.ui-workload-view-over .ui-workload-view-bar i { background: var(--ui-danger); }
+.ui-workload-view-under .ui-workload-view-load { color: var(--ui-warning); }
+.ui-workload-view-under .ui-workload-view-bar i { background: var(--ui-warning); }
+.ui-workload-view-items { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-workload-view-item { display: grid; gap: 2px; font-size: 12px; }
+.ui-workload-view-item select { box-sizing: border-box; width: 100%; padding: 2px 4px; border: 1px solid var(--ui-border); border-radius: 4px; background: var(--ui-surface); color: var(--ui-muted); font: 12px var(--ui-font); }
+.ui-workload-view-item select:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-workload-view-side { display: grid; gap: 8px; }
+.ui-workload-view-side h4 { margin: 0; font-size: 14px; font-weight: 650; }
+.ui-workload-view-moves { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-workload-view-move { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-size: 13px; }
+.ui-workload-view-move span { min-width: 0; overflow-wrap: anywhere; }
+.ui-workload-view-stuck { background: var(--ui-warning-soft); color: var(--ui-warning); }
+.ui-workload-view-btn { flex: none; padding: 5px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 12px/1.2 var(--ui-font); cursor: pointer; }
+.ui-workload-view-btn:hover { border-color: var(--ui-accent); }
+.ui-workload-view-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-workload-view-said { min-height: 1.4em; margin: 0; color: var(--ui-muted); font-size: 13px; }
+`
+
+let workload_view_most = { people: 300, weeks: 104, items: 5000 }
+
+// Hours as a decimal of 0 or more, or null.
+fn workload_view_hours(v) {
+    let kind = type_of(v)
+    if kind != "int" && kind != "float" && kind != "dec" && kind != "str" { return null }
+    let d = dec(v)
+    is_err(d) || d < 0 ? null : d
+}
+
+// People made safe: { id, name, capacity, skills, weeks }.
+fn workload_view_people(people) -> list = (type_of(people) == "list" ? people : []) | take(workload_view_most.people)
+    | filter((p) => type_of(p) == "map" && p.id != null)
+    | map((p) => ({ id: str(p.id), name: filled(trim(str(p.name ?? ""))) ?? str(p.id), capacity: workload_view_hours(p.capacity ?? 40) ?? 40m,
+                    skills: type_of(p.skills) == "list" ? p.skills | map(str) : [], weeks: type_of(p.weeks) == "map" ? p.weeks : {} }))
+
+// Assignments made safe, and what was wrong with the rest, by position.
+fn workload_view_items(items, people: list, weeks: list) -> map {
+    let good = []
+    let problems = []
+    let seen = {}
+    let ids = people | map((p) => p.id)
+    let given = type_of(items) == "list" ? items : []
+    if len(given) > workload_view_most.items {
+        problems = problems | push(`Only the first ${workload_view_most.items} assignments are read.`)
+    }
+    for [i, a] in enumerate(take(given, workload_view_most.items)) {
+        let at = `Assignment ${i + 1}`
+        let m = type_of(a) == "map" ? a : {}
+        let id = str(m.id ?? `row-${i + 1}`)
+        let hours = workload_view_hours(m.hours)
+        let label = filled(trim(str(m.title ?? ""))) ?? id
+        if type_of(a) != "map" {
+            problems = problems | push(`${at}: this is not an assignment.`)
+        } else if has(seen, id) {
+            problems = problems | push(`${at}: the id ${id} is used twice.`)
+        } else if hours == null {
+            problems = problems | push(`${at} (${label}): "${slice(str(m.hours ?? ""), 0, 20)}" is not a number of hours.`)
+        } else if !contains(ids, str(m.person ?? "")) {
+            problems = problems | push(`${at} (${label}): nobody called ${slice(str(m.person ?? ""), 0, 30)} is in the list.`)
+        } else if !contains(weeks, str(m.week ?? "")) {
+            problems = problems | push(`${at} (${label}): the week ${slice(str(m.week ?? ""), 0, 30)} is not shown.`)
+        } else {
+            seen = set(seen, id, true)
+            good = good | push({ id, title: label, person: str(m.person), week: str(m.week), hours, skill: m.skill != null ? str(m.skill) : null })
+        }
+    }
+    { items: good, problems }
+}
+
+// A person's capacity in a week.
+fn workload_view_capacity(p: map, week: str) = workload_view_hours(get(p.weeks, week)) ?? p.capacity
+
+// The key of a cell: people's ids and weeks may hold anything but a line break.
+fn workload_view_key(person: str, week: str) -> str = `${person}\n${week}`
+
+// Hours in each cell, as a map by key.
+fn workload_view_totals(items: list) -> map {
+    let out = {}
+    for a in items {
+        let k = workload_view_key(a.person, a.week)
+        out = set(out, k, (get(out, k) ?? 0m) + a.hours)
+    }
+    out
+}
+
+// Whole percent of capacity, half up.
+fn workload_view_percent(hours, capacity) {
+    if capacity == 0 { return hours > 0 ? null : 0 }
+    int(round(dec(hours) * 100 / capacity, 0, "half_up"))
+}
+
+// "over", "under" or "ok" for hours against capacity.
+fn workload_view_state(hours, capacity, under) -> str {
+    if hours > capacity { return "over" }
+    if capacity > 0 && hours * 100 < capacity * under { return "under" }
+    "ok"
+}
+
+// Numbers as hours read: 7.50m is "7.5", 40.0m is "40".
+fn workload_view_num(d) -> str {
+    let s = str(d)
+    contains(s, ".") ? re.replace(re.replace(s, "0+$", ""), "\\.$", "") : s
+}
+
+// See the top of the file.
+fn workload_view_load(people: list, weeks: list, items: list, under) -> map {
+    let totals = workload_view_totals(items)
+    let cells = {}
+    for p in people {
+        for w in weeks {
+            let k = workload_view_key(p.id, w)
+            let hours = get(totals, k) ?? 0m
+            let capacity = workload_view_capacity(p, w)
+            cells = set(cells, k, { hours, capacity, percent: workload_view_percent(hours, capacity), state: workload_view_state(hours, capacity, under) })
+        }
+    }
+    { cells }
+}
+
+// The best assignment to move out of an overloaded cell, and to whom, or null. The move
+// that leaves the least overload wins; then the fewest hours moved, so as to disturb
+// the least; then the person left with the most room, which spreads the load and picks
+// an under-used person first; then the order they were given in.
+fn workload_view_best(p: map, week: str, people: list, items: list, totals: map) {
+    let capacity = workload_view_capacity(p, week)
+    let excess = (get(totals, workload_view_key(p.id, week)) ?? 0m) - capacity
+    let best = null
+    for a in items {
+        if a.person == p.id && a.week == week && a.hours > 0 {
+            for [i, t] in enumerate(people) {
+                let room = workload_view_capacity(t, week) - (get(totals, workload_view_key(t.id, week)) ?? 0m)
+                let skilled = a.skill == null || contains(t.skills, a.skill)
+                if t.id != p.id && skilled && room >= a.hours {
+                    let left = excess > a.hours ? excess - a.hours : 0m
+                    let score = { left, hours: a.hours, room: room - a.hours, order: i }
+                    if best == null || workload_view_better(score, best.score) { best = { assignment: a, to: t, score } }
+                }
+            }
+        }
+    }
+    best
+}
+
+fn workload_view_better(a: map, b: map) -> bool {
+    if a.left != b.left { return a.left < b.left }
+    if a.hours != b.hours { return a.hours < b.hours }
+    if a.room != b.room { return a.room > b.room }
+    a.order < b.order
+}
+
+// Why nothing can be moved out of a cell, in words.
+fn workload_view_why(p: map, week: str, people: list, items: list, totals: map) -> str {
+    let mine = items | filter((a) => a.person == p.id && a.week == week)
+    let others = people | filter((t) => t.id != p.id)
+    if len(others) == 0 { return "There is nobody else to give it to." }
+    let needs = mine | map((a) => a.skill) | filter((s) => s != null) | unique
+    let free = mine | filter((a) => a.skill == null)
+    let no_one = needs | filter((s) => !any(others, (t) => contains(t.skills, s)))
+    if len(free) == 0 && len(no_one) == len(needs) && len(needs) > 0 {
+        return `Nobody else has ${join(needs, " or ")}.`
+    }
+    "Everyone who could take it is too full that week."
+}
+
+// See the top of the file. Each move is planned on the state the last one left, so
+// two overloads never count on the same free hours. A week with nothing left to move
+// goes in `stuck`, and the walk ends when every overload is cleared or stuck.
+fn workload_view_suggest(people: list, weeks: list, items: list, under = 50) -> map {
+    let work = items
+    let moves = []
+    let stuck = []
+    let done = {}
+    let turns = 0
+    let going = true
+    while going && turns < 200 {
+        turns += 1
+        let totals = workload_view_totals(work)
+        let worst = null
+        for w in weeks {
+            for p in people {
+                let k = workload_view_key(p.id, w)
+                let over = (get(totals, k) ?? 0m) - workload_view_capacity(p, w)
+                if over > 0 && !has(done, k) && (worst == null || over > worst.over) { worst = { person: p, week: w, over, key: k } }
+            }
+        }
+        if worst == null {
+            going = false
+        } else {
+            let best = workload_view_best(worst.person, worst.week, people, work, totals)
+            if best == null {
+                done = set(done, worst.key, true)
+                stuck = stuck | push({ person: worst.person.id, name: worst.person.name, week: worst.week, over: worst.over,
+                                       why: workload_view_why(worst.person, worst.week, people, work, totals) })
+            } else {
+                let a = best.assignment
+                let t = best.to
+                let from_before = get(totals, worst.key)
+                let to_before = get(totals, workload_view_key(t.id, worst.week)) ?? 0m
+                moves = moves | push({ assignment: a.id, title: a.title, week: worst.week, hours: a.hours, from: worst.person.id, to: t.id,
+                                       from_name: worst.person.name, to_name: t.name, from_before, from_after: from_before - a.hours, to_before,
+                                       to_after: to_before + a.hours, from_capacity: workload_view_capacity(worst.person, worst.week),
+                                       to_capacity: workload_view_capacity(t, worst.week) })
+                work = work | map((x) => x.id == a.id ? set(x, "person", t.id) : x)
+            }
+        }
+    }
+    { moves, stuck, items: work }
+}
+
+// A week as it heads its column.
+fn workload_view_week(w: str) -> str = date.valid(w, "date") ? date.format(w, "D MMM") : w
+
+component WorkloadView(people: list = [], weeks: list = [], assignments: list = [], under = 50, title: str = "Workload", id: str = "workload-view",
+                       name: str = "assignments", on_move = null, class: str? = null) {
+    style global workload_view_css
+    let crew = workload_view_people(people)
+    let cols = (type_of(weeks) == "list" ? weeks : []) | take(workload_view_most.weeks) | map(str) | unique
+    let read = workload_view_items(assignments, crew, cols)
+    state items = read.items
+    state last_move = null
+    state said = ""
+    let pct = workload_view_hours(under) ?? 50m
+    let load = workload_view_load(crew, cols, items, pct)
+    let plan = workload_view_suggest(crew, cols, items, pct)
+    let who = (pid: str) => find(crew, (p) => p.id == pid)
+    let shift = (aid: str, to: str) => {
+        let a = find(items, (x) => x.id == aid)
+        if a != null && a.person != to {
+            items = items | map((x) => x.id == aid ? set(x, "person", to) : x)
+            last_move = { assignment: aid, from: a.person, to }
+            said = `${a.title} moved from ${who(a.person).name} to ${who(to).name}.`
+            on_move && on_move({ assignment: aid, title: a.title, week: a.week, hours: a.hours, from: a.person, to })
+        }
+    }
+    let data = () => items | map((a) => ({ id: a.id, title: a.title, person: a.person, week: a.week, hours: str(a.hours), skill: a.skill }))
+    <section class={ui_cls(["ui-workload-view", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-workload-view-title id={`${id}-title`}>{title}</h3>
+        <input type="hidden" name={name} value={json.stringify(data())}/>
+        {len(read.problems) > 0 && <ul.ui-workload-view-problems role="alert">{for p in take(read.problems, 6) => <li key={p}>{p}</li>}</ul>}
+        {len(crew) == 0 || len(cols) == 0
+            ? <p.ui-workload-view-said>{len(crew) == 0 ? "No people to show." : "No weeks to show."}</p>
+            : <div.ui-workload-view-wrap tabindex="0" role="region" aria-label="Workload by person and week">
+                <table.ui-workload-view-table>
+                    <thead><tr><th scope="col">Person</th>{for w in cols => <th key={w} scope="col">{workload_view_week(w)}</th>}</tr></thead>
+                    <tbody>
+                        {for p in crew => <tr key={p.id} data-person={p.id}>
+                            <th scope="row">{p.name}{len(p.skills) > 0 && <small>{join(p.skills, ", ")}</small>}</th>
+                            {for w in cols => {
+                                let cell = get(load.cells, workload_view_key(p.id, w))
+                                let mine = items | filter((a) => a.person == p.id && a.week == w)
+                                let width = min([cell.percent ?? 100, 100])
+                                <td key={w} data-week={w} class={`ui-workload-view-cell ${cell.state == "ok" ? "" : `ui-workload-view-${cell.state}`}`}>
+                                    <span.ui-workload-view-load>
+                                        <span>{workload_view_num(cell.hours)} of {workload_view_num(cell.capacity)} h</span>
+                                        <span>{cell.percent != null ? `${cell.percent}%` : "no capacity"}{cell.state != "ok" ? <span.ui-sr> {cell.state == "over" ? "over allocated" : "under allocated"}</span> : ""}</span>
+                                    </span>
+                                    <span.ui-workload-view-bar aria-hidden="true"><i style={`width: ${width}%`}></i></span>
+                                    {len(mine) > 0 && <ul.ui-workload-view-items>
+                                        {for a in mine => <li.ui-workload-view-item key={a.id} data-item={a.id}>
+                                            <span>{a.title}, {workload_view_num(a.hours)} h{a.skill != null ? ` (${a.skill})` : ""}</span>
+                                            <select aria-label={`Move ${a.title} to`} @change={(e) => { shift(a.id, e.value) }}>
+                                                {for t in crew => <option key={t.id} value={t.id} selected={t.id == a.person}
+                                                    disabled={a.skill != null && !contains(t.skills, a.skill)}>{t.name}{a.skill != null && !contains(t.skills, a.skill) ? ` (no ${a.skill})` : ""}</option>}
+                                            </select>
+                                        </li>}
+                                    </ul>}
+                                </td>
+                            }}
+                        </tr>}
+                    </tbody>
+                </table>
+              </div>}
+        <div.ui-workload-view-side>
+            <h4>Suggestions</h4>
+            {len(plan.moves) == 0 && len(plan.stuck) == 0 && <p.ui-workload-view-said>Nobody is over allocated.</p>}
+            {(len(plan.moves) > 0 || len(plan.stuck) > 0) && <ul.ui-workload-view-moves>
+                {for m in plan.moves => <li.ui-workload-view-move key={m.assignment}>
+                    <span>Week of {workload_view_week(m.week)}: move {m.title} ({workload_view_num(m.hours)} h) from {m.from_name} to {m.to_name}. {m.from_name} {workload_view_num(m.from_before)} to {workload_view_num(m.from_after)} of {workload_view_num(m.from_capacity)} h, {m.to_name} {workload_view_num(m.to_before)} to {workload_view_num(m.to_after)} of {workload_view_num(m.to_capacity)} h.</span>
+                    <button.ui-workload-view-btn type="button" @click={() => { shift(m.assignment, m.to) }}>Apply</button>
+                </li>}
+                {for s in plan.stuck => <li class="ui-workload-view-move ui-workload-view-stuck" key={`${s.person}-${s.week}`}>
+                    <span>Week of {workload_view_week(s.week)}: {s.name} stays {workload_view_num(s.over)} h over. {s.why}</span>
+                </li>}
+            </ul>}
+        </div>
+        <p.ui-workload-view-said aria-live="polite">{said}
+            {last_move != null && <button.ui-workload-view-btn type="button" @click={() => { let m = last_move; shift(m.assignment, m.from); last_move = null }}>Undo</button>}
+        </p>
+    </section>
+}

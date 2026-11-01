@@ -1,0 +1,524 @@
+// AlertInbox: what needs someone, worst first. A swipe to the right acknowledges an alert and
+// a swipe to the left offers to snooze it, each by a flick or a pull past a third of the row, and
+// a short pull springs back. A tap on a row opens the same two with their words, for
+// anyone who does not swipe, and arrow keys do it from the keyboard. The badge counts what is
+// waiting and nothing else: it goes down at once on either, goes up as a snooze runs out,
+// and follows alerts that arrive or go. A slip is one Undo away; the Done tab reopens one later.
+//
+//   component Oncall() {
+//       state kept = load_alert_state()          // a server fn
+//       <AlertInbox alerts={rows} now_ms={server_now} saved={kept} on_change={(s) => { save_alert_state(s) }}
+//                   on_ack={(id) => { ack(id) }} on_badge={(n) => { tab_badge = n }}/>
+//   }
+//
+// alerts: each { id, severity, title, body?, source?, at?, snooze? }. severity: "critical",
+// "warning" or "info" ("error" and "high" count as critical, "medium" as warning, others
+// as info). at: when, as a date-time or milliseconds. snooze: false for one that may not be put off.
+// One with no title or a second with the same id is left out. now_ms: the time in milliseconds,
+// for the server's picture; from then on it reads the phone's clock. saved: { acks, snoozed },
+// as on_change gave it; snoozed is a list of { id, until }. store: a localStorage key to keep
+// it under as well, which in a phone app lasts one launch. snooze_options: each { label, minutes }, or
+// { label, morning: true } for 8:00 tomorrow where the phone is. on_ack(id): inside one of your
+// components, an alert acknowledged. on_snooze(id, until): snoozed, in milliseconds. on_reopen(id):
+// an acknowledgement or a snooze taken back. on_badge(count): whenever the count changes.
+// on_change(state): whenever acks or snoozes change. app_badge: also set the
+// home-screen badge where the browser has setAppBadge. check_seconds: how often it looks for
+// snoozes running out (15). label: its name ("Alerts"). class.
+//
+// Keys, on a focused row: right acknowledges, left offers the snooze, Enter opens the row.
+
+import ui/theme.qwe use ui_cls
+
+let alert_inbox_css = css`
+.ui-alerts { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.35 var(--ui-font); }
+.ui-alerts-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.ui-alerts-title { margin: 0; font-size: 18px; font-weight: 700; }
+.ui-alerts-badge { display: inline-grid; place-items: center; min-width: 24px; height: 24px; padding: 0 7px; border-radius: 999px; background: var(--ui-danger); color: var(--ui-bg); font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ui-alerts-badge[data-none] { background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-alerts-tabs { display: flex; gap: 2px; padding: 2px; margin-bottom: 10px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-alerts-tab { flex: 1; min-height: 44px; padding: 0 6px; border: 0; border-radius: 4px; background: transparent; color: var(--ui-muted); font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-alerts-tab[aria-pressed="true"] { background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow); }
+.ui-alerts-tab:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-alerts-body { display: grid; gap: 14px; }
+.ui-alerts-list { min-width: 0; }
+.ui-alerts-group { margin: 10px 0 4px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--ui-muted); }
+.ui-alerts-rows { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--ui-border); }
+.ui-alerts-row { position: relative; overflow: hidden; border-bottom: 1px solid var(--ui-border); overscroll-behavior-x: contain; --s: var(--ui-info); }
+.ui-alerts-row[data-sev="critical"] { --s: var(--ui-danger); }
+.ui-alerts-row[data-sev="warning"] { --s: var(--ui-warning); }
+.ui-alerts-under { position: absolute; inset: 0; display: flex; justify-content: space-between; align-items: center; padding: 0 16px; visibility: hidden; font-weight: 600; color: var(--ui-bg); }
+.ui-alerts-row[data-pull="right"] .ui-alerts-under { visibility: visible; background: var(--ui-success); }
+.ui-alerts-row[data-pull="left"] .ui-alerts-under { visibility: visible; background: var(--ui-warning); justify-content: flex-end; }
+.ui-alerts-row[data-pull="left"] .ui-alerts-under-ack, .ui-alerts-row[data-pull="right"] .ui-alerts-under-snz { display: none; }
+.ui-alerts-front { position: relative; display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; gap: 2px 10px; align-items: baseline; align-content: center; min-height: 60px; padding: 8px 14px; background: var(--ui-surface); outline: none; cursor: pointer;
+  touch-action: pan-y; transition: transform .22s cubic-bezier(.2, .8, .2, 1); -webkit-tap-highlight-color: transparent; }
+.ui-alerts-front:focus-visible { box-shadow: inset var(--ui-focus); }
+.ui-alerts-moving { transition: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-alerts-chosen { background: var(--ui-accent-soft); }
+.ui-alerts-dot { align-self: center; width: 10px; height: 10px; border-radius: 50%; background: var(--s); }
+.ui-alerts-name { font-weight: 600; overflow-wrap: anywhere; }
+.ui-alerts-when { color: var(--ui-muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ui-alerts-text { grid-column: 2 / -1; color: var(--ui-muted); font-size: 14px; overflow-wrap: anywhere; }
+.ui-alerts-acts { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 14px 12px; background: var(--ui-subtle); }
+.ui-alerts-act { flex: 1 1 auto; min-width: 44px; min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-alerts-act:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-alerts-act-main { border-color: transparent; background: var(--ui-success); color: var(--ui-bg); }
+.ui-alerts-panel { display: none; }
+.ui-alerts-none { margin: 12px 0; color: var(--ui-muted); }
+.ui-alerts-undo { position: sticky; bottom: max(8px, env(safe-area-inset-bottom)); z-index: 2; display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; padding: 4px 6px 4px 14px; border-radius: var(--ui-radius); background: var(--ui-fg); color: var(--ui-bg); font-size: 14px; }
+.ui-alerts-undo span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-alerts-undo-btn { flex: none; min-width: 64px; min-height: 44px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: inherit; font: 600 14px/1 var(--ui-font); text-decoration: underline; cursor: pointer; touch-action: manipulation; }
+.ui-alerts-undo-btn:focus-visible { outline: 2px solid currentColor; }
+@container (min-width: 620px) {
+  .ui-alerts-body { grid-template-columns: minmax(0, 1fr) 280px; gap: 22px; }
+  .ui-alerts-inline { display: none; }
+  .ui-alerts-panel { display: block; align-self: start; position: sticky; top: 8px; padding: 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+  .ui-alerts-panel h3 { margin: 0 0 4px; font-size: 16px; }
+  .ui-alerts-panel p { margin: 0 0 10px; color: var(--ui-muted); font-size: 14px; }
+  .ui-alerts-panel .ui-alerts-acts { flex-direction: column; padding: 0; background: none; }
+}
+@media (hover: hover) {
+  .ui-alerts-act:not(.ui-alerts-act-main):hover { background: var(--ui-subtle); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-alerts-front { transition: none; } }
+`
+
+let alert_inbox_order = ["critical", "warning", "info"]
+
+fn alert_inbox_sev(x) -> str {
+    let s = lower(str(x ?? ""))
+    if s == "critical" || s == "error" || s == "high" { return "critical" }
+    if s == "warning" || s == "medium" { return "warning" }
+    "info"
+}
+
+fn alert_inbox_sev_name(s: str) -> str = match s {
+    "critical" => "Critical"
+    "warning" => "Warning"
+    _ => "Info"
+}
+
+// When, in milliseconds, or null.
+fn alert_inbox_ms(x) {
+    let t = type_of(x)
+    if t == "int" { return x }
+    if t == "str" && date.valid(x) { return date.ms(x) }
+    null
+}
+
+// The alerts that can be shown: with a title, each id once, ids as text.
+fn alert_inbox_clean(alerts) {
+    if type_of(alerts) != "list" { return [] }
+    let named = take(alerts, 500) | filter((a) => type_of(a) == "map" && filled(get(a, "title")) != null)
+    let all = for [i, a] in enumerate(named) => {
+        {
+            id: get(a, "id") != null ? str(a.id) : `_${i}`, title: str(a.title), body: get(a, "body"), source: get(a, "source"),
+            sev: alert_inbox_sev(get(a, "severity")), at: alert_inbox_ms(get(a, "at")), can_snooze: get(a, "snooze") != false,
+        }
+    }
+    let ids = all | map((a) => a.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// What was kept, in the form the rest expects.
+fn alert_inbox_kept(saved) {
+    if type_of(saved) != "map" { return { acks: [], snoozed: [] } }
+    let a = get(saved, "acks")
+    let s = get(saved, "snoozed")
+    {
+        acks: type_of(a) == "list" ? a | filter((x) => x != null) | map((x) => str(x)) : [],
+        snoozed: type_of(s) == "list" ? s | filter((x) => type_of(x) == "map" && get(x, "id") != null && type_of(get(x, "until")) == "int") | map((x) => { id: str(x.id), until: x.until }) : [],
+    }
+}
+
+// The three piles at a moment. A snooze still running keeps an alert out of the count; one run
+// out does not, whether or not anyone has tidied the list. An acknowledgement wins over all.
+fn alert_inbox_piles(alerts, acks, snoozed, t: num) {
+    let done = alerts | filter((a) => contains(acks, a.id))
+    let open = alerts | filter((a) => !contains(acks, a.id))
+    let until_of = (a) => {
+        let s = find(snoozed, (x) => x.id == a.id)
+        s != null && s.until > t ? s.until : null
+    }
+    let sleeping = open | filter((a) => until_of(a) != null) | map((a) => { ...a, until: until_of(a) })
+    let waiting = open | filter((a) => until_of(a) == null)
+    { waiting, sleeping, done }
+}
+
+// Worst first, and within that the newest; an alert with no time goes last in its group.
+fn alert_inbox_sorted(xs) {
+    let later = xs | sort_by((a) => 0 - (a.at ?? 0))
+    flatten(alert_inbox_order | map((s) => later | filter((a) => a.sev == s)))
+}
+
+fn alert_inbox_groups(xs) {
+    let in_order = alert_inbox_sorted(xs)
+    alert_inbox_order | map((s) => { sev: s, rows: in_order | filter((a) => a.sev == s) }) | filter((g) => len(g.rows) > 0)
+}
+
+fn alert_inbox_badge(n: int) -> str = n > 99 ? "99+" : str(n)
+
+// How long ago, or how long until, in the fewest words.
+fn alert_inbox_span(ms: num) -> str {
+    let m = floor(ms / 60000)
+    if m < 1 { return "under a minute" }
+    if m < 60 { return `${m} min` }
+    let h = floor(m / 60)
+    if h < 48 { return `${h} h` }
+    `${floor(h / 24)} days`
+}
+
+fn alert_inbox_ago(at, t: num) -> str {
+    if at == null || t <= 0 { return "" }
+    t - at < 60000 ? "just now" : `${alert_inbox_span(t - at)} ago`
+}
+
+// What a release of the row comes to: "ack", "snooze" or "", from where it was let go and how
+// fast it was going, in pixels a millisecond. A flick from under a third still counts, in its own direction.
+fn alert_inbox_settle(x: num, v: num, width: num) -> str {
+    let far = abs(x) >= width * 0.34
+    let flick = abs(v) >= 0.5 && abs(x) >= 24 && (x > 0) == (v > 0)
+    if !far && !flick { return "" }
+    x > 0 ? "ack" : "snooze"
+}
+
+fn alert_inbox_sample(s, pos: num, t: num) {
+    let dt = t - s.at
+    dt < 32 ? s : { pos, at: t, v: (pos - s.pos) / dt }
+}
+
+// The speed at release, signed: none if the finger stopped before it lifted.
+fn alert_inbox_speed(s, pos: num, t: num, moved: num) -> num {
+    if t - moved > 80 { return 0 }
+    let dt = t - s.at
+    let since = dt >= 8 ? (pos - s.pos) / dt : 0
+    abs(since) > abs(s.v) ? since : s.v
+}
+
+fn alert_inbox_options(options) {
+    let given = type_of(options) == "list" ? options | filter((o) => type_of(o) == "map" && filled(get(o, "label")) != null) : []
+    len(given) > 0 ? given : [{ label: "15 minutes", minutes: 15 }, { label: "1 hour", minutes: 60 }, { label: "Until tomorrow", morning: true }]
+}
+
+view AlertInboxActions(a, options, on_ack, on_snooze) =
+    <div.ui-alerts-acts role="group" aria-label={`Actions for ${a.title}`}>
+        <button.ui-alerts-act.ui-alerts-act-main type="button" @click={() => { on_ack() }}>Acknowledge</button>
+        {a.can_snooze && <span style="display: contents">
+            {for [i, o] in enumerate(options) => <button.ui-alerts-act.ui-alerts-act-snooze key={i} type="button" @click={() => { on_snooze(o) }}>{o.label}</button>}
+        </span>}
+    </div>
+
+component AlertInbox(alerts = [], now_ms: int = 0, saved = null, store: str? = null, snooze_options = null, on_ack = null, on_snooze = null, on_reopen = null,
+                     on_badge = null, on_change = null, app_badge: bool = false, check_seconds: int = 15, label: str = "Alerts", class: str? = null) {
+    style global alert_inbox_css
+    state acks = alert_inbox_kept(saved).acks
+    state snoozed = alert_inbox_kept(saved).snoozed
+    state t = now_ms
+    state tab = "waiting"
+    state chosen = ""        // the row opened
+    state leaving = null     // { id, what, until }: a row on its way out
+    state undo = null        // { kind, id, title, seconds }: the last thing done
+    state undo_at = 0
+    state g = null
+    state moving = false
+    state dragged = false    // a mouse's drag ends in a click, which is no tap on the row
+    state armed = false      // past the point where letting go would act
+    state win = null
+    state box = null
+    state said = ""
+    state last_count = -1
+    let clean = alert_inbox_clean(alerts)
+    let options = alert_inbox_options(snooze_options)
+    let piles = alert_inbox_piles(clean, acks, snoozed, t)
+    let count = len(piles.waiting)
+    let groups = alert_inbox_groups(piles.waiting)
+    let chosen_alert = find(piles.waiting, (a) => a.id == chosen)
+    let buzz = (kind: str, ms: int) => {
+        if win != null {
+            if win.quilloNative != null {
+                js("quilloNative.haptic", kind)
+            } else {
+                if win.navigator.vibrate != null && js("navigator.userActivation.hasBeenActive") == true { js("navigator.vibrate", ms) }
+            }
+        }
+    }
+    let told = () => {
+        let kept = { acks, snoozed }
+        on_change && on_change(kept)
+        if store != null {
+            let text = json.stringify(kept)
+            // Storage can throw when it is blocked or full, which would stop the handler where it stands.
+            js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.setItem", store, text) ?? true) }))
+        }
+    }
+    let tick = () => {
+        let at = now()
+        let before = len(piles.waiting)
+        t = at
+        // A snooze run out is an alert again: it says so, once, however it was noticed.
+        let after = len(alert_inbox_piles(clean, acks, snoozed, at).waiting)
+        if after > before {
+            said = after - before == 1 ? "A snoozed alert is back." : `${after - before} snoozed alerts are back.`
+            snoozed = snoozed | filter((s) => s.until > at)
+            told()
+            buzz("warning", 40)
+        }
+        if undo != null && at - undo_at > 8000 { undo = null }
+    }
+    let focus_next = (id: str) => {
+        // After the list has changed: the row that took its place, or the tabs when none is left.
+        let order = alert_inbox_sorted(piles.waiting) | map((a) => a.id)
+        let at = index_of(order, id) ?? 0
+        let after = filter(order, (x) => x != id)
+        let next = len(after) > 0 ? after[at >= len(after) ? len(after) - 1 : at] : null
+        js("requestAnimationFrame", (_t = null) => {
+            let el = next != null ? box.querySelector(`[data-id="${next}"] .ui-alerts-front`) : box.querySelector(".ui-alerts-tab")
+            if el != null { el.focus() }
+        })
+    }
+    let ack = (a) => {
+        focus_next(a.id)
+        acks = acks + [a.id]
+        chosen = ""
+        undo = { kind: "ack", id: a.id, title: a.title }
+        undo_at = now()
+        said = `${a.title} acknowledged. Undo is below.`
+        told()
+        on_ack && on_ack(a.id)
+        buzz("success", 20)
+    }
+    let snooze = (a, o) => {
+        if a.can_snooze {
+            // Any snooze that ran out meanwhile is told of first, so the count moves for one reason at a time.
+            tick()
+            let base = t
+            let until = 0
+            if get(o, "morning") == true {
+                let d = js_new("Date", base)
+                d.setDate(d.getDate() + 1)
+                d.setHours(8, 0, 0, 0)
+                until = d.getTime()
+            } else {
+                until = base + get(o, "minutes", 15) * 60000
+            }
+            focus_next(a.id)
+            snoozed = (snoozed | filter((s) => s.id != a.id)) + [{ id: a.id, until }]
+            chosen = ""
+            undo = { kind: "snooze", id: a.id, title: a.title }
+            undo_at = base
+            said = `${a.title} snoozed for ${alert_inbox_span(until - base)}. Undo is below.`
+            told()
+            on_snooze && on_snooze(a.id, until)
+            buzz("light", 12)
+        }
+    }
+    let reopen = (id: str) => {
+        acks = acks | filter((x) => x != id)
+        snoozed = snoozed | filter((s) => s.id != id)
+        undo = null
+        said = "Back in the list."
+        told()
+        on_reopen && on_reopen(id)
+        buzz("selection", 8)
+    }
+    let spring = (el) => {
+        el.style.transform = ""
+        el.parentElement.removeAttribute("data-pull")
+    }
+    if win != null { every(max([check_seconds, 1]) * 1000, () => { tick() }) }
+    if leaving != null {
+        every(190, () => {
+            let was = leaving
+            leaving = null
+            let a = find(clean, (x) => x.id == was.id)
+            if a != null { ack(a) }
+            let el = box.querySelector(`[data-id="${was.id}"] .ui-alerts-front`)
+            if el != null { spring(el) }
+        })
+    }
+    // Whatever changed the count, a callback and the app's own badge hear of it, once.
+    if win != null && count != last_count {
+        last_count = count
+        on_badge && on_badge(count)
+        if app_badge && win.navigator.setAppBadge != null {
+            if count > 0 { js("navigator.setAppBadge", count) } else { js("navigator.clearAppBadge") }
+        }
+    }
+    <section class={ui_cls(["ui-alerts", class])} aria-label={label}
+             @mount={(me) => {
+                 box = me
+                 let w = js("window")
+                 let d = js("document")
+                 if store != null && saved == null {
+                     let text = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.getItem", store)) }))
+                     if type_of(text) == "str" {
+                         let got = json.parse(text)
+                         if !is_err(got) {
+                             let k = alert_inbox_kept(got)
+                             acks = k.acks
+                             snoozed = k.snoozed
+                         }
+                     }
+                 }
+                 t = now()
+                 win = w
+                 let back = (_e = null) => { if d.visibilityState == "visible" { tick() } }
+                 d.addEventListener("visibilitychange", back)
+                 w.addEventListener("pageshow", back)
+                 () => {
+                     d.removeEventListener("visibilitychange", back)
+                     w.removeEventListener("pageshow", back)
+                 }
+             }}>
+        <div.ui-alerts-head>
+            <h2.ui-alerts-title>{label}</h2>
+            <span.ui-alerts-badge data-none={count == 0 ? "true" : null} aria-label={count == 1 ? "1 alert needs you" : `${count} alerts need you`}>{alert_inbox_badge(count)}</span>
+        </div>
+        <div.ui-alerts-tabs role="group" aria-label="Which alerts">
+            <button.ui-alerts-tab type="button" aria-pressed={tab == "waiting" ? "true" : "false"} @click={() => { tab = "waiting" }}>Waiting {count}</button>
+            <button.ui-alerts-tab type="button" aria-pressed={tab == "sleeping" ? "true" : "false"} @click={() => { tab = "sleeping" }}>Snoozed {len(piles.sleeping)}</button>
+            <button.ui-alerts-tab type="button" aria-pressed={tab == "done" ? "true" : "false"} @click={() => { tab = "done" }}>Done {len(piles.done)}</button>
+        </div>
+        <div.ui-alerts-body>
+            <div.ui-alerts-list>
+                {tab == "waiting" && <div
+                    @pointerdown={(e) => {
+                        dragged = false
+                        let el = e.target.closest(".ui-alerts-front")
+                        let free = el != null && e.isPrimary && e.button == 0 && leaving == null
+                        g = free ? { pid: e.pointerId, id: el.parentElement.dataset.id, el, x: e.clientX, y: e.clientY, on: false, at: 0, moved: e.timeStamp, s: { pos: e.clientX, at: e.timeStamp, v: 0 } } : null
+                    }}
+                    @pointermove={(e) => {
+                        if g != null && e.pointerId == g.pid {
+                            let dx = e.clientX - g.x
+                            let dy = e.clientY - g.y
+                            if !g.on {
+                                if abs(dy) > 8 && abs(dy) >= abs(dx) { g = null }
+                                if g != null && abs(dx) > 8 && abs(dx) > abs(dy) {
+                                    g.el.setPointerCapture(e.pointerId)
+                                    g.el.classList.add("ui-alerts-moving")
+                                    moving = true
+                                    g = { ...g, on: true, slop: dx > 0 ? 8 : -8 }
+                                }
+                            }
+                            if g != null && g.on {
+                                let a = find(clean, (x) => x.id == g.id)
+                                // Nothing behind a pull to the left of one that may not be put off, so it barely moves.
+                                let raw = dx - g.slop
+                                let x = raw < 0 && a != null && !a.can_snooze ? raw * 0.15 : raw
+                                g.el.style.transform = `translateX(${x}px)`
+                                g.el.parentElement.dataset.pull = x > 0 ? "right" : "left"
+                                let past = abs(x) >= g.el.offsetWidth * 0.34
+                                if past != armed {
+                                    armed = past
+                                    if past { buzz("medium", 10) }
+                                }
+                                g = { ...g, at: x, moved: e.timeStamp, s: alert_inbox_sample(g.s, e.clientX, e.timeStamp) }
+                            }
+                        }
+                    }}
+                    @pointerup={(e) => {
+                        if g != null && e.pointerId == g.pid {
+                            let was = g
+                            g = null
+                            if was.on {
+                                moving = false
+                                armed = false
+                                dragged = e.pointerType == "mouse"
+                                was.el.classList.remove("ui-alerts-moving")
+                                let v = alert_inbox_speed(was.s, e.clientX, e.timeStamp, was.moved)
+                                let end = alert_inbox_settle(was.at, v, was.el.offsetWidth)
+                                let a = find(clean, (x) => x.id == was.id)
+                                if end == "ack" && a != null {
+                                    was.el.style.transform = "translateX(100%)"
+                                    leaving = { id: was.id }
+                                } else {
+                                    spring(was.el)
+                                    if end == "snooze" && a != null && a.can_snooze {
+                                        chosen = was.id
+                                        let row = was.el.parentElement
+                                        js("requestAnimationFrame", (_t = null) => {
+                                            let first = box.querySelector(".ui-alerts-panel .ui-alerts-act-snooze")
+                                            let shown = first != null && first.getClientRects().length > 0 ? first : row.querySelector(".ui-alerts-act-snooze")
+                                            if shown != null { shown.focus() }
+                                        })
+                                    }
+                                }
+                            }
+                        }
+                    }}
+                    @pointercancel={(e) => {
+                        if g != null && e.pointerId == g.pid {
+                            let was = g
+                            g = null
+                            if was.on {
+                                moving = false
+                                armed = false
+                                was.el.classList.remove("ui-alerts-moving")
+                                spring(was.el)
+                            }
+                        }
+                    }}>
+                    {count == 0 && <p.ui-alerts-none>Nothing is waiting.</p>}
+                    {for g2 in groups => <div key={g2.sev}>
+                        <p.ui-alerts-group>{alert_inbox_sev_name(g2.sev)} {len(g2.rows)}</p>
+                        <ul.ui-alerts-rows>
+                            {for a in g2.rows => <li.ui-alerts-row key={a.id} data-id={a.id} data-sev={a.sev}>
+                                <div.ui-alerts-under aria-hidden="true"><span.ui-alerts-under-ack>Acknowledge</span><span.ui-alerts-under-snz>{a.can_snooze ? "Snooze" : ""}</span></div>
+                                <div class={ui_cls(["ui-alerts-front", chosen == a.id && "ui-alerts-chosen"])} tabindex="0" role="button" aria-expanded={chosen == a.id ? "true" : "false"}
+                                     aria-label={`${alert_inbox_sev_name(a.sev)}: ${a.title}. Right arrow acknowledges, left arrow snoozes.`}
+                                     @click={() => { if dragged { dragged = false } else { chosen = chosen == a.id ? "" : a.id } }}
+                                     @keydown={(e) => {
+                                         if e.key == "Enter" || e.key == " " { e.preventDefault(); chosen = chosen == a.id ? "" : a.id }
+                                         if e.key == "ArrowRight" { e.preventDefault(); ack(a) }
+                                         if e.key == "ArrowLeft" && a.can_snooze { e.preventDefault(); chosen = a.id }
+                                     }}>
+                                    <i.ui-alerts-dot aria-hidden="true"></i>
+                                    <span.ui-alerts-name>{a.title}</span>
+                                    <span.ui-alerts-when>{alert_inbox_ago(a.at, t)}</span>
+                                    {(a.body != null || a.source != null) && <span.ui-alerts-text>{a.source != null ? `${a.source}: ` : ""}{a.body != null ? str(a.body) : ""}</span>}
+                                </div>
+                                {chosen == a.id && <div.ui-alerts-inline><AlertInboxActions a={a} options={options} on_ack={() => { ack(a) }} on_snooze={(o) => { snooze(a, o) }}/></div>}
+                            </li>}
+                        </ul>
+                    </div>}
+                </div>}
+                {tab == "sleeping" && <div>
+                    {len(piles.sleeping) == 0 && <p.ui-alerts-none>Nothing is snoozed.</p>}
+                    <ul.ui-alerts-rows>
+                        {for a in alert_inbox_sorted(piles.sleeping) => <li.ui-alerts-row key={a.id} data-id={a.id} data-sev={a.sev}>
+                            <div.ui-alerts-front>
+                                <i.ui-alerts-dot aria-hidden="true"></i>
+                                <span.ui-alerts-name>{a.title}</span>
+                                <span.ui-alerts-when>back in {alert_inbox_span(a.until - t)}</span>
+                            </div>
+                            <div.ui-alerts-acts><button.ui-alerts-act type="button" aria-label={`Wake ${a.title} now`} @click={() => { reopen(a.id) }}>Wake now</button></div>
+                        </li>}
+                    </ul>
+                </div>}
+                {tab == "done" && <div>
+                    {len(piles.done) == 0 && <p.ui-alerts-none>Nothing acknowledged yet.</p>}
+                    <ul.ui-alerts-rows>
+                        {for a in alert_inbox_sorted(piles.done) => <li.ui-alerts-row key={a.id} data-id={a.id} data-sev={a.sev}>
+                            <div.ui-alerts-front>
+                                <i.ui-alerts-dot aria-hidden="true"></i>
+                                <span.ui-alerts-name>{a.title}</span>
+                                <span.ui-alerts-when>{alert_inbox_ago(a.at, t)}</span>
+                            </div>
+                            <div.ui-alerts-acts><button.ui-alerts-act type="button" aria-label={`Reopen ${a.title}`} @click={() => { reopen(a.id) }}>Reopen</button></div>
+                        </li>}
+                    </ul>
+                </div>}
+                {undo != null && <div.ui-alerts-undo><span>{undo.kind == "ack" ? "Acknowledged" : "Snoozed"}: {undo.title}</span><button.ui-alerts-undo-btn type="button" @click={() => { reopen(undo.id) }}>Undo</button></div>}
+            </div>
+            <aside.ui-alerts-panel aria-label="Chosen alert">
+                {chosen_alert != null ? <div>
+                    <h3>{chosen_alert.title}</h3>
+                    {chosen_alert.body != null && <p>{str(chosen_alert.body)}</p>}
+                    <AlertInboxActions a={chosen_alert} options={options} on_ack={() => { ack(chosen_alert) }} on_snooze={(o) => { snooze(chosen_alert, o) }}/>
+                </div> : <p>Choose an alert to see what can be done.</p>}
+            </aside>
+        </div>
+        <span.ui-sr role="status">{said}</span>
+    </section>
+}

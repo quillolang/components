@@ -1,0 +1,453 @@
+// ApprovalQueue: requests dealt with one at a time, as a manager's phone wants them. Each
+// stands alone on a card with what is needed to judge it. A swipe to the right approves and a
+// swipe to the left rejects, by a pull past a third of the card or a flick, and a short pull
+// springs back; the two buttons under it, and the arrow keys, do the same. Where a reason is
+// required nothing is decided until one is given. Undo takes back the last decision, as far back
+// as there are decisions, and the count says how many are left.
+//
+//   component Approvals() {
+//       state kept = load_decisions()            // a server fn
+//       <ApprovalQueue requests={rows} saved={kept} reasons={["Over budget", "Needs a quote", "Not this quarter"]}
+//                      on_change={(list) => { save_decisions(list) }}
+//                      on_decide={(d) => { send_decision(d) }} on_undo={(d) => { take_back(d) }}/>
+//   }
+//
+// requests: each { id, title, who?, amount?, detail?, fields? }. amount: text, or a decimal, as
+// money must stay exact: it is shown as given. fields: a list of { label, value } lines. One with no
+// title or a second with the same id is left out. reason_for: which decisions need a reason:
+// "reject" (the default), "both" or "none". reasons: words offered to tap in, as text.
+// least: the fewest letters that count as a reason (3). saved: what on_change gave. on_decide(d):
+// inside one of your components, as each is decided, { id, decision, reason }, decision
+// being "approved" or "rejected". on_undo(d): the same, for one taken back: a decision already sent
+// is the program's to withdraw. on_change(list): all the decisions in order, after any change.
+// on_done(list): when none are left. label: its name ("Approvals"). class.
+//
+// On a phone the reason sheet stands on the on-screen keyboard, by visualViewport, as iOS covers the
+// page and Android may or may not shrink it. A wide container keeps the list of requests beside the
+// card, to take them in another order.
+
+import ui/theme.qwe use ui_cls
+
+let approval_queue_css = css`
+.ui-approvals { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-approvals-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+.ui-approvals-title { margin: 0; font-size: 18px; font-weight: 700; }
+.ui-approvals-left { color: var(--ui-muted); font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-approvals-bar { height: 4px; margin-bottom: 12px; border-radius: 2px; background: var(--ui-subtle); overflow: hidden; }
+.ui-approvals-bar i { display: block; height: 100%; background: var(--ui-accent); transition: width .25s; }
+.ui-approvals-body { display: grid; gap: 14px; }
+.ui-approvals-side { display: none; }
+.ui-approvals-main { min-width: 0; }
+.ui-approvals-stack { position: relative; padding-bottom: 12px; overscroll-behavior-x: contain; }
+.ui-approvals-peek { position: absolute; inset: 8px 10px 4px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-subtle); }
+.ui-approvals-peek2 { inset: 16px 20px -4px; }
+.ui-approvals-card { position: relative; display: grid; gap: 6px; min-height: 240px; padding: 16px; align-content: start; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); box-shadow: var(--ui-shadow); outline: none;
+  touch-action: pan-y; transition: transform .22s cubic-bezier(.2, .8, .2, 1), opacity .2s; -webkit-tap-highlight-color: transparent; }
+.ui-approvals-card:focus-visible { box-shadow: var(--ui-focus); }
+.ui-approvals-moving { transition: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-approvals-still { transition: none; }
+.ui-approvals-stamp { position: absolute; top: 14px; padding: 4px 10px; border: 2px solid currentColor; border-radius: var(--ui-radius-sm); font-weight: 700; opacity: 0; pointer-events: none; }
+.ui-approvals-stamp-yes { left: 14px; color: var(--ui-success); }
+.ui-approvals-stamp-no { right: 14px; color: var(--ui-danger); }
+.ui-approvals-who { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-approvals-name { margin: 0; font-size: 20px; font-weight: 650; overflow-wrap: anywhere; }
+.ui-approvals-amount { margin: 0; font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-approvals-detail { margin: 0; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-approvals-fields { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 12px; margin: 4px 0 0; font-size: 14px; }
+.ui-approvals-fields dt { color: var(--ui-muted); }
+.ui-approvals-fields dd { margin: 0; overflow-wrap: anywhere; }
+.ui-approvals-keys { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 6px; }
+.ui-approvals-btn { min-height: 54px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 600 16px/1.1 var(--ui-font); cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.ui-approvals-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-approvals-btn:disabled { opacity: .5; cursor: default; }
+.ui-approvals-yes { border-color: transparent; background: var(--ui-success); color: var(--ui-bg); }
+.ui-approvals-no { border-color: transparent; background: var(--ui-danger); color: var(--ui-bg); }
+.ui-approvals-undo { width: 100%; min-height: 46px; margin-top: 8px; font-weight: 500; font-size: 15px; }
+.ui-approvals-done { padding: 28px 12px; text-align: center; }
+.ui-approvals-done h3 { margin: 0 0 4px; font-size: 20px; }
+.ui-approvals-done p { margin: 0; color: var(--ui-muted); }
+.ui-approvals-sheet { width: 100%; max-width: none; max-height: calc(100dvh - var(--ui-approvals-kb, 0px) - 16px); margin: auto 0 var(--ui-approvals-kb, 0px); padding: 16px 16px max(16px, env(safe-area-inset-bottom)); border: 0; border-radius: calc(var(--ui-radius) + 6px) calc(var(--ui-radius) + 6px) 0 0;
+  background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); overscroll-behavior: contain; box-sizing: border-box; }
+.ui-approvals-sheet::backdrop { background: var(--ui-overlay); }
+.ui-approvals-sheet h3 { margin: 0 0 8px; font-size: 18px; overflow-wrap: anywhere; }
+.ui-approvals-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.ui-approvals-chip { min-width: 44px; min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-approvals-chip:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-approvals-field { display: block; width: 100%; box-sizing: border-box; min-height: 88px; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-bg); color: var(--ui-fg); font: 16px/1.4 var(--ui-font); resize: vertical; }
+.ui-approvals-field:focus { outline: none; box-shadow: var(--ui-focus); }
+.ui-approvals-field[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-approvals-err { margin: 4px 0 0; min-height: 20px; color: var(--ui-danger); font-size: 14px; }
+.ui-approvals-sheet-keys { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 6px; }
+.ui-approvals-none { margin: 12px 0; color: var(--ui-muted); }
+.ui-approvals-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; min-height: 48px; padding: 6px 10px; border: 0; border-radius: var(--ui-radius-sm); background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; touch-action: manipulation; }
+.ui-approvals-row[aria-current] { background: var(--ui-accent-soft); color: var(--ui-accent); font-weight: 600; }
+.ui-approvals-row:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-approvals-row:disabled { color: var(--ui-muted); cursor: default; }
+.ui-approvals-row span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-approvals-row small { flex: none; }
+@container (min-width: 620px) {
+  .ui-approvals-body { grid-template-columns: 260px minmax(0, 1fr); gap: 24px; }
+  .ui-approvals-side { display: block; align-self: start; max-height: 70dvh; overflow-y: auto; overscroll-behavior: contain; margin: 0; padding: 6px; list-style: none; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); }
+  .ui-approvals-card { min-height: 300px; }
+}
+/* A <dialog> stands over the whole window, so the window's width is the one to ask, Split View included. */
+@media (min-width: 600px) {
+  .ui-approvals-sheet { width: 440px; margin: auto; border-radius: calc(var(--ui-radius) + 6px); padding-bottom: 16px; }
+}
+@media (hover: hover) { .ui-approvals-btn:not(:disabled):not(.ui-approvals-yes):not(.ui-approvals-no):hover, .ui-approvals-chip:hover, .ui-approvals-row:not(:disabled):hover { background: var(--ui-subtle); } }
+@media (prefers-reduced-motion: reduce) { .ui-approvals-card, .ui-approvals-bar i { transition: none; } }
+`
+
+// The requests that can be shown: with a title, each id once, ids as text.
+fn approval_queue_clean(requests) {
+    if type_of(requests) != "list" { return [] }
+    let named = take(requests, 500) | filter((r) => type_of(r) == "map" && filled(get(r, "title")) != null)
+    let all = for [i, r] in enumerate(named) => {
+        let f = get(r, "fields")
+        {
+            id: get(r, "id") != null ? str(r.id) : `_${i}`, title: str(r.title), who: get(r, "who"), amount: get(r, "amount"), detail: get(r, "detail"),
+            fields: type_of(f) == "list" ? f | filter((x) => type_of(x) == "map" && get(x, "label") != null) : [],
+        }
+    }
+    let ids = all | map((r) => r.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// What was decided before, as far as it can be read.
+fn approval_queue_kept(saved) {
+    if type_of(saved) != "list" { return [] }
+    saved | filter((d) => type_of(d) == "map" && get(d, "id") != null && (get(d, "decision") == "approved" || get(d, "decision") == "rejected"))
+          | map((d) => { id: str(d.id), decision: d.decision, reason: str(get(d, "reason") ?? "") })
+}
+
+fn approval_queue_pending(requests, decided) {
+    let ids = decided | map((d) => d.id)
+    requests | filter((r) => !contains(ids, r.id))
+}
+
+// Whether a decision needs a reason first.
+fn approval_queue_needs(mode: str, decision: str) -> bool = mode == "both" || (mode == "reject" && decision == "rejected")
+
+// A reason counts once it has that many letters, not counting what is round them.
+fn approval_queue_reason_ok(text, least: int) -> bool = type_of(text) == "str" && len(trim(text)) >= (least < 1 ? 1 : least)
+
+// What a release comes to: "approved", "rejected" or "", from where the card was let go and how
+// fast it was going, in pixels a millisecond. A flick from under a third still counts, its own way.
+fn approval_queue_settle(x: num, v: num, width: num) -> str {
+    let far = abs(x) >= width * 0.34
+    let flick = abs(v) >= 0.5 && abs(x) >= 24 && (x > 0) == (v > 0)
+    if !far && !flick { return "" }
+    x > 0 ? "approved" : "rejected"
+}
+
+fn approval_queue_sample(s, pos: num, t: num) {
+    let dt = t - s.at
+    dt < 32 ? s : { pos, at: t, v: (pos - s.pos) / dt }
+}
+
+// The speed at release, signed: none if the finger stopped before it lifted.
+fn approval_queue_speed(s, pos: num, t: num, moved: num) -> num {
+    if t - moved > 80 { return 0 }
+    let dt = t - s.at
+    let since = dt >= 8 ? (pos - s.pos) / dt : 0
+    abs(since) > abs(s.v) ? since : s.v
+}
+
+// How a card leans for a pull, and how strongly a stamp shows.
+fn approval_queue_tilt(x: num, width: num) -> float {
+    let t = x / (width > 0 ? width : 1) * 8
+    round(t > 8 ? 8.0 : (t < -8 ? -8.0 : t), 2)
+}
+
+fn approval_queue_stamp(x: num, width: num) -> float {
+    let s = abs(x) / ((width > 0 ? width : 1) * 0.34)
+    round(s > 1 ? 1.0 : s, 2)
+}
+
+// What the on-screen keyboard covers: the part of the window below the visible part.
+fn approval_queue_covered(inner: num, height: num, top: num) -> num {
+    let c = round(inner - height - top)
+    c < 0 ? 0 : c
+}
+
+fn approval_queue_tally(decided) {
+    let yes = len(decided | filter((d) => d.decision == "approved"))
+    { yes, no: len(decided) - yes }
+}
+
+fn approval_queue_word(d: str) -> str = d == "approved" ? "Approved" : "Rejected"
+
+component ApprovalQueue(requests = [], reason_for: str = "reject", reasons = [], least: int = 3, saved = null, on_decide = null, on_undo = null, on_change = null, on_done = null,
+                        label: str = "Approvals", class: str? = null) {
+    style global approval_queue_css
+    let all = approval_queue_clean(requests)
+    state decided = approval_queue_kept(saved) | filter((d) => find(all, (r) => r.id == d.id) != null)
+    state chosen = ""        // a request taken out of turn, on a tablet
+    state leaving = null     // { id, decision, reason }: a card on its way out
+    state asking = ""        // the decision a reason is being asked for
+    state reason = ""
+    state bad = false
+    state g = null
+    state dragged = false
+    state armed = false
+    state card = null
+    state dlg = null
+    state field = null
+    state win = null
+    state said = ""
+    let pending = approval_queue_pending(all, decided)
+    let total = len(all)
+    let left = len(pending)
+    let cur = find(pending, (r) => r.id == chosen) ?? first(pending)
+    let tally = approval_queue_tally(decided)
+    let chips = type_of(reasons) == "list" ? reasons | filter((r) => filled(r) != null) | map((r) => str(r)) : []
+    let buzz = (kind: str, ms: int) => {
+        if win != null {
+            if win.quilloNative != null {
+                js("quilloNative.haptic", kind)
+            } else {
+                if win.navigator.vibrate != null && js("navigator.userActivation.hasBeenActive") == true { js("navigator.vibrate", ms) }
+            }
+        }
+    }
+    let home = () => {
+        card.style.transform = ""
+        card.style.opacity = ""
+        let stamps = card.querySelectorAll(".ui-approvals-stamp")
+        stamps[0].style.opacity = ""
+        stamps[1].style.opacity = ""
+    }
+    let fly = (d: str, why: str) => {
+        if leaving == null && cur != null {
+            leaving = { id: cur.id, decision: d, reason: why }
+            card.style.transform = `translateX(${d == "approved" ? 120 : -120}%) rotate(${d == "approved" ? 8 : -8}deg)`
+            card.style.opacity = "0"
+        }
+    }
+    let ask_reason = (d: str) => {
+        if leaving == null && cur != null {
+            if approval_queue_needs(reason_for, d) {
+                asking = d
+                reason = ""
+                bad = false
+                dlg.showModal()
+                field.focus()
+            } else {
+                fly(d, "")
+            }
+        }
+    }
+    let press_send = () => {
+        if approval_queue_reason_ok(reason, least) {
+            let d = asking
+            let why = trim(reason)
+            asking = ""
+            dlg.close()
+            fly(d, why)
+        } else {
+            bad = true
+            field.focus()
+        }
+    }
+    let take_back = () => {
+        if len(decided) > 0 && leaving == null {
+            let d = last(decided)
+            decided = slice(decided, 0, len(decided) - 1)
+            chosen = d.id
+            said = `${approval_queue_word(d.decision)} taken back.`
+            on_change && on_change(decided)
+            on_undo && on_undo(d)
+            buzz("selection", 8)
+            js("requestAnimationFrame", (_t = null) => { if card != null { card.focus() } })
+        }
+    }
+    if leaving != null {
+        every(210, () => {
+            let was = leaving
+            let r = find(all, (x) => x.id == was.id)
+            leaving = null
+            chosen = ""
+            // The next card takes the same place, with no sliding back to it.
+            card.classList.add("ui-approvals-still")
+            home()
+            decided = decided + [was]
+            said = `${approval_queue_word(was.decision)}: ${r.title}. ${left} left.`
+            on_change && on_change(decided)
+            on_decide && on_decide(was)
+            buzz(was.decision == "approved" ? "success" : "warning", 20)
+            if left == 0 { on_done && on_done(decided) }
+            js("requestAnimationFrame", (_t = null) => {
+                if card != null {
+                    card.classList.remove("ui-approvals-still")
+                    card.focus()
+                }
+            })
+        })
+    }
+    <section class={ui_cls(["ui-approvals", class])} aria-label={label}
+             @mount={(_me) => {
+                 let w = js("window")
+                 win = w
+             }}>
+        <div.ui-approvals-head>
+            <h2.ui-approvals-title>{label}</h2>
+            <span.ui-approvals-left>{total == 0 ? "None" : left == 0 ? "All done" : `${left} left of ${total}`}</span>
+        </div>
+        <div.ui-approvals-bar aria-hidden="true"><i style={`width: ${total > 0 ? round((total - left) * 100 / total, 1) : 0}%`}></i></div>
+        {total == 0 && <p.ui-approvals-none>Nothing to approve.</p>}
+        {total > 0 && <div.ui-approvals-body>
+            <ul.ui-approvals-side aria-label="Requests">
+                {for r in all => <li key={r.id}>
+                    <button.ui-approvals-row type="button" disabled={find(decided, (d) => d.id == r.id) != null} aria-current={cur != null && cur.id == r.id ? "true" : null}
+                            @click={() => { chosen = r.id }}>
+                        <span>{r.title}</span>
+                        <small>{find(decided, (d) => d.id == r.id) != null ? approval_queue_word(find(decided, (d) => d.id == r.id).decision) : ""}</small>
+                    </button>
+                </li>}
+            </ul>
+            <div.ui-approvals-main>
+                {left == 0 && <div.ui-approvals-done>
+                    <h3>All done</h3>
+                    <p>{tally.yes} approved, {tally.no} rejected.</p>
+                </div>}
+                {left > 0 && <div.ui-approvals-stack>
+                    {left > 2 && <div.ui-approvals-peek.ui-approvals-peek2 aria-hidden="true"></div>}
+                    {left > 1 && <div.ui-approvals-peek aria-hidden="true"></div>}
+                    <article.ui-approvals-card tabindex="0" aria-label={`${cur.title}. Right arrow approves, left arrow rejects.`}
+                             @mount={(me) => { card = me }}
+                             @contextmenu={(e) => { if g != null && g.on { e.preventDefault() } }}
+                             @keydown={(e) => {
+                                 if e.target.isSameNode(card) && e.key == "ArrowRight" { e.preventDefault(); ask_reason("approved") }
+                                 if e.target.isSameNode(card) && e.key == "ArrowLeft" { e.preventDefault(); ask_reason("rejected") }
+                             }}
+                             @pointerdown={(e) => {
+                                 dragged = false
+                                 let free = e.isPrimary && e.button == 0 && leaving == null && e.target.closest("a, button, input") == null
+                                 g = free ? { pid: e.pointerId, x: e.clientX, y: e.clientY, on: false, at: 0, moved: e.timeStamp, s: { pos: e.clientX, at: e.timeStamp, v: 0 } } : null
+                             }}
+                             @pointermove={(e) => {
+                                 if g != null && e.pointerId == g.pid {
+                                     let dx = e.clientX - g.x
+                                     let dy = e.clientY - g.y
+                                     if !g.on {
+                                         // Up and down is the page's, or the card's own if it is long.
+                                         if abs(dy) > 8 && abs(dy) >= abs(dx) { g = null }
+                                         if g != null && abs(dx) > 8 && abs(dx) > abs(dy) {
+                                             card.setPointerCapture(e.pointerId)
+                                             card.classList.add("ui-approvals-moving")
+                                             g = { ...g, on: true, slop: dx > 0 ? 8 : -8 }
+                                         }
+                                     }
+                                     if g != null && g.on {
+                                         let x = dx - g.slop
+                                         let w = card.offsetWidth
+                                         card.style.transform = `translateX(${x}px) rotate(${approval_queue_tilt(x, w)}deg)`
+                                         let stamps = card.querySelectorAll(".ui-approvals-stamp")
+                                         let shown = approval_queue_stamp(x, w)
+                                         stamps[0].style.opacity = x > 0 ? shown : 0
+                                         stamps[1].style.opacity = x < 0 ? shown : 0
+                                         let past = shown >= 1
+                                         if past != armed {
+                                             armed = past
+                                             if past { buzz("medium", 10) }
+                                         }
+                                         g = { ...g, at: x, moved: e.timeStamp, s: approval_queue_sample(g.s, e.clientX, e.timeStamp) }
+                                     }
+                                 }
+                             }}
+                             @pointerup={(e) => {
+                                 if g != null && e.pointerId == g.pid {
+                                     let was = g
+                                     g = null
+                                     if was.on {
+                                         armed = false
+                                         dragged = e.pointerType == "mouse"
+                                         card.classList.remove("ui-approvals-moving")
+                                         let v = approval_queue_speed(was.s, e.clientX, e.timeStamp, was.moved)
+                                         let end = approval_queue_settle(was.at, v, card.offsetWidth)
+                                         if end == "" || approval_queue_needs(reason_for, end) { home() }
+                                         if end != "" { ask_reason(end) }
+                                     }
+                                 }
+                             }}
+                             @pointercancel={(e) => {
+                                 if g != null && e.pointerId == g.pid {
+                                     let was = g
+                                     g = null
+                                     if was.on {
+                                         armed = false
+                                         card.classList.remove("ui-approvals-moving")
+                                         home()
+                                     }
+                                 }
+                             }}>
+                        <span.ui-approvals-stamp.ui-approvals-stamp-yes aria-hidden="true">Approve</span>
+                        <span.ui-approvals-stamp.ui-approvals-stamp-no aria-hidden="true">Reject</span>
+                        {cur.who != null && <p.ui-approvals-who>{str(cur.who)}</p>}
+                        <h3.ui-approvals-name>{cur.title}</h3>
+                        {cur.amount != null && <p.ui-approvals-amount>{str(cur.amount)}</p>}
+                        {cur.detail != null && <p.ui-approvals-detail>{str(cur.detail)}</p>}
+                        {len(cur.fields) > 0 && <dl.ui-approvals-fields>
+                            {for f in cur.fields => <div key={str(f.label)} style="display: contents"><dt>{str(f.label)}</dt><dd>{str(get(f, "value") ?? "")}</dd></div>}
+                        </dl>}
+                    </article>
+                </div>}
+                <div.ui-approvals-keys>
+                    <button.ui-approvals-btn.ui-approvals-no type="button" disabled={left == 0} @click={() => { ask_reason("rejected") }}>Reject</button>
+                    <button.ui-approvals-btn.ui-approvals-yes type="button" disabled={left == 0} @click={() => { ask_reason("approved") }}>Approve</button>
+                </div>
+                <button.ui-approvals-btn.ui-approvals-undo type="button" disabled={len(decided) == 0} @click={() => { take_back() }}>
+                    {len(decided) > 0 ? `Undo: ${approval_queue_word(last(decided).decision)}` : "Nothing to undo"}
+                </button>
+            </div>
+        </div>}
+        <dialog.ui-approvals-sheet aria-label={asking == "approved" ? "Why approve" : "Why reject"}
+                @mount={(me) => {
+                    dlg = me
+                    let w = js("window")
+                    let vv = w.visualViewport
+                    // What the keyboard covers, each time the visible part of the window changes.
+                    let fit = (_e = null) => {
+                        if vv != null {
+                            me.style.setProperty("--ui-approvals-kb", `${approval_queue_covered(w.innerHeight, vv.height, vv.offsetTop)}px`)
+                        }
+                    }
+                    if vv != null {
+                        vv.addEventListener("resize", fit)
+                        vv.addEventListener("scroll", fit)
+                    }
+                    () => {
+                        if vv != null {
+                            vv.removeEventListener("resize", fit)
+                            vv.removeEventListener("scroll", fit)
+                        }
+                    }
+                }}
+                @click={(e) => { if e.target.isSameNode(dlg) { dlg.close() } }}
+                @close={() => { asking = "" }}>
+            <h3>{asking == "approved" ? "Why approve" : "Why reject"} {cur != null ? cur.title : ""}?</h3>
+            {len(chips) > 0 && <div.ui-approvals-chips role="group" aria-label="Common reasons">
+                {for c in chips => <button.ui-approvals-chip key={c} type="button" @click={() => {
+                    reason = c
+                    bad = false
+                }}>{c}</button>}
+            </div>}
+            // Tied by wrapping, as several on a page would share any id written here.
+            <label>
+                <span.ui-sr>Reason</span>
+                <textarea.ui-approvals-field value={reason} aria-invalid={bad ? "true" : "false"} placeholder="Say why"
+                          @mount={(me) => { field = me }}
+                          @input={(e) => {
+                              reason = e.value
+                              bad = false
+                          }}></textarea>
+            </label>
+            <p.ui-approvals-err role="alert">{bad ? `A reason is needed, of ${least} letters or more.` : ""}</p>
+            <div.ui-approvals-sheet-keys>
+                <button.ui-approvals-btn.ui-approvals-cancel type="button" @click={() => { dlg.close() }}>Cancel</button>
+                <button class={ui_cls(["ui-approvals-btn", "ui-approvals-send", asking == "approved" ? "ui-approvals-yes" : "ui-approvals-no"])} type="button" @click={() => { press_send() }}>{asking == "approved" ? "Approve" : "Reject"}</button>
+            </div>
+        </dialog>
+        <span.ui-sr role="status">{said}</span>
+    </section>
+}

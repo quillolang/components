@@ -1,0 +1,269 @@
+// FunnelAnalyzer: step counts to a funnel that explains itself: what each step keeps
+// and loses, the biggest leak, and a what-if on any step that carries a better rate
+// through to the end, the steps after it keeping the rates they have. A step that
+// grows is warned about, since a funnel can only lose people.
+//
+//   <FunnelAnalyzer steps={[{ name: "Visited", count: 10000 }, { name: "Cart", count: 1800 }, { name: "Paid", count: 630 }]}/>
+//   <FunnelAnalyzer title="Sign-up" steps={steps} on_change={(f) => { end = f.end }}/>
+//
+// Rates are decimals and each what-if count is multiplied before it is divided, so a
+// rate of 40% on 4,500 is 1,800 and nothing drifts; people are rounded half up once,
+// at the end. Counts go up to 999,999,999,999.
+//
+// steps: the steps in order, each { name, count }; the reader can edit, add and remove
+// them (up to 30). title: the heading ("Funnel"). id: a prefix for its fields' ids
+// ("funnel-analyzer"), unique on the page. Each step's fields are named step_name and
+// step_count, once for each step in order, so a form around it gets them as lists;
+// the what-if's are what_if_step and what_if_rate; name: a prefix for those names.
+// on_change(result): inside one of your components, given { counts, end, overall,
+// leak, what_if } after each change, or null while a count is wrong: overall is a
+// decimal percentage, leak the leaking steps' names, what_if the end with the what-if
+// applied, or null.
+//
+// funnel_analyzer_rows(counts), funnel_analyzer_leak(rows) and
+// funnel_analyzer_what_if(counts, at, rate) are the arithmetic, for a program's own
+// use: rows are { count, lost, rate, overall, grew }, rate and overall being decimal
+// percentages (null where the step before held nobody), and what_if gives
+// { counts, end, gain, gain_rate } or { error }.
+
+import ui/theme.qwe use ui_cls
+
+let funnel_analyzer_css = css`
+.ui-funnel-analyzer { display: grid; gap: 14px; min-width: 0; max-width: 760px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-funnel-analyzer .ui-funnel-analyzer-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-funnel-analyzer-scroll { position: relative; min-width: 0; overflow-x: auto; }
+.ui-funnel-analyzer-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-funnel-analyzer-table { width: 100%; min-width: 560px; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-funnel-analyzer-table th { padding: 6px 8px; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: right; white-space: nowrap; }
+.ui-funnel-analyzer-table th:first-child { text-align: left; }
+.ui-funnel-analyzer-table td { padding: 6px 8px; border-bottom: 1px solid var(--ui-border); text-align: right; white-space: nowrap; }
+.ui-funnel-analyzer-table td:first-child { text-align: left; }
+.ui-funnel-analyzer-input { box-sizing: border-box; width: 100%; min-width: 0; height: 32px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-funnel-analyzer-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-funnel-analyzer-input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-funnel-analyzer-count { width: 110px; text-align: right; }
+.ui-funnel-analyzer-track { display: block; height: 4px; margin-top: 5px; border-radius: 2px; background: var(--ui-subtle); overflow: hidden; }
+.ui-funnel-analyzer-fill { display: block; height: 100%; background: var(--ui-accent); }
+.ui-funnel-analyzer-leaky td { background: var(--ui-danger-soft); }
+.ui-funnel-analyzer-leaky .ui-funnel-analyzer-fill { background: var(--ui-danger); }
+.ui-funnel-analyzer-button { min-height: 32px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 13px var(--ui-font); cursor: pointer; }
+.ui-funnel-analyzer-button:hover:not(:disabled) { border-color: var(--ui-strong); }
+.ui-funnel-analyzer-button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-funnel-analyzer-button:disabled { opacity: .55; cursor: not-allowed; }
+.ui-funnel-analyzer-live { display: grid; gap: 8px; min-width: 0; }
+.ui-funnel-analyzer-leak { margin: 0; padding: 10px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-weight: 600; }
+.ui-funnel-analyzer-warn { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+.ui-funnel-analyzer-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-funnel-analyzer-whatif { display: grid; gap: 10px; margin: 0; padding: 12px 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-funnel-analyzer-whatif legend { padding: 0 6px; font-weight: 600; }
+.ui-funnel-analyzer-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.ui-funnel-analyzer-field { display: grid; gap: 4px; min-width: 0; font-size: 13px; }
+.ui-funnel-analyzer-field .ui-funnel-analyzer-input { height: 36px; }
+.ui-funnel-analyzer-result { margin: 0; font-weight: 600; }
+.ui-funnel-analyzer-hint { margin: 0; color: var(--ui-muted); font-size: 13px; }
+@media (max-width: 480px) { .ui-funnel-analyzer-pair { grid-template-columns: minmax(0, 1fr); } }
+`
+
+let funnel_analyzer_limit = 30
+
+// A count as typed: a whole number of 0 or more, commas allowed, else null.
+fn funnel_analyzer_read(text) {
+    let t = replace(trim(str(text ?? "")), ",", "")
+    re.test(t, "^\\d{1,12}$") ? int(t) : null
+}
+
+// A percentage as typed, as a decimal: 0 to 100, a trailing % allowed, else null.
+fn funnel_analyzer_rate(text) {
+    let t = replace(trim(str(text ?? "")), "%", "")
+    if !re.test(t, "^\\d{1,3}(\\.\\d{1,6})?$") { return null }
+    let d = dec(t)
+    d > 100 ? null : d
+}
+
+fn funnel_analyzer_group(n: int) -> str {
+    if n < 1000 { return str(n) }
+    let rest = str(n % 1000)
+    `${funnel_analyzer_group(floor(n / 1000))},${repeat("0", 3 - len(rest))}${rest}`
+}
+
+// Whole people, the sign written when asked.
+fn funnel_analyzer_people(n: int, signed: bool = false) -> str =
+    `${n < 0 ? "-" : (signed && n > 0 ? "+" : "")}${funnel_analyzer_group(abs(n))}`
+
+fn funnel_analyzer_pct(d) -> str = d == null ? "None" : `${str(round(d, 1, "half_up"))}%`
+
+fn funnel_analyzer_rows(counts: list) -> list =
+    for i in range(len(counts)) {
+        let c = counts[i]
+        let before = i == 0 ? null : counts[i - 1]
+        {
+            count: c,
+            lost: before == null ? 0 : before - c,
+            rate: before == null || before == 0 ? null : dec(c) * 100 / dec(before),
+            overall: counts[0] == 0 ? null : dec(c) * 100 / dec(counts[0]),
+            grew: before != null && c > before,
+        }
+    }
+
+// The steps losing the most people, as indexes (several when they tie), and the most lost;
+// { at: [], lost: 0 } when nobody is lost anywhere.
+fn funnel_analyzer_leak(rows: list) -> map {
+    let most = max(rows | map((r) => r.lost)) ?? 0
+    if most <= 0 { return { at: [], lost: 0 } }
+    { at: range(len(rows)) | filter((i) => rows[i].lost == most), lost: most }
+}
+
+// Counts with step `at` converting at `rate` percent, what comes after keeping its rates.
+fn funnel_analyzer_what_if(counts: list, at: int, rate) -> map {
+    let before = counts[at - 1]
+    let today = counts[at]
+    let last = len(counts) - 1
+    if today == 0 && at < last { return { error: "Nobody reaches this step today, so the steps after it have no rate to carry the change through." } }
+    let reached = dec(before) * rate / 100
+    let scaled = for j in range(len(counts)) {
+        j < at ? counts[j] : int(round(j == at ? reached : reached * dec(counts[j]) / dec(today), 0, "half_up"))
+    }
+    let end = scaled[last]
+    let gain = end - counts[last]
+    { counts: scaled, end, gain, gain_rate: counts[last] == 0 ? null : dec(gain) * 100 / dec(counts[last]), error: null }
+}
+
+fn funnel_analyzer_names(steps: list, at: list) -> str {
+    let names = at | map((i) => steps[i])
+    len(names) == 1 ? names[0] : `${join(slice(names, 0, len(names) - 1), ", ")} and ${names[len(names) - 1]}`
+}
+
+fn funnel_analyzer_start(steps: list) -> list =
+    for i in range(min([len(steps), funnel_analyzer_limit])) {
+        let s = steps[i]
+        { id: i, name: str(s.name ?? ""), text: s.count == null ? "" : str(s.count) }
+    }
+
+fn funnel_analyzer_label(s: map, i: int) -> str = filled(trim(s.name)) ?? `Step ${i + 1}`
+
+component FunnelAnalyzer(steps: list = [], title: str = "Funnel", id: str = "funnel-analyzer", name: str? = null, on_change = null, class: str? = null) {
+    style global funnel_analyzer_css
+    state rows_in = funnel_analyzer_start(steps)
+    state serial = len(steps)
+    state picked = null
+    state rate_text = ""
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let labels = for i in range(len(rows_in)) => funnel_analyzer_label(rows_in[i], i)
+    let reads = rows_in | map((s) => funnel_analyzer_read(s.text))
+    let wrong = range(len(rows_in)) | filter((i) => reads[i] == null)
+    let enough = len(rows_in) >= 2
+    let ready = enough && len(wrong) == 0 && reads[0] != 0
+    let rows = ready ? funnel_analyzer_rows(reads) : []
+    let leak = ready ? funnel_analyzer_leak(rows) : { at: [], lost: 0 }
+    let grows = range(len(rows)) | filter((i) => rows[i].grew)
+    // What the what-if is on: the step picked, else the leak, else the second step.
+    let at = () => {
+        let i = picked == null ? null : index_of(rows_in | map((s) => s.id), picked)
+        (i != null && i >= 1 ? i : null) ?? first(leak.at) ?? 1
+    }
+    let at_step = ready ? at() : 1
+    let rate = trim(rate_text) == "" ? null : funnel_analyzer_rate(rate_text)
+    let rate_bad = trim(rate_text) != "" && rate == null
+    let result = ready && rate != null ? funnel_analyzer_what_if(reads, at_step, rate) : null
+    let applied = result != null && result.error == null
+    let leak_text = () => {
+        let share = funnel_analyzer_pct(dec(leak.lost) * 100 / dec(reads[leak.at[0] - 1]))
+        let from = funnel_analyzer_names(labels, leak.at | map((i) => i - 1))
+        let into = funnel_analyzer_names(labels, leak.at)
+        len(leak.at) == 1
+            ? `The biggest leak is ${from} to ${into}: ${funnel_analyzer_people(leak.lost)} people lost, ${share} of those who got that far.`
+            : `The biggest leaks tie: ${into}, each losing ${funnel_analyzer_people(leak.lost)} people.`
+    }
+    let tell = () => {
+        if on_change != null {
+            let r = rows_in | map((s) => funnel_analyzer_read(s.text))
+            if len(r) < 2 || any(r, (x) => x == null) || r[0] == 0 { on_change(null) } else {
+                let rs = funnel_analyzer_rows(r)
+                let lk = funnel_analyzer_leak(rs)
+                let names = for i in range(len(rows_in)) => funnel_analyzer_label(rows_in[i], i)
+                let p = trim(rate_text) == "" ? null : funnel_analyzer_rate(rate_text)
+                let w = p == null ? null : funnel_analyzer_what_if(r, at(), p)
+                on_change({ counts: r, end: r[len(r) - 1], overall: rs[len(r) - 1].overall, leak: lk.at | map((i) => names[i]),
+                            what_if: w == null || w.error != null ? null : w.end })
+            }
+        }
+    }
+    let edit = (sid: int, field: str, text: str) => {
+        rows_in = rows_in | map((s) => s.id == sid ? set(s, field, text) : s)
+        tell()
+    }
+    let add = () => {
+        rows_in = push(rows_in, { id: serial, name: "", text: "" })
+        serial += 1
+        tell()
+    }
+    let drop = (e, sid: int) => {
+        let box = e.target.closest(".ui-funnel-analyzer")
+        rows_in = rows_in | filter((s) => s.id != sid)
+        tell()
+        box.querySelector(".ui-funnel-analyzer-add").focus()
+    }
+    <section class={ui_cls(["ui-funnel-analyzer", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-funnel-analyzer-title id={`${id}-title`}>{title}</h3>
+        <div.ui-funnel-analyzer-scroll tabindex="0" role="group" aria-label="Funnel steps">
+            <table.ui-funnel-analyzer-table>
+                <thead><tr><th>Step</th><th>People</th><th>Kept</th><th>Lost</th><th>Of the first</th>{applied && <th>What-if</th>}<th><span.ui-sr>Remove</span></th></tr></thead>
+                <tbody>
+                    {for i in range(len(rows_in)) {
+                        let s = rows_in[i]
+                        let r = ready ? rows[i] : null
+                        <tr key={s.id} data-step={i} class={ready && contains(leak.at, i) ? "ui-funnel-analyzer-leaky" : ""}>
+                            <td>
+                                <label.ui-sr for={`${id}-name-${s.id}`}>Name of step {i + 1}</label>
+                                <input.ui-funnel-analyzer-input type="text" id={`${id}-name-${s.id}`} name={named("step_name")} value={s.name} placeholder={`Step ${i + 1}`} autocomplete="off"
+                                       @input={(e) => { edit(s.id, "name", e.value) }}/>
+                                {ready && <span.ui-funnel-analyzer-track aria-hidden="true"><span.ui-funnel-analyzer-fill style={`width: ${str(round(min([100m, r.overall ?? 0m]), 1, "half_up"))}%`}></span></span>}
+                            </td>
+                            <td>
+                                <label.ui-sr for={`${id}-count-${s.id}`}>People at {labels[i]}</label>
+                                <input.ui-funnel-analyzer-input.ui-funnel-analyzer-count type="text" inputmode="numeric" id={`${id}-count-${s.id}`} name={named("step_count")} value={s.text}
+                                       autocomplete="off" aria-invalid={reads[i] == null ? "true" : null} @input={(e) => { edit(s.id, "text", e.value) }}/>
+                            </td>
+                            <td data-k="rate">{ready && i > 0 ? funnel_analyzer_pct(r.rate) : ""}</td>
+                            <td data-k="lost">{ready && i > 0 ? funnel_analyzer_people(r.lost) : ""}</td>
+                            <td data-k="overall">{ready ? funnel_analyzer_pct(r.overall) : ""}</td>
+                            {applied && <td data-k="whatif">{funnel_analyzer_people(result.counts[i])}</td>}
+                            <td><button.ui-funnel-analyzer-button type="button" aria-label={`Remove ${labels[i]}`} @click={(e) => { drop(e, s.id) }}>Remove</button></td>
+                        </tr>
+                    }}
+                </tbody>
+            </table>
+        </div>
+        <div>
+            <button.ui-funnel-analyzer-button.ui-funnel-analyzer-add type="button" disabled={len(rows_in) >= funnel_analyzer_limit} @click={add}>Add a step</button>
+        </div>
+        <div.ui-funnel-analyzer-live aria-live="polite">
+            {!enough && <p.ui-funnel-analyzer-hint>A funnel needs at least two steps.</p>}
+            {enough && len(wrong) > 0 && <p.ui-funnel-analyzer-error role="alert">{wrong | map((i) => labels[i]) | join(", ")}: {len(wrong) == 1 ? "the count must be" : "the counts must be"} a whole number of 0 or more.</p>}
+            {enough && len(wrong) == 0 && reads[0] == 0 && <p.ui-funnel-analyzer-error role="alert">{labels[0]} has nobody in it, so there is nothing to follow.</p>}
+            {ready && <p.ui-funnel-analyzer-leak>{len(leak.at) > 0 ? leak_text() : "Nobody is lost between these steps."} {funnel_analyzer_pct(rows[len(rows) - 1].overall)} of {labels[0]} reach {labels[len(labels) - 1]}.</p>}
+            {ready && len(grows) > 0 && <p.ui-funnel-analyzer-warn>{funnel_analyzer_names(labels, grows)} {len(grows) == 1 ? "has" : "have"} more people than the step before. A funnel can only lose people: check the counts and the order of the steps.</p>}
+        </div>
+        {ready && <fieldset.ui-funnel-analyzer-whatif>
+            <legend>What if</legend>
+            <div.ui-funnel-analyzer-pair>
+                <label.ui-funnel-analyzer-field for={`${id}-at`}>Step to change
+                    <select.ui-funnel-analyzer-input id={`${id}-at`} name={named("what_if_step")} @change={(e) => { picked = int(e.value); tell() }}>
+                        {for i in range(1, len(rows_in)) => <option key={rows_in[i].id} value={rows_in[i].id} selected={i == at_step}>{labels[i - 1]} to {labels[i]}</option>}
+                    </select></label>
+                <label.ui-funnel-analyzer-field for={`${id}-rate`}>Rate instead of {funnel_analyzer_pct(rows[at_step].rate)} (%)
+                    <input.ui-funnel-analyzer-input type="text" inputmode="decimal" id={`${id}-rate`} name={named("what_if_rate")} value={rate_text} autocomplete="off" aria-invalid={rate_bad ? "true" : null}
+                           @input={(e) => { rate_text = e.value; tell() }}/></label>
+            </div>
+            <div aria-live="polite">
+                {rate_bad && <p.ui-funnel-analyzer-error role="alert">The rate must be a percentage from 0 to 100.</p>}
+                {result != null && result.error != null && <p.ui-funnel-analyzer-error role="alert">{result.error}</p>}
+                {applied && <p.ui-funnel-analyzer-result>{labels[len(labels) - 1]}: {funnel_analyzer_people(result.end)} instead of {funnel_analyzer_people(reads[len(reads) - 1])}, {funnel_analyzer_people(result.gain, true)} people{result.gain_rate == null ? "" : ` (${result.gain_rate > 0 ? "+" : ""}${funnel_analyzer_pct(result.gain_rate)})`}.</p>}
+                {ready && rate == null && !rate_bad && <p.ui-funnel-analyzer-hint>Type a rate to see what it does to the end of the funnel.</p>}
+            </div>
+        </fieldset>}
+    </section>
+}

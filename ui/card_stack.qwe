@@ -1,0 +1,290 @@
+// CardStack: payment cards in a fan, as they sit in a hand. A tap lifts one out, with a switch to
+// freeze it and its details, which stay hidden until asked for. Then each field shows or copies
+// by itself, so you can copy the number into a form with the security code still hidden. They
+// go again after a time, and when the app leaves the screen. On a tablet the fan stands beside
+// the card's details.
+//
+//   import ui/card_stack.qwe use CardStack
+//
+//   component Cards() {
+//       <CardStack today="2026-11-01" cards={[
+//           { id: "a", name: "Everyday", brand: "Visa", last4: "4242", color: "#27324b" },
+//           { id: "b", name: "Travel", brand: "Mastercard", last4: "4444", frozen: true }]}
+//                  on_reveal={(card) => card_details(card.id)}
+//                  on_freeze={(the_id, frozen) => set_frozen(the_id, frozen)}/>
+//   }
+//
+// cards: each { id, name, brand, last4, color, frozen, holder, number, expiry, cvv }. color: the
+// card's colour, as #rgb or #rrggbb (dark, as the text is white). The last four are for a
+// demo or a test: what is in `cards` is in the page's HTML, so for a real card pass only name,
+// brand and last4, and give the rest from on_reveal. label ("Your cards"). hide_after: seconds
+// the details stay (30). on_lift(id): the card lifted, null when put back. on_reveal(card):
+// gives { number, expiry, cvv, holder }, and may wait for a server fn, after your own check of
+// who is asking; an error value or null says so. on_freeze(id, frozen): may wait; an error
+// value or false puts the switch back and says so. on_copy(id, field): a field was copied.
+//
+// A clipboard keeps what it is given until something replaces it: the page says so.
+//
+// card_stack_fields(card) gives what shows, and card_stack_group(digits) writes a number.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let card_stack_css = css`
+.ui-cardstack { display: grid; gap: 14px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 14px/1.4 var(--ui-font); --ui-cardstack-w: min(100cqw - 28px, 340px); --ui-cardstack-h: calc(var(--ui-cardstack-w) / 1.586); --ui-cardstack-gap: 54px; }
+/* Each card shows a strip of 54 px, wide enough for a finger; the fan's lean is only a few degrees, as more would take from that. */
+.ui-cardstack-deck {
+  position: relative; width: var(--ui-cardstack-w); max-width: 100%; margin: 6px auto 0; padding: 0; list-style: none;
+  height: calc(var(--ui-cardstack-h) + (var(--ui-cardstack-n) - 1) * var(--ui-cardstack-gap) + 10px); transition: height .26s cubic-bezier(.2, .8, .2, 1);
+}
+.ui-cardstack-item {
+  position: absolute; inset: 0 0 auto 0; z-index: calc(var(--ui-cardstack-i) + 1); transform-origin: 50% 160%;
+  transform: translateY(calc(var(--ui-cardstack-i) * var(--ui-cardstack-gap))) rotate(calc(var(--ui-cardstack-lean) * 1.1deg));
+  transition: transform .26s cubic-bezier(.2, .8, .2, 1);
+}
+/* Lifted, it goes to the top, and the others line up below it, a strip each. */
+.ui-cardstack-lifted .ui-cardstack-deck { height: calc(var(--ui-cardstack-h) + 10px + (var(--ui-cardstack-n) - 1) * var(--ui-cardstack-gap)); overflow: clip; overflow-clip-margin: 8px; }
+.ui-cardstack-lifted .ui-cardstack-item { transform: translateY(calc(var(--ui-cardstack-h) + 10px + var(--ui-cardstack-r) * var(--ui-cardstack-gap))); }
+.ui-cardstack-lifted .ui-cardstack-chosen { z-index: 40; transform: none; }
+.ui-cardstack-card {
+  box-sizing: border-box; position: relative; display: grid; grid-template-rows: auto 1fr auto; width: 100%; height: var(--ui-cardstack-h); padding: 12px 16px; overflow: hidden; border: 0; border-radius: 14px;
+  background: var(--ui-cardstack-c, #2b2a3a); background-image: linear-gradient(135deg, rgba(255, 255, 255, .14), rgba(255, 255, 255, 0) 55%); color: #fff; box-shadow: 0 2px 10px rgba(15, 14, 24, .3);
+  font: 14px/1.3 var(--ui-font); text-align: left; cursor: pointer; touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ui-cardstack-card:focus-visible { outline: 3px solid var(--ui-accent); outline-offset: 2px; }
+.ui-cardstack-chosen .ui-cardstack-card { box-shadow: 0 10px 26px rgba(15, 14, 24, .4); }
+.ui-cardstack-row { display: flex; justify-content: space-between; gap: 8px; font-weight: 600; pointer-events: none; }
+.ui-cardstack-digits { align-self: end; font: 500 17px/1.2 var(--ui-mono); letter-spacing: .04em; font-variant-numeric: tabular-nums; pointer-events: none; }
+.ui-cardstack-brand { font-size: 13px; opacity: .92; pointer-events: none; }
+/* Frost over a frozen card, and the word, as a colour alone says nothing to some. */
+.ui-cardstack-frozen .ui-cardstack-card { background-image: linear-gradient(135deg, rgba(190, 225, 255, .55), rgba(190, 225, 255, .25)); }
+.ui-cardstack-tag { padding: 0 8px; border-radius: 999px; background: #fff; color: #0b4f8a; font-size: 12px; font-weight: 700; }
+.ui-cardstack-panel { display: grid; gap: 12px; min-width: 0; padding: 12px 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-cardstack-panel h3 { margin: 0; font-size: 16px; }
+.ui-cardstack-freeze { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: 48px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; touch-action: manipulation; }
+.ui-cardstack-freeze:disabled { opacity: .6; cursor: default; }
+.ui-cardstack-freeze:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: var(--ui-radius-sm); }
+.ui-cardstack-knob { position: relative; flex: none; width: 52px; height: 32px; border-radius: 999px; background: var(--ui-strong); transition: background .15s; }
+.ui-cardstack-knob::after { content: ""; position: absolute; top: 3px; left: 3px; width: 26px; height: 26px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, .3); transition: transform .15s; }
+.ui-cardstack-freeze[aria-checked="true"] .ui-cardstack-knob { background: var(--ui-info); }
+.ui-cardstack-freeze[aria-checked="true"] .ui-cardstack-knob::after { transform: translateX(20px); }
+.ui-cardstack-fields { display: grid; gap: 2px; margin: 0; }
+.ui-cardstack-field { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 2px 6px; min-height: 52px; border-top: 1px solid var(--ui-border); }
+.ui-cardstack-field dt { grid-column: 1; grid-row: 1; align-self: end; color: var(--ui-muted); font-size: 12px; }
+.ui-cardstack-field dd { grid-column: 1; grid-row: 2; align-self: start; margin: 0; font: 500 15px/1.3 var(--ui-mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; user-select: all; -webkit-user-select: all; }
+.ui-cardstack-mini { grid-row: 1 / span 2; align-self: center; min-width: 56px; min-height: 44px; padding: 0 8px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-accent); font: 600 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-cardstack-mini:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-cardstack-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-cardstack-err { color: var(--ui-danger); }
+.ui-cardstack-empty { margin: 0; padding: 16px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius); color: var(--ui-muted); text-align: center; }
+.ui-cardstack-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+/* Beside each other, on a tablet: the fan keeps its width, and the details take what is left. */
+@container (min-width: 620px) {
+  .ui-cardstack-lay { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 1fr); gap: 24px; align-items: start; }
+  .ui-cardstack-deck { margin: 6px 0 0; }
+}
+@media (hover: hover) { .ui-cardstack-mini:hover { background: var(--ui-subtle); } }
+@media (prefers-reduced-motion: reduce) { .ui-cardstack-item, .ui-cardstack-deck, .ui-cardstack-knob, .ui-cardstack-knob::after { transition: none; } }
+`
+
+// A number in fours, as a card has it. Other lengths are grouped the same way.
+fn card_stack_group(digits) -> str {
+    let d = re.replace(str(digits ?? ""), "\\D", "")
+    let n = len(d)
+    range(0, ceil(n / 4)) | map((i) => slice(d, i * 4, min([(i + 1) * 4, n]))) | join(" ")
+}
+
+// A colour safe to write into a style, or null.
+fn card_stack_color(c) -> str? {
+    if type_of(c) != "str" { return null }
+    re.test(c, "^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$") ? c : null
+}
+
+// What each field shows and copies: the digits alone go on the clipboard, for a form to take.
+fn card_stack_fields(d) -> list {
+    if d == null { return [] }
+    let number = re.replace(str(d.number ?? ""), "\\D", "")
+    let rows = [
+        { field: "number", label: "Card number", text: card_stack_group(number), copy: number, mask: `•••• •••• •••• ${slice(number, max([0, len(number) - 4]), len(number))}` },
+        { field: "expiry", label: "Expires", text: str(d.expiry ?? ""), copy: str(d.expiry ?? ""), mask: "••/••" },
+        { field: "cvv", label: "Security code", text: str(d.cvv ?? ""), copy: str(d.cvv ?? ""), mask: "•••" },
+        { field: "holder", label: "Name on card", text: str(d.holder ?? ""), copy: str(d.holder ?? ""), mask: "•••• ••••" },
+    ]
+    rows | filter((r) => r.copy != "")
+}
+
+// How far a card leans in the fan: nothing in the middle, more to the outside.
+fn card_stack_lean(i: int, n: int) -> num = i - (n - 1) / 2
+
+// A card's place among those left when one is lifted, so they close up with no gap.
+fn card_stack_rest(i: int, cards: list, lifted) -> int {
+    let at = index_of(cards | map((c) => c.id), lifted)
+    at != null && at >= 0 && at < i ? i - 1 : i
+}
+
+// Whether a card's details are held in `cards` itself.
+fn card_stack_has_details(c) -> bool = c != null && (c.number != null || c.cvv != null || c.expiry != null)
+
+component CardStack(cards: list = [], label: str = "Your cards", hide_after: int = 30, on_lift = null, on_reveal = null, on_freeze = null, on_copy = null) {
+    style global card_stack_css
+    state lifted = null      // the lifted card's id
+    state frozen = cards | filter((c) => c.frozen == true) | map((c) => c.id)
+    state pending = false    // a freeze is being asked for
+    state details = null     // what on_reveal gave, for the lifted card
+    state shown = []         // which fields are in plain sight
+    state until = 0          // when the details go, in ms
+    state note = ""
+    state bad = false
+    state loading = false
+    state win = null
+    let chosen = cards | find((c) => c.id == lifted)
+    let is_cold = lifted != null && contains(frozen, lifted)
+    let fields = card_stack_fields(details)
+    let forget = () => {
+        details = null
+        shown = []
+        until = 0
+    }
+    let speak = (text: str, wrong: bool) => {
+        note = text
+        bad = wrong
+    }
+    let lift = (the_id) => {
+        forget()
+        speak("", false)
+        lifted = lifted == the_id ? null : the_id
+        on_lift && on_lift(lifted)
+    }
+    let open_details = () => {
+        if chosen != null && !is_cold && !loading {
+            speak("", false)
+            let the_id = chosen.id
+            if on_reveal == null {
+                if card_stack_has_details(chosen) {
+                    details = chosen
+                    until = now() + hide_after * 1000
+                } else {
+                    speak("There are no details to show for this card.", true)
+                }
+            } else {
+                loading = true
+                let r = js("Promise.resolve", on_reveal(chosen))
+                loading = false
+                if lifted == the_id {
+                    if r == null || is_err(r) || r == false {
+                        speak("The details could not be fetched. Nothing was shown.", true)
+                    } else {
+                        details = r
+                        until = now() + hide_after * 1000
+                    }
+                }
+            }
+        }
+    }
+    let flip_field = (field: str) => {
+        shown = contains(shown, field) ? shown | filter((s) => s != field) : shown + [field]
+    }
+    let copy_field = (row) => {
+        // Nothing waits before the copy, as a browser allows it only straight after a tap.
+        let nav = win.navigator
+        let done = nav.clipboard == null ? false : js("Promise.resolve", nav.clipboard.writeText(row.copy))
+        if done == false || is_err(done) {
+            // The text is put in plain sight and can be selected by a long press.
+            if !contains(shown, row.field) { shown = shown + [row.field] }
+            speak(`This browser could not copy it. Hold on the ${lower(row.label)} to select it.`, true)
+        } else {
+            speak(`${row.label} copied. It stays on the clipboard until you copy something else.`, false)
+            on_copy && on_copy(lifted, row.field)
+        }
+    }
+    let set_cold = (the_id, on: bool) => { frozen = on ? frozen + [the_id] : frozen | filter((f) => f != the_id) }
+    let freeze = () => {
+        if lifted != null && !pending {
+            let the_id = lifted
+            let want = !contains(frozen, the_id)
+            speak("", false)
+            set_cold(the_id, want)
+            if want { forget() }
+            if on_freeze != null {
+                pending = true
+                let r = js("Promise.resolve", on_freeze(the_id, want))
+                pending = false
+                if r == false || is_err(r) {
+                    set_cold(the_id, !want)
+                    speak(`The card could not be ${want ? "frozen" : "unfrozen"}. Nothing changed.`, true)
+                }
+            }
+        }
+    }
+    let leave = (_e = null) => {
+        if win.document.visibilityState == "hidden" { forget() }
+    }
+    if details != null {
+        every(1000, () => {
+            if now() >= until {
+                forget()
+                speak("The details were hidden again.", false)
+            }
+        })
+    }
+    <section class={ui_cls(["ui-cardstack", lifted != null && "ui-cardstack-lifted"])} aria-label={label} style={`--ui-cardstack-n: ${max([1, len(cards)])}`}
+             @mount={(_el) => {
+                 let doc = js("document")
+                 win = js("window")
+                 doc.addEventListener("visibilitychange", leave)
+                 () => { doc.removeEventListener("visibilitychange", leave) }
+             }}
+             @keydown={(e) => {
+                 if e.key == "Escape" && lifted != null {
+                     e.preventDefault()
+                     lift(lifted)
+                 }
+             }}>
+        {len(cards) == 0 && <p.ui-cardstack-empty>No cards yet.</p>}
+        {len(cards) > 0 && <div.ui-cardstack-lay>
+            <ol.ui-cardstack-deck>
+                {for p in enumerate(cards) => <li key={p[1].id}
+                     class={ui_cls(["ui-cardstack-item", lifted == p[1].id && "ui-cardstack-chosen", contains(frozen, p[1].id) && "ui-cardstack-frozen"])}
+                     style={`--ui-cardstack-i: ${p[0]}; --ui-cardstack-lean: ${card_stack_lean(p[0], len(cards))}; --ui-cardstack-r: ${card_stack_rest(p[0], cards, lifted)}${card_stack_color(p[1].color) != null ? `; --ui-cardstack-c: ${card_stack_color(p[1].color)}` : ""}`}>
+                    <button.ui-cardstack-card type="button" aria-expanded={lifted == p[1].id ? "true" : "false"}
+                            aria-label={`${p[1].name}, ${p[1].brand != null ? p[1].brand : "card"}, ending ${p[1].last4}${contains(frozen, p[1].id) ? ", frozen" : ""}`}
+                            @click={() => { lift(p[1].id) }}>
+                        <span.ui-cardstack-row>
+                            <span>{p[1].name}</span>
+                            {contains(frozen, p[1].id) ? <span.ui-cardstack-tag>Frozen</span> : <span.ui-cardstack-brand>{p[1].brand}</span>}
+                        </span>
+                        <span></span>
+                        <span.ui-cardstack-digits>•••• {p[1].last4}</span>
+                    </button>
+                </li>}
+            </ol>
+            <div>
+                {chosen != null && <div.ui-cardstack-panel>
+                    <h3>{chosen.name}</h3>
+                    <button.ui-cardstack-freeze type="button" role="switch" aria-checked={is_cold ? "true" : "false"} disabled={pending} @click={freeze}>
+                        <span>{is_cold ? "Frozen: no payments can be made" : "Freeze this card"}</span>
+                        <span.ui-cardstack-knob aria-hidden="true"></span>
+                    </button>
+                    {is_cold && <p.ui-cardstack-note>Unfreeze this card to see its details.</p>}
+                    {!is_cold && details == null && <div.ui-cardstack-acts><Button size="lg" variant="outline" loading={loading} on_click={open_details}>Show card details</Button></div>}
+                    {details != null && <dl.ui-cardstack-fields>
+                        {for f in fields => <div.ui-cardstack-field key={f.field}>
+                            <dt>{f.label}</dt>
+                            <dd data-field={f.field}>{contains(shown, f.field) ? f.text : f.mask}</dd>
+                            <button.ui-cardstack-mini type="button" aria-label={`${contains(shown, f.field) ? "Hide" : "Show"} ${lower(f.label)}`} @click={() => { flip_field(f.field) }}>{contains(shown, f.field) ? "Hide" : "Show"}</button>
+                            <button.ui-cardstack-mini type="button" aria-label={`Copy ${lower(f.label)}`} @click={() => { copy_field(f) }}>Copy</button>
+                        </div>}
+                    </dl>}
+                    <div.ui-cardstack-acts>
+                        {details != null && <Button size="lg" variant="ghost" on_click={() => {
+                            forget()
+                            speak("", false)
+                        }}>Hide details</Button>}
+                        <Button size="lg" variant="ghost" on_click={() => { lift(lifted) }}>Put back</Button>
+                    </div>
+                </div>}
+                {note != "" && <p class={ui_cls(["ui-cardstack-note", bad && "ui-cardstack-err"])} role={bad ? "alert" : "status"}>{note}</p>}
+            </div>
+        </div>}
+    </section>
+}

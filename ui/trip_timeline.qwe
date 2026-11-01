@@ -1,0 +1,272 @@
+// TripTimeline: the legs of a trip, in order, through however many time zones, each in the
+// local time of where it happens: the flight leaves at 22:40 in Lisbon and lands at 06:15 in
+// Dubai, the next day, and takes what it really takes. It marks what is past, what is under way
+// and the next leg, which stands out and counts down by itself, and says what a person needs
+// between legs: the wait, a change of clocks, a change of day. A time carries its own offset,
+// so it reads the same on a phone in any zone, with no table of zones and no network.
+//
+//   import ui/trip_timeline.qwe use TripTimeline
+//
+//   <TripTimeline title="Lisbon to Tokyo" now="2026-11-03T14:05:00+00:00" legs={[
+//       { id: 1, kind: "flight", title: "TP 1012", from: "Lisbon", to: "Dubai", ref: "Seat 14A",
+//         departs: "2026-11-03T22:40:00+00:00", arrives: "2026-11-04T09:15:00+04:00" },
+//       { id: 2, kind: "stay", title: "Airport hotel", from: "Dubai", departs: "2026-11-04T11:00:00+04:00" },
+//   ]}/>
+//
+// legs: a list of { id, kind, title, from, to?, departs, arrives?, ref?, note? }. kind: "flight",
+// "train", "bus", "ferry", "car", "stay" or "walk" (anything else draws a dot). departs,
+// arrives: ISO date-times with the offset of where they happen, shown as written. They need not
+// come in order. A leg whose `departs` cannot be read is left out, and counted; an `arrives`
+// that cannot be read, or that comes before it left, is treated as not given. now: the moment,
+// the same form, so that server and browser write the same; left out, nothing is marked until
+// the page has started, from the phone's clock. tick: seconds between looks at the clock (30).
+// title: the trip's heading. on_pick(leg): a leg pressed, inside one of your components.
+//
+// The equal of scrolling to find what is next is "Go to next", which also moves focus there.
+//
+// trip_timeline_rows, trip_timeline_mark, trip_timeline_span and trip_timeline_shift are the
+// working.
+
+import ui/theme.qwe use ui_cls
+
+let trip_timeline_css = css`
+.ui-triptl { position: relative; container-type: inline-size; font: 15px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-triptl-in { display: grid; gap: 14px; }
+.ui-triptl-side { display: grid; gap: 8px; align-content: start; }
+.ui-triptl-title { margin: 0; font-size: 20px; font-weight: 700; overflow-wrap: anywhere; }
+.ui-triptl-next {
+  margin: 0; padding: 12px 14px; border-radius: var(--ui-radius); background: var(--ui-accent-soft); color: var(--ui-fg); font-weight: 600;
+}
+.ui-triptl-next span { display: block; color: var(--ui-muted); font-size: 13px; font-weight: 400; }
+.ui-triptl-go {
+  box-sizing: border-box; justify-self: start; min-width: 44px; min-height: 44px; padding: 0 16px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-triptl-go:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-triptl-list { margin: 0; padding: 0; list-style: none; }
+.ui-triptl-day { margin: 16px 0 6px; color: var(--ui-muted); font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+.ui-triptl-item:first-child .ui-triptl-day { margin-top: 0; }
+.ui-triptl-leg {
+  box-sizing: border-box; display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 2px 10px; width: 100%; min-height: 72px; padding: 10px 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: inherit; font: inherit; text-align: left; cursor: pointer; scroll-margin: 12px; -webkit-tap-highlight-color: transparent;
+}
+.ui-triptl-leg:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-triptl-leg[data-mark="past"] { opacity: .62; }
+.ui-triptl-leg[data-mark="now"] { border-color: var(--ui-success); box-shadow: inset 4px 0 0 var(--ui-success); }
+.ui-triptl-leg[data-mark="next"] { border-color: var(--ui-accent); box-shadow: inset 4px 0 0 var(--ui-accent), 0 0 0 1px var(--ui-accent); }
+.ui-triptl-icon { grid-row: 1 / span 3; display: grid; place-items: center; width: 36px; height: 36px; border-radius: 50%; background: var(--ui-subtle); color: var(--ui-fg); }
+.ui-triptl-icon svg { width: 20px; height: 20px; }
+.ui-triptl-name { font-weight: 600; overflow-wrap: anywhere; }
+.ui-triptl-times { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; font-variant-numeric: tabular-nums; }
+.ui-triptl-times b { font-size: 19px; font-weight: 700; }
+.ui-triptl-where { color: var(--ui-muted); font-size: 13px; overflow-wrap: anywhere; }
+.ui-triptl-off { color: var(--ui-muted); font-size: 12px; }
+.ui-triptl-more { grid-column: 2; color: var(--ui-muted); font-size: 13px; overflow-wrap: anywhere; }
+.ui-triptl-gap { display: flex; flex-wrap: wrap; gap: 0 10px; margin: 4px 0 4px 17px; padding: 6px 0 6px 18px; border-left: 2px dashed var(--ui-strong); color: var(--ui-muted); font-size: 13px; }
+.ui-triptl-gap:empty { display: none; }
+.ui-triptl-shift { color: var(--ui-fg); font-weight: 600; }
+.ui-triptl-empty { padding: 20px 8px; color: var(--ui-muted); text-align: center; }
+/* With the room, what is next stays in sight beside the whole trip. */
+@container (min-width: 620px) {
+  .ui-triptl-in { grid-template-columns: 250px minmax(0, 1fr); align-items: start; gap: 24px; }
+  .ui-triptl-side { position: sticky; top: 12px; }
+}
+@media (hover: hover) { .ui-triptl-leg:hover { border-color: var(--ui-strong); } }
+`
+
+fn trip_timeline_clock() = now()
+
+fn trip_timeline_time(s) = type_of(s) == "str" && date.valid(s, "date-time")
+
+// The offset as minutes ahead of UTC: "+05:30" is 330.
+fn trip_timeline_minutes(off) {
+    if off == "Z" { return 0 }
+    let sign = slice(off, 0, 1) == "-" ? -1 : 1
+    sign * ((int(slice(off, 1, 3)) ?? 0) * 60 + (int(slice(off, 4, 6)) ?? 0))
+}
+
+// How a person would say an offset: UTC, UTC+1, UTC-3:30.
+fn trip_timeline_utc(off) {
+    let m = trip_timeline_minutes(off)
+    if m == 0 { return "UTC" }
+    let rest = abs(m) % 60
+    `UTC${m < 0 ? "-" : "+"}${floor(abs(m) / 60)}${rest == 0 ? "" : `:${rest < 10 ? "0" : ""}${rest}`}`
+}
+
+// The calendar date a date-time was written in, which is the local one.
+fn trip_timeline_day(t) = slice(t, 0, 10)
+
+// 1 h 35 min, 45 min, 3 days 2 h. Whole minutes.
+fn trip_timeline_span(ms) {
+    let mins = round(ms / 60000)
+    if mins < 1 { return "under 1 min" }
+    let days = floor(mins / 1440)
+    let hours = floor((mins % 1440) / 60)
+    let rest = mins % 60
+    if days > 0 { return hours > 0 ? `${days} ${days == 1 ? "day" : "days"} ${hours} h` : `${days} ${days == 1 ? "day" : "days"}` }
+    if hours > 0 { return rest > 0 ? `${hours} h ${rest} min` : `${hours} h` }
+    `${rest} min`
+}
+
+// What changing from one offset to another does to a person's watch, or "".
+fn trip_timeline_shift(from_off, to_off) {
+    let m = trip_timeline_minutes(to_off) - trip_timeline_minutes(from_off)
+    if m == 0 { return "" }
+    `Clocks go ${m > 0 ? "forward" : "back"} ${trip_timeline_span(abs(m) * 60000)}`
+}
+
+// The local day an arrival falls on, against the day it left: "", "next day", "+2 days",
+// "previous day" (crossing the date line eastward does that).
+fn trip_timeline_day_change(from_t, to_t) {
+    let n = date.days_between(trip_timeline_day(from_t), trip_timeline_day(to_t))
+    if n == 0 { return "" }
+    if n == 1 { return "next day" }
+    if n == -1 { return "previous day" }
+    `${n > 0 ? "+" : ""}${n} days`
+}
+
+// The legs that can be read, in the order they really happen, whatever their offsets, with
+// what each one needs worked out once.
+fn trip_timeline_rows(legs) {
+    let good = (type_of(legs) == "list" ? legs : []) | filter((l) => type_of(l) == "map" && trip_timeline_time(l.departs))
+    let made = good | enumerate() | map((pair) => {
+        let l = pair[1]
+        let dep = date.ms(l.departs)
+        let arr_ok = trip_timeline_time(l.arrives) && date.ms(l.arrives) >= dep
+        { id: l.id ?? pair[0], leg: l, dep: dep, arr: arr_ok ? date.ms(l.arrives) : null, arrives: arr_ok ? l.arrives : null,
+          dep_off: date.parts(l.departs).offset, arr_off: arr_ok ? date.parts(l.arrives).offset : null, order: pair[0] }
+    })
+    made | sort_by((r) => r.dep)
+}
+
+// Each row's mark at `ms`: "past", "now" (under way), "next" or "later". One row at most is
+// "next": the first still to leave. A row with no end is under way only until the next
+// leg leaves, and a stay is never quite over until it is.
+fn trip_timeline_mark(rows, ms) {
+    if ms == null { return rows | map((_r) => "later") }
+    let n = len(rows)
+    let first_ahead = index_of(rows | map((r) => r.dep > ms), true)
+    for pair in enumerate(rows) => {
+        let i = pair[0]
+        let r = pair[1]
+        let ends = r.arr ?? (i + 1 < n ? rows[i + 1].dep : r.dep)
+        i == first_ahead ? "next" : (r.dep > ms ? "later" : (ends > ms ? "now" : "past"))
+    }
+}
+
+// What stands between one leg and the next: the wait, by real time, and a change of clocks.
+fn trip_timeline_between(a, b) {
+    let end = a.arr ?? a.dep
+    let off = a.arr_off ?? a.dep_off
+    { wait: a.arr != null && b.dep > end ? trip_timeline_span(b.dep - end) : "", shift: trip_timeline_shift(off, b.dep_off) }
+}
+
+// "in 8 h 35 min", or "left 5 min ago".
+fn trip_timeline_until(ms, now_ms) = ms >= now_ms ? `in ${trip_timeline_span(ms - now_ms)}` : `${trip_timeline_span(now_ms - ms)} ago`
+
+fn trip_timeline_icon(kind) = match kind {
+    "flight" => "M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5Z"
+    "train" => "M12 2c-4 0-8 .5-8 4v9.5A3.5 3.5 0 0 0 7.5 19L6 20.5v.5h12v-.5L16.5 19a3.5 3.5 0 0 0 3.5-3.5V6c0-3.5-4-4-8-4ZM7.5 17a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm9 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3ZM18 11H6V6h12v5Z"
+    "bus" => "M4 16c0 .9.4 1.7 1 2.2V20a1 1 0 0 0 1 1h1a1 1 0 0 0 1-1v-1h8v1a1 1 0 0 0 1 1h1a1 1 0 0 0 1-1v-1.8c.6-.5 1-1.3 1-2.2V6c0-3.5-3.6-4-8-4s-8 .5-8 4v10Zm3.5 1a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm9 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3ZM18 11H6V6h12v5Z"
+    "ferry" => "M20 21c-1.4 0-2.8-.5-4-1.3a7 7 0 0 1-8 0C6.8 20.5 5.4 21 4 21H2v2h2c1.4 0 2.7-.3 4-1a8.8 8.8 0 0 0 8 0c1.3.7 2.6 1 4 1h2v-2h-2ZM3.9 19H4c1.6 0 3-.9 4-2 1 1.1 2.4 2 4 2s3-.9 4-2c1 1.1 2.4 2 4 2h.1l1.9-6.7a1 1 0 0 0-.7-1.2L20 10.6V6a2 2 0 0 0-2-2h-3V1H9v3H6a2 2 0 0 0-2 2v4.6l-1.3.5a1 1 0 0 0-.7 1.2L3.9 19ZM6 6h12v4l-6-2-6 2V6Z"
+    "car" => "M19 5H5L3 11v8a1 1 0 0 0 1 1h1a1 1 0 0 0 1-1v-1h12v1a1 1 0 0 0 1 1h1a1 1 0 0 0 1-1v-8l-2-6ZM6.5 15a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm11 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3ZM5 10l1.5-3.5h11L19 10H5Z"
+    "stay" => "M7 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm12-6h-8v7H3V5H1v15h2v-3h18v3h2v-9a4 4 0 0 0-4-4Z"
+    "walk" => "M13.5 5.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM9.8 8.9 7 23h2.1l1.8-8 2.1 2v6h2v-7.5l-2.1-2 .6-3A7.3 7.3 0 0 0 19 13v-2c-1.9 0-3.5-1-4.3-2.4l-1-1.6a2 2 0 0 0-2.5-.8L6 8.3V13h2V9.6l1.8-.7Z"
+    _ => "M12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10Z"
+}
+
+fn trip_timeline_offset() {
+    let off = 0 - js_new("Date").getTimezoneOffset()
+    let hh = floor(abs(off) / 60)
+    `${off < 0 ? "-" : "+"}${hh < 10 ? "0" : ""}${hh}:${abs(off) % 60 < 10 ? "0" : ""}${abs(off) % 60}`
+}
+
+view TripTimelineTimes(label: str, t: str, place, note: str = "") =
+    <span.ui-triptl-times>
+        <b>{date.format(t, "HH:mm")}</b>
+        <span.ui-triptl-where>{label} {place ?? ""}</span>
+        <span.ui-triptl-off>{trip_timeline_utc(date.parts(t).offset)}{note != "" ? `, ${note}` : ""}</span>
+    </span>
+
+component TripTimeline(legs = [], now: str? = null, tick: num = 30, title: str = "Your trip", on_pick = null, class: str? = null) {
+    style global trip_timeline_css
+    state base = trip_timeline_time(now) ? date.ms(now) : null
+    state seen_now = now
+    state since = 0
+    state moved_on = 0
+    state box = null
+    if now != seen_now {
+        seen_now = now
+        if trip_timeline_time(now) {
+            base = date.ms(now)
+            since = trip_timeline_clock()
+            moved_on = 0
+        }
+    }
+    if tick > 0 && base != null { every(round(tick * 1000), () => { moved_on = trip_timeline_clock() - since }) }
+
+    let rows = trip_timeline_rows(legs)
+    let at_ms = base == null ? null : base + moved_on
+    let marks = trip_timeline_mark(rows, at_ms)
+    let count = len(rows)
+    let next_i = index_of(marks, "next")
+    let now_i = index_of(marks, "now")
+    let aim_i = next_i ?? now_i
+    let aim = aim_i != null ? rows[aim_i] : null
+    let left_out = type_of(legs) == "list" ? len(legs) - count : 0
+    let done = at_ms != null && count > 0 && next_i == null && now_i == null
+    let until = next_i != null ? trip_timeline_until(rows[next_i].dep, at_ms) : ""
+    <section class={ui_cls(["ui-triptl", class])} aria-label={title} @mount={(el) => {
+        box = el
+        since = trip_timeline_clock()
+        if base == null { base = since }
+    }}>
+        <div.ui-triptl-in>
+            <div.ui-triptl-side>
+                <h3.ui-triptl-title>{title}</h3>
+                {aim != null && <p.ui-triptl-next data-state={next_i != null ? "next" : "now"}>
+                    {next_i != null ? `Next: ${aim.leg.title ?? "Your next leg"} ${until}` : `Under way: ${aim.leg.title ?? "This leg"}`}
+                    <span>{date.format(aim.leg.departs, "ddd D MMM, HH:mm")} in {aim.leg.from ?? "local time"}</span>
+                </p>}
+                {done && <p.ui-triptl-next data-state="done">That was the last leg.</p>}
+                {aim != null && <button.ui-triptl-go type="button" @click={() => {
+                    let el = box.querySelector(`[data-mark="${next_i != null ? "next" : "now"}"]`)
+                    if el != null {
+                        let calm = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+                        el.focus({ preventScroll: true })
+                        el.scrollIntoView({ block: "center", behavior: calm ? "auto" : "smooth" })
+                    }
+                }}>Go to next</button>}
+                {left_out > 0 && <p.ui-triptl-where>{left_out == 1 ? "One leg has no time that can be read." : `${left_out} legs have no time that can be read.`}</p>}
+            </div>
+            {count == 0
+                ? <p.ui-triptl-empty>No legs on this trip yet.</p>
+                : <ol.ui-triptl-list>
+                      {for pair in enumerate(rows) => {
+                          let i = pair[0]
+                          let r = pair[1]
+                          let before = i > 0 ? rows[i - 1] : null
+                          let new_day = before == null || trip_timeline_day(before.leg.departs) != trip_timeline_day(r.leg.departs)
+                          let gap = before != null ? trip_timeline_between(before, r) : null
+                          let inside = r.arrives != null ? trip_timeline_shift(r.dep_off, r.arr_off) : ""
+                          <li.ui-triptl-item key={r.id}>
+                              {new_day && <h4.ui-triptl-day>{date.format(r.leg.departs, "dddd D MMMM")}</h4>}
+                              {gap != null && (gap.wait != "" || gap.shift != "") && <div.ui-triptl-gap>
+                                  {gap.wait != "" && <span.ui-triptl-wait>{gap.wait} between</span>}
+                                  {gap.shift != "" && <span.ui-triptl-shift>{gap.shift}</span>}
+                              </div>}
+                              <button.ui-triptl-leg type="button" data-id={str(r.id)} data-mark={marks[i]} aria-current={marks[i] == "next" ? "step" : null}
+                                      @click={() => { on_pick && on_pick(r.leg) }}>
+                                  <span.ui-triptl-icon aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d={trip_timeline_icon(r.leg.kind)}/></svg></span>
+                                  <span.ui-triptl-name>{r.leg.title ?? "A leg"}</span>
+                                  <TripTimelineTimes label={r.leg.kind == "stay" ? "Check in," : "From"} t={r.leg.departs} place={r.leg.from}/>
+                                  {r.arrives != null && <TripTimelineTimes label={r.leg.kind == "stay" ? "Check out," : "To"} t={r.arrives} place={r.leg.to}
+                                                                           note={trip_timeline_day_change(r.leg.departs, r.arrives)}/>}
+                                  <span.ui-triptl-more>{r.arr != null ? trip_timeline_span(r.arr - r.dep) : ""}{r.arr != null && inside != "" ? ". " : ""}{inside}{(r.arr != null || inside != "") && r.leg.ref != null ? ". " : ""}{r.leg.ref ?? ""}{r.leg.note != null ? ` ${r.leg.note}` : ""}</span>
+                              </button>
+                          </li>
+                      }}
+                  </ol>}
+        </div>
+    </section>
+}

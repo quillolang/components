@@ -1,0 +1,247 @@
+// AbTestCalc: reads an A/B test from visitors and conversions per variant: the
+// rates, the lift, a two-proportion z-test with its p-value, a confidence interval
+// on the difference, and a verdict in plain words. It will not call a winner on too
+// small a sample, and says what the traffic could have detected at all.
+//
+//   <AbTestCalc visitors_a={10000} conversions_a={500} visitors_b={10000} conversions_b={580}/>
+//   <AbTestCalc names={["Old checkout", "New checkout"]} confidence={99} even_split={false}
+//               on_change={(f) => { lift = f.lift }}/>
+//
+// The method: the z-test pools the two rates (z = difference / sqrt(p(1 - p)(1/nA +
+// 1/nB))) and is two-sided; the interval does not pool, as is usual, so in a close
+// call the two can disagree by a hair. Rates are floats: a square root has no exact
+// decimal, and nothing here is money.
+//
+// visitors_a, conversions_a, visitors_b, conversions_b: where the fields start
+// (numbers or numeric text; empty by default). names: what the two variants are
+// called (["Control", "Variant"]). confidence: 80, 90, 95 or 99 percent (95), which
+// the reader can change. even_split: traffic was meant to be split evenly, so a
+// split further from even than chance allows is warned about (true). title: the
+// heading ("A/B test result"). id: a prefix for its fields' ids ("ab-test-calc"),
+// unique on the page. The fields are named visitors_a, conversions_a, visitors_b,
+// conversions_b and confidence, so a form around it sends them; name: a prefix for
+// those names. on_change(figures): inside one of your components, given the map
+// below after each change that leaves a complete test, or null when it does not.
+//
+// ab_test_calc_figures(visitors_a, conversions_a, visitors_b, conversions_b, confidence)
+// is the arithmetic, for a program's own use: { rate_a, rate_b, difference, lift, z, p,
+// low, high, detectable, significant, winner, small, testable }, with rates as
+// fractions; lift, z and p are null where they have no value (a control of 0%, no
+// conversions at all), and winner is "a", "b" or null. ab_test_calc_read(text) reads
+// a count, null when it is not one. ab_test_calc_verdict(figures, names, confidence)
+// gives the verdict's sentence.
+
+import ui/theme.qwe use ui_cls
+
+let ab_test_calc_css = css`
+.ui-ab-test-calc { display: grid; gap: 16px; min-width: 0; max-width: 620px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-ab-test-calc .ui-ab-test-calc-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-ab-test-calc-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; }
+.ui-ab-test-calc-arm { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-ab-test-calc-arm legend { padding: 0 0 6px; font-weight: 600; }
+.ui-ab-test-calc-field { display: grid; gap: 4px; min-width: 0; font-size: 13px; }
+.ui-ab-test-calc-field input, .ui-ab-test-calc-field select { box-sizing: border-box; width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-ab-test-calc-field input:hover, .ui-ab-test-calc-field select:hover { border-color: var(--ui-strong); }
+.ui-ab-test-calc-field input:focus, .ui-ab-test-calc-field select:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-ab-test-calc-field input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-ab-test-calc-level { max-width: 180px; }
+.ui-ab-test-calc-live { display: grid; gap: 12px; min-width: 0; }
+.ui-ab-test-calc-verdict { margin: 0; padding: 10px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-weight: 600; }
+.ui-ab-test-calc-win { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-ab-test-calc-early { background: var(--ui-warning-soft); color: var(--ui-warning); }
+.ui-ab-test-calc-out { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 20px; margin: 0; }
+.ui-ab-test-calc-out div { display: flex; justify-content: space-between; gap: 12px; min-width: 0; padding-bottom: 6px; border-bottom: 1px solid var(--ui-border); }
+.ui-ab-test-calc-out dt { color: var(--ui-muted); }
+.ui-ab-test-calc-out dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }
+.ui-ab-test-calc-wide { grid-column: 1 / -1; }
+.ui-ab-test-calc-notes { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-ab-test-calc-notes li { padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); }
+.ui-ab-test-calc-hint { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-ab-test-calc-errors { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+@media (max-width: 520px) { .ui-ab-test-calc-grid, .ui-ab-test-calc-out { grid-template-columns: minmax(0, 1fr); } }
+`
+
+let ab_test_calc_levels = [80, 90, 95, 99]
+
+// A count as typed: a whole number of 0 or more up to 15 digits (commas allowed), else null.
+fn ab_test_calc_read(text) {
+    let t = replace(trim(str(text ?? "")), ",", "")
+    re.test(t, "^\\d{1,15}$") ? int(t) : null
+}
+
+// A number with commas and exactly `places` decimals, worked out in whole numbers so
+// that the server and the browser write the same text.
+fn ab_test_calc_num(v: num, places: int) -> str {
+    let scale = pow(10, places)
+    let units = round(abs(v) * scale)
+    let whole = floor(units / scale)
+    let frac = str(units - whole * scale)
+    let tail = places == 0 ? "" : `.${repeat("0", places - len(frac))}${frac}`
+    `${v < 0 && units > 0 ? "-" : ""}${ab_test_calc_group(whole)}${tail}`
+}
+
+fn ab_test_calc_group(n: num) -> str {
+    if n < 1000 { return str(n) }
+    let rest = str(n % 1000)
+    `${ab_test_calc_group(floor(n / 1000))},${repeat("0", 3 - len(rest))}${rest}`
+}
+
+fn ab_test_calc_pct(x: num, places: int = 2) -> str = `${ab_test_calc_num(x * 100, places)}%`
+
+// A signed amount in percentage points, for a difference between two rates.
+fn ab_test_calc_points(x: num) -> str = `${x > 0 ? "+" : ""}${ab_test_calc_num(x * 100, 2)} pts`
+
+// The p-value as a reader wants it: small ones are only "below 0.0001".
+fn ab_test_calc_p_text(p: num) -> str = p < 0.0001 ? "below 0.0001" : ab_test_calc_num(p, 4)
+
+fn ab_test_calc_figures(visitors_a: int, conversions_a: int, visitors_b: int, conversions_b: int, confidence: num = 95) -> map {
+    let n1 = float(visitors_a)
+    let n2 = float(visitors_b)
+    let c1 = float(conversions_a)
+    let c2 = float(conversions_b)
+    let rate_a = c1 / n1
+    let rate_b = c2 / n2
+    let difference = rate_b - rate_a
+    let pooled = (c1 + c2) / (n1 + n2)
+    // With nobody converting, or everybody, the pooled spread is 0 and there is no test.
+    let se_pooled = sqrt(pooled * (1 - pooled) * (1 / n1 + 1 / n2))
+    let testable = se_pooled > 0
+    let z = testable ? difference / se_pooled : null
+    // erfc and not 1 - cdf, which is 0 past about z = 8.
+    let p = testable ? math.erfc(abs(z) / sqrt(2)) : null
+    let crit = stats.normal_inv(1 - (1 - confidence / 100) / 2)
+    let se = sqrt(rate_a * (1 - rate_a) / n1 + rate_b * (1 - rate_b) / n2)
+    let small = min([conversions_a, visitors_a - conversions_a, conversions_b, visitors_b - conversions_b]) < 10
+    let significant = testable && p < 1 - confidence / 100
+    {
+        rate_a, rate_b, difference, z, p, testable, small, significant,
+        lift: conversions_a == 0 ? null : difference / rate_a,
+        low: difference - crit * se,
+        high: difference + crit * se,
+        detectable: (crit + stats.normal_inv(0.8)) * se_pooled,
+        winner: significant ? (difference > 0 ? "b" : "a") : null,
+    }
+}
+
+// What is wrong with the numbers typed, one sentence for each thing, each saying where.
+fn ab_test_calc_problems(va, ca, vb, cb, names: list) -> list {
+    let arm = (label: str, v, c, tv, tc) => {
+        let bad = []
+        if v == null { bad = push(bad, tv == "" ? `${label}: visitors is empty.` : `${label}: visitors must be a whole number, not "${tv}".`) }
+        if v != null && v == 0 { bad = push(bad, `${label}: visitors must be above 0.`) }
+        if c == null { bad = push(bad, tc == "" ? `${label}: conversions is empty.` : `${label}: conversions must be a whole number, not "${tc}".`) }
+        if v != null && c != null && c > v { bad = push(bad, `${label}: conversions (${ab_test_calc_num(c, 0)}) cannot be above visitors (${ab_test_calc_num(v, 0)}).`) }
+        bad
+    }
+    arm(names[0], ab_test_calc_read(va), ab_test_calc_read(ca), trim(va), trim(ca)) + arm(names[1], ab_test_calc_read(vb), ab_test_calc_read(cb), trim(vb), trim(cb))
+}
+
+fn ab_test_calc_verdict(f: map, names: list, confidence: num) -> str {
+    let a = names[0]
+    let b = names[1]
+    if !f.testable { return f.rate_a == 0 ? "Nobody converted in either variant, so there is nothing to compare yet." : "Everybody converted in both variants, so there is nothing to compare." }
+    if f.small { return "Too early to call: the sample is too small to trust either way." }
+    if !f.significant {
+        return `No clear winner: a difference of ${ab_test_calc_num(abs(f.difference) * 100, 2)} points could well be chance (p = ${ab_test_calc_p_text(f.p)}).`
+    }
+    let top = f.winner == "b" ? b : a
+    let other = f.winner == "b" ? a : b
+    let lead = f.winner == "b" ? f.difference : -f.difference
+    `${top} beats ${other} by ${ab_test_calc_num(lead * 100, 2)} points at ${confidence}% confidence (p = ${ab_test_calc_p_text(f.p)}).`
+}
+
+// What the reader should know beyond the verdict.
+fn ab_test_calc_warnings(f: map, va: int, ca: int, vb: int, cb: int, names: list, even_split: bool) -> list {
+    let notes = []
+    if f.small {
+        let low = (label: str, c: int, n: int) => min([c, n - c]) < 10
+            ? [`${label} has ${ab_test_calc_num(c, 0)} conversions from ${ab_test_calc_num(n, 0)} visitors; the test needs at least 10 of each outcome in each variant.`] : []
+        notes = notes + low(names[0], ca, va) + low(names[1], cb, vb)
+    }
+    let split_z = abs(float(va) - float(vb)) / sqrt(float(va) + float(vb))
+    if even_split && math.erfc(split_z / sqrt(2)) < 0.001 {
+        let share = float(va) / (float(va) + float(vb))
+        notes = push(notes, `Traffic split ${ab_test_calc_pct(share, 1)} to ${ab_test_calc_pct(1 - share, 1)}, further from even than chance allows: check how visitors were assigned before trusting this.`)
+    }
+    notes
+}
+
+component AbTestCalc(visitors_a = null, conversions_a = null, visitors_b = null, conversions_b = null, names: list = ["Control", "Variant"],
+                     confidence: int = 95, even_split: bool = true, title: str = "A/B test result", id: str = "ab-test-calc",
+                     name: str? = null, on_change = null, class: str? = null) {
+    style global ab_test_calc_css
+    state va = visitors_a == null ? "" : str(visitors_a)
+    state ca = conversions_a == null ? "" : str(conversions_a)
+    state vb = visitors_b == null ? "" : str(visitors_b)
+    state cb = conversions_b == null ? "" : str(conversions_b)
+    state level = contains(ab_test_calc_levels, confidence) ? confidence : 95
+    let labels = [filled(str(names[0] ?? "")) ?? "Control", filled(str(names[1] ?? "")) ?? "Variant"]
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let blank = trim(va) == "" && trim(ca) == "" && trim(vb) == "" && trim(cb) == ""
+    let problems = blank ? [] : ab_test_calc_problems(va, ca, vb, cb, labels)
+    let ready = !blank && len(problems) == 0
+    let reads = [va, ca, vb, cb] | map(ab_test_calc_read)
+    let f = ready ? ab_test_calc_figures(reads[0], reads[1], reads[2], reads[3], level) : null
+    let notes = ready ? ab_test_calc_warnings(f, reads[0], reads[1], reads[2], reads[3], labels, even_split) : []
+    let tell = () => {
+        if on_change != null {
+            let r = [va, ca, vb, cb] | map(ab_test_calc_read)
+            let good = len(ab_test_calc_problems(va, ca, vb, cb, labels)) == 0
+            on_change(good ? ab_test_calc_figures(r[0], r[1], r[2], r[3], level) : null)
+        }
+    }
+    let wrong = (i: int) => {
+        if blank { return null }
+        let r = reads[i]
+        let over = (i == 1 && r != null && reads[0] != null && r > reads[0]) || (i == 3 && r != null && reads[2] != null && r > reads[2])
+        let none = (i == 0 || i == 2) && r != null && r == 0
+        r == null || over || none ? "true" : null
+    }
+    let tone = !ready ? "" : (f.small ? "ui-ab-test-calc-early" : (f.significant ? "ui-ab-test-calc-win" : ""))
+    <section class={ui_cls(["ui-ab-test-calc", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-ab-test-calc-title id={`${id}-title`}>{title}</h3>
+        <div.ui-ab-test-calc-grid>
+            <fieldset.ui-ab-test-calc-arm>
+                <legend>{labels[0]}</legend>
+                <label.ui-ab-test-calc-field for={`${id}-va`}>Visitors
+                    <input type="text" inputmode="numeric" id={`${id}-va`} name={named("visitors_a")} value={va} autocomplete="off" aria-invalid={wrong(0)}
+                           @input={(e) => { va = e.value; tell() }}/></label>
+                <label.ui-ab-test-calc-field for={`${id}-ca`}>Conversions
+                    <input type="text" inputmode="numeric" id={`${id}-ca`} name={named("conversions_a")} value={ca} autocomplete="off" aria-invalid={wrong(1)}
+                           @input={(e) => { ca = e.value; tell() }}/></label>
+            </fieldset>
+            <fieldset.ui-ab-test-calc-arm>
+                <legend>{labels[1]}</legend>
+                <label.ui-ab-test-calc-field for={`${id}-vb`}>Visitors
+                    <input type="text" inputmode="numeric" id={`${id}-vb`} name={named("visitors_b")} value={vb} autocomplete="off" aria-invalid={wrong(2)}
+                           @input={(e) => { vb = e.value; tell() }}/></label>
+                <label.ui-ab-test-calc-field for={`${id}-cb`}>Conversions
+                    <input type="text" inputmode="numeric" id={`${id}-cb`} name={named("conversions_b")} value={cb} autocomplete="off" aria-invalid={wrong(3)}
+                           @input={(e) => { cb = e.value; tell() }}/></label>
+            </fieldset>
+        </div>
+        <label.ui-ab-test-calc-field.ui-ab-test-calc-level for={`${id}-level`}>Confidence
+            <select id={`${id}-level`} name={named("confidence")} @change={(e) => { level = int(e.value); tell() }}>
+                {for l in ab_test_calc_levels => <option value={l} selected={l == level}>{l}%</option>}
+            </select></label>
+        <div.ui-ab-test-calc-live aria-live="polite">
+            {blank && <p.ui-ab-test-calc-hint>Enter visitors and conversions for both variants.</p>}
+            {len(problems) > 0 && <ul.ui-ab-test-calc-errors role="alert">{for p in problems => <li>{p}</li>}</ul>}
+            {ready && <p class={ui_cls(["ui-ab-test-calc-verdict", tone])}>{ab_test_calc_verdict(f, labels, level)}</p>}
+            {ready && <dl.ui-ab-test-calc-out>
+                <div data-k="rate-a"><dt>{labels[0]} rate</dt><dd>{ab_test_calc_pct(f.rate_a)}</dd></div>
+                <div data-k="rate-b"><dt>{labels[1]} rate</dt><dd>{ab_test_calc_pct(f.rate_b)}</dd></div>
+                <div data-k="lift"><dt>Lift</dt><dd>{f.lift == null ? "None: the control is 0%" : `${f.lift > 0 ? "+" : ""}${ab_test_calc_pct(f.lift)}`}</dd></div>
+                <div data-k="diff"><dt>Difference</dt><dd>{ab_test_calc_points(f.difference)}</dd></div>
+                <div data-k="z"><dt>z</dt><dd>{f.z == null ? "None" : ab_test_calc_num(f.z, 3)}</dd></div>
+                <div data-k="p"><dt>p-value</dt><dd>{f.p == null ? "None" : ab_test_calc_p_text(f.p)}</dd></div>
+                <div.ui-ab-test-calc-wide data-k="ci"><dt>{level}% interval on the difference</dt><dd>{ab_test_calc_points(f.low)} to {ab_test_calc_points(f.high)}</dd></div>
+            </dl>}
+            {ready && f.testable && !f.significant && <p.ui-ab-test-calc-hint>
+                This traffic could reliably show a difference of about {ab_test_calc_num(f.detectable * 100, 2)} points or more.</p>}
+            {len(notes) > 0 && <ul.ui-ab-test-calc-notes>{for n in notes => <li>{n}</li>}</ul>}
+        </div>
+    </section>
+}

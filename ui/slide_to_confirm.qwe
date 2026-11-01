@@ -1,0 +1,286 @@
+// SlideToConfirm: a thumb to drag right across a track before something serious happens,
+// a payment or a deletion, so that it cannot be done by a stray tap. Short of the end it
+// springs back. A thrown thumb that is well along and still moving fast goes on to the end by
+// itself. The thumb is a slider for keys: the arrows move it and it confirms at the end,
+// and leaving it sends it back. Below the track, a Hold to confirm button does the same
+// for anyone who cannot drag: pressed and held, with a finger, a switch or the Enter key,
+// until it fills. A screen reader's double tap is one quick press, so a press that was
+// not held asks to be pressed again, and that second press confirms.
+//
+//   component Pay() {
+//       state paid = false
+//       <SlideToConfirm label="Slide to pay $120.00" done_label="Paid" tone="danger" done={paid}
+//                       on_confirm={() => { paid = true; send_payment() }}/>
+//   }
+//
+// label: what the track says. done_label: what it says once confirmed. tone: "accent" or
+// "danger". hold_label: the button's words. hold_ms: how long a hold takes, in milliseconds
+// (1500). on_confirm(): inside one of your components, it was confirmed, called once.
+// done: from outside, whether it stands confirmed; set it back to false to ask again.
+// disabled: nothing moves. class.
+
+import ui/theme.qwe use ui_cls
+
+let slide_to_confirm_css = css`
+.ui-slide-confirm { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); --t: var(--ui-accent); --tf: var(--ui-accent-fg); --ts: var(--ui-accent-soft); }
+.ui-slide-confirm-inner { display: grid; gap: 10px; }
+.ui-slide-confirm-danger { --t: var(--ui-danger); --tf: #fff; --ts: var(--ui-danger-soft); }
+.ui-slide-confirm-track { position: relative; height: 60px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); container-type: inline-size; touch-action: pan-y; }
+.ui-slide-confirm-fill { position: absolute; inset: 0 auto 0 0; width: 100%; background: var(--ts); transform-origin: 0 50%; transform: scaleX(0); transition: transform .26s cubic-bezier(.2, .8, .2, 1); }
+.ui-slide-confirm-text { position: absolute; inset: 0; display: grid; place-items: center; padding: 0 64px; font-weight: 600; text-align: center; pointer-events: none; }
+.ui-slide-confirm-thumb { position: absolute; top: 4px; left: 4px; display: grid; place-items: center; width: 52px; height: 52px; border-radius: 50%; background: var(--t); color: var(--tf); box-shadow: var(--ui-shadow);
+  cursor: grab; touch-action: pan-y; outline: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; transition: transform .26s cubic-bezier(.2, .8, .2, 1); }
+.ui-slide-confirm-thumb svg { width: 24px; height: 24px; }
+.ui-slide-confirm-thumb:focus-visible { box-shadow: 0 0 0 3px var(--ui-bg), 0 0 0 6px var(--t); }
+.ui-slide-confirm-moving .ui-slide-confirm-thumb, .ui-slide-confirm-moving .ui-slide-confirm-fill { transition: none; }
+.ui-slide-confirm-moving .ui-slide-confirm-thumb { cursor: grabbing; }
+.ui-slide-confirm-done .ui-slide-confirm-thumb { transform: translateX(calc(100cqw - 60px)); cursor: default; }
+.ui-slide-confirm-done .ui-slide-confirm-fill { transform: scaleX(1); }
+.ui-slide-confirm-off { opacity: .55; }
+.ui-slide-confirm-off .ui-slide-confirm-thumb { cursor: not-allowed; }
+.ui-slide-confirm-hold { position: relative; min-height: 48px; padding: 0 16px; overflow: hidden; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 15px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-slide-confirm-hold span { position: relative; }
+.ui-slide-confirm-hold i { position: absolute; inset: 0; background: var(--ts); transform-origin: 0 50%; transform: scaleX(var(--h, 0)); }
+.ui-slide-confirm-hold:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-slide-confirm-hold[aria-disabled="true"] { color: var(--ui-muted); opacity: .6; cursor: default; }
+@media (hover: hover) { .ui-slide-confirm-hold:not([aria-disabled="true"]):hover { background: var(--ui-subtle); } }
+@container (min-width: 520px) {
+  .ui-slide-confirm-inner { grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-slide-confirm-thumb, .ui-slide-confirm-fill { transition: none; } }
+`
+
+fn slide_to_confirm_axis(dx: num, dy: num, slop: num) -> str {
+    if abs(dx) < slop && abs(dy) < slop { return "" }
+    abs(dx) > abs(dy) ? "x" : "y"
+}
+
+// How far along the track a thumb moved by dx is, from 0 to 1.
+fn slide_to_confirm_part(dx: num, travel: num) -> num {
+    if travel <= 0 { return 0 }
+    max([0, min([1, dx / travel])])
+}
+
+// A release confirms from 90% of the way, or from 70% still moving at a pixel a millisecond or more.
+// Speed alone never does: this is the one gesture that must not go off by accident.
+fn slide_to_confirm_commit(part: num, speed: num) -> bool {
+    part >= 0.9 || (part >= 0.7 && speed >= 1)
+}
+
+// The arrow keys' steps, 10% at a time; End stops one short of the end, so one key press alone never confirms.
+fn slide_to_confirm_key(key: str, pct: int) -> int {
+    match key {
+        "ArrowRight" => min([100, pct + 10])
+        "ArrowUp" => min([100, pct + 10])
+        "ArrowLeft" => max([0, pct - 10])
+        "ArrowDown" => max([0, pct - 10])
+        "Home" => 0
+        "End" => max([pct, 90])
+        _ => pct
+    }
+}
+
+fn slide_to_confirm_sample(s, pos: num, now: num) {
+    let dt = now - s.at
+    dt < 32 ? s : { pos, at: now, v: (pos - s.pos) / dt }
+}
+
+fn slide_to_confirm_speed(s, pos: num, now: num, moved: num) -> num {
+    if now - moved > 80 { return 0 }
+    let dt = now - s.at
+    let since = dt >= 8 ? (pos - s.pos) / dt : 0
+    abs(since) > abs(s.v) ? since : s.v
+}
+
+// A tap felt where the phone can give one.
+fn slide_to_confirm_buzz() {
+    if is_err(js("quilloNative.haptic", "success")) && js("navigator.userActivation.hasBeenActive") == true { js("navigator.vibrate", 20) }
+}
+
+component SlideToConfirm(label: str = "Slide to confirm", done_label: str = "Confirmed", hold_label: str = "Hold to confirm", tone: str = "accent", hold_ms: int = 1500,
+                         on_confirm = null, done: bool = false, disabled: bool = false, class: str? = null) {
+    style global slide_to_confirm_css
+    state finished = done
+    state was_done = done
+    state moving = false
+    state pct = 0            // where the keys have put the thumb
+    state track = null
+    state thumb = null
+    state fill = null
+    state btn = null
+    state g = null
+    state holding = 0        // when a hold began; 0 for none
+    state held = false       // the press in progress came to something, so its click is nothing
+    state armed = false      // a quick press asked for a second
+    state armed_at = 0
+    state said = ""
+    // The prop going back to false asks again; to true, it stands confirmed.
+    if done != was_done {
+        was_done = done
+        finished = done
+        pct = 0
+        armed = false
+    }
+    let travel = () => track.clientWidth - thumb.offsetWidth - 8
+    let put = (part: num) => {
+        let t = travel()
+        thumb.style.transform = part > 0 ? `translateX(${round(part * t, 2)}px)` : ""
+        fill.style.transform = part > 0 ? `scaleX(${round((part * t + 56) / track.clientWidth, 4)})` : ""
+    }
+    let confirm = () => {
+        if !finished {
+            finished = true
+            holding = 0
+            armed = false
+            pct = 0
+            thumb.style.transform = ""
+            fill.style.transform = ""
+            btn.style.setProperty("--h", "0")
+            said = done_label
+            slide_to_confirm_buzz()
+            on_confirm && on_confirm()
+        }
+    }
+    let stop_hold = () => {
+        holding = 0
+        btn.style.setProperty("--h", "0")
+    }
+    let begin_hold = () => {
+        if !finished && !disabled && holding == 0 { holding = js("performance.now") }
+    }
+    let step_hold = () => {
+        if holding > 0 {
+            let p = (js("performance.now") - holding) / hold_ms
+            btn.style.setProperty("--h", `${round(min([1, p]), 3)}`)
+            if p >= 1 {
+                held = true
+                confirm()
+            }
+        }
+    }
+    if holding > 0 { every(32, step_hold) }
+    if armed { every(5000, () => {
+        armed = false
+        said = ""
+    }) }
+    let locked = finished || disabled
+    <div class={ui_cls(["ui-slide-confirm", tone == "danger" && "ui-slide-confirm-danger", finished && "ui-slide-confirm-done", disabled && "ui-slide-confirm-off", moving && "ui-slide-confirm-moving", class])}>
+        <div.ui-slide-confirm-inner>
+        <div.ui-slide-confirm-track @mount={(me) => { track = me }}>
+            <span.ui-slide-confirm-fill aria-hidden="true" @mount={(me) => { fill = me }}></span>
+            <span.ui-slide-confirm-text aria-hidden="true">{finished ? done_label : label}</span>
+            <div.ui-slide-confirm-thumb role="slider" tabindex={locked ? null : "0"} aria-label={label} aria-orientation="horizontal"
+                 aria-valuemin="0" aria-valuemax="100" aria-valuenow={finished ? 100 : pct} aria-valuetext={finished ? done_label : `${pct}%`}
+                 aria-disabled={locked ? "true" : null}
+                 @mount={(me) => { thumb = me }}
+                 @keydown={(e) => {
+                     if !locked {
+                         let to = slide_to_confirm_key(e.key, pct)
+                         if to != pct || e.key == "ArrowRight" || e.key == "ArrowLeft" || e.key == "Home" || e.key == "End" {
+                             e.preventDefault()
+                             pct = to
+                             put(to / 100)
+                             if to >= 100 { confirm() }
+                         }
+                     }
+                 }}
+                 @blur={() => {
+                     if pct > 0 && !finished {
+                         pct = 0
+                         put(0)
+                     }
+                 }}
+                 @pointerdown={(e) => {
+                     g = !locked && e.isPrimary && e.button == 0
+                         ? { id: e.pointerId, x: e.clientX, y: e.clientY, on: false, part: 0, moved: e.timeStamp, s: { pos: e.clientX, at: e.timeStamp, v: 0 } }
+                         : null
+                 }}
+                 @pointermove={(e) => {
+                     if g != null && e.pointerId == g.id {
+                         let dx = e.clientX - g.x
+                         if !g.on {
+                             let way = slide_to_confirm_axis(dx, e.clientY - g.y, 6)
+                             if way == "y" { g = null }
+                             if way == "x" {
+                                 thumb.setPointerCapture(e.pointerId)
+                                 moving = true
+                                 g = { ...g, on: true }
+                             }
+                         }
+                         if g != null && g.on {
+                             let part = slide_to_confirm_part(dx, travel())
+                             put(part)
+                             g = { ...g, part, moved: e.timeStamp, s: slide_to_confirm_sample(g.s, e.clientX, e.timeStamp) }
+                         }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     if g != null && e.pointerId == g.id {
+                         let was = g
+                         g = null
+                         moving = false
+                         if was.on {
+                             if slide_to_confirm_commit(was.part, slide_to_confirm_speed(was.s, e.clientX, e.timeStamp, was.moved)) { confirm() } else { put(0) }
+                         }
+                     }
+                 }}
+                 @pointercancel={(e) => {
+                     if g != null && e.pointerId == g.id {
+                         g = null
+                         moving = false
+                         put(0)
+                     }
+                 }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    {finished ? <path d="M5 13l5 5L20 7"/> : <path d="M5 12h14M13 6l6 6-6 6"/>}
+                </svg>
+            </div>
+        </div>
+        <button.ui-slide-confirm-hold type="button" aria-disabled={locked ? "true" : null} @mount={(me) => { btn = me }}
+                @contextmenu={(e) => { if holding > 0 { e.preventDefault() } }}
+                @pointerdown={(e) => {
+                    held = false
+                    begin_hold()
+                }}
+                @pointerup={() => { stop_hold() }}
+                @pointercancel={() => { stop_hold() }}
+                @pointerleave={() => { stop_hold() }}
+                @keydown={(e) => {
+                    if e.key == "Enter" || e.key == " " {
+                        e.preventDefault()
+                        if !e.repeat {
+                            held = false
+                            begin_hold()
+                        }
+                    }
+                }}
+                @keyup={(e) => {
+                    if e.key == "Enter" || e.key == " " {
+                        e.preventDefault()
+                        let quick = holding > 0
+                        stop_hold()
+                        // As a click from a key: Enter held down and let go early, or a screen reader's press.
+                        if quick { btn.click() }
+                    }
+                }}
+                @click={(e) => {
+                    if held { held = false } else {
+                        if !locked {
+                            if armed && e.timeStamp - armed_at >= 400 { confirm() } else {
+                                if !armed {
+                                    armed = true
+                                    armed_at = e.timeStamp
+                                    said = "Press again to confirm"
+                                }
+                            }
+                        }
+                    }
+                }}>
+            <i aria-hidden="true"></i>
+            <span>{finished ? done_label : armed ? "Press again to confirm" : hold_label}</span>
+        </button>
+        </div>
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

@@ -1,0 +1,265 @@
+// UtmBuilder: builds a campaign link that reports will group properly. It cleans each
+// value (one case, spaces turned into a separator) and shows what will be sent, warns of
+// what splits a report in two (Email and email, spring_sale beside spring-sale, a
+// spelling close to one used before, a medium no analytics tool groups), keeps the
+// address's own query and fragment where they are, replaces any utm_ already there, and
+// remembers recent values to pick from.
+//
+//   <UtmBuilder url="https://example.com/sale?ref=7#buy" source="newsletter" medium="email"/>
+//   <UtmBuilder recent={{ source: ["google"], medium: ["cpc"] }} remember="utm-recent"
+//               on_change={(r) => { link = r.link }}/>
+//
+// url, source, medium, campaign, term, content: where the fields start. letter_case:
+// "lower" (the default) or "typed". separator: what spaces become, "-" (the default), "_"
+// or "keep" (sent as %20). recent: values to offer at the start, a map from each field to
+// a list. remember: a name to keep recent values under in this browser (localStorage),
+// after Copy or Keep; left out, they last as long as the page. most_recent: how many a
+// field keeps (8). title: its heading. id: a prefix for its ids, unique on the page. The
+// fields are named url, utm_source, utm_medium, utm_campaign, utm_term and utm_content,
+// so a form around it sends them; name: a prefix for those names. on_change(result):
+// inside one of your components, given { link, ok, warnings } after a change: link is
+// null until it can be built, warnings how many there are. class: more classes for its
+// outer element.
+//
+// utm_builder_clean(value, letter_case, separator) cleans one value, utm_builder_link(url,
+// values, letter_case, separator) gives { link, problems, notes }, and
+// utm_builder_warnings(values, letter_case, separator, recent) the warnings, for a
+// program's own use. values is { source, medium, campaign, term, content }.
+
+import ui/theme.qwe use ui_cls
+
+let utm_builder_css = css`
+.ui-utm { display: grid; gap: 12px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-utm .ui-utm-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-utm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.ui-utm-field { display: grid; gap: 4px; min-width: 0; align-content: start; }
+.ui-utm-field label { font-size: 13px; font-weight: 500; }
+.ui-utm-req { color: var(--ui-muted); font-weight: 400; }
+.ui-utm-input { box-sizing: border-box; width: 100%; height: 36px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 14px var(--ui-font); }
+.ui-utm-input:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-utm-input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-utm-sent { color: var(--ui-muted); font: 12px var(--ui-mono); overflow-wrap: anywhere; }
+.ui-utm-recent { display: flex; flex-wrap: wrap; gap: 4px; }
+.ui-utm-pick { padding: 1px 7px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); font: 12px/1.5 var(--ui-font); cursor: pointer; }
+.ui-utm-pick:hover { border-color: var(--ui-accent); }
+.ui-utm-pick:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-utm-options { display: flex; flex-wrap: wrap; gap: 12px; }
+.ui-utm-option { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.ui-utm-option select { height: 30px; padding: 0 6px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); }
+.ui-utm-option select:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-utm-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-utm-list li { padding: 6px 10px; border-left: 4px solid var(--ui-warning); border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); overflow-wrap: anywhere; }
+.ui-utm-list.ui-utm-bad li { border-left-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-utm-result { display: grid; gap: 6px; }
+.ui-utm-result h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.ui-utm-link { margin: 0; padding: 8px 10px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font: 13px/1.5 var(--ui-mono); overflow-wrap: anywhere; }
+.ui-utm-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-utm-btn { height: 30px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-utm-btn:hover { background: var(--ui-subtle); }
+.ui-utm-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-utm-note { color: var(--ui-muted); font-size: 13px; }
+`
+
+let utm_builder_fields = [{ id: "source", label: "Source", required: true, hint: "newsletter, google" }, { id: "medium", label: "Medium", required: true, hint: "email, cpc" },
+                          { id: "campaign", label: "Campaign", required: true, hint: "spring-sale" }, { id: "term", label: "Term", required: false, hint: "paid keywords" },
+                          { id: "content", label: "Content", required: false, hint: "header-link" }]
+let utm_builder_mediums = ["cpc", "ppc", "cpm", "cpv", "display", "banner", "email", "social", "paid-social", "paid_social", "organic", "affiliate", "referral", "retargeting", "sms", "push", "video", "audio", "print", "qr", "partner"]
+let utm_builder_aliases = { "e-mail": "email", mail: "email", newsletter: "email", "paid-search": "cpc", paid_search: "cpc", paidsearch: "cpc", adwords: "cpc", sem: "cpc", facebook: "social", instagram: "social", linkedin: "social", twitter: "social" }
+
+// One value, cleaned: trimmed, one case, spaces as the separator.
+fn utm_builder_clean(value: str, letter_case: str = "lower", separator: str = "-") -> str {
+    let t = trim(value)
+    let cased = letter_case == "lower" ? lower(t) : t
+    separator == "keep" ? re.replace(cased, "\\s+", " ") : re.replace(cased, "\\s+", separator)
+}
+
+// How a value joins its words, or null if it has one word: "hyphen", "underscore",
+// "camel", or "mixed" with more than one.
+fn utm_builder_style(value: str) -> str? {
+    let hyphen = contains(value, "-")
+    let under = contains(value, "_")
+    let camel = re.test(value, "[a-z][A-Z]")
+    let n = count([hyphen, under, camel], (x) => x)
+    n > 1 ? "mixed" : (hyphen ? "hyphen" : (under ? "underscore" : (camel ? "camel" : null)))
+}
+
+// A value with case and joining taken away, to see two spellings are one.
+fn utm_builder_core(value: str) -> str = re.replace(lower(value), "[\\s_-]+", "")
+
+// The warnings about the values, as text. See the top of the file.
+fn utm_builder_warnings(values: map, letter_case: str, separator: str, recent: map) -> list {
+    let out = []
+    let filled_fields = utm_builder_fields | filter((f) => trim(get(values, f.id) ?? "") != "")
+    let sent = (f) => utm_builder_clean(get(values, f.id), letter_case, separator)
+    for f in filled_fields {
+        let raw_value = trim(get(values, f.id))
+        let clean = sent(f)
+        if re.test(raw_value, "\\s") {
+            out = push(out, separator == "keep" ? `${f.label} has spaces, which show as %20 in the link and in reports.`
+                : `${f.label} has spaces: they become ${separator}, giving ${clean}.`)
+        }
+        if letter_case == "lower" && lower(raw_value) != raw_value { out = push(out, `${f.label} had capitals: it goes as ${clean}, so it counts with the rest.`) }
+        if letter_case == "typed" && re.test(raw_value, "[A-Z]") { out = push(out, `${f.label} has capitals: Email and email would count as two sources in reports.`) }
+        if utm_builder_style(clean) == "mixed" { out = push(out, `${f.label} joins words in more than one way: ${clean}. Pick one.`) }
+        if re.test(clean, "[^\\w. ~-]") { out = push(out, `${f.label} has characters that get encoded: ${clean}. Letters, digits, - and _ read best in reports.`) }
+        let like = find(get(recent, f.id) ?? [], (r) => r != clean && utm_builder_core(r) == utm_builder_core(clean))
+        if like != null { out = push(out, `${f.label} ${clean} is close to ${like}, used before. The same spelling keeps them together in reports.`) }
+    }
+    let styles = unique(filled_fields | map((f) => utm_builder_style(sent(f))) | filter((s) => s != null && s != "mixed"))
+    if len(styles) > 1 { out = push(out, `The fields join words differently: some with ${join(styles | map(utm_builder_style_word), ", some with ")}. Reports read better with one.`) }
+    let medium = utm_builder_clean(values.medium ?? "", letter_case, separator)
+    let low_medium = lower(medium)
+    if medium != "" {
+        let alias = get(utm_builder_aliases, low_medium)
+        if alias != null { out = push(out, `Medium ${medium}: analytics tools group this under ${alias}.`) }
+        else if !contains(utm_builder_mediums, low_medium) { out = push(out, `Medium ${medium} is not one analytics tools group by: the usual are cpc, email, social, display, referral, affiliate.`) }
+    }
+    let source = utm_builder_clean(values.source ?? "", letter_case, separator)
+    if source != "" && lower(source) == low_medium { out = push(out, `Source and medium are both ${source}: source says who sent the visit, medium how.`) }
+    out
+}
+
+fn utm_builder_style_word(s: str) -> str = match s { "hyphen" => "hyphens", "underscore" => "underscores", _ => "capitals" }
+
+// The link. problems stop it; notes do not.
+fn utm_builder_link(url: str, values: map, letter_case: str, separator: str) -> map {
+    let problems = []
+    let notes = []
+    let address = trim(url)
+    if address == "" { return { link: null, problems: ["Enter the page's address."], notes } }
+    if len(address) > 8000 { return { link: null, problems: [`The address is ${format_number(len(address), "en-US", 0)} characters, past the 8,000 it will read.`], notes } }
+    if re.test(address, "\\s") { return { link: null, problems: ["The address has a space in it: encode it as %20 or take it out."], notes } }
+    if starts_with(address, "/") || starts_with(address, "?") || starts_with(address, "#") { return { link: null, problems: ["A campaign link goes in emails and ads, so it needs the whole address, with https://."], notes } }
+    let schemed = re.test(address, "^[a-z][a-z0-9+.-]*://", "i")
+    if !schemed && re.test(address, "^[a-z][a-z0-9+.-]*:", "i") && !re.test(address, "^[^:/]+:\\d") { return { link: null, problems: ["This is not a web address: it must start with http:// or https://."], notes } }
+    if !schemed { notes = push(notes, "No https:// on the address, so it was added.") }
+    let full = schemed ? address : `https://${address}`
+    let m = re.find(full, "^([a-z][a-z0-9+.-]*)://([^/?#]*)([^?#]*)(?:\\?([^#]*))?(#.*)?$", "i")
+    if m == null || m.groups[1] == "" { return { link: null, problems: ["The address has no host."], notes } }
+    if !re.test(m.groups[0], "^https?$", "i") { return { link: null, problems: ["This is not a web address: it must start with http:// or https://."], notes } }
+    if !re.test(m.groups[1], "\\.|^localhost(:|$)|^\\[") { notes = push(notes, `The host ${m.groups[1]} has no dot: check the address.`) }
+    let head = `${m.groups[0]}://${m.groups[1]}${m.groups[2]}`
+    let given = utm_builder_fields | filter((f) => trim(get(values, f.id) ?? "") != "")
+    let names = given | map((f) => `utm_${f.id}`)
+    let pieces = split(m.groups[3] ?? "", "&") | filter((p) => p != "")
+    let key_of = (p) => lower(split(p, "=")[0])
+    let replaced = pieces | filter((p) => contains(names, key_of(p)))
+    let left_utm = pieces | filter((p) => starts_with(key_of(p), "utm_") && !contains(names, key_of(p)))
+    let kept = pieces | filter((p) => !contains(names, key_of(p)))
+    for p in replaced { notes = push(notes, `The address already had ${p}: replaced.`) }
+    for p in left_utm { notes = push(notes, `The address keeps ${p}, as no value here replaces it.`) }
+    let fragment = m.groups[4] ?? ""
+    if contains(fragment, "?") { notes = push(notes, "The fragment holds a ?, as a hash route does. The parameters go before the #, where analytics tools read them.") }
+    let added = given | map((f) => `utm_${f.id}=${url_encode(utm_builder_clean(get(values, f.id), letter_case, separator))}`)
+    let all_parts = kept + added
+    let link = `${head}${len(all_parts) > 0 ? `?${join(all_parts, "&")}` : ""}${fragment}`
+    if len(link) > 2000 { notes = push(notes, `The link is ${format_number(len(link), "en-US", 0)} characters: some tools cut links past 2,000.`) }
+    { link, problems, notes }
+}
+
+// A value at the front of its list, once.
+fn utm_builder_add(past: map, field: str, value: str, most: int) -> map =
+    value == "" ? past : set(past, field, take([value] + remove(get(past, field) ?? [], value), most))
+
+// What localStorage held, kept only if it is what was put there.
+fn utm_builder_read_store(text) -> map {
+    let v = type_of(text) == "str" ? json.parse(text) : null
+    if type_of(v) != "map" { return {} }
+    reduce(utm_builder_fields, {}, (m, f) => {
+        let xs = get(v, f.id)
+        type_of(xs) == "list" ? set(m, f.id, xs | filter((x) => type_of(x) == "str")) : m
+    })
+}
+
+component UtmBuilder(url: str = "", source: str = "", medium: str = "", campaign: str = "", term: str = "", content: str = "", letter_case: str = "lower", separator: str = "-",
+                     recent = {}, remember: str? = null, most_recent: int = 8, title: str = "Campaign link", id: str = "utm-builder", name: str? = null, on_change = null, class: str? = null) {
+    style global utm_builder_css
+    state address = url
+    state vals = { source, medium, campaign, term, content }
+    state how_case = letter_case
+    state how_space = separator
+    state past = type_of(recent) == "map" ? recent : {}
+    state copied = ""
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let built = utm_builder_link(address, vals, how_case, how_space)
+    let missing = utm_builder_fields | filter((f) => f.required && trim(get(vals, f.id) ?? "") == "")
+    let warns = utm_builder_warnings(vals, how_case, how_space, past)
+    let problems = built.problems + (missing | map((f) => `${f.label} is needed.`))
+    let ready = built.link != null && len(missing) == 0
+    let tell = () => {
+        if on_change != null {
+            let b = utm_builder_link(address, vals, how_case, how_space)
+            let gone = count(utm_builder_fields, (f) => f.required && trim(get(vals, f.id) ?? "") == "")
+            on_change({ link: gone == 0 ? b.link : null, ok: b.link != null && gone == 0, warnings: len(utm_builder_warnings(vals, how_case, how_space, past)) + len(b.notes) })
+        }
+    }
+    let keep = () => {
+        let next = reduce(utm_builder_fields, past, (m, f) => utm_builder_add(m, f.id, utm_builder_clean(get(vals, f.id) ?? "", how_case, how_space), most_recent))
+        past = next
+        if remember != null { js("localStorage.setItem", remember, json.stringify(next)) }
+    }
+    let copy = () => {
+        keep()
+        js("navigator.clipboard.writeText", built.link).then((_ = null) => { copied = "Copied" }, (_ = null) => { copied = "Could not copy: select the link instead" })
+    }
+    <section class={ui_cls(["ui-utm", class])} aria-labelledby={`${id}-title`} @mount={() => {
+        if remember != null {
+            let stored = utm_builder_read_store(js("localStorage.getItem", remember))
+            past = reduce(keys(stored), past, (m, k) => set(m, k, take(unique(get(stored, k) + (get(m, k) ?? [])), most_recent)))
+        }
+    }}>
+        <h3.ui-utm-title id={`${id}-title`}>{title}</h3>
+        <div.ui-utm-field>
+            <label for={`${id}-url`}>Page address</label>
+            <input.ui-utm-input type="text" inputmode="url" id={`${id}-url`} name={named("url")} value={address} spellcheck="false" autocomplete="off" placeholder="https://example.com/sale"
+                   aria-invalid={len(built.problems) > 0 && trim(address) != "" ? "true" : null} @input={(e) => { address = e.value; copied = ""; tell() }}/>
+        </div>
+        <div.ui-utm-grid>
+            {for f in utm_builder_fields => {
+                let value = get(vals, f.id) ?? ""
+                let clean = utm_builder_clean(value, how_case, how_space)
+                let picks = take(get(past, f.id) ?? [], 5)
+                <div.ui-utm-field key={f.id}>
+                    <label for={`${id}-${f.id}`}>{f.label}{f.required ? "" : " "}{!f.required && <span.ui-utm-req>(optional)</span>}</label>
+                    <input.ui-utm-input type="text" id={`${id}-${f.id}`} name={named(`utm_${f.id}`)} value={value} list={`${id}-${f.id}-list`} spellcheck="false" autocomplete="off" placeholder={f.hint}
+                           @input={(e) => { vals = set(vals, f.id, e.value); copied = ""; tell() }}/>
+                    <datalist id={`${id}-${f.id}-list`}>{for r in get(past, f.id) ?? [] => <option key={r} value={r}></option>}</datalist>
+                    {clean != value && trim(value) != "" && <span.ui-utm-sent data-sent={f.id}>{`Sent as ${clean}`}</span>}
+                    {len(picks) > 0 && <div.ui-utm-recent role="group" aria-label={`Recent ${lower(f.label)} values`}>
+                        {for r in picks => <button.ui-utm-pick key={r} type="button" @click={() => { vals = set(vals, f.id, r); copied = ""; tell() }}>{r}</button>}
+                    </div>}
+                </div>
+            }}
+        </div>
+        <div.ui-utm-options>
+            <label.ui-utm-option>Case
+                <select name={named("letter_case")} @change={(e) => { how_case = e.value; tell() }}>
+                    <option value="lower" selected={how_case == "lower"}>all lower case</option>
+                    <option value="typed" selected={how_case == "typed"}>as typed</option>
+                </select>
+            </label>
+            <label.ui-utm-option>Spaces become
+                <select name={named("separator")} @change={(e) => { how_space = e.value; tell() }}>
+                    <option value="-" selected={how_space == "-"}>hyphens</option>
+                    <option value="_" selected={how_space == "_"}>underscores</option>
+                    <option value="keep" selected={how_space == "keep"}>stay as spaces</option>
+                </select>
+            </label>
+        </div>
+        {len(problems) > 0 && <ul class="ui-utm-list ui-utm-bad" data-problems>{for p in problems => <li key={p}>{p}</li>}</ul>}
+        {len(warns) + len(built.notes) > 0 && <ul.ui-utm-list data-warnings aria-live="polite">
+            {for w in warns + built.notes => <li key={w}>{w}</li>}
+        </ul>}
+        {ready && <div.ui-utm-result>
+            <h4 id={`${id}-link-label`}>Final link</h4>
+            <p.ui-utm-link data-link aria-labelledby={`${id}-link-label`} aria-live="polite">{built.link}</p>
+            <div.ui-utm-actions>
+                <button.ui-utm-btn type="button" data-copy @click={copy}>Copy</button>
+                <button.ui-utm-btn type="button" data-keep @click={keep}>Keep values</button>
+                <span.ui-utm-note aria-live="polite">{copied}</span>
+            </div>
+        </div>}
+    </section>
+}

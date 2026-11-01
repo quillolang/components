@@ -1,0 +1,436 @@
+// NowPlaying: a full-screen player. Big art that swipes to the next or last track, a seek bar
+// with fine scrubbing, the queue, the speed and a sleep timer, tied to the media session,
+// so the lock screen, a headset's buttons, a watch and the car show the track and work it. On a
+// wide screen the queue stays open beside the player; a phone on its side puts the art
+// beside the controls.
+//
+//   import ui/now_playing.qwe use NowPlaying
+//
+//   <NowPlaying id="player" queue={[
+//       { id: 1, title: "Harbour Lights", artist: "The Low Tides", album: "Salt", art: "/art/salt.jpg", src: "/audio/harbour.m4a" },
+//   ]} on_close={() => { showing = false }}/>
+//
+// queue: each { id, title, artist, album, art, src }. A new list keeps the track playing, if it is
+// still there. id: the id of its <audio> ("ui-nowp-audio"), for MiniPlayer, ScrubBar, SleepTimerSheet
+// and SyncedLyrics to follow by their `media` prop. start: the track to begin on (0). start_at: the
+// seconds to begin from, for coming back. speeds: what the speed button goes through
+// ([1, 1.25, 1.5, 2]); one or none hides it. sleep: offer a sleep timer (true). label: what screen
+// readers call it. skip: the seconds of the session's skip back and on, and of a headset's (15).
+//
+// on_change({ index, track, playing, time, duration, speed }): inside one of your components, on
+// each new track, play, pause and speed. on_end(): the last track finished. on_close(): shows a
+// button to close it, and is called when that is pressed.
+//
+// The box needs a height: `--ui-nowp-height`, 100dvh unless set.
+//
+// Keys: Space plays and pauses, anywhere in it but on a button. The seek bar has its own, and each
+// gesture its button: Previous and Next for a swipe of the art.
+//
+// A browser refusing to start sound before a tap is a normal path: the button stays Play, and it
+// says so. Where there is no media session it says that too. Phones stop a page's sound when an app
+// without background audio leaves the screen, and Quillo's two apps do not ask for it yet.
+
+import ui/theme.qwe use ui_cls
+import ui/scrub_bar.qwe use ScrubBar
+import ui/sleep_timer_sheet.qwe use SleepTimerSheet
+
+let now_playing_css = css`
+.ui-nowp { position: relative; height: var(--ui-nowp-height, 100dvh); min-width: 0; overflow: hidden; container: ui-nowp / size; background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-nowp-wrap {
+  display: grid; grid-template: "top" auto "stage" minmax(0, 1fr) "ctrl" auto / minmax(0, 1fr); gap: 4px; height: 100%; box-sizing: border-box;
+  padding: env(safe-area-inset-top, 0px) max(12px, env(safe-area-inset-right, 0px)) calc(8px + env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px));
+}
+.ui-nowp-top { grid-area: top; display: flex; align-items: center; gap: 4px; min-height: 48px; }
+.ui-nowp-where { flex: 1; text-align: center; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-nowp-gap { width: 46px; flex: none; }
+.ui-nowp-stage { grid-area: stage; position: relative; display: grid; place-items: center; min-height: 0; container-type: size; touch-action: pan-y; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-nowp-art {
+  display: grid; place-items: center; width: min(100cqw, 100cqh); height: min(100cqw, 100cqh); overflow: hidden; border-radius: 14px; background: var(--ui-accent-soft); color: var(--ui-accent);
+  font: 700 72px var(--ui-font); box-shadow: var(--ui-shadow-lg); will-change: transform;
+}
+.ui-nowp-art img { display: block; width: 100%; height: 100%; object-fit: cover; -webkit-user-drag: none; pointer-events: none; }
+.ui-nowp-ctrl { grid-area: ctrl; display: grid; gap: 0; min-width: 0; }
+.ui-nowp-words { min-width: 0; padding: 4px 8px 0; }
+.ui-nowp-title { margin: 0; overflow: hidden; font-size: 20px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.ui-nowp-artist { margin: 0; overflow: hidden; color: var(--ui-muted); text-overflow: ellipsis; white-space: nowrap; }
+.ui-nowp-row { display: flex; align-items: center; justify-content: center; gap: 12px; }
+.ui-nowp-tools { display: flex; align-items: center; justify-content: space-around; gap: 8px; min-height: 52px; }
+.ui-nowp-btn {
+  display: grid; place-items: center; min-width: 52px; min-height: 52px; padding: 0 6px; border: 0; border-radius: 50%; background: none; color: var(--ui-fg); font: 600 14px var(--ui-font);
+  font-variant-numeric: tabular-nums; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+}
+.ui-nowp-btn:disabled { color: var(--ui-strong); cursor: default; }
+.ui-nowp-btn svg { width: 30px; height: 30px; }
+.ui-nowp-small svg { width: 24px; height: 24px; }
+.ui-nowp-small { min-width: 46px; min-height: 46px; border-radius: 12px; }
+.ui-nowp-wide { border-radius: 999px; }
+.ui-nowp-pressed { background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-nowp-play { position: relative; width: 68px; height: 68px; background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-nowp-play svg { width: 34px; height: 34px; }
+.ui-nowp-busy::after { content: ""; position: absolute; inset: -4px; border: 3px solid transparent; border-top-color: var(--ui-accent); border-radius: 50%; animation: ui-nowp-spin .9s linear infinite; }
+@keyframes ui-nowp-spin { to { transform: rotate(360deg); } }
+.ui-nowp-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-nowp-said { min-height: 18px; margin: 0; text-align: center; color: var(--ui-muted); font-size: 13px; }
+.ui-nowp-said:empty { display: none; }
+.ui-nowp-queue { grid-area: stage; display: none; flex-direction: column; min-width: 0; min-height: 0; background: var(--ui-bg); }
+.ui-nowp-queue h2 { margin: 0; padding: 8px; font-size: 15px; font-weight: 650; }
+.ui-nowp-open .ui-nowp-queue { display: flex; }
+.ui-nowp-open .ui-nowp-stage { visibility: hidden; }
+.ui-nowp-list { flex: 1; min-height: 0; margin: 0; padding: 0; overflow-y: auto; overscroll-behavior: contain; list-style: none; }
+.ui-nowp-item { display: flex; align-items: center; gap: 2px; border-radius: 12px; }
+.ui-nowp-item[aria-current="true"] { background: var(--ui-accent-soft); }
+.ui-nowp-jump { display: flex; flex: 1; align-items: center; gap: 10px; min-width: 0; min-height: 56px; padding: 6px 8px; border: 0; border-radius: 12px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; touch-action: manipulation; }
+.ui-nowp-jump:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-nowp-thumb { flex: none; width: 44px; height: 44px; border-radius: 8px; background: var(--ui-subtle); object-fit: cover; }
+.ui-nowp-names { min-width: 0; }
+.ui-nowp-names b, .ui-nowp-names span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-nowp-names b { font-weight: 600; }
+.ui-nowp-names span { color: var(--ui-muted); font-size: 13px; }
+.ui-nowp-empty { margin: 0; padding: 32px 16px; text-align: center; color: var(--ui-muted); }
+@media (hover: hover) { .ui-nowp-btn:hover:not(:disabled), .ui-nowp-jump:hover { background: var(--ui-subtle); } .ui-nowp-play:hover:not(:disabled) { background: var(--ui-accent); } }
+/* Wide: the queue beside the player, always there, so its button goes. */
+@container ui-nowp (min-width: 700px) {
+  .ui-nowp-wrap { grid-template: "top queue" auto "stage queue" minmax(0, 1fr) "ctrl queue" auto / minmax(0, 1fr) minmax(280px, 38%); column-gap: 24px; }
+  .ui-nowp-queue, .ui-nowp-open .ui-nowp-queue { grid-area: queue; display: flex; border-left: 1px solid var(--ui-border); padding-left: 12px; }
+  .ui-nowp-qbtn { display: none; }
+  .ui-nowp-open .ui-nowp-stage { visibility: visible; }
+}
+/* A phone on its side: no height for art above the controls, so it goes beside them. */
+@container ui-nowp (min-width: 560px) and (max-height: 520px) {
+  .ui-nowp-wrap { grid-template: "stage top" auto "stage ctrl" minmax(0, 1fr) / 40% minmax(0, 1fr); column-gap: 20px; }
+  .ui-nowp-queue { display: none; grid-area: stage; border: 0; padding: 0; }
+  .ui-nowp-open .ui-nowp-queue { display: flex; grid-area: stage; border: 0; padding: 0; }
+  .ui-nowp-open .ui-nowp-stage { visibility: hidden; }
+  .ui-nowp-qbtn { display: grid; }
+  .ui-nowp-ctrl { align-content: center; overflow-y: auto; }
+  .ui-nowp-title { font-size: 17px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-nowp-busy::after { animation: none; } }
+`
+
+// A queue that can be used: each item has a title, and an id, its place when it has none.
+fn now_playing_clean(queue) -> list {
+    if type_of(queue) != "list" { return [] }
+    let rows = queue | filter((x) => type_of(x) == "map")
+    rows | enumerate() | map((pair) => {
+        let t = pair[1]
+        {
+            id: str(get(t, "id") ?? pair[0]),
+            title: str(get(t, "title") ?? "Untitled"),
+            artist: str(get(t, "artist") ?? ""),
+            album: str(get(t, "album") ?? ""),
+            art: type_of(get(t, "art")) == "str" ? t.art : "",
+            src: type_of(get(t, "src")) == "str" ? t.src : "",
+        }
+    })
+}
+
+// A place in the queue, kept within it; what cannot be read is the first.
+fn now_playing_place(v, count: int) -> int {
+    let t = type_of(v)
+    if count <= 0 || (t != "int" && t != "float") { return 0 }
+    max([0, min([floor(v), count - 1])])
+}
+
+// The next speed in the list, the first if this one is not in it.
+fn now_playing_next_speed(speeds: list, now) {
+    if len(speeds) == 0 { return 1 }
+    let i = index_of(speeds, now)
+    i == null ? speeds[0] : speeds[(i + 1) % len(speeds)]
+}
+
+// What Previous does: past three seconds in, back to the start of this track, as every
+// player does; before that, to the track before.
+fn now_playing_back(time, index: int) -> int = time > 3 || index == 0 ? index : index - 1
+
+// A swipe of the art at release: 1 on, -1 back, 0 stays. A quarter of the width does it, or a flick
+// of 0.5 px/ms over at least 30 px, as long as the finger is not by then going back.
+fn now_playing_swipe(dx, speed, width) -> int {
+    if dx <= 0 - width / 4 || (dx <= -30 && speed <= -0.5) { return speed > 0.3 ? 0 : 1 }
+    if dx >= width / 4 || (dx >= 30 && speed >= 0.5) { return speed < -0.3 ? 0 : -1 }
+    0
+}
+
+// Two points, moving on every 50 ms, so the speed at release is never read from one last move.
+fn now_playing_mark(g: map, x, t) -> map = t - g.b_t > 50 ? set(set(set(set(g, "a_x", g.b_x), "a_t", g.b_t), "b_x", x), "b_t", t) : g
+
+let now_playing_pause = "M6 4h4v16H6zM14 4h4v16h-4z"
+let now_playing_play = "M7 4v16l14-8z"
+
+component NowPlaying(queue = [], id: str = "ui-nowp-audio", start = 0, start_at = 0, speeds = [1, 1.25, 1.5, 2], sleep: bool = true, skip: int = 15,
+                     label: str = "Now playing", on_change = null, on_end = null, on_close = null, class: str? = null) {
+    style global now_playing_css
+    let rates = type_of(speeds) == "list" ? speeds | filter((x) => type_of(x) == "int" || type_of(x) == "float") : []
+    let sig = type_of(queue) == "list" ? join(now_playing_clean(queue) | map((t) => t.id), ",") : ""
+    state items = now_playing_clean(queue)
+    state at = now_playing_place(start, len(items))
+    state seen = sig
+    state audio = null
+    state media_session = null
+    state playing = false
+    state busy = false
+    state speed = 1
+    state showing = false     // the queue, on a phone
+    state said = ""
+    state no_session = false
+    state stage = null
+    state art = null
+    state still = false
+    state press = null        // a finger on the art, while it lasts; no markup reads it
+    let track = len(items) > 0 ? items[min([at, len(items) - 1])] : null
+    let report = () => {
+        if on_change != null && audio != null {
+            on_change({ index: at, track: track, playing: !audio.paused, time: audio.currentTime, duration: math.isfinite(audio.duration) ? audio.duration : 0, speed: speed })
+        }
+    }
+    let position = () => {
+        if media_session != null && math.isfinite(audio.duration) && audio.duration > 0 && audio.currentTime <= audio.duration {
+            media_session.setPositionState({ duration: audio.duration, playbackRate: audio.playbackRate, position: audio.currentTime })
+        }
+    }
+    let describe = () => {
+        if media_session != null && track != null {
+            media_session.metadata = js_new("MediaMetadata", {
+                title: track.title, artist: track.artist, album: track.album,
+                artwork: track.art == "" ? [] : [{ src: track.art, sizes: "512x512" }],
+            })
+        }
+    }
+    let begin = () => {
+        said = ""
+        // `AbortError` is only a new track arriving, which plays in its turn. Refusals are the others.
+        audio.play().catch((err) => {
+            if err.name == "NotAllowedError" {
+                said = "This device wants a tap first: press play."
+                busy = false
+            }
+        })
+    }
+    let load_track = (i, play_it) => {
+        let t = items[i]
+        at = i
+        said = ""
+        audio.src = t.src
+        audio.defaultPlaybackRate = speed
+        audio.load()
+        describe()
+        report()
+        if play_it && t.src != "" { begin() }
+        if t.src == "" { said = "This track cannot be played." }
+    }
+    let toggle = () => {
+        if audio != null && track != null {
+            if audio.paused { begin() } else { audio.pause() }
+        }
+    }
+    let on_track = () => {
+        if at + 1 < len(items) { load_track(at + 1, !audio.paused) }
+    }
+    let back_track = () => {
+        let to = now_playing_back(audio.currentTime, at)
+        if to == at { audio.currentTime = 0 } else { load_track(to, !audio.paused) }
+    }
+    let spring = (el) => {
+        el.style.transition = still ? "none" : "transform .22s cubic-bezier(.2, .8, .2, 1)"
+        el.style.transform = ""
+    }
+    // A different queue: stay on the track that was playing, if it is still there.
+    if sig != seen {
+        let old = track
+        let fresh = now_playing_clean(queue)
+        seen = sig
+        items = fresh
+        let was = old == null ? null : index_of(fresh | map((t) => t.id), old.id)
+        if was != null {
+            at = was
+        } else if audio != null && len(fresh) > 0 {
+            load_track(0, false)
+        } else {
+            at = 0
+        }
+    }
+    let remove_at = (i) => {
+        let was_current = i == at
+        let rest = items | enumerate() | filter((p) => p[0] != i) | map((p) => p[1])
+        items = rest
+        if i < at {
+            at = at - 1
+        } else if was_current && len(rest) > 0 {
+            load_track(min([i, len(rest) - 1]), !audio.paused)
+        } else if was_current {
+            audio.pause()
+            audio.removeAttribute("src")
+            audio.load()
+        }
+    }
+    <div class={ui_cls(["ui-nowp", showing && "ui-nowp-open", class])} role="region" aria-label={label}
+         @keydown={(e) => {
+             if e.key == " " && e.target.closest("button, input, [role=slider]") == null {
+                 e.preventDefault()
+                 toggle()
+             }
+         }}>
+        <audio id={id} preload="metadata"
+               @mount={(el) => {
+                   audio = el
+                   still = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+                   let s = js("navigator").mediaSession
+                   if track != null {
+                       el.src = track.src
+                       if type_of(start_at) == "int" || type_of(start_at) == "float" { el.currentTime = max([0, start_at]) }
+                   }
+                   if s == null {
+                       no_session = true
+                   } else {
+                       media_session = s
+                       describe()
+                       // A system may not know one of these, and then setting it throws.
+                       js("Promise.resolve", js_new("Promise", (done) => { done(s.setActionHandler("play", () => { begin() })) }))
+                       js("Promise.resolve", js_new("Promise", (done) => { done(s.setActionHandler("pause", () => { audio.pause() })) }))
+                       js("Promise.resolve", js_new("Promise", (done) => { done(s.setActionHandler("previoustrack", () => { back_track() })) }))
+                       js("Promise.resolve", js_new("Promise", (done) => { done(s.setActionHandler("nexttrack", () => { on_track() })) }))
+                       js("Promise.resolve", js_new("Promise", (done) => { done(s.setActionHandler("seekbackward", (d) => { audio.currentTime = max([0, audio.currentTime - (d.seekOffset ?? skip)]) })) }))
+                       js("Promise.resolve", js_new("Promise", (done) => { done(s.setActionHandler("seekforward", (d) => { audio.currentTime = audio.currentTime + (d.seekOffset ?? skip) })) }))
+                       js("Promise.resolve", js_new("Promise", (done) => { done(s.setActionHandler("seekto", (d) => { audio.currentTime = d.seekTime })) }))
+                   }
+                   // navigator.audioSession, on Safari: sound goes on with the phone's silent switch on, as a player's should.
+                   let sound = js("navigator").audioSession
+                   if sound != null { sound.type = "playback" }
+               }}
+               @play={() => {
+                   playing = true
+                   if media_session != null { media_session.playbackState = "playing" }
+                   report()
+               }}
+               @pause={() => {
+                   playing = false
+                   if media_session != null { media_session.playbackState = "paused" }
+                   position()
+                   report()
+               }}
+               @playing={() => {
+                   busy = false
+                   position()
+               }}
+               @waiting={() => { busy = true }}
+               @canplay={() => { busy = false }}
+               @durationchange={() => { position() }}
+               @ratechange={() => { position() }}
+               @seeked={() => { position() }}
+               @error={() => {
+                   if track != null && track.src != "" { said = "This track cannot be played." }
+                   busy = false
+                   playing = false
+               }}
+               @ended={() => {
+                   if at + 1 < len(items) {
+                       load_track(at + 1, true)
+                   } else {
+                       on_end && on_end()
+                   }
+               }}></audio>
+        <div.ui-nowp-wrap>
+            <div.ui-nowp-top>
+                {on_close != null
+                    ? <button.ui-nowp-btn.ui-nowp-small type="button" aria-label="Close player" @click={() => { on_close() }}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+                      </button>
+                    : <span.ui-nowp-gap></span>}
+                <span.ui-nowp-where>{len(items) > 0 ? `${at + 1} of ${len(items)}` : ""}</span>
+                <span.ui-nowp-gap></span>
+            </div>
+            <div.ui-nowp-stage
+                 @mount={(el) => { stage = el }}
+                 @pointerdown={(e) => {
+                     if len(items) > 1 && (e.pointerType != "mouse" || e.button == 0) {
+                         stage.setPointerCapture(e.pointerId)
+                         press = { x: e.clientX, y: e.clientY, moving: false, a_x: e.clientX, a_t: e.timeStamp, b_x: e.clientX, b_t: e.timeStamp }
+                         art.style.transition = "none"
+                     }
+                 }}
+                 @pointermove={(e) => {
+                     if press != null {
+                         let dx = e.clientX - press.x
+                         let dy = e.clientY - press.y
+                         if !press.moving && abs(dx) >= 10 && abs(dx) > abs(dy) { press = set(press, "moving", true) }
+                         if press.moving {
+                             press = now_playing_mark(press, e.clientX, e.timeStamp)
+                             // No track that way: it gives, and comes back.
+                             let edge = (dx > 0 && at == 0) || (dx < 0 && at + 1 >= len(items))
+                             art.style.transform = `translateX(${edge ? dx * 0.3 : dx}px)`
+                         }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     if press != null {
+                         let p = press
+                         press = null
+                         let dx = e.clientX - p.x
+                         let by = p.moving ? now_playing_swipe(dx, (e.clientX - p.a_x) / max([1, e.timeStamp - p.a_t]), stage.clientWidth) : 0
+                         spring(art)
+                         if by == 1 && at + 1 < len(items) { load_track(at + 1, !audio.paused) }
+                         if by == -1 && at > 0 { load_track(at - 1, !audio.paused) }
+                     }
+                 }}
+                 @pointercancel={() => {
+                     press = null
+                     spring(art)
+                 }}>
+                <div.ui-nowp-art @mount={(el) => { art = el }}>
+                    {track != null && track.art != "" ? <img src={track.art} alt="" draggable="false"/> : <span aria-hidden="true">{track == null ? "" : slice(track.title, 0, 1)}</span>}
+                </div>
+            </div>
+            <div.ui-nowp-queue aria-label="Queue" role="group">
+                <h2>Queue</h2>
+                {len(items) == 0 && <p.ui-nowp-empty>Nothing in the queue.</p>}
+                <ol.ui-nowp-list>
+                    {for [i, t] in enumerate(items) => <li.ui-nowp-item key={t.id} aria-current={i == at ? "true" : "false"}>
+                        <button.ui-nowp-jump type="button" @click={() => {
+                            let go_on = !audio.paused
+                            showing = false
+                            load_track(i, go_on)
+                        }}>
+                            {t.art != "" ? <img.ui-nowp-thumb src={t.art} alt="" loading="lazy" draggable="false"/> : <span.ui-nowp-thumb></span>}
+                            <span.ui-nowp-names><b>{t.title}</b><span>{t.artist}</span></span>
+                        </button>
+                        <button.ui-nowp-btn.ui-nowp-small type="button" aria-label={`Remove ${t.title}`} @click={() => { remove_at(i) }}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                        </button>
+                    </li>}
+                </ol>
+            </div>
+            <div.ui-nowp-ctrl>
+                <div.ui-nowp-words>
+                    <p.ui-nowp-title>{track == null ? "Nothing playing" : track.title}</p>
+                    <p.ui-nowp-artist>{track == null ? "" : track.artist}</p>
+                </div>
+                <ScrubBar media={id} label="Position in the track" page_scrolls={false}/>
+                <div.ui-nowp-row>
+                    <button.ui-nowp-btn type="button" aria-label="Previous" disabled={track == null} @click={() => { back_track() }}>
+                        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 5h2v14H6zM20 5v14L9 12z"/></svg>
+                    </button>
+                    <button class={ui_cls(["ui-nowp-btn", "ui-nowp-play", busy && playing && "ui-nowp-busy"])} type="button" aria-label={playing ? "Pause" : "Play"} disabled={track == null} @click={() => { toggle() }}>
+                        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={playing ? now_playing_pause : now_playing_play}/></svg>
+                    </button>
+                    <button.ui-nowp-btn type="button" aria-label="Next" disabled={at + 1 >= len(items)} @click={() => { on_track() }}>
+                        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16 5h2v14h-2zM4 5v14l11-7z"/></svg>
+                    </button>
+                </div>
+                <div.ui-nowp-tools>
+                    {len(rates) > 1 && <button.ui-nowp-btn.ui-nowp-small.ui-nowp-wide type="button" aria-label={`Speed: ${speed} times`} @click={() => {
+                        speed = now_playing_next_speed(rates, speed)
+                        audio.defaultPlaybackRate = speed
+                        audio.playbackRate = speed
+                        report()
+                    }}>{speed}×</button>}
+                    {sleep && <SleepTimerSheet media={id} trigger="Sleep"/>}
+                    <button class={ui_cls(["ui-nowp-btn", "ui-nowp-small", "ui-nowp-qbtn", showing && "ui-nowp-pressed"])} type="button" aria-label="Queue" aria-pressed={showing ? "true" : "false"} @click={() => { showing = !showing }}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+                    </button>
+                </div>
+                <p.ui-nowp-said role="status">{said}</p>
+                {no_session && <p.ui-nowp-said>This browser has no lock-screen controls, so the player works from here only.</p>}
+            </div>
+        </div>
+    </div>
+}

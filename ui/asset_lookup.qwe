@@ -1,0 +1,273 @@
+// AssetLookup: scan or type an asset's tag, and see what it is, what has happened to it and
+// what to do about it right now. It works from the list it is given, with no connection,
+// so a basement with no signal is no problem. A tag it does not know is not a dead end: it
+// offers what the person may have meant, the O for 0 slips first, and a way to report it.
+//
+//   import ui/asset_lookup.qwe use AssetLookup
+//
+//   <AssetLookup today="2026-11-02" assets={[{ tag: "PMP-1042", name: "Sump pump", status: "in_service", location: "Basement",
+//       next_service: "2026-10-20", history: [{ on: "2026-04-20", what: "Serviced", who: "M. Roy" }] }]}
+//       actions={[{ id: "report", label: "Report a fault" }]} on_action={(a, what) => { open_job(a, what) }}/>
+//
+// assets: each { tag, name, kind, status, location, assigned, serial, next_service, expires,
+// history, todo, notes }. status: "in_service", "out_of_service", "missing" or anything
+// else, shown as it is. next_service: the date a service is due, as text. expires: the date
+// a certificate runs out. history: each { on, what, who }, shown newest first. todo: more
+// things to do, as text. Tags match whatever their case, spaces or hyphens.
+//
+// today: the date, as text, which the server should pass. soon: days ahead that count as
+// due soon (14). actions: buttons on a record, each { id, label }. use_camera, wedge, sound,
+// as for ScanCountInput. title ("Asset lookup"). id: a prefix for its ids.
+//
+// on_found(asset): each one shown. on_action(asset, action). on_unknown(tag): when a tag
+// nobody knows is reported.
+//
+// asset_lookup_key(tag), asset_lookup_find(index, tag), asset_lookup_index(assets),
+// asset_lookup_near(assets, tag) and asset_lookup_todo(asset, today, soon) are the plain logic.
+// A thing to do: { level ("stop", "warn" or "ok"), text }.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/scan_count.qwe use ScanCountInput, scan_count_clean
+
+let asset_lookup_css = css`
+.ui-assetl { display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-assetl h3 { margin: 0; font-size: 18px; }
+.ui-assetl-cols { display: grid; gap: 12px; min-width: 0; }
+.ui-assetl-col { display: grid; gap: 12px; min-width: 0; align-content: start; }
+.ui-assetl-recent { display: grid; gap: 4px; min-width: 0; }
+.ui-assetl-recent h4 { margin: 0; color: var(--ui-muted); font-size: 13px; font-weight: 500; }
+.ui-assetl-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.ui-assetl-chip { min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 600 14px var(--ui-mono); cursor: pointer; touch-action: manipulation; overflow-wrap: anywhere; }
+.ui-assetl-chip:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-assetl-card { display: grid; gap: 10px; min-width: 0; padding: 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-assetl-card h4 { margin: 0; font-size: 19px; overflow-wrap: anywhere; outline: none; }
+.ui-assetl-tag { font: 600 14px var(--ui-mono); overflow-wrap: anywhere; }
+.ui-assetl-state { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 999px; background: var(--ui-subtle); font: 700 13px var(--ui-font); }
+.ui-assetl-state[data-status="in_service"] { background: var(--ui-success-soft); }
+.ui-assetl-state[data-status="out_of_service"], .ui-assetl-state[data-status="missing"] { background: var(--ui-danger); color: #fff; }
+.ui-assetl-todo { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-assetl-todo li { padding: 8px 12px; border-left: 6px solid var(--ui-success); border-radius: var(--ui-radius-sm); background: var(--ui-success-soft); font-weight: 600; }
+.ui-assetl-todo li[data-level="warn"] { border-color: var(--ui-warning); background: var(--ui-warning-soft); }
+.ui-assetl-todo li[data-level="stop"] { border-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-assetl-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 12px; margin: 0; }
+.ui-assetl-facts dt { color: var(--ui-muted); }
+.ui-assetl-facts dd { margin: 0; overflow-wrap: anywhere; }
+.ui-assetl-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-assetl-acts > * { flex: 1 1 140px; }
+.ui-assetl-hist { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-assetl-hist li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0 10px; padding: 6px 0; border-top: 1px solid var(--ui-border); }
+.ui-assetl-hist time { color: var(--ui-muted); font: 13px var(--ui-mono); }
+.ui-assetl-hist small { grid-column: 2; color: var(--ui-muted); }
+.ui-assetl-more { min-height: 44px; }
+.ui-assetl-more summary { display: flex; align-items: center; min-height: 44px; font-weight: 600; cursor: pointer; }
+.ui-assetl-more summary:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-assetl-miss { display: grid; gap: 8px; padding: 12px; border: 2px solid var(--ui-warning); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-assetl-miss h4 { margin: 0; font-size: 17px; overflow-wrap: anywhere; outline: none; }
+.ui-assetl-miss p { margin: 0; }
+.ui-assetl-near { display: grid; gap: 6px; }
+.ui-assetl-pick { display: grid; gap: 0; box-sizing: border-box; width: 100%; min-height: 52px; padding: 6px 12px; border: 2px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-bg); color: var(--ui-fg); font: 600 15px var(--ui-font); text-align: left; cursor: pointer; }
+.ui-assetl-pick small { color: var(--ui-muted); font: 500 13px var(--ui-mono); }
+.ui-assetl-pick:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-assetl-empty { margin: 0; padding: 20px 12px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius-sm); color: var(--ui-muted); text-align: center; }
+@container (min-width: 640px) {
+  .ui-assetl-cols { grid-template-columns: 300px minmax(0, 1fr); gap: 20px; align-items: start; }
+}
+`
+
+// What a tag is compared by: its letters and digits, in one case.
+fn asset_lookup_key(tag) -> str = upper(re.replace(scan_count_clean(tag), "[^A-Za-z0-9]", ""))
+
+// The same with what a thumb or a worn label confuses made one.
+fn asset_lookup_fold(key: str) -> str = re.replace(re.replace(re.replace(re.replace(key, "O", "0"), "[IL]", "1"), "S", "5"), "B", "8")
+
+fn asset_lookup_list(assets: list) -> list = assets | filter((a) => type_of(a) == "map" && get(a, "tag") != null && asset_lookup_key(a.tag) != "")
+
+// Assets by key, for looking up in a long list.
+fn asset_lookup_index(assets: list) -> map = group_by(asset_lookup_list(assets), (a) => asset_lookup_key(a.tag))
+
+// The asset with a tag, or null. get(), as a tag may be `constructor`.
+fn asset_lookup_find(index, tag) {
+    let found = get(index, asset_lookup_key(tag))
+    found != null ? found[0] : null
+}
+
+// How many letters apart two keys are, by Levenshtein's distance.
+fn asset_lookup_distance(a: str, b: str) -> int {
+    let x = split(a, "")
+    let y = split(b, "")
+    let done = enumerate(x) | reduce(range(0, len(y) + 1), (row, p) =>
+        enumerate(y) | reduce([p[0] + 1], (cur, q) => {
+            let j = q[0]
+            cur | push(min([row[j + 1] + 1, cur[j] + 1, row[j] + (q[1] == p[1] ? 0 : 1)]))
+        }))
+    done[len(y)]
+}
+
+// What was probably meant: slips between O and 0 and the like first, then the nearest by
+// one or two letters, at most three. A tag of a few letters is near everything, so it needs
+// to be close in proportion.
+fn asset_lookup_near(assets: list, tag) -> list {
+    let k = asset_lookup_key(tag)
+    if k == "" { return [] }
+    let fold = asset_lookup_fold(k)
+    let reach = len(k) < 5 ? 1 : 2
+    let scored = asset_lookup_list(assets) | map((a) => {
+        let key = asset_lookup_key(a.tag)
+        let far = abs(len(key) - len(k)) > reach ? 99 : (asset_lookup_fold(key) == fold ? 0 : asset_lookup_distance(key, k))
+        { a: a, far: far }
+    }) | filter((s) => s.far <= reach)
+    slice(sort_by(scored, (s) => s.far), 0, 3) | map((s) => s.a)
+}
+
+fn asset_lookup_date(x) -> bool = type_of(x) == "str" && re.test(x, "^[0-9]{4}-[0-9]{2}-[0-9]{2}$") && date.valid(x)
+
+fn asset_lookup_status_text(s) -> str = match s {
+    "in_service" => "In service"
+    "out_of_service" => "Out of service"
+    "missing" => "Missing"
+    null => "Not known"
+    _ => str(s)
+}
+
+// One date against today, for what is due: an entry, or null.
+fn asset_lookup_due(word: str, on, today, soon: int) {
+    if !asset_lookup_date(on) || !asset_lookup_date(today) { return null }
+    let days = date.days_between(today, on)
+    let plural = (n) => n == 1 ? "1 day" : `${n} days`
+    if days < 0 { return { level: "stop", text: `${word} overdue by ${plural(0 - days)}.` } }
+    if days == 0 { return { level: "warn", text: `${word} due today.` } }
+    days <= soon ? { level: "warn", text: `${word} due in ${plural(days)}.` } : null
+}
+
+// What to do with it now, the most serious first. Something with nothing wrong says so, as
+// a person holding it wants to hear it.
+fn asset_lookup_todo(asset, today, soon: int = 14) -> list {
+    let status = get(asset, "status")
+    let first = status == "out_of_service" ? [{ level: "stop", text: "Do not use. It is out of service." }] :
+        (status == "missing" ? [{ level: "stop", text: "Reported missing. Tell the office where it is." }] : [])
+    let dates = [asset_lookup_due("Service", get(asset, "next_service"), today, soon), asset_lookup_due("Certificate", get(asset, "expires"), today, soon)] | filter((x) => x != null)
+    let more = type_of(get(asset, "todo")) == "list" ? asset.todo | map((t) => ({ level: "warn", text: str(t) })) : []
+    let all = first + dates + more
+    let ranked = sort_by(all, (x) => x.level == "stop" ? 0 : 1)
+    len(ranked) > 0 ? ranked : [{ level: "ok", text: "Nothing to do. It is fine to use." }]
+}
+
+// Its history, newest first, dates as text sorting as they should.
+fn asset_lookup_history(asset) -> list {
+    let h = get(asset, "history")
+    if type_of(h) != "list" { return [] }
+    reverse(sort_by(h | filter((x) => type_of(x) == "map"), (x) => str(get(x, "on") ?? "")))
+}
+
+// A recent list: this tag at the front, each once, eight at most.
+fn asset_lookup_recent(recent: list, tag: str) -> list = slice([tag] + (recent | filter((t) => t != tag)), 0, 8)
+
+component AssetLookup(assets: list = [], today: str? = null, soon: int = 14, actions: list = [], use_camera: bool = true, wedge: bool = false, sound: bool = true,
+                      title: str = "Asset lookup", id: str = "ui-assetl", on_found = null, on_action = null, on_unknown = null, class: str? = null) {
+    style global asset_lookup_css
+    state shown = null       // the asset on the screen
+    state missing = null     // the tag nobody knows
+    state reported = false
+    state recent = []
+    state said = ""
+    state root = null
+    let index = asset_lookup_index(assets)
+    let near = missing != null ? asset_lookup_near(assets, missing) : []
+    let todo = shown != null ? asset_lookup_todo(shown, today, soon) : []
+    let history = shown != null ? asset_lookup_history(shown) : []
+    let heading = () => {
+        // A screen reader is told what came up, and a phone shows the top of it.
+        js("requestAnimationFrame", (_t = null) => {
+            let h = root.querySelector(".ui-assetl-show h4")
+            if h != null {
+                h.focus({ preventScroll: true })
+                h.scrollIntoView({ block: "nearest" })
+            }
+        })
+    }
+    let look = (tag) => {
+        let found = asset_lookup_find(index, tag)
+        said = ""
+        reported = false
+        if found != null {
+            shown = found
+            missing = null
+            recent = asset_lookup_recent(recent, str(found.tag))
+            on_found && on_found(found)
+        } else {
+            shown = null
+            missing = scan_count_clean(tag)
+        }
+        heading()
+        found != null
+    }
+    <section class={ui_cls(["ui-assetl", class])} @mount={(el) => { root = el }}>
+        <h3>{title}</h3>
+        <div.ui-assetl-cols>
+            <div.ui-assetl-col>
+                <ScanCountInput id={`${id}-in`} label="Asset tag" use_camera={use_camera} wedge={wedge} sound={sound} on_scan={(code, _how) => look(code)}/>
+                {len(recent) > 0 && <div.ui-assetl-recent>
+                    <h4>Recent</h4>
+                    <div.ui-assetl-chips>
+                        {for t in recent => <button.ui-assetl-chip type="button" key={t} @click={() => { look(t) }}>{t}</button>}
+                    </div>
+                </div>}
+            </div>
+            <div.ui-assetl-col>
+                <div.ui-assetl-show>
+                    {shown == null && missing == null && <p.ui-assetl-empty>Scan a tag to see the record.</p>}
+                    {shown != null && <div.ui-assetl-card>
+                        <div>
+                            <h4 tabindex="-1">{str(get(shown, "name") ?? shown.tag)}</h4>
+                            <span.ui-assetl-tag>{str(shown.tag)}</span>
+                            <span.ui-assetl-state data-status={get(shown, "status")}>{asset_lookup_status_text(get(shown, "status"))}</span>
+                        </div>
+                        <ul.ui-assetl-todo aria-label="What to do">
+                            {for [i, t] in enumerate(todo) => <li key={i} data-level={t.level}>{t.text}</li>}
+                        </ul>
+                        <dl.ui-assetl-facts>
+                            {for f in [["Kind", "kind"], ["Location", "location"], ["With", "assigned"], ["Serial", "serial"], ["Next service", "next_service"], ["Certificate to", "expires"], ["Notes", "notes"]] {
+                                let v = get(shown, f[1])
+                                {v != null && <div style="display: contents" key={f[1]}><dt>{f[0]}</dt><dd>{str(v)}</dd></div>}
+                            }}
+                        </dl>
+                        {len(actions) > 0 && <div.ui-assetl-acts>
+                            {for a in actions => <Button size="lg" variant="outline" key={str(get(a, "id") ?? "")} on_click={() => {
+                                said = `${str(get(a, "label") ?? "Done")}: ${str(shown.tag)}`
+                                on_action && on_action(shown, a)
+                            }}>{str(get(a, "label") ?? "")}</Button>}
+                        </div>}
+                        <p role="status" style="margin: 0; font-weight: 600">{said}</p>
+                        {len(history) > 0 && <details.ui-assetl-more open={true}>
+                            <summary>History, {len(history)}</summary>
+                            <ul.ui-assetl-hist>
+                                {for [i, h] in enumerate(history) => <li key={i}>
+                                    <time>{str(get(h, "on") ?? "")}</time>
+                                    <span>{str(get(h, "what") ?? "")}</span>
+                                    {get(h, "who") != null && <small>{str(h.who)}</small>}
+                                </li>}
+                            </ul>
+                        </details>}
+                    </div>}
+                    {missing != null && <div.ui-assetl-miss>
+                        <h4 tabindex="-1">Not in the register: {missing}</h4>
+                        {len(near) > 0
+                            ? <div.ui-assetl-near>
+                                <p>Did you mean one of these?</p>
+                                {for a in near => <button.ui-assetl-pick type="button" key={str(a.tag)} @click={() => { look(str(a.tag)) }}>
+                                    <span>{str(get(a, "name") ?? a.tag)}</span>
+                                    <small>{str(a.tag)}</small>
+                                </button>}
+                            </div>
+                            : <p>Check the label and scan it again. If it is new, report it.</p>}
+                        <Button size="lg" variant="outline" disabled={reported} on_click={() => {
+                            reported = true
+                            on_unknown && on_unknown(missing)
+                        }}>{reported ? "Reported" : "Report this tag"}</Button>
+                    </div>}
+                </div>
+            </div>
+        </div>
+    </section>
+}

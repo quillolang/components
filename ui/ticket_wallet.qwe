@@ -1,0 +1,411 @@
+// TicketWallet: the tickets a person holds, stacked by date as cards in a wallet, what is next
+// on top, and what has passed kept apart under its own heading. Pressing one shows its
+// code at full size, on white, with the brightness up and the screen kept on; a swipe, the
+// buttons or the arrow keys go through the others without closing. Every code is drawn here,
+// so a phone in a stadium with no signal can still show one.
+//
+//   import ui/ticket_wallet.qwe use TicketWallet
+//
+//   <TicketWallet now="2026-11-03T18:00:00+00:00" tickets={[
+//       { id: "c1", title: "Dead Combo", venue: "Coliseu", starts: "2026-11-03T21:00:00+00:00", seat: "Row F, 12", code: "TK-88213" },
+//       { id: "t1", title: "Train to Porto", kind: "barcode", starts: "2026-11-04T08:30:00+00:00", ends: "2026-11-04T11:15:00+00:00", code: "CP4418221" },
+//   ]}/>
+//
+// tickets: a list of { id, title, venue?, starts, ends?, seat?, holder?, code, kind? }. starts:
+// an ISO date-time with its offset, shown as written, or a date for a ticket good all day. A
+// ticket whose date cannot be read still shows, under "No date", as it may be the one a person
+// needs. ends: when it stops being good; left out, `grace` hours after it starts (6), or
+// the end of the day for a date. code: what the scanner reads. kind: "qr" (default) or
+// "barcode". now: the time, in the same form, so the server writes what the browser does;
+// left out, the dates settle once the page has started, from the phone's clock. tick: seconds
+// between looks at the clock (30). label: its heading ("Tickets").
+// keep: saves them in this browser (localStorage), under `keep_key` ("quillo-ticket-wallet"), and
+// a page that gives none shows the saved ones (true). on_keep(tickets): called once with them,
+// for a program to keep. In the phone apps localStorage comes back empty at each launch,
+// as the app's address changes: there, keep them through a `server fn` and SQLite and give them
+// back as `tickets`. A web page itself reloads offline only under a service worker, which a
+// component cannot install: this keeps the data, not the page.
+//
+// ticket_wallet_rows, ticket_wallet_groups and ticket_wallet_when are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/qr_code.qwe use QrCode
+import ui/barcode.qwe use Barcode
+
+let ticket_wallet_css = css`
+.ui-twallet { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.35 var(--ui-font); }
+.ui-twallet-title { margin: 0 0 4px; font-size: 20px; font-weight: 700; }
+.ui-twallet-net { margin: 0 0 12px; color: var(--ui-muted); font-size: 13px; }
+.ui-twallet-net[data-off] { color: var(--ui-fg); font-weight: 600; }
+.ui-twallet-groups { display: grid; gap: 16px; }
+.ui-twallet-day { margin: 0 0 6px; color: var(--ui-muted); font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+.ui-twallet-stack { margin: 0; padding: 0; list-style: none; }
+/* Each card lies on the one before, with its head showing: what the eye reads in a wallet. */
+.ui-twallet-stack > li + li { margin-top: -40px; }
+.ui-twallet-card {
+  position: relative; box-sizing: border-box; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-content: start; gap: 0 10px; width: 100%; height: 116px; padding: 12px 14px;
+  border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 4px); background: var(--ui-surface); color: inherit; font: inherit; text-align: left; cursor: pointer;
+  box-shadow: 0 -3px 10px rgb(0 0 0 / .1); -webkit-tap-highlight-color: transparent;
+}
+.ui-twallet-card:focus-visible { outline: none; box-shadow: var(--ui-focus); z-index: 1; }
+.ui-twallet-card-title { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-twallet-card-time { font-weight: 700; font-variant-numeric: tabular-nums; }
+.ui-twallet-card-where { grid-column: 1 / -1; color: var(--ui-muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-twallet-card-show { grid-column: 1 / -1; align-self: end; margin-top: 18px; color: var(--ui-accent); font-size: 13px; font-weight: 600; }
+.ui-twallet-past .ui-twallet-card-show { display: none; }
+.ui-twallet-past { margin-top: 18px; border-top: 1px solid var(--ui-border); padding-top: 4px; }
+.ui-twallet-past summary { display: flex; align-items: center; min-height: 44px; color: var(--ui-muted); font-weight: 600; cursor: pointer; }
+.ui-twallet-past .ui-twallet-card { height: auto; min-height: 64px; box-shadow: none; opacity: .75; }
+.ui-twallet-past .ui-twallet-stack { display: grid; gap: 6px; }
+.ui-twallet-past .ui-twallet-stack > li + li { margin-top: 0; }
+.ui-twallet-empty { padding: 20px; color: var(--ui-muted); text-align: center; }
+/* The code's page: light whatever the theme, since a scanner reads dark on light. */
+.ui-twallet-full {
+  box-sizing: border-box; position: fixed; inset: 0; width: 100%; max-width: none; height: 100dvh; max-height: none; margin: 0; padding: max(14px, env(safe-area-inset-top)) 14px max(14px, env(safe-area-inset-bottom));
+  overflow: hidden; border: 0; background: #fff; color: #111; font: 15px/1.35 var(--ui-font); overscroll-behavior: contain;
+}
+.ui-twallet-full[open] { display: flex; flex-direction: column; gap: 10px; }
+.ui-twallet-full::backdrop { background: #fff; }
+.ui-twallet-sheet {
+  flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; touch-action: pan-y; user-select: none; -webkit-touch-callout: none; will-change: transform; outline: none;
+  transition: transform .26s cubic-bezier(.22, 1, .36, 1);
+}
+.ui-twallet-sheet[data-dragging] { transition: none; }
+.ui-twallet-code { display: grid; place-items: center; width: 100%; min-height: 0; }
+.ui-twallet-code svg { display: block; width: min(90vw, 58dvh); height: auto; max-width: 100%; }
+.ui-twallet-code .ui-barcode svg { width: 100%; height: 26dvh; }
+.ui-twallet-code .ui-barcode { width: 100%; }
+.ui-twallet-none { margin: 0; padding: 24px; color: #444; }
+.ui-twallet-full-title { margin: 0; font-size: 22px; font-weight: 800; line-height: 1.2; overflow-wrap: anywhere; text-align: center; }
+.ui-twallet-full-line { margin: 0; color: #333; font-size: 15px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; text-align: center; }
+.ui-twallet-full-line:empty { display: none; }
+.ui-twallet-gone { margin: 0; padding: 2px 10px; border-radius: 999px; background: #8a1c1c; color: #fff; font-size: 13px; font-weight: 700; }
+.ui-twallet-say { margin: 0; color: #444; font-size: 14px; text-align: center; }
+.ui-twallet-say:empty { display: none; }
+.ui-twallet-bar { flex: none; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.ui-twallet-btn { box-sizing: border-box; min-height: 48px; padding: 0 8px; border: 1px solid #111; border-radius: 12px; background: #fff; color: #111; font: 600 15px/1 var(--ui-font); cursor: pointer; }
+.ui-twallet-btn:disabled { opacity: .4; cursor: default; }
+.ui-twallet-btn:focus-visible { outline: 3px solid #0a66ff; outline-offset: 2px; }
+.ui-twallet-done { background: #111; color: #fff; }
+/* With the room, days stand side by side, and a code stands by its details. */
+@container (min-width: 620px) {
+  .ui-twallet-groups { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .ui-twallet-sheet { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-content: center; justify-items: center; column-gap: 24px; }
+  .ui-twallet-code { grid-column: 2; grid-row: 1 / span 5; }
+  .ui-twallet-code svg { width: min(46vw, 70dvh); }
+  .ui-twallet-bar { width: min(520px, 100%); margin: 0 auto; }
+}
+@media (hover: hover) { .ui-twallet-card:hover { border-color: var(--ui-strong); } }
+@media (prefers-reduced-motion: reduce) { .ui-twallet-sheet { transition: none; } }
+`
+
+fn ticket_wallet_clock() = now()
+
+fn ticket_wallet_time(s) = type_of(s) == "str" && date.valid(s, "date-time")
+
+fn ticket_wallet_date(s) = type_of(s) == "str" && date.valid(s, "date")
+
+// Ticket by ticket: when it starts, what day it belongs to, and whether its time has gone.
+fn ticket_wallet_row(t, i: int, ms, today, grace: num) {
+    let timed = ticket_wallet_time(t.starts)
+    let dated = !timed && ticket_wallet_date(t.starts)
+    let start = timed ? date.ms(t.starts) : (dated ? date.ms(t.starts) : null)
+    let day = timed ? slice(t.starts, 0, 10) : (dated ? t.starts : null)
+    let ends = ticket_wallet_time(t.ends) ? date.ms(t.ends) : (timed ? start + grace * 3600000 : null)
+    let gone = ms == null || day == null ? false : (ends != null ? ends <= ms : day < today)
+    { id: t.id ?? `${i}`, t: t, start: start, day: day, timed: timed, gone: gone }
+}
+
+// { live, past }: those still good, soonest first and the undated last; those gone, newest first.
+fn ticket_wallet_rows(tickets, ms, today, grace: num = 6) {
+    let rows = (type_of(tickets) == "list" ? tickets : []) | filter((t) => type_of(t) == "map") | enumerate() | map((p) => ticket_wallet_row(p[1], p[0], ms, today, grace))
+    let live = rows | filter((r) => !r.gone) | sort_by((r) => r.start ?? 99999999999999)
+    let past = rows | filter((r) => r.gone) | sort_by((r) => 0 - r.start)
+    { live: live, past: past }
+}
+
+// What a day is called, seen from `today`.
+fn ticket_wallet_day(day, today) {
+    if day == null { return "No date" }
+    if today == null { return date.format(day, "ddd D MMM") }
+    let n = date.days_between(today, day)
+    n == 0 ? "Today" : (n == 1 ? "Tomorrow" : date.format(day, "ddd D MMM"))
+}
+
+// Live rows as [{ day, label, rows }], in order, each day once.
+fn ticket_wallet_groups(live, today) =
+    unique(live | map((r) => r.day ?? "")) | map((d) => {
+        let day = d == "" ? null : d
+        { day: d, label: ticket_wallet_day(day, today), rows: live | filter((r) => (r.day ?? "") == d) }
+    })
+
+// The time on a card: "21:00", or "All day".
+fn ticket_wallet_when(r) = r.timed ? date.format(r.t.starts, "HH:mm") : (r.day != null ? "All day" : "")
+
+fn ticket_wallet_where(t) = join([t.venue, t.seat] | filter((x) => x != null && x != ""), ", ")
+
+fn ticket_wallet_net(online, kept) {
+    if !online { return kept ? "Offline. Your tickets are saved and still work." : "Offline. Tickets still work while this page stays open." }
+    kept ? "Ready offline." : "Keep this page open to use them offline."
+}
+
+// A finger as it goes; see route_steps.qwe, of which this is the same small tool.
+fn ticket_wallet_track(x: num, y: num, at: num) = { x0: x, y0: y, x: x, y: y, lock: null, samples: [[at, x]] }
+
+fn ticket_wallet_track_move(track, x: num, y: num, at: num, slop: num = 8) {
+    let dx = abs(x - track.x0)
+    let dy = abs(y - track.y0)
+    let lock = track.lock
+    if lock == null && max([dx, dy]) >= slop { lock = dx > dy ? "x" : "y" }
+    { x0: track.x0, y0: track.y0, x: x, y: y, lock: lock, samples: slice(track.samples, -5, len(track.samples)) + [[at, x]] }
+}
+
+fn ticket_wallet_speed(track, at: num) {
+    let s = track.samples
+    let last = s[len(s) - 1]
+    if at - last[0] > 120 { return 0 }
+    let recent = s | filter((p) => last[0] - p[0] <= 100)
+    let first = len(recent) > 1 || len(s) < 2 ? recent[0] : s[len(s) - 2]
+    let took = last[0] - first[0]
+    took <= 0 ? 0 : (last[1] - first[1]) / took
+}
+
+// -1 to the ticket before, 1 to the one after, 0 back where it was.
+fn ticket_wallet_release(dx: num, speed: num, width: num) {
+    let flung = abs(speed) >= 0.4 && abs(dx) >= 12
+    if !flung && abs(dx) < width * 0.3 { return 0 }
+    if flung && (speed > 0) != (dx > 0) { return 0 }
+    dx > 0 ? -1 : 1
+}
+
+fn ticket_wallet_rubber(dx: num) = dx > 0 ? round(dx / (1 + dx / 160), 2) : 0 - round(abs(dx) / (1 + abs(dx) / 160), 2)
+
+fn ticket_wallet_offset() {
+    let off = 0 - js_new("Date").getTimezoneOffset()
+    let hh = floor(abs(off) / 60)
+    `${off < 0 ? "-" : "+"}${hh < 10 ? "0" : ""}${hh}:${abs(off) % 60 < 10 ? "0" : ""}${abs(off) % 60}`
+}
+
+view TicketWalletCard(row, on_open) =
+    <button.ui-twallet-card type="button" data-id={str(row.id)} aria-haspopup="dialog" @click={on_open}>
+        <span.ui-twallet-card-title>{row.t.title ?? "A ticket"}</span>
+        <span.ui-twallet-card-time>{ticket_wallet_when(row)}</span>
+        <span.ui-twallet-card-where>{ticket_wallet_where(row.t)}</span>
+        <span.ui-twallet-card-show>Show code</span>
+    </button>
+
+component TicketWallet(tickets = [], now: str? = null, tick: num = 30, grace: num = 6, label: str = "Tickets", keep: bool = true,
+                       keep_key: str = "quillo-ticket-wallet", on_keep = null, class: str? = null) {
+    style global ticket_wallet_css
+    state copy = null
+    state kept = on_keep != null
+    state online = true
+    state base = ticket_wallet_time(now) ? date.ms(now) : null
+    state offset = ticket_wallet_time(now) ? date.parts(now).offset : null
+    state seen_now = now
+    state since = 0
+    state moved_on = 0
+    state dlg = null
+    state win = null
+    state wake = null
+    state before = null
+    state open_id = null
+    state say = ""
+    state sheet = null
+    state track = null
+    state dragging = false
+    if now != seen_now {
+        seen_now = now
+        if ticket_wallet_time(now) {
+            base = date.ms(now)
+            offset = date.parts(now).offset
+            since = ticket_wallet_clock()
+            moved_on = 0
+        }
+    }
+    if tick > 0 && base != null { every(round(tick * 1000), () => { moved_on = ticket_wallet_clock() - since }) }
+
+    let from_copy = copy != null
+    let at_ms = base == null ? null : base + moved_on
+    let today = at_ms == null ? null : slice(date.from_ms(at_ms, offset), 0, 10)
+    let parts = ticket_wallet_rows(from_copy ? copy : tickets, at_ms, today, grace)
+    let groups = ticket_wallet_groups(parts.live, today)
+    let order = parts.live + parts.past
+    let ids = order | map((r) => r.id)
+    let place = open_id == null ? null : index_of(ids, open_id)
+    let shown = place == null ? null : order[place]
+    let count = len(order)
+
+    let boost = () => {
+        say = ""
+        if win.quilloNative != null {
+            let was = js("quilloNative.brightness")
+            if !is_err(was) {
+                before = was
+                js("quilloNative.brightness", 1)
+            }
+            js("quilloNative.keepAwake", true)
+        } else {
+            say = "Turn your screen's brightness up for the scanner."
+            if win.navigator.wakeLock != null {
+                let lock = js("navigator.wakeLock.request", "screen")
+                if !is_err(lock) { wake = lock }
+            }
+        }
+    }
+    let ease = () => {
+        if win.quilloNative != null {
+            if before != null { js("quilloNative.brightness", before) }
+            before = null
+            js("quilloNative.keepAwake", false)
+        }
+        if wake != null {
+            js("Promise.resolve", wake.release())
+            wake = null
+        }
+    }
+    let open_ticket = (id) => {
+        open_id = id
+        dlg.showModal()
+        boost()
+    }
+    let shut = () => {
+        if open_id != null {
+            open_id = null
+            track = null
+            dragging = false
+            ease()
+        }
+    }
+    let move = (by: int) => {
+        if place != null {
+            let to = place + by
+            if to >= 0 && to < count { open_id = ids[to] }
+        }
+    }
+    let cancel = (_e = null) => {
+        track = null
+        dragging = false
+        if sheet != null { sheet.style.removeProperty("transform") }
+    }
+    <section class={ui_cls(["ui-twallet", class])} aria-label={label} @mount={(_el) => {
+        win = js("window")
+        let d = js("document")
+        since = ticket_wallet_clock()
+        if base == null {
+            offset = ticket_wallet_offset()
+            base = since
+        }
+        online = win.navigator.onLine != false
+        let have = type_of(tickets) == "list" && len(tickets) > 0
+        if keep {
+            let store = js("Promise.resolve", js_new("Promise", (done) => { done(win.localStorage) }))
+            if !is_err(store) {
+                if have {
+                    let wrote = js("Promise.resolve", js_new("Promise", (done) => { done(store.setItem(keep_key, json.stringify(tickets))) }))
+                    if !is_err(wrote) { kept = true }
+                } else {
+                    let text = js("Promise.resolve", js_new("Promise", (done) => { done(store.getItem(keep_key)) }))
+                    if type_of(text) == "str" {
+                        let back = json.parse(text)
+                        if type_of(back) == "list" {
+                            copy = back
+                            kept = true
+                        }
+                    }
+                }
+            }
+        }
+        if have && on_keep != null { on_keep(tickets) }
+        let up = (_e) => { online = true }
+        let down = (_e) => { online = false }
+        win.addEventListener("online", up)
+        win.addEventListener("offline", down)
+        let back = (_e) => {
+            if open_id != null && js("document.visibilityState") == "visible" { boost() }
+        }
+        d.addEventListener("visibilitychange", back)
+        () => {
+            win.removeEventListener("online", up)
+            win.removeEventListener("offline", down)
+            d.removeEventListener("visibilitychange", back)
+            if open_id != null { ease() }
+        }
+    }}>
+        <h3.ui-twallet-title>{label}</h3>
+        <p.ui-twallet-net role="status" data-off={online ? null : ""}>{from_copy ? "Saved copy. " : ""}{ticket_wallet_net(online, kept)}</p>
+        {count == 0 && <p.ui-twallet-empty>No tickets yet.</p>}
+        <div.ui-twallet-groups>
+            {for g in groups => <section key={g.day} data-day={g.day}>
+                <h4.ui-twallet-day>{g.label}</h4>
+                <ul.ui-twallet-stack>
+                    {for r in g.rows => <li key={r.id}><TicketWalletCard row={r} on_open={() => { open_ticket(r.id) }}/></li>}
+                </ul>
+            </section>}
+        </div>
+        {len(parts.past) > 0 && <details.ui-twallet-past>
+            <summary>Past tickets ({len(parts.past)})</summary>
+            <ul.ui-twallet-stack>
+                {for r in parts.past => <li key={r.id}><TicketWalletCard row={r} on_open={() => { open_ticket(r.id) }}/></li>}
+            </ul>
+        </details>}
+        <dialog.ui-twallet-full aria-label="Ticket code" @mount={(el) => { dlg = el }} @close={shut}
+                @keydown={(e) => {
+                    if e.key == "ArrowRight" {
+                        e.preventDefault()
+                        move(1)
+                    }
+                    if e.key == "ArrowLeft" {
+                        e.preventDefault()
+                        move(-1)
+                    }
+                }}>
+            {shown != null && <div.ui-twallet-sheet data-dragging={dragging ? "" : null} data-id={str(shown.id)}
+                 @mount={(el) => { sheet = el }}
+                 @pointerdown={(e) => { if e.button == 0 { track = ticket_wallet_track(e.clientX, e.clientY, e.timeStamp) } }}
+                 @pointermove={(e) => {
+                     if track != null {
+                         track = ticket_wallet_track_move(track, e.clientX, e.clientY, e.timeStamp)
+                         if track.lock == "y" {
+                             cancel()
+                         } else if track.lock == "x" {
+                             if !dragging {
+                                 dragging = true
+                                 sheet.setPointerCapture(e.pointerId)
+                             }
+                             let dx = track.x - track.x0
+                             let blocked = (dx > 0 && place == 0) || (dx < 0 && place == count - 1)
+                             sheet.style.transform = `translateX(${blocked ? ticket_wallet_rubber(dx) : round(dx, 1)}px)`
+                         }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     if track != null && track.lock == "x" {
+                         let go = ticket_wallet_release(track.x - track.x0, ticket_wallet_speed(track, e.timeStamp), sheet.offsetWidth)
+                         cancel()
+                         if go != 0 { move(go) }
+                     } else {
+                         track = null
+                     }
+                 }}
+                 @pointercancel={cancel}>
+                <div.ui-twallet-code>
+                    {str(shown.t.code ?? "") == "" ? <p.ui-twallet-none>This ticket has no code.</p> : shown.t.kind == "barcode"
+                        ? <Barcode text={str(shown.t.code ?? "")} bar={2} height={160} show_text={false} label={`Code for ${shown.t.title ?? "this ticket"}`}/>
+                        : <QrCode text={str(shown.t.code ?? "")} size={320} label={`Code for ${shown.t.title ?? "this ticket"}`}/>}
+                </div>
+                <h3.ui-twallet-full-title>{shown.t.title ?? "A ticket"}</h3>
+                <p.ui-twallet-full-line>{shown.day != null ? ticket_wallet_day(shown.day, today) : ""}{ticket_wallet_when(shown) != "" ? `, ${ticket_wallet_when(shown)}` : ""}</p>
+                <p.ui-twallet-full-line>{ticket_wallet_where(shown.t)}</p>
+                <p.ui-twallet-full-line>{shown.t.holder ?? ""}</p>
+                {shown.gone && <p.ui-twallet-gone>This ticket has passed</p>}
+            </div>}
+            <p.ui-twallet-say role="status">{say}</p>
+            <div.ui-twallet-bar>
+                <button.ui-twallet-btn.ui-twallet-prev type="button" disabled={place == null || place == 0} @click={() => { move(-1) }}>Previous</button>
+                <button.ui-twallet-btn.ui-twallet-done type="button" @click={() => { dlg.close() }}>Done</button>
+                <button.ui-twallet-btn.ui-twallet-next type="button" disabled={place == null || place == count - 1} @click={() => { move(1) }}>Next</button>
+            </div>
+        </dialog>
+    </section>
+}

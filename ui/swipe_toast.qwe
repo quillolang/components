@@ -1,0 +1,238 @@
+// SwipeToast: short notes low on the screen, for what just happened: swiped sideways, either
+// way, they go; each can offer Undo, and each goes by itself after a few seconds. New ones
+// stack below the last. They stand above a tab bar, and above the on-screen keyboard when
+// it is up, so they are never hidden by either. A finger on one, or focus in one, holds its
+// timer. They take nothing from the page and are announced without moving focus.
+//
+//   import ui/swipe_toast.qwe use SwipeToast
+//
+//   component Inbox() {
+//       state notes = []
+//       <SwipeToast toasts={notes} offset={64} on_undo={(t) => { restore(t.id) }}/>
+//   }
+//
+// toasts: a list of maps, which may grow at any time: id (each its own; the text serves),
+// text, undo (the words on its button; none when left out), seconds (how long this one
+// stays), tone ("danger" for a red edge, "success" for a green one). A row without text is
+// left out, and so is an id seen before. seconds: how long each stays (5; 0 keeps it until
+// someone acts). limit: how many show at once (3): the newest do, the others wait and say
+// how many, and come back as those go. offset: how far above the screen's foot they stand,
+// in pixels, for a tab bar (64; the safe area is added). label: what screen readers call
+// the place ("Notifications"). on_undo(toast): called when Undo is pressed.
+// on_dismiss(toast): called when it leaves any other way.
+//
+// The equal of the swipe is the Dismiss button, and Escape or Delete with focus in it.
+// The fixed position is held by a frame with a transform: see the demo.
+
+import ui/bottom_sheet.qwe use bottom_sheet_track, bottom_sheet_track_move, bottom_sheet_speed, bottom_sheet_dismissed, bottom_sheet_keyboard_watch
+
+let swipe_toast_css = css`
+.ui-swipe-toast-host {
+  position: fixed; inset: auto 0 var(--ui-swipe-toast-bottom, 64px) 0; z-index: 60; display: flex; flex-direction: column; align-items: center; gap: 8px;
+  box-sizing: border-box; padding: 0 max(12px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left)); pointer-events: none;
+  transition: bottom .2s;
+}
+.ui-swipe-toast-host quillo-island { display: contents; }
+.ui-swipe-toast-more { margin: 0; padding: 0 10px; border-radius: 999px; background: var(--ui-subtle); color: var(--ui-muted); font: 12px/20px var(--ui-font); pointer-events: auto; }
+.ui-swipe-toast {
+  display: flex; align-items: center; gap: 4px; box-sizing: border-box; width: 100%; max-width: 420px; min-height: 52px; padding: 2px 4px 2px 14px;
+  border: 1px solid var(--ui-border); border-left: 3px solid var(--ui-swipe-toast-edge, var(--ui-border)); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 14px/1.35 var(--ui-font); pointer-events: auto;
+  /* Sideways is this gesture's; up and down still scroll the page. */
+  touch-action: pan-y; -webkit-touch-callout: none; user-select: none;
+  animation: ui-swipe-toast-in .26s cubic-bezier(.22, 1, .36, 1); transition: transform .24s cubic-bezier(.22, 1, .36, 1), opacity .2s;
+}
+@keyframes ui-swipe-toast-in { from { transform: translateY(16px); opacity: 0; } }
+.ui-swipe-toast-danger { --ui-swipe-toast-edge: var(--ui-danger); }
+.ui-swipe-toast-success { --ui-swipe-toast-edge: var(--ui-success); }
+.ui-swipe-toast-left, .ui-swipe-toast-right { opacity: 0; }
+.ui-swipe-toast-left { transform: translateX(-110%); }
+.ui-swipe-toast-right { transform: translateX(110%); }
+.ui-swipe-toast-fade { transform: translateY(12px); opacity: 0; }
+.ui-swipe-toast-text { flex: 1; min-width: 0; margin: 0; padding: 6px 0; overflow-wrap: anywhere; }
+.ui-swipe-toast-undo {
+  flex: none; min-width: 56px; height: 44px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm); background: transparent;
+  color: var(--ui-accent); font: 600 14px var(--ui-font); cursor: pointer; touch-action: inherit;
+}
+.ui-swipe-toast-close {
+  display: grid; place-items: center; flex: none; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); cursor: pointer; touch-action: inherit;
+}
+@media (hover: hover) { .ui-swipe-toast-undo:hover, .ui-swipe-toast-close:hover { background: var(--ui-subtle); } }
+.ui-swipe-toast-undo:focus-visible, .ui-swipe-toast-close:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-swipe-toast-close svg { width: 16px; height: 16px; }
+@media (prefers-reduced-motion: reduce) { .ui-swipe-toast { animation: none; transition: none; } .ui-swipe-toast-host { transition: none; } }
+`
+
+// Those that can show, in order, each once.
+fn swipe_toast_rows(toasts, gone) {
+    let done = gone
+    let list_of = type_of(toasts) == "list" ? toasts : []
+    let given = list_of | filter((t) => type_of(t) == "map" && t.text != null && str(t.text) != "")
+    let seen = {}
+    let line = []
+    for t in given {
+        let id = str(t.id ?? t.text)
+        if !contains(done, id) && get(seen, id, false) == false {
+            seen = set(seen, id, true)
+            line = line + [{ id: id, text: str(t.text), undo: t.undo == null ? "" : str(t.undo), tone: t.tone, seconds: t.seconds }]
+        }
+    }
+    line
+}
+
+// How long a toast stays, in milliseconds; 0 for one that waits. Its own seconds come first.
+fn swipe_toast_ms(toast, seconds) {
+    let own = toast.seconds
+    let s = type_of(own) == "int" || type_of(own) == "float" ? own : seconds
+    let good = type_of(s) == "int" || type_of(s) == "float" ? s : 5
+    good <= 0 ? 0 : round(min([good, 3600]) * 1000)
+}
+
+// Above the tab bar, or above the keyboard when it is up, which hides the tab bar anyway.
+fn swipe_toast_bottom(offset: num, keyboard: num) = keyboard > 0 ? `${keyboard + 8}px` : `calc(${offset}px + env(safe-area-inset-bottom))`
+
+fn swipe_toast_class(tone, away: str?) {
+    let edge = tone == "danger" ? " ui-swipe-toast-danger" : tone == "success" ? " ui-swipe-toast-success" : ""
+    `ui-swipe-toast${edge}${away == null ? "" : ` ui-swipe-toast-${away}`}`
+}
+
+component SwipeToastItem(toast, seconds: num = 5, on_gone = null) {
+    let life = swipe_toast_ms(toast, seconds)
+    state left = life
+    state held = false
+    state inside = false
+    state away = null           // "left", "right" or "fade" as it goes
+    state how = "dismiss"
+    state slide = 200
+    state card = null
+    state track = null
+    state dragging = false
+    state moved = false
+    if away != null {
+        every(slide, () => { on_gone && on_gone(toast, how) })
+    }
+    if life > 0 && !held && !inside && away == null {
+        every(100, () => {
+            left = left - 100
+            if left <= 0 { away = "fade" }
+        })
+    }
+    let spring = () => {
+        card.style.removeProperty("transform")
+        card.style.removeProperty("opacity")
+        card.style.removeProperty("transition")
+    }
+    let moving = (e) => {
+        if track != null {
+            track = bottom_sheet_track_move(track, e.clientX, e.clientY, e.timeStamp)
+            if track.lock == "y" && !dragging { track = null }
+            if track != null && track.lock == "x" {
+                if !dragging {
+                    dragging = true
+                    moved = true
+                    card.setPointerCapture(e.pointerId)
+                    card.style.transition = "none"
+                }
+                let dx = track.x - track.x0
+                card.style.transform = `translateX(${round(dx, 2)}px)`
+                card.style.opacity = str(round(max([0.25, 1 - abs(dx) / card.offsetWidth]), 3))
+            }
+        }
+    }
+    let ended = (e) => {
+        held = false
+        if track != null && dragging {
+            let dx = track.x - track.x0
+            let speed = bottom_sheet_speed(track, "x", e.timeStamp)
+            // The way it was going counts: back past where it started is not away.
+            let sign = dx >= 0 ? 1 : -1
+            let leave = bottom_sheet_dismissed(abs(dx), card.offsetWidth, speed * sign, 0.4)
+            spring()
+            if leave { away = dx >= 0 ? "right" : "left" }
+        }
+        track = null
+        dragging = false
+    }
+    let cancelled = () => {
+        held = false
+        if dragging { spring() }
+        track = null
+        dragging = false
+    }
+    <div class={swipe_toast_class(toast.tone, away)}
+         @mount={(el) => {
+             card = el
+             if js("window.matchMedia", "(prefers-reduced-motion: reduce)").matches { slide = 16 }
+         }}
+         @pointerdown={(e) => {
+             moved = false
+             if e.button == 0 {
+                 held = true
+                 track = bottom_sheet_track(e.clientX, e.clientY, e.timeStamp)
+             }
+         }}
+         @pointermove={moving}
+         @pointerup={ended}
+         @pointercancel={cancelled}
+         @pointerleave={() => {
+             if !dragging {
+                 held = false
+                 track = null
+             }
+         }}
+         @touchmove={(e) => {
+             if dragging && e.cancelable { e.preventDefault() }
+         }}
+         @focusin={() => { inside = true }}
+         @focusout={() => { inside = false }}
+         @keydown={(e) => {
+             if e.key == "Escape" || e.key == "Delete" { away = "fade" }
+         }}>
+        <p.ui-swipe-toast-text>{toast.text}</p>
+        {toast.undo != "" && <button.ui-swipe-toast-undo type="button"
+                @click={() => {
+                    if !moved {
+                        how = "undo"
+                        away = "fade"
+                    }
+                    moved = false
+                }}>{toast.undo}</button>}
+        <button.ui-swipe-toast-close type="button" aria-label="Dismiss"
+                @click={() => {
+                    if !moved { away = "fade" }
+                    moved = false
+                }}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+    </div>
+}
+
+component SwipeToast(toasts = [], seconds: num = 5, limit: int = 3, offset: int = 64, label: str = "Notifications",
+                     on_undo = null, on_dismiss = null) {
+    style global swipe_toast_css
+    state gone = []
+    state keyboard = 0
+    let line = swipe_toast_rows(toasts, gone)
+    let room = max([1, limit])
+    let showing = slice(line, max([0, len(line) - room]), len(line))
+    let waiting = len(line) - len(showing)
+    <div.ui-swipe-toast-host role="status" aria-live="polite" aria-label={label}
+         style={`--ui-swipe-toast-bottom: ${swipe_toast_bottom(offset, keyboard)}`}
+         @mount={(_el) => {
+             let undo = bottom_sheet_keyboard_watch(js("window"), (px) => { keyboard = px })
+             () => { undo() }
+         }}>
+        {waiting > 0 && <p.ui-swipe-toast-more>{waiting} more</p>}
+        {for t in showing =>
+            <SwipeToastItem key={t.id} toast={t} seconds={seconds}
+                            on_gone={(row, how) => {
+                                gone = gone + [row.id]
+                                if how == "undo" {
+                                    on_undo && on_undo(row)
+                                } else {
+                                    on_dismiss && on_dismiss(row)
+                                }
+                            }}/>}
+    </div>
+}

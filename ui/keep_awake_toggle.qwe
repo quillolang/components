@@ -1,0 +1,198 @@
+// KeepAwakeToggle: a switch that keeps the screen on, for a recipe, a boarding pass, a
+// map at the wheel. In the Quillo app it asks the phone itself (quilloNative); in a
+// browser it holds a screen Wake Lock, which a browser lets go when the page leaves the
+// screen, so it takes it again on coming back. It says what is going on: held, away,
+// refused, or not possible here. The screen goes back to normal when this leaves the page.
+//
+//   <KeepAwakeToggle/>
+//   <KeepAwakeToggle label="Keep the recipe on screen" on_change={(on) => { cooking = on }}/>
+//
+// label: what the switch says ("Keep the screen on"). hint: a line under it, where
+// nothing else is being said. start: on from the first moment, for a page that is
+// always wanted awake (false): a browser may refuse that until the first tap. on_change(on, how):
+// inside one of your components, called with true and "app" or "web" when the screen is
+// held, and false and null when it is not. on_refused(why): called with "power" (the
+// system saves power, as iOS's Low Power Mode does), "hidden", "none", "insecure" or "other".
+
+import ui/theme.qwe use ui_cls
+
+let keep_awake_toggle_css = css`
+.ui-keepawake { container-type: inline-size; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-keepawake-in { display: grid; gap: 6px; }
+.ui-keepawake-row { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 56px; padding: 8px 14px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: inherit; font: inherit; text-align: left; cursor: pointer;
+  touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.ui-keepawake-row:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-keepawake-sun { flex: none; width: 22px; height: 22px; color: var(--ui-muted); }
+.ui-keepawake-text { flex: 1; min-width: 0; display: grid; gap: 1px; }
+.ui-keepawake-label { font-weight: 500; }
+.ui-keepawake-hint { color: var(--ui-muted); font-size: 13px; }
+.ui-keepawake-track { flex: none; position: relative; width: 46px; height: 28px; border-radius: 999px; background: var(--ui-strong); transition: background .15s; }
+.ui-keepawake-track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .25); transition: transform .15s; }
+.ui-keepawake-row[aria-checked="true"] .ui-keepawake-track { background: var(--ui-accent); }
+.ui-keepawake-row[aria-checked="true"] .ui-keepawake-track::after { transform: translateX(18px); }
+.ui-keepawake-row[aria-checked="true"] .ui-keepawake-sun { color: var(--ui-accent); }
+.ui-keepawake-say { margin: 0; padding: 0 2px; font-size: 13px; color: var(--ui-muted); }
+.ui-keepawake-say:empty { display: none; }
+.ui-keepawake-say[data-bad] { color: var(--ui-danger); }
+/* A switch that runs across a tablet is a long way from its words: what it says goes beside it. */
+@container (min-width: 600px) {
+  .ui-keepawake-in { grid-template-columns: minmax(0, 420px) minmax(0, 1fr); align-items: center; column-gap: 16px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-keepawake-track, .ui-keepawake-track::after { transition: none; } }
+`
+
+// Why a request failed, from the browser's or the app's words.
+fn keep_awake_toggle_reason(text) {
+    let t = lower(str(text))
+    if contains(t, "not visible") || contains(t, "hidden") {
+        "hidden"
+    } else if contains(t, "battery") || contains(t, "power") {
+        "power"
+    } else {
+        "other"
+    }
+}
+
+// The next status when the lock is let go: nothing to do when the person turned it off.
+// While the page is away it is taken back on return, and with the page on the screen it
+// was the system's decision, which the person should hear about.
+fn keep_awake_toggle_after_release(wanted, hidden) {
+    if !wanted {
+        "off"
+    } else if hidden {
+        "away"
+    } else {
+        "lost"
+    }
+}
+
+fn keep_awake_toggle_message(status, how, why) = match status {
+    "asking" => "Asking to keep the screen on."
+    "on" => how == "app" ? "The screen stays on while this app is open." : "The screen stays on while this page is showing."
+    "away" => "The page left the screen. It will hold the screen again on coming back."
+    "lost" => "The system let the screen go. Turn this on to hold it again."
+    "refused" => match why {
+        "power" => "Refused: the phone is saving power. Low Power Mode or a low battery can do this."
+        "hidden" => "Refused: the page must be showing. It will try again on coming back."
+        _ => "Refused: this browser did not allow it just now."
+    }
+    "none" => why == "insecure" ? "Only pages on https can hold the screen on." : "This browser cannot hold the screen on, so it will dim as usual."
+    _ => ""
+}
+
+component KeepAwakeToggle(label: str = "Keep the screen on", hint: str? = null, start: bool = false, on_change = null, on_refused = null, class: str? = null) {
+    style global keep_awake_toggle_css
+    state status = "off"     // off, asking, on, away, lost, refused, none
+    state how = null         // "app" or "web"
+    state why = null
+    state wanted = false
+    state lock = null        // the browser's WakeLockSentinel
+    state held = false       // on_change has last said it is held
+
+    let told = (on) => {
+        if on != held {
+            held = on
+            on_change && on_change(on, on ? how : null)
+        }
+    }
+    let refuse = (reason) => {
+        why = reason
+        status = reason == "none" || reason == "insecure" ? "none" : "refused"
+        // Hidden is the one refusal that comes right by itself, on return.
+        wanted = reason == "hidden"
+        told(false)
+        on_refused && on_refused(reason)
+    }
+    let released = (_e = null) => {
+        lock = null
+        let next = keep_awake_toggle_after_release(wanted, js("document.visibilityState") == "hidden")
+        if next != "off" {
+            status = next
+            if next == "lost" { wanted = false }
+            told(false)
+        }
+    }
+    let hold = () => {
+        status = "asking"
+        why = null
+        let r = js("quilloNative.keepAwake", true)
+        if !is_err(r) {
+            how = "app"
+            status = "on"
+            told(true)
+        } else if !contains(r.error, "not defined") {
+            refuse(keep_awake_toggle_reason(r.error))
+        } else if js("isSecureContext") != true {
+            refuse("insecure")
+        } else {
+            let got = js("navigator.wakeLock.request", "screen")
+            if is_err(got) {
+                refuse(contains(got.error, "not defined") ? "none" : keep_awake_toggle_reason(got.error))
+            } else if !wanted {
+                // Turned off while the browser was answering.
+                got.release()
+                status = "off"
+            } else {
+                lock = got
+                got.addEventListener("release", released)
+                how = "web"
+                status = "on"
+                told(true)
+            }
+        }
+    }
+    let drop = () => {
+        wanted = false
+        if lock != null {
+            let l = lock
+            lock = null
+            l.removeEventListener("release", released)
+            l.release()
+        }
+        if how == "app" { js("quilloNative.keepAwake", false) }
+        told(false)
+    }
+    let flip = () => {
+        if wanted {
+            drop()
+            status = "off"
+            why = null
+        } else {
+            wanted = true
+            hold()
+        }
+    }
+    let say = keep_awake_toggle_message(status, how, why)
+    <div class={ui_cls(["ui-keepawake", class])} @mount={(_el) => {
+        let d = js("document")
+        let back = (_e = null) => {
+            // The app's flag stays set across this, but saying it again costs nothing, and
+            // a phone that ended the web view has forgotten nothing it needs to be told.
+            if wanted && js("document.visibilityState") == "visible" && (lock == null || lock.released == true) { hold() }
+        }
+        d.addEventListener("visibilitychange", back)
+        if start {
+            wanted = true
+            hold()
+        }
+        () => {
+            d.removeEventListener("visibilitychange", back)
+            drop()
+        }
+    }}>
+        <div.ui-keepawake-in>
+        <button.ui-keepawake-row type="button" role="switch" aria-checked={wanted ? "true" : "false"} @click={flip}>
+            <svg.ui-keepawake-sun viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                 stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+            <span.ui-keepawake-text>
+                <span.ui-keepawake-label>{label}</span>
+                {hint != null && <span.ui-keepawake-hint>{hint}</span>}
+            </span>
+            <span.ui-keepawake-track aria-hidden="true"></span>
+        </button>
+        <p.ui-keepawake-say role="status" data-bad={status == "refused" || status == "none" || status == "lost" ? "" : null}>{say}</p>
+        </div>
+    </div>
+}

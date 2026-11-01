@@ -1,0 +1,340 @@
+// DebtPayoff: the fastest way out of several debts, compared. Each month every debt adds
+// its interest (the yearly rate over twelve, rounded half up to the cent) and gets its
+// minimum; the extra payment, and the minimum of every debt already cleared, all go to one
+// debt at a time: the highest rate first (avalanche, the cheapest) or the smallest
+// balance first (snowball, the quickest wins). The order is fixed at the start. It says the
+// months to clear and the interest paid by each, the order debts clear in, what one
+// saves over the other, and the months one by one. A minimum that does not cover its
+// debt's interest is flagged, and so is a plan that never clears: no answer is
+// given then, as the debts only grow.
+//
+//   <DebtPayoff extra="200" debts={[{ name: "Card", balance: 4000, rate: 22.9, minimum: 100 },
+//                                   { name: "Car", balance: "9000", rate: 6.5, minimum: 250 }]}/>
+//   <DebtPayoff debts={list} currency="EUR" on_change={(r) => { months = r.avalanche.months }}/>
+//
+// debts: maps { name, balance, rate, minimum }, rate being a yearly percent, at most 20.
+// extra: what is paid each month on top of the minimums. plan: the one the month-by-month
+// table starts on, "avalanche" (the default) or "snowball". currency: ISO code ("USD"; one Quillo does
+// not know falls back to it). locale: how to write amounts (the program's). title: the heading
+// ("Debt payoff"). id: a prefix for its ids ("debt-payoff"), unique on the page. name: a prefix for
+// the names of its fields ("debt": debt_name, debt_balance, debt_rate, debt_minimum, debt_extra,
+// debt_plan). on_change(r): inside one of your components, after each change, given
+// { avalanche, snowball } when the figures are good, each { months, interest, order, never },
+// interest a decimal and months null when it never clears, order the names first cleared first.
+// class: more classes for its outer element. A plan is followed for 100 years at most.
+//
+// debt_payoff_plan(debts, extra, strategy) is the month-by-month logic in whole minor units and
+// debt_payoff_warnings(debts) finds the minimums below the interest, for a program's own use.
+
+import ui/theme.qwe use ui_cls
+
+let debt_payoff_css = css`
+.ui-debt-payoff { container-type: inline-size; display: grid; gap: 16px; min-width: 0; max-width: 760px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-debt-payoff .ui-debt-payoff-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-debt-payoff input[type=text] { box-sizing: border-box; width: 100%; min-width: 0; height: 36px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-debt-payoff input[type=text]:hover { border-color: var(--ui-strong); }
+.ui-debt-payoff input[type=text]:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-debt-payoff input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-debt-payoff-rows { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-debt-payoff-row, .ui-debt-payoff-labels { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1.2fr) 74px; gap: 8px; align-items: center; }
+.ui-debt-payoff-labels { color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-debt-payoff-cell { display: grid; gap: 3px; min-width: 0; }
+.ui-debt-payoff-cell label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+@container (max-width: 520px) {
+  .ui-debt-payoff-labels { display: none; }
+  .ui-debt-payoff-row { grid-template-columns: repeat(2, minmax(0, 1fr)); padding-bottom: 10px; }
+  .ui-debt-payoff-cell label { position: static; width: auto; height: auto; clip: auto; color: var(--ui-muted); font-size: 12px; }
+}
+.ui-debt-payoff-btn { box-sizing: border-box; height: 34px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-debt-payoff-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-debt-payoff-btn:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-debt-payoff-btn:disabled { color: var(--ui-muted); cursor: not-allowed; }
+.ui-debt-payoff-bar { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 10px 16px; }
+.ui-debt-payoff-extra { display: grid; gap: 5px; width: 200px; max-width: 100%; }
+.ui-debt-payoff-extra label { font-size: 13px; font-weight: 500; }
+.ui-debt-payoff-errors { margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-debt-payoff-warn { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-debt-payoff-warn li { padding: 6px 10px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+.ui-debt-payoff-out { display: grid; gap: 12px; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-debt-payoff-compare { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-debt-payoff-compare th, .ui-debt-payoff-months th { padding: 4px 0; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: right; }
+.ui-debt-payoff-compare td, .ui-debt-payoff-months td { padding: 4px 0; border-bottom: 1px solid var(--ui-border); text-align: right; }
+.ui-debt-payoff-compare th:first-child, .ui-debt-payoff-compare td:first-child, .ui-debt-payoff-months th:first-child, .ui-debt-payoff-months td:first-child { text-align: left; }
+.ui-debt-payoff-compare th + th, .ui-debt-payoff-compare td + td, .ui-debt-payoff-months th + th, .ui-debt-payoff-months td + td { padding-left: 10px; }
+.ui-debt-payoff-order { text-align: left !important; overflow-wrap: anywhere; }
+.ui-debt-payoff-verdict { margin: 0; font-weight: 600; }
+.ui-debt-payoff-plans { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; margin: 0; padding: 0; border: 0; }
+.ui-debt-payoff-plans legend { float: left; margin-right: 8px; padding: 0; font-size: 13px; font-weight: 500; }
+.ui-debt-payoff-plans label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ui-debt-payoff-plans input { margin: 0; accent-color: var(--ui-accent); }
+.ui-debt-payoff-scroll { max-height: 320px; overflow: auto; }
+.ui-debt-payoff-scroll:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px; }
+.ui-debt-payoff-months { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-debt-payoff-months th { position: sticky; top: 0; background: var(--ui-subtle); }
+`
+
+// The currency's code, USD when Quillo does not know it.
+fn debt_payoff_code(currency) -> str {
+    let c = upper(trim(str(currency ?? "")))
+    type_of(money.minor_units(c)) == "error" ? "USD" : c
+}
+
+// What was typed as a decimal: 0 when empty, null when it is not a plain number from
+// 0 to most. A comma counts only as a thousands comma, so "12,50" is refused, not 1250.
+fn debt_payoff_read(text, most) {
+    let t = trim(str(text ?? ""))
+    if t == "" { return 0m }
+    if len(t) > 40 { return null }
+    let plain = re.test(t, "^[0-9]{1,3}(,[0-9]{3})+(\\.[0-9]*)?$") ? replace(t, ",", "") : t
+    if !re.test(plain, "^([0-9]+\\.?[0-9]*|\\.[0-9]+)$") { return null }
+    let d = dec(plain)
+    is_err(d) || d > most ? null : d
+}
+
+// A month's interest on a balance at a yearly percent, half up to the unit.
+fn debt_payoff_interest(balance: int, rate: dec) -> int = int(round(dec(balance) * rate / 1200, 0, "half_up"))
+
+// The order a strategy pays debts off in: places in the list. Ties keep the list's order.
+fn debt_payoff_order(debts: list, strategy: str) -> list {
+    let places = range(len(debts))
+    let by_balance = sort_by(places, (i) => debts[i].balance)
+    let by_rate = sort_by(places, (i) => 0m - debts[i].rate)
+    strategy == "snowball"
+        ? sort_by(by_rate, (i) => debts[i].balance)
+        : sort_by(by_balance, (i) => 0m - debts[i].rate)
+}
+
+// One strategy followed month by month. debts: [{ name, balance, rate, minimum }], balances
+// and minimums in minor units; extra likewise; strategy "avalanche" or "snowball". What a
+// month pays is the same to the end, the sum of the minimums and the extra, until a debt's
+// last payment. Gives { months, interest, paid, order: [{ name, month }], rows: [{ month, paid,
+// interest, left, cleared }], never }: months and order are as far as it got when never is
+// true. paid always equals the balances plus interest when it clears.
+fn debt_payoff_plan(debts: list, extra: int, strategy: str) -> map {
+    let open_at_start = debts | filter((d) => d.balance > 0)
+    let order = debt_payoff_order(open_at_start, strategy)
+    let budget = sum(open_at_start | map((d) => d.minimum)) + extra
+    let owed = open_at_start | map((d) => d.balance)
+    let n = len(owed)
+    let month = 0
+    let total_interest = 0
+    let total_paid = 0
+    let rows = []
+    let done = []
+    let limit = sum(owed) * 100 + 100000000
+    let running = n > 0
+    let never = false
+    while running {
+        month += 1
+        let interest = range(n) | map((i) => debt_payoff_interest(owed[i], open_at_start[i].rate))
+        let due = range(n) | map((i) => owed[i] + interest[i])
+        let pay = range(n) | map((i) => min([due[i], open_at_start[i].minimum]))
+        let left = budget - sum(pay)
+        for i in order {
+            if left > 0 {
+                let more = min([due[i] - pay[i], left])
+                pay = set(pay, i, pay[i] + more)
+                left = left - more
+            }
+        }
+        let cleared = []
+        for i in range(n) {
+            if owed[i] > 0 && due[i] - pay[i] == 0 {
+                cleared = cleared | push(open_at_start[i].name)
+                done = done | push({ name: open_at_start[i].name, month })
+            }
+        }
+        owed = range(n) | map((i) => due[i] - pay[i])
+        let paid = sum(pay)
+        let spent_on_interest = sum(interest)
+        total_interest += spent_on_interest
+        total_paid += paid
+        let balance_left = sum(owed)
+        rows = rows | push({ month, paid, interest: spent_on_interest, left: balance_left, cleared })
+        if balance_left == 0 {
+            running = false
+        } else if month >= 1200 || balance_left > limit {
+            running = false
+            never = true
+        }
+    }
+    { months: month, interest: total_interest, paid: total_paid, order: done, rows, never }
+}
+
+// The debts whose minimum does not cover a month's interest: [{ name, minimum, interest }].
+fn debt_payoff_warnings(debts: list) -> list {
+    debts | filter((d) => d.balance > 0 && d.minimum <= debt_payoff_interest(d.balance, d.rate))
+        | map((d) => ({ name: d.name, minimum: d.minimum, interest: debt_payoff_interest(d.balance, d.rate) }))
+}
+
+// The props' debts as rows of text, at most 20.
+fn debt_payoff_rows(debts) -> list {
+    let given = type_of(debts) == "list" ? take(debts, 20) | filter((d) => type_of(d) == "map") : []
+    let text = (x) => x == null ? "" : str(x)
+    let rows = given | enumerate() | map((row) => {
+        let d = row[1]
+        { id: row[0] + 1, name: text(d.name), balance: text(d.balance), rate: text(d.rate), minimum: text(d.minimum) }
+    })
+    len(rows) > 0 ? rows : [{ id: 1, name: "", balance: "", rate: "", minimum: "" }]
+}
+
+// All the figures from the fields as typed: { errors, debts, warnings, avalanche, snowball,
+// interest_now }; avalanche is null with errors or with nothing owed.
+fn debt_payoff_work(rows: list, extra_text, code: str) -> map {
+    let errors = []
+    let debts = []
+    let most = 100000000000m
+    let minor = (d: dec) => money.to_minor(money.of(d, code, "half_up"))
+    let extra = debt_payoff_read(extra_text, most)
+    if extra == null { errors = errors | push({ field: "extra", text: "The extra payment must be a number of 0 or more." }) }
+    for [i, r] in enumerate(rows) {
+        let label = filled(trim(r.name)) ?? `debt ${i + 1}`
+        let balance = debt_payoff_read(r.balance, most)
+        let rate = debt_payoff_read(r.rate, 1000m)
+        let minimum = debt_payoff_read(r.minimum, most)
+        if balance == null { errors = errors | push({ field: `balance-${r.id}`, text: `The balance of ${label} must be a number of 0 or more, up to 100,000,000,000.` }) }
+        if rate == null { errors = errors | push({ field: `rate-${r.id}`, text: `The rate of ${label} must be a percent from 0 to 1000.` }) }
+        if minimum == null { errors = errors | push({ field: `minimum-${r.id}`, text: `The minimum of ${label} must be a number of 0 or more.` }) }
+        if balance != null && rate != null && minimum != null {
+            debts = debts | push({ name: filled(trim(r.name)) ?? `Debt ${i + 1}`, balance: minor(balance), rate, minimum: minor(minimum) })
+        }
+    }
+    if len(errors) > 0 { return { errors, debts: [], warnings: [], avalanche: null, snowball: null, interest_now: 0 } }
+    let open = debts | filter((d) => d.balance > 0)
+    if len(open) == 0 { return { errors, debts, warnings: [], avalanche: null, snowball: null, interest_now: 0 } }
+    let whole = minor(extra)
+    { errors, debts, warnings: debt_payoff_warnings(open), avalanche: debt_payoff_plan(open, whole, "avalanche"), snowball: debt_payoff_plan(open, whole, "snowball"),
+      interest_now: sum(open | map((d) => debt_payoff_interest(d.balance, d.rate))) }
+}
+
+// One sentence on which plan comes out ahead, with `shown` writing amounts.
+fn debt_payoff_verdict(a: map, s: map, shown) -> str {
+    if a.never && s.never { return "Neither plan clears the debts." }
+    if a.never { return "Only the snowball clears the debts." }
+    if s.never { return "Only the avalanche clears the debts." }
+    let saved = s.interest - a.interest
+    let faster = s.months - a.months
+    let when = faster > 0 ? ` and ${faster} ${faster == 1 ? "month" : "months"}` : ""
+    if saved > 0 { return `The avalanche saves ${shown(saved)}${when} over the snowball.` }
+    if saved < 0 { return `The snowball saves ${shown(0 - saved)} over the avalanche.` }
+    "Both plans cost the same."
+}
+
+component DebtPayoff(debts = null, extra = null, plan: str = "avalanche", currency: str = "USD", locale: str? = null, title: str = "Debt payoff", id: str = "debt-payoff",
+                     name: str = "debt", on_change = null, class: str? = null) {
+    style global debt_payoff_css
+    state rows = debt_payoff_rows(debts)
+    state extra_text = extra == null ? "" : str(extra)
+    state serial = 1000
+    state chosen = plan == "snowball" ? "snowball" : "avalanche"
+    state every_month = false
+    let code = debt_payoff_code(currency)
+    let work = debt_payoff_work(rows, extra_text, code)
+    let ok = work.avalanche != null
+    let shown = (minor: int) => locale != null ? money.format(money.from_minor(minor, code), locale) : money.format(money.from_minor(minor, code))
+    let bad = (field: str) => work.errors | any((e) => e.field == field)
+    let field_id = (part: str) => `${id}-${part}`
+    let named = (part: str) => `${name}_${part}`
+    let picked = !ok ? null : (chosen == "snowball" ? work.snowball : work.avalanche)
+    let months_shown = !ok ? [] : (every_month ? picked.rows : take(picked.rows, 24))
+    let tell = () => {
+        if on_change != null && ok {
+            let part = (p: map) => ({ months: p.never ? null : p.months, interest: money.from_minor(p.interest, code).amount, order: p.order | map((o) => o.name), never: p.never })
+            on_change({ avalanche: part(work.avalanche), snowball: part(work.snowball) })
+        }
+    }
+    let change = (rid, field: str, value) => {
+        rows = rows | map((r) => r.id == rid ? set(r, field, value) : r)
+        tell()
+    }
+    let add = () => {
+        if len(rows) < 20 {
+            serial += 1
+            rows = rows | push({ id: serial, name: "", balance: "", rate: "", minimum: "" })
+        }
+    }
+    let drop = (rid) => {
+        let left = rows | filter((r) => r.id != rid)
+        serial += 1
+        rows = len(left) > 0 ? left : [{ id: serial, name: "", balance: "", rate: "", minimum: "" }]
+        tell()
+    }
+    let plan_row = (label: str, p: map) => <tr>
+        <td>{label}</td>
+        <td data-months="">{p.never ? "Never" : `${p.months} ${p.months == 1 ? "month" : "months"}`}</td>
+        <td data-interest="">{p.never ? "No end" : shown(p.interest)}</td>
+        <td.ui-debt-payoff-order data-order="">{join(p.order | map((o) => `${o.name} (month ${o.month})`), ", ")}</td>
+    </tr>
+    <section class={ui_cls(["ui-debt-payoff", class])} aria-labelledby={field_id("title")}>
+        <h3.ui-debt-payoff-title id={field_id("title")}>{title}</h3>
+        <div.ui-debt-payoff-labels aria-hidden="true">
+            <span>Debt</span><span>Balance</span><span>Rate a year %</span><span>Minimum a month</span><span></span>
+        </div>
+        <ul.ui-debt-payoff-rows>
+            {for r in rows => <li.ui-debt-payoff-row key={r.id}>
+                <div.ui-debt-payoff-cell>
+                    <label for={field_id(`name-${r.id}`)}>Debt</label>
+                    <input type="text" autocomplete="off" maxlength="60" id={field_id(`name-${r.id}`)} name={named("name")} value={r.name} placeholder="Name" @input={(e) => { change(r.id, "name", e.value) }}/>
+                </div>
+                <div.ui-debt-payoff-cell>
+                    <label for={field_id(`balance-${r.id}`)}>Balance</label>
+                    <input type="text" inputmode="decimal" autocomplete="off" id={field_id(`balance-${r.id}`)} name={named("balance")} value={r.balance} placeholder="0.00"
+                           aria-invalid={bad(`balance-${r.id}`) ? "true" : null} @input={(e) => { change(r.id, "balance", e.value) }}/>
+                </div>
+                <div.ui-debt-payoff-cell>
+                    <label for={field_id(`rate-${r.id}`)}>Rate a year in percent</label>
+                    <input type="text" inputmode="decimal" autocomplete="off" id={field_id(`rate-${r.id}`)} name={named("rate")} value={r.rate} placeholder="0"
+                           aria-invalid={bad(`rate-${r.id}`) ? "true" : null} @input={(e) => { change(r.id, "rate", e.value) }}/>
+                </div>
+                <div.ui-debt-payoff-cell>
+                    <label for={field_id(`minimum-${r.id}`)}>Minimum a month</label>
+                    <input type="text" inputmode="decimal" autocomplete="off" id={field_id(`minimum-${r.id}`)} name={named("minimum")} value={r.minimum} placeholder="0.00"
+                           aria-invalid={bad(`minimum-${r.id}`) ? "true" : null} @input={(e) => { change(r.id, "minimum", e.value) }}/>
+                </div>
+                <button.ui-debt-payoff-btn type="button" aria-label={`Remove ${filled(r.name) ?? "this debt"}`} @click={() => { drop(r.id) }}>Remove</button>
+            </li>}
+        </ul>
+        <div.ui-debt-payoff-bar>
+            <button.ui-debt-payoff-btn type="button" disabled={len(rows) >= 20} @click={add}>Add a debt</button>
+            <div.ui-debt-payoff-extra>
+                <label for={field_id("extra")}>Extra a month ({code})</label>
+                <input type="text" inputmode="decimal" autocomplete="off" id={field_id("extra")} name={named("extra")} value={extra_text} placeholder="0.00" aria-invalid={bad("extra") ? "true" : null}
+                       @input={(e) => { extra_text = e.value; tell() }}/>
+            </div>
+        </div>
+        {len(work.errors) > 0 && <ul.ui-debt-payoff-errors role="alert">{for e in work.errors => <li key={e.field}>{e.text}</li>}</ul>}
+        {len(work.warnings) > 0 && <ul.ui-debt-payoff-warn>
+            {for w in work.warnings => <li key={w.name}>{`The minimum of ${shown(w.minimum)} on ${w.name} does not cover its ${shown(w.interest)} of interest a month: on its own it never clears.`}</li>}
+        </ul>}
+        {ok && <div.ui-debt-payoff-out aria-live="polite">
+            <table.ui-debt-payoff-compare>
+                <thead><tr><th scope="col">Plan</th><th scope="col">Clear in</th><th scope="col">Interest</th><th scope="col" class="ui-debt-payoff-order">Order</th></tr></thead>
+                <tbody>
+                    {plan_row("Avalanche", work.avalanche)}
+                    {plan_row("Snowball", work.snowball)}
+                </tbody>
+            </table>
+            <p.ui-debt-payoff-verdict data-verdict="">{debt_payoff_verdict(work.avalanche, work.snowball, shown)}</p>
+            {work.avalanche.never && work.snowball.never && <p.ui-debt-payoff-verdict role="status">{`Interest is ${shown(work.interest_now)} a month now, and these payments never get past it. Pay more than that each month.`}</p>}
+            <fieldset.ui-debt-payoff-plans>
+                <legend>Month by month</legend>
+                <label><input type="radio" name={named("plan")} value="avalanche" checked={chosen == "avalanche"} @change={() => { chosen = "avalanche" }}/> Avalanche</label>
+                <label><input type="radio" name={named("plan")} value="snowball" checked={chosen == "snowball"} @change={() => { chosen = "snowball" }}/> Snowball</label>
+            </fieldset>
+            <div.ui-debt-payoff-scroll tabindex="0" role="region" aria-label="Month by month">
+                <table.ui-debt-payoff-months>
+                    <thead><tr><th scope="col">Month</th><th scope="col">Paid</th><th scope="col">Interest</th><th scope="col">Left to pay</th><th scope="col">Cleared</th></tr></thead>
+                    <tbody>
+                        {for m in months_shown => <tr key={m.month}><td>{m.month}</td><td>{shown(m.paid)}</td><td>{shown(m.interest)}</td><td>{shown(m.left)}</td><td>{join(m.cleared, ", ")}</td></tr>}
+                    </tbody>
+                </table>
+            </div>
+            {len(picked.rows) > 24 && <button.ui-debt-payoff-btn type="button" aria-expanded={every_month ? "true" : "false"} @click={() => { every_month = !every_month }}>
+                {every_month ? "Show the first 24 months" : `Show all ${len(picked.rows)} months`}
+            </button>}
+        </div>}
+    </section>
+}

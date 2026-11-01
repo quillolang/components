@@ -1,0 +1,358 @@
+// TransactionFeed: an account's money going in and out, as a phone shows it: what is still pending
+// at the top, then each day with its total, a search over the top, a category on every row, and
+// a tap on a row for all of it in a sheet from below. On a tablet the details stand in a pane
+// beside the list, so one can be read while looking through the rest.
+//
+//   import ui/transaction_feed.qwe use TransactionFeed
+//
+//   <div style="height: 100dvh">
+//       <TransactionFeed today="2026-11-01" items={[
+//           { id: "t1", date: "2026-11-01", title: "Cafe Luz", amount: -4.50m, category: "Food" },
+//           { id: "t2", date: "2026-10-31", title: "Payroll", amount: "2300.00", category: "Income", note: "October" },
+//           { id: "t3", date: "2026-11-01", title: "Hotel Sol", amount: -180m, category: "Travel", pending: true }]}/>
+//   </div>
+//
+// items: each { id, date, title, amount, currency, category, pending, note, account, ref, time }.
+// date: a date or a date-time. amount: a decimal, an int or numeric text, negative for money
+// leaving; anything else shows as a dash and counts for nothing in a total. time: words for the
+// sheet ("14:02"). today: "YYYY-MM-DD", from your page, for Today and Yesterday. currency: for
+// items with none ("USD"). locale. label ("Transactions"). on_open(id): a row was opened.
+//
+// It scrolls by itself, so put it in something with a height. A person's own words are matched
+// as plain text. Sheet: drag it down, its handle, the X, Escape or the phone's back close it.
+//
+// transaction_feed_groups(items, today, currency, locale) and transaction_feed_match(item, words)
+// are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/price.qwe use price_text
+
+let transaction_feed_css = css`
+.ui-txfeed { box-sizing: border-box; height: 100%; min-width: 0; container-type: inline-size; color: var(--ui-fg); background: var(--ui-bg); font: 15px/1.4 var(--ui-font); }
+.ui-txfeed-lay { display: grid; height: 100%; min-height: 0; min-width: 0; }
+.ui-txfeed-looking { --ui-txfeed-top: 83px; }
+.ui-txfeed-list { min-height: 0; min-width: 0; height: 100%; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+.ui-txfeed-find { position: sticky; top: 0; z-index: 3; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px; padding: 8px 12px; background: var(--ui-bg); border-bottom: 1px solid var(--ui-border); }
+/* 16 px and up, or iOS zooms the page when it is focused. */
+.ui-txfeed-box { box-sizing: border-box; width: 100%; min-height: 44px; padding: 8px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px/1.3 var(--ui-font); -webkit-appearance: none; appearance: none; }
+.ui-txfeed-box:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-txfeed-clear { width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ui-muted); font: 22px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-txfeed-clear:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-txfeed-said { grid-column: 1 / -1; min-height: 0; margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-txfeed-days { margin: 0; padding: 0 0 calc(12px + env(safe-area-inset-bottom)); list-style: none; }
+.ui-txfeed-day { position: sticky; top: var(--ui-txfeed-top, 61px); z-index: 2; display: flex; justify-content: space-between; gap: 12px; margin: 0; padding: 6px 14px; background: var(--ui-subtle); color: var(--ui-muted); font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-txfeed-pending .ui-txfeed-day { color: var(--ui-warning); }
+.ui-txfeed-rows { margin: 0; padding: 0; list-style: none; }
+.ui-txfeed-row {
+  box-sizing: border-box; display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; align-items: center; gap: 10px; width: 100%; min-height: 60px; padding: 8px 14px; border: 0; border-bottom: 1px solid var(--ui-border); background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; touch-action: manipulation;
+}
+.ui-txfeed-row:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-txfeed-row[aria-current="true"] { background: var(--ui-accent-soft); }
+.ui-txfeed-mark { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 50%; background: var(--ui-subtle); color: var(--ui-muted); font-weight: 700; }
+.ui-txfeed-main { min-width: 0; }
+.ui-txfeed-title { display: block; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-txfeed-cat { display: block; overflow: hidden; color: var(--ui-muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.ui-txfeed-amt { font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-txfeed-in { color: var(--ui-success); }
+.ui-txfeed-none { margin: 0; padding: 28px 16px; color: var(--ui-muted); text-align: center; }
+.ui-txfeed-sheet {
+  box-sizing: border-box; inset: auto 0 0 0; width: min(100%, 560px); max-width: 100%; max-height: 85dvh; margin: 0 auto; padding: 0 0 env(safe-area-inset-bottom); overflow: hidden; border: 1px solid var(--ui-border); border-bottom: 0;
+  border-radius: calc(var(--ui-radius) + 6px) calc(var(--ui-radius) + 6px) 0 0; background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 15px/1.4 var(--ui-font); transition: transform .22s cubic-bezier(.2, .8, .2, 1);
+}
+.ui-txfeed-sheet[open] { display: flex; flex-direction: column; animation: ui-txfeed-up .24s cubic-bezier(.2, .8, .2, 1); }
+.ui-txfeed-sheet::backdrop { background: var(--ui-overlay); }
+@keyframes ui-txfeed-up { from { transform: translateY(100%); } }
+.ui-txfeed-dragging { transition: none; }
+html:has(.ui-txfeed-sheet[open]) { overflow: hidden; }
+.ui-txfeed-grip { display: grid; place-items: center; flex: none; width: 100%; height: 44px; padding: 0; border: 0; background: transparent; cursor: grab; touch-action: none; }
+.ui-txfeed-grip span { width: 40px; height: 5px; border-radius: 999px; background: var(--ui-strong); }
+.ui-txfeed-grip:focus-visible { outline: none; }
+.ui-txfeed-grip:focus-visible span { background: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-txfeed-body { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 18px 18px; }
+.ui-txfeed-pane { display: none; }
+.ui-txfeed-head { display: grid; grid-template-columns: minmax(0, 1fr) 44px; align-items: start; gap: 4px; }
+.ui-txfeed-head h3 { margin: 0; font-size: 18px; outline: none; overflow-wrap: anywhere; }
+.ui-txfeed-x { width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ui-muted); font: 22px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-txfeed-x:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-txfeed-big { margin: 2px 0 12px; font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-txfeed-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; margin: 0; }
+.ui-txfeed-facts dt { color: var(--ui-muted); }
+.ui-txfeed-facts dd { margin: 0; overflow-wrap: anywhere; }
+/* Room for both: the sheet's place is taken by a pane, and the list keeps its scroll. */
+@container (min-width: 640px) {
+  .ui-txfeed-lay { grid-template-columns: minmax(0, 1fr) minmax(280px, 340px); }
+  .ui-txfeed-pane { display: block; min-height: 0; overflow-y: auto; padding: 18px; border-left: 1px solid var(--ui-border); background: var(--ui-subtle); }
+}
+@media (hover: hover) { .ui-txfeed-row:hover { background: var(--ui-subtle); } }
+@media (prefers-reduced-motion: reduce) { .ui-txfeed-sheet { transition: none; } .ui-txfeed-sheet[open] { animation: none; } }
+`
+
+// An amount as a decimal, or null: bad data shows a dash and is not added up.
+fn transaction_feed_dec(v) {
+    let kind = type_of(v)
+    if kind != "dec" && kind != "int" && kind != "float" && kind != "str" { return null }
+    let d = dec(v)
+    is_err(d) ? null : d
+}
+
+// An amount with its sign always written, as money in and money out read differently.
+fn transaction_feed_amount(v, currency: str, locale: str?) -> str {
+    let d = transaction_feed_dec(v)
+    if d == null { return "—" }
+    let text = price_text(d, currency, locale)
+    d > 0m ? `+${text}` : text
+}
+
+// The currency of an item.
+fn transaction_feed_cur(t, fallback: str) -> str = type_of(t.currency) == "str" && t.currency != "" ? t.currency : fallback
+
+// The calendar day of an item, or "" when it has none that can be read.
+fn transaction_feed_day_of(t) -> str {
+    if type_of(t.date) != "str" || !date.valid(t.date) { return "" }
+    slice(t.date, 0, 10)
+}
+
+// A day in words: Today and Yesterday, else the weekday and date, with the year when it is not this one.
+fn transaction_feed_day_label(d: str, today: str?) -> str {
+    if d == "" { return "No date" }
+    if type_of(today) != "str" || !date.valid(today, "date") { return date.format(d, "ddd, MMM D, YYYY") }
+    if d == today { return "Today" }
+    if d == date.add_days(today, -1) { return "Yesterday" }
+    date.format(d, slice(d, 0, 4) == slice(today, 0, 4) ? "ddd, MMM D" : "ddd, MMM D, YYYY")
+}
+
+// Each currency's total of some rows, exact, in the order they first come.
+fn transaction_feed_total(rows: list, fallback: str, locale: str?) -> str {
+    let good = rows | filter((t) => transaction_feed_dec(t.amount) != null)
+    let by = good | group_by((t) => transaction_feed_cur(t, fallback))
+    good | map((t) => transaction_feed_cur(t, fallback)) | unique() | map((c) => {
+        let amounts = get(by, c, []) | map((t) => transaction_feed_dec(t.amount))
+        transaction_feed_amount(sum(amounts), c, locale)
+    }) | join(" · ")
+}
+
+// Whether an item has every word of a search, in any field a person would look by.
+fn transaction_feed_match(t, words: list, fallback: str = "USD", locale: str? = null) -> bool {
+    let hay = lower(`${t.title ?? ""} ${t.category ?? ""} ${t.note ?? ""} ${t.account ?? ""} ${transaction_feed_amount(t.amount, transaction_feed_cur(t, fallback), locale)}`)
+    all(words, (w) => contains(hay, w))
+}
+
+// The words of a search.
+fn transaction_feed_words(text: str) -> list = split(lower(trim(text)), " ") | filter((w) => w != "")
+
+// What the feed shows: pending first whatever its date, then each day, newest first, in the
+// order given within it, and what has no date last.
+fn transaction_feed_groups(items: list, today: str?, fallback: str = "USD", locale: str? = null) -> list {
+    let waiting = items | filter((t) => t.pending == true)
+    let settled = items | filter((t) => t.pending != true)
+    let by = settled | group_by((t) => transaction_feed_day_of(t))
+    let days = settled | map((t) => transaction_feed_day_of(t)) | unique() | filter((d) => d != "") | sort() | reverse()
+    let undated = get(by, "", [])
+    let dated = days | map((d) => {
+        let rows = get(by, d, [])
+        { day: d, label: transaction_feed_day_label(d, today), total: transaction_feed_total(rows, fallback, locale), rows: rows }
+    })
+    let first = len(waiting) > 0 ? [{ day: "pending", label: "Pending", total: transaction_feed_total(waiting, fallback, locale), rows: waiting }] : []
+    let last = len(undated) > 0 ? [{ day: "none", label: "No date", total: transaction_feed_total(undated, fallback, locale), rows: undated }] : []
+    first + dated + last
+}
+
+// The letter in a row's round mark.
+fn transaction_feed_letter(t) -> str {
+    let c = split(trim(str(t.category ?? t.title ?? "?")), "")
+    len(c) == 0 ? "?" : upper(c[0])
+}
+
+// Whether a pull closes the sheet: a third of it, or a flick down that has moved enough to mean it.
+fn transaction_feed_closes(dy: num, speed: num, height: num) -> bool = dy >= height / 3 || (speed >= 0.5 && dy >= 24)
+
+// The last few points of a drag, for the speed at the release.
+fn transaction_feed_trail(trail: list, y: num, at_ms: num) -> list {
+    let all_of = trail + [{ y: y, at: at_ms }]
+    slice(all_of, max([0, len(all_of) - 6]), len(all_of))
+}
+
+fn transaction_feed_speed(trail: list, y: num, at_ms: num) -> num {
+    let old = trail | filter((p) => at_ms - p.at >= 16 && at_ms - p.at <= 120)
+    if len(old) == 0 { return 0 }
+    (y - old[0].y) / (at_ms - old[0].at)
+}
+
+// All there is to say about one, in the sheet and in the pane.
+view TransactionFeedDetail(t, fallback: str, locale: str?, today: str?, on_close = null) =
+    <div>
+        <div.ui-txfeed-head>
+            <h3 tabindex="-1">{t.title}</h3>
+            <button.ui-txfeed-x type="button" aria-label="Close details" @click={() => { on_close() }}>×</button>
+        </div>
+        <p class={ui_cls(["ui-txfeed-big", transaction_feed_dec(t.amount) != null && transaction_feed_dec(t.amount) > 0m && "ui-txfeed-in"])}>{transaction_feed_amount(t.amount, transaction_feed_cur(t, fallback), locale)}</p>
+        <dl.ui-txfeed-facts>
+            <dt>Status</dt><dd>{t.pending == true ? "Pending: this may still change" : "Completed"}</dd>
+            <dt>Date</dt><dd>{transaction_feed_day_label(transaction_feed_day_of(t), today)}{t.time != null ? `, ${t.time}` : ""}</dd>
+            <dt>Category</dt><dd>{t.category != null ? t.category : "None"}</dd>
+            {t.account != null && <dt>Account</dt>}
+            {t.account != null && <dd>{t.account}</dd>}
+            {t.note != null && <dt>Note</dt>}
+            {t.note != null && <dd>{t.note}</dd>}
+            {t.ref != null && <dt>Reference</dt>}
+            {t.ref != null && <dd>{t.ref}</dd>}
+        </dl>
+    </div>
+
+component TransactionFeed(items: list = [], today: str? = null, currency: str = "USD", locale: str? = null, label: str = "Transactions", on_open = null) {
+    style global transaction_feed_css
+    state search = ""
+    state chosen = null      // the open item's id
+    state wide = false       // room for a pane
+    state dlg = null
+    state pane_el = null
+    state opener = null      // the row that opened it, for focus to return to
+    state pushed = false     // a history entry stands for the sheet
+    state popping = false    // the going back asked for by closing has not arrived yet
+    state grab = null        // where the finger went down on the handle
+    state axis = null
+    state trail = []
+    state pulled = false     // a pull ended, so the click after it is not a tap
+    let words = transaction_feed_words(search)
+    let matching = len(words) == 0 ? items : items | filter((t) => transaction_feed_match(t, words, currency, locale))
+    let groups = transaction_feed_groups(matching, today, currency, locale)
+    let open_item = items | find((t) => t.id == chosen)
+    let shut = () => {
+        if chosen != null {
+            chosen = null
+            let from = opener
+            opener = null
+            if from != null && wide { from.focus() }
+        }
+        if pushed {
+            pushed = false
+            popping = true
+            js("history.back")
+        }
+    }
+    let open_row = (t, e) => {
+        opener = e.target.closest("button")
+        chosen = t.id
+        on_open && on_open(t.id)
+        if !wide && !pushed {
+            pushed = true
+            js("history.pushState", { ui_txfeed: true }, "")
+        }
+        js("Promise.resolve", 1)
+        if wide && pane_el != null {
+            let h = pane_el.querySelector("h3")
+            if h != null { h.focus() }
+        }
+    }
+    let spring = () => {
+        dlg.classList.remove("ui-txfeed-dragging")
+        dlg.style.transform = ""
+    }
+    let finish = (e) => {
+        if grab != null && e.pointerId == grab.id {
+            let dy = e.clientY - grab.y
+            let was = axis
+            let speed = transaction_feed_speed(trail, e.clientY, e.timeStamp)
+            grab = null
+            axis = null
+            spring()
+            if was == "y" {
+                pulled = true
+                if e.type == "pointerup" && transaction_feed_closes(dy, speed, dlg.offsetHeight) { shut() }
+            }
+        }
+    }
+    if chosen != null && !wide && dlg != null && !dlg.open { dlg.showModal() }
+    if (chosen == null || wide) && dlg != null && dlg.open { dlg.close() }
+    <section.ui-txfeed aria-label={label}
+             @mount={(el) => {
+                 let w = js("window")
+                 let measure = (_e = null) => { wide = el.clientWidth >= 640 }
+                 let back = (_e = null) => {
+                     if popping {
+                         popping = false
+                     } else if pushed {
+                         pushed = false
+                         chosen = null
+                     }
+                 }
+                 let watch = js_new("ResizeObserver", measure)
+                 watch.observe(el)
+                 w.addEventListener("popstate", back)
+                 measure()
+                 () => {
+                     watch.disconnect()
+                     w.removeEventListener("popstate", back)
+                 }
+             }}>
+        <div.ui-txfeed-lay>
+            <div class={ui_cls(["ui-txfeed-list", search != "" && "ui-txfeed-looking"])}>
+                <div.ui-txfeed-find role="search">
+                    <input.ui-txfeed-box type="search" aria-label="Search transactions" placeholder="Search" enterkeyhint="search" autocomplete="off" bind:value={search}
+                           @keydown={(e) => { if e.key == "Enter" { e.target.blur() } }}/>
+                    {search != "" && <button.ui-txfeed-clear type="button" aria-label="Clear search" @click={() => { search = "" }}>×</button>}
+                    {search != "" && <p.ui-txfeed-said role="status">{len(matching) == 1 ? "1 found" : `${len(matching)} found`}</p>}
+                </div>
+                {len(items) == 0 && <p.ui-txfeed-none>No transactions yet.</p>}
+                {len(items) > 0 && len(matching) == 0 && <p.ui-txfeed-none>Nothing matches that.</p>}
+                <ol.ui-txfeed-days>
+                    {for g in groups => <li key={g.day} class={g.day == "pending" ? "ui-txfeed-pending" : null}>
+                        <h3.ui-txfeed-day><span>{g.label}</span><span>{g.total}</span></h3>
+                        <ul.ui-txfeed-rows>
+                            {for t in g.rows => <li key={t.id}>
+                                <button.ui-txfeed-row type="button" aria-haspopup="dialog" aria-current={chosen == t.id ? "true" : null} @click={(e) => { open_row(t, e) }}>
+                                    <span.ui-txfeed-mark aria-hidden="true">{transaction_feed_letter(t)}</span>
+                                    <span.ui-txfeed-main>
+                                        <span.ui-txfeed-title>{t.title}</span>
+                                        <span.ui-txfeed-cat>{t.category != null ? t.category : "No category"}{t.pending == true ? " · Pending" : ""}</span>
+                                    </span>
+                                    <span class={ui_cls(["ui-txfeed-amt", transaction_feed_dec(t.amount) != null && transaction_feed_dec(t.amount) > 0m && "ui-txfeed-in"])}>{transaction_feed_amount(t.amount, transaction_feed_cur(t, currency), locale)}</span>
+                                </button>
+                            </li>}
+                        </ul>
+                    </li>}
+                </ol>
+            </div>
+            <aside.ui-txfeed-pane aria-label="Details" @mount={(el) => { pane_el = el }}>
+                {wide && open_item != null && <TransactionFeedDetail t={open_item} fallback={currency} locale={locale} today={today} on_close={shut}/>}
+                {open_item == null && <p.ui-txfeed-none>Choose a transaction to see it here.</p>}
+            </aside>
+        </div>
+        <dialog.ui-txfeed-sheet aria-label="Transaction details" @mount={(el) => { dlg = el }}
+                @close={() => { if !wide { shut() } }}
+                @click={(e) => { if e.target.tagName == "DIALOG" { shut() } }}>
+            <button.ui-txfeed-grip type="button" aria-label="Close details"
+                    @pointerdown={(e) => {
+                        if e.button == 0 && grab == null {
+                            e.target.closest("button").setPointerCapture(e.pointerId)
+                            grab = { y: e.clientY, x: e.clientX, id: e.pointerId }
+                            trail = transaction_feed_trail([], e.clientY, e.timeStamp)
+                            axis = null
+                            pulled = false
+                        }
+                    }}
+                    @pointermove={(e) => {
+                        if grab != null && e.pointerId == grab.id {
+                            let dy = e.clientY - grab.y
+                            let dx = e.clientX - grab.x
+                            if axis == null && (abs(dy) > 6 || abs(dx) > 6) {
+                                axis = abs(dy) >= abs(dx) ? "y" : "x"
+                                if axis == "y" { dlg.classList.add("ui-txfeed-dragging") }
+                            }
+                            if axis == "y" {
+                                dlg.style.transform = `translateY(${max([0, dy])}px)`
+                                trail = transaction_feed_trail(trail, e.clientY, e.timeStamp)
+                            }
+                        }
+                    }}
+                    @pointerup={finish}
+                    @pointercancel={finish}
+                    @click={() => {
+                        if pulled { pulled = false } else { shut() }
+                    }}><span></span></button>
+            <div.ui-txfeed-body>
+                {!wide && open_item != null && <TransactionFeedDetail t={open_item} fallback={currency} locale={locale} today={today} on_close={shut}/>}
+            </div>
+        </dialog>
+    </section>
+}

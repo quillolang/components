@@ -1,0 +1,196 @@
+// KeywordExtractor: what a text is about, from the text alone: its commonest single
+// words and two-word phrases, leaving out each language's common words, with how often
+// each comes and what share of the text it is. A word past the share a search engine
+// would take for stuffing gets a warning, and the keywords can be ticked and copied as
+// tags. It reads words of any alphabet, takes "Quillo's" and "Quillo’s" as "quillo", and
+// "l'homme" as "homme"; a phrase never runs across a comma or a full stop.
+//
+//   <KeywordExtractor value={post.body} name="body"/>
+//   <KeywordExtractor language="es" top={15} stuffing={2.5} on_change={(r) => { tags = r.tags }}/>
+//
+// value: the text to start with. name: the field's name ("text"), and tags_name a hidden
+// field's holding the tags ("tags"), so a plain <form> sends both, with the menu as
+// `language`. label: the field's
+// label ("Text to analyse"). rows: the box's height in lines (6). id: a prefix for its
+// ids ("keyword-extractor"), unique on the page. language: "auto" (worked out from the
+// words, the default), "en", "es", "fr", "de", "pt", "it" or "none", which leaves every
+// word in; there is a menu for it too. top: how many of each to list (10). stuffing: the
+// share of the text, in percent, past which a word is warned about (3); only in a
+// text of 30 words or more, and of a word said three times or more. limit: the most
+// characters read (100000); past it, it reads the start and says so. on_change(result):
+// inside one of your components, given the map below with text and tags as well.
+// class: more classes for its outer element.
+//
+// keyword_extractor_analyse(text, language, top, stuffing, limit) is the analysis, for a
+// program's own use: { total, language, language_name, detected, capped, words, phrases,
+// warnings }, where words and phrases are lists of { term, count, density } (density in
+// percent) and warnings of { term, density }. keyword_extractor_tags(result, left_out)
+// gives the tags as text.
+
+import ui/theme.qwe use ui_cls
+import ui/copy_button.qwe use CopyButton
+import ui/readability_meter.qwe use readability_meter_language, readability_meter_language_names, readability_meter_one, readability_meter_stop_sets, readability_meter_words
+
+let keyword_extractor_css = css`
+.ui-keyword-extractor { display: grid; gap: 14px; min-width: 0; max-width: 760px; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-keyword-extractor-field { display: grid; gap: 5px; min-width: 0; }
+.ui-keyword-extractor-field label { font-size: 13px; font-weight: 500; }
+.ui-keyword-extractor-field textarea { box-sizing: border-box; display: block; width: 100%; min-width: 0; padding: 9px 12px; resize: vertical; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.5 var(--ui-font); }
+.ui-keyword-extractor-field select { box-sizing: border-box; justify-self: start; height: 34px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); }
+.ui-keyword-extractor-field textarea:hover, .ui-keyword-extractor-field select:hover { border-color: var(--ui-strong); }
+.ui-keyword-extractor-field textarea:focus, .ui-keyword-extractor-field select:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-keyword-extractor-said { margin: 0; font-weight: 600; }
+.ui-keyword-extractor-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-keyword-extractor-warn { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); }
+.ui-keyword-extractor-lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; min-width: 0; }
+.ui-keyword-extractor-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-keyword-extractor-table caption { padding-bottom: 4px; font-size: 13px; font-weight: 600; text-align: left; }
+.ui-keyword-extractor-table th { padding: 4px 6px; border-bottom: 1px solid var(--ui-strong); color: var(--ui-muted); font-size: 12px; font-weight: 500; text-align: right; }
+.ui-keyword-extractor-table th:first-child { text-align: left; }
+.ui-keyword-extractor-table td { padding: 5px 6px; border-bottom: 1px solid var(--ui-border); text-align: right; }
+.ui-keyword-extractor-table td:first-child { text-align: left; overflow-wrap: anywhere; }
+.ui-keyword-extractor-table label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.ui-keyword-extractor-table input { flex: none; margin: 0; accent-color: var(--ui-accent); }
+.ui-keyword-extractor-table input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-keyword-extractor-over td { color: var(--ui-warning); font-weight: 600; }
+.ui-keyword-extractor-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; min-width: 0; }
+.ui-keyword-extractor-tags code { flex: 1 1 200px; min-width: 0; padding: 6px 10px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font: 13px/1.5 var(--ui-mono); overflow-wrap: anywhere; }
+.ui-keyword-extractor-copy { height: 32px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-keyword-extractor-copy:hover { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-keyword-extractor-copy:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+`
+
+// The word's dictionary form: one kind of apostrophe, no possessive, no French or Italian article stuck to it.
+fn keyword_extractor_clean(word: str, code: str?) -> str {
+    if code == "fr" || code == "it" { return re.replace(word, "^(?:l|d|j|c|n|s|t|m|qu|dell|all|nell|sull|dall|un)'", "") }
+    code == "en" ? re.replace(word, "'s$", "") : word
+}
+
+// Counts the terms as `group_by` does, keeping first seen first, then the most frequent
+// first. group_by and not a map built with `m[w]`: in the browser a map holding the key
+// "constructor" fails when read by index, and any text may hold that word.
+fn keyword_extractor_rank(terms: list, per_term: int, total: int, top: int) -> list {
+    let groups = group_by(terms, (t) => t)
+    let ranked = sort_by(for [term, seen] in groups => { term, count: len(seen), density: len(seen) * per_term * 100 / total }, (x) => -x.count)
+    take(ranked, top)
+}
+
+// Two neighbours make a phrase when only a space or one line break lies between them,
+// or nothing, as in a script written without spaces.
+fn keyword_extractor_joined(chars: list, a, b) -> bool {
+    let gap = b.start - a.end
+    if gap == 0 { return true }
+    if gap == 1 { return chars[a.end] == " " || chars[a.end] == "\n" }
+    gap > 1 && gap < 8 && re.test(join(slice(chars, a.end, b.start), ""), "^[ \\t]*\\n?[ \\t]*$")
+}
+
+// The analysis (see the top of the file).
+fn keyword_extractor_analyse(text: str, language: str = "auto", top: int = 10, stuffing = 3, limit: int = 100000) {
+    let capped = len(text) > limit
+    let t = capped ? slice(text, 0, limit) : text
+    let found = readability_meter_words(t)
+    let lows = found | map((w) => replace(lower(w.text), "’", "'"))
+    let guess = language == "auto" ? readability_meter_language(lows) : null
+    let code = language == "auto" ? (guess == null ? null : guess.code) : (language == "none" ? null : language)
+    let stop = code != null && has(readability_meter_stop_sets, code) ? get(readability_meter_stop_sets, code, {}) : {}
+    let total = len(found)
+    let clean = lows | map((w) => keyword_extractor_clean(w, code))
+    // A keyword is not a common word, a number or a stray letter; a character of a script
+    // without spaces is a word of its own.
+    let keeps = for i in range(0, total) {
+        let w = clean[i]
+        !has(stop, lows[i]) && !has(stop, w) && (len(w) > 1 || re.test(w, "[぀-鿿]")) && !re.test(w, "^[0-9.,:'-]+$")
+    }
+    let terms = range(0, total) | filter((i) => keeps[i]) | map((i) => clean[i])
+    let chars = split(t, "")
+    let pairs = range(0, max([total - 1, 0]))
+        | filter((i) => keeps[i] && keeps[i + 1] && keyword_extractor_joined(chars, found[i], found[i + 1]))
+        | map((i) => clean[i] + (found[i].end == found[i + 1].start ? "" : " ") + clean[i + 1])
+    let words = total == 0 ? [] : keyword_extractor_rank(terms, 1, total, top)
+    let phrases = total == 0 ? [] : keyword_extractor_rank(pairs, 2, total, top) | filter((p) => p.count >= 2)
+    let warnings = total < 30 ? [] : (words + phrases) | filter((w) => w.count >= 3 && w.density > stuffing) | map((w) => { term: w.term, density: w.density })
+    { total, language: code, language_name: code == null ? null : get(readability_meter_language_names, code, null), detected: language == "auto" && guess != null,
+      capped, words, phrases, warnings }
+}
+
+// The keywords that are not left out, as a list of tags to paste.
+fn keyword_extractor_tags(result, left_out: list = []) -> str =
+    (result.words + result.phrases) | map((w) => w.term) | filter((t) => !contains(left_out, t)) | join(", ")
+
+component KeywordExtractor(value: str = "", name: str = "text", tags_name: str = "tags", label: str = "Text to analyse", rows: int = 6, id: str = "keyword-extractor",
+                           language: str = "auto", top: int = 10, stuffing = 3, limit: int = 100000, on_change = null, class: str? = null) {
+    style global keyword_extractor_css
+    state text = value
+    state lang = language
+    state left_out = []
+    let r = keyword_extractor_analyse(text, lang, top, stuffing, limit)
+    let tags = keyword_extractor_tags(r, left_out)
+    let blank = trim(text) == ""
+    let none = !blank && len(r.words) == 0
+    let pct = (d) => `${readability_meter_one(d)}%`
+    let said = blank ? "Type or paste some text to find its keywords."
+        : r.total == 0 ? "There are no words in this text."
+        : none ? `${r.total} ${r.total == 1 ? "word" : "words"}, all of them common words or numbers, so no keywords.`
+        : `${r.total} ${r.total == 1 ? "word" : "words"}, ${len(r.words)} keywords shown.`
+    let lang_said = r.language_name != null ? `Common words of ${r.language_name} left out${r.detected ? " (worked out from the text)" : ""}.`
+        : lang == "none" ? "No words left out." : "No language recognised, so no common words were left out."
+    let tell = (next_text: str, next_lang: str, next_out: list) => {
+        if on_change != null {
+            let x = keyword_extractor_analyse(next_text, next_lang, top, stuffing, limit)
+            on_change({ ...x, text: next_text, tags: keyword_extractor_tags(x, next_out) })
+        }
+    }
+    let flip = (term: str, yes: bool) => {
+        left_out = yes ? remove(left_out, term) : push(left_out, term)
+        tell(text, lang, left_out)
+    }
+    let table = (title: str, rows_of: list, first_head: str) =>
+        <table.ui-keyword-extractor-table>
+            <caption>{title}</caption>
+            <thead><tr><th scope="col">{first_head}</th><th scope="col">Times</th><th scope="col">Share</th></tr></thead>
+            <tbody>
+                {for w in rows_of => <tr key={w.term} class={any(r.warnings, (x) => x.term == w.term) ? "ui-keyword-extractor-over" : null}>
+                    <td><label><input type="checkbox" checked={!contains(left_out, w.term)} aria-label={`Use ${w.term} as a tag`} @change={(e) => { flip(w.term, e.checked) }}/>{w.term}</label></td>
+                    <td>{w.count}</td>
+                    <td>{pct(w.density)}</td>
+                </tr>}
+            </tbody>
+        </table>
+    <section class={ui_cls(["ui-keyword-extractor", class])} aria-labelledby={`${id}-said`}>
+        <div.ui-keyword-extractor-field>
+            <label for={`${id}-text`}>{label}</label>
+            <textarea id={`${id}-text`} name={name} rows={rows} value={text} @input={(e) => { text = e.value; tell(e.value, lang, left_out) }}></textarea>
+        </div>
+        <div.ui-keyword-extractor-field>
+            <label for={`${id}-language`}>Language</label>
+            <select id={`${id}-language`} name="language" @change={(e) => { lang = e.value; tell(text, e.value, left_out) }}>
+                <option value="auto" selected={lang == "auto"}>Work it out</option>
+                <option value="en" selected={lang == "en"}>English</option>
+                <option value="es" selected={lang == "es"}>Spanish</option>
+                <option value="fr" selected={lang == "fr"}>French</option>
+                <option value="de" selected={lang == "de"}>German</option>
+                <option value="pt" selected={lang == "pt"}>Portuguese</option>
+                <option value="it" selected={lang == "it"}>Italian</option>
+                <option value="none" selected={lang == "none"}>None: keep every word</option>
+            </select>
+        </div>
+        <div>
+            <p.ui-keyword-extractor-said id={`${id}-said`} aria-live="polite">{said}</p>
+            {r.total > 0 && <p.ui-keyword-extractor-note>{lang_said}</p>}
+            {r.capped && <p.ui-keyword-extractor-note>Only the first {format_number(limit, "en-US", 0)} characters were read.</p>}
+        </div>
+        {for w in r.warnings => <p.ui-keyword-extractor-warn key={w.term}>"{w.term}" is {pct(w.density)} of the text, over the {stuffing}% that reads as keyword stuffing.</p>}
+        {len(r.words) > 0 && <div.ui-keyword-extractor-lists>
+            {table("Single words", r.words, "Word")}
+            {len(r.phrases) > 0 ? table("Two-word phrases", r.phrases, "Phrase") : <p.ui-keyword-extractor-note>No two-word phrase comes twice.</p>}
+        </div>}
+        {len(r.words) > 0 && <div.ui-keyword-extractor-tags>
+            <code id={`${id}-tags`}>{tags == "" ? "No tags ticked" : tags}</code>
+            <CopyButton text={tags} label="Copy as tags" class="ui-keyword-extractor-copy"/>
+        </div>}
+        <input type="hidden" name={tags_name} value={tags}/>
+    </section>
+}

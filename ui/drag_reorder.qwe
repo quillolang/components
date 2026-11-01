@@ -1,0 +1,285 @@
+// DragReorder: a list put in order by hand. On touch a long press lifts a row, so the
+// list still scrolls under a passing finger; the grip at its left lifts one at once,
+// which suits a mouse too. Rows make way as it moves, the list or the page scrolls by
+// itself near its edges, and letting go drops it there. The arrow keys move a row from its
+// grip, screen readers have a Move up and a Move down button in each row, and in a wide
+// container those stand on the row for anyone to press.
+//
+//   component Stops() {
+//       state rows = load_stops()
+//       <DragReorder items={rows} max_height="60dvh" label="Stops"
+//                    on_reorder={(ids) => { save_order(ids) }}/>
+//   }
+//
+// items: each { id, title, subtitle? }. One without a title is left out, a second with an
+// id already seen too, and if the list changes, rows keep the order they were given by hand and new
+// ones go last. on_reorder(ids): inside one of your components, called with all the ids, as text, in the
+// new order, when a row has really moved. delay: the long press, in milliseconds
+// (320). max_height: a CSS height past which the list scrolls inside itself; without it the
+// page scrolls. label: the list's name for screen readers. class.
+
+import ui/theme.qwe use ui_cls
+
+let drag_reorder_css = css`
+.ui-drag-reorder { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-drag-reorder-list { position: relative; margin: 0; padding: 0; list-style: none; overscroll-behavior-y: contain; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-subtle); }
+.ui-drag-reorder-row { position: relative; display: flex; align-items: center; gap: 6px; min-height: 60px; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface);
+  touch-action: pan-y; -webkit-touch-callout: none; transition: transform .18s cubic-bezier(.2, .8, .2, 1), box-shadow .15s; }
+.ui-drag-reorder-row:last-child { border-bottom: 0; }
+.ui-drag-reorder-pressing { background: var(--ui-subtle); user-select: none; -webkit-user-select: none; }
+.ui-drag-reorder-lifted { z-index: 3; box-shadow: var(--ui-shadow-lg); transition: box-shadow .15s; user-select: none; -webkit-user-select: none; cursor: grabbing; }
+.ui-drag-reorder-grip { display: grid; flex: none; place-items: center; width: 44px; height: 52px; padding: 0; border: 0; background: transparent; color: var(--ui-muted); cursor: grab; touch-action: none; }
+.ui-drag-reorder-grip svg { width: 20px; height: 20px; }
+.ui-drag-reorder-grip:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: var(--ui-radius-sm); }
+.ui-drag-reorder-text { flex: 1; min-width: 0; }
+.ui-drag-reorder-title { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-drag-reorder-sub { display: block; color: var(--ui-muted); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* For screen readers on a phone, which have no arrow keys. position: relative on the row keeps them from widening the page. */
+.ui-drag-reorder-moves { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.ui-drag-reorder-move { min-width: 44px; min-height: 44px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-drag-reorder-move[aria-disabled="true"] { color: var(--ui-muted); opacity: .55; cursor: default; }
+.ui-drag-reorder-move:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-drag-reorder-move:not([aria-disabled="true"]):hover { background: var(--ui-subtle); } }
+@container (min-width: 520px) {
+  .ui-drag-reorder-moves { position: static; display: flex; flex: none; gap: 6px; width: auto; height: auto; overflow: visible; clip: auto; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-drag-reorder-row { transition: none; } }
+`
+
+// The rows that can be shown: those with a title, each id once, ids as text.
+fn drag_reorder_clean(items) {
+    if type_of(items) != "list" { return [] }
+    let named = items | filter((i) => type_of(i) == "map" && get(i, "title") != null)
+    // One without an id gets its place, marked so it cannot be taken for a real id of that number.
+    let all = enumerate(named) | map((p) => { ...p[1], id: get(p[1], "id") != null ? str(p[1].id) : `_${p[0]}` })
+    let ids = all | map((i) => i.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// The ids in the order they stand now: those given by hand first, then any new.
+fn drag_reorder_ids(rows, hand: list) -> list {
+    let have = rows | map((r) => r.id)
+    let kept = hand | filter((id) => contains(have, id))
+    kept + (have | filter((id) => !contains(kept, id)))
+}
+
+// The list with the item at from moved to the place to.
+fn drag_reorder_move(ids: list, from: int, to: int) -> list {
+    if from == to || from < 0 || to < 0 || from >= len(ids) || to >= len(ids) { return ids }
+    let rest = enumerate(ids) | filter((p) => p[0] != from) | map((p) => p[1])
+    slice(rest, 0, to) + [ids[from]] + slice(rest, to, len(rest))
+}
+
+// The place a row dragged by dy would land in: how many of the others have their middle above its middle.
+fn drag_reorder_target(from: int, tops: list, heights: list, dy: num) -> int {
+    let middle = tops[from] + heights[from] / 2 + dy
+    enumerate(tops) | filter((p) => p[0] != from && p[1] + heights[p[0]] / 2 < middle) | len()
+}
+
+// How far row i steps aside while the row at from hangs over the place to.
+fn drag_reorder_shift(i: int, from: int, to: int, step: num) -> num {
+    if i > from && i <= to { return -step }
+    if i < from && i >= to { return step }
+    0
+}
+
+// Pixels a tick the list scrolls, for a finger y between an edge's top and bottom: more
+// the nearer the edge, nothing outside the zone.
+fn drag_reorder_speed(y: num, top: num, bottom: num, zone: num, fastest: num) -> num {
+    if y < top + zone { return -round(fastest * min([1, (top + zone - y) / zone])) }
+    if y > bottom - zone { return round(fastest * min([1, (y - bottom + zone) / zone])) }
+    0
+}
+
+// What scrolls this element: the nearest box that can, else the page.
+fn drag_reorder_scroller(el) {
+    let box = el.parentElement
+    while box != null && !box.isSameNode(js("document.body")) {
+        let how = js("getComputedStyle", box).overflowY
+        if (how == "auto" || how == "scroll") && box.scrollHeight > box.clientHeight { return box }
+        box = box.parentElement
+    }
+    js("document.scrollingElement")
+}
+
+// A tap felt, where there is such a thing.
+fn drag_reorder_buzz() {
+    if is_err(js("quilloNative.haptic", "medium")) && js("navigator.userActivation.hasBeenActive") == true { js("navigator.vibrate", 10) }
+}
+
+component DragReorder(items = [], on_reorder = null, delay: int = 320, max_height: str? = null, label: str = "List in order", class: str? = null) {
+    style global drag_reorder_css
+    let rows = drag_reorder_clean(items)
+    state hand = []          // the order made here, ids as text
+    let ids = drag_reorder_ids(rows, hand)
+    let shown = ids | map((id) => find(rows, (r) => r.id == id))
+    state list_el = null
+    state press = null       // a touch on a row, waiting for its time: { id, row, x, y }
+    state lifted = ""        // the id of the row in the air
+    state g = null           // that row's drag, which handlers keep to themselves
+    state said = ""
+    let title_of = (id: str) => find(rows, (r) => r.id == id).title
+    let commit = (from: int, to: int, row_id: str) => {
+        let next = drag_reorder_move(ids, from, to)
+        hand = next
+        said = `${title_of(row_id)} moved to place ${to + 1} of ${len(next)}.`
+        on_reorder && on_reorder(next)
+    }
+    let shift_rows = (to: int) => {
+        let all = g.rows
+        for i in range(0, len(all)) {
+            if i != g.from {
+                let by = drag_reorder_shift(i, g.from, to, g.step)
+                all[i].style.transform = by != 0 ? `translateY(${by}px)` : ""
+            }
+        }
+    }
+    let follow = () => {
+        let dy = g.py - g.y + (g.box.scrollTop - g.top0)
+        g.rows[g.from].style.transform = `translateY(${dy}px)`
+        let to = drag_reorder_target(g.from, g.tops, g.heights, dy)
+        if to != g.to {
+            shift_rows(to)
+            g = { ...g, to }
+        }
+    }
+    let lift = (row, id: int, y: num) => {
+        press = null
+        let all = list_el.querySelectorAll(".ui-drag-reorder-row")
+        let n = all.length
+        let els = for i in range(0, n) => all[i]
+        let from = index_of(ids, row.dataset.id)
+        let box = drag_reorder_scroller(row)
+        g = { pid: id, y, py: y, from, to: from, rows: els, box, top0: box.scrollTop,
+              tops: for e in els => e.offsetTop, heights: for e in els => e.offsetHeight, step: row.offsetHeight }
+        row.setPointerCapture(id)
+        lifted = row.dataset.id
+        drag_reorder_buzz()
+    }
+    // Rows go back to their places at once, in their new order, and the one let go glides in.
+    let drop = (cancel: bool) => {
+        let was = g
+        g = null
+        lifted = ""
+        let row = was.rows[was.from]
+        let dy = was.py - was.y + (was.box.scrollTop - was.top0)
+        let id = row.dataset.id
+        if cancel || was.to == was.from {
+            for e in was.rows { e.style.transform = "" }
+        } else {
+            for e in was.rows {
+                e.style.transition = "none"
+                e.style.transform = ""
+            }
+            let hung = was.tops[was.from] + dy
+            commit(was.from, was.to, id)
+            js("requestAnimationFrame", (_t = null) => {
+                for e in was.rows { e.style.transition = "" }
+                if !js("matchMedia", "(prefers-reduced-motion: reduce)").matches {
+                    row.animate([{ transform: `translateY(${hung - row.offsetTop}px)` }, { transform: "none" }], { duration: 160, easing: "ease-out" })
+                }
+            })
+        }
+    }
+    let by_key = (e, id: str) => {
+        let at = index_of(ids, id)
+        let to = match e.key {
+            "ArrowUp" => at - 1
+            "ArrowDown" => at + 1
+            "Home" => 0
+            "End" => len(ids) - 1
+            _ => -1
+        }
+        if to >= 0 && to < len(ids) && to != at {
+            e.preventDefault()
+            commit(at, to, id)
+        }
+        if e.key == "ArrowUp" || e.key == "ArrowDown" || e.key == "Home" || e.key == "End" { e.preventDefault() }
+    }
+    let step = (id: str, by: int) => {
+        let at = index_of(ids, id)
+        let to = at + by
+        if to >= 0 && to < len(ids) { commit(at, to, id) }
+    }
+    let tick = () => {
+        if g != null {
+            let page = g.box.isSameNode(js("document.scrollingElement"))
+            let r = g.box.getBoundingClientRect()
+            let top = page ? 0 : r.top
+            let bottom = page ? js("window.innerHeight") : r.bottom
+            let by = drag_reorder_speed(g.py, top, bottom, 56, 10)
+            if by != 0 {
+                g.box.scrollTop += by
+                follow()
+            }
+        }
+    }
+    if press != null { every(delay, () => {
+        if press != null { lift(press.row, press.id, press.y) }
+    }) }
+    if lifted != "" { every(16, tick) }
+    <div class={ui_cls(["ui-drag-reorder", class])}>
+        <ul.ui-drag-reorder-list role="list" aria-label={label} style={max_height != null ? `max-height: ${max_height}; overflow-y: auto` : null}
+            @mount={(me) => {
+                list_el = me
+                // Once a row is in the air the finger is the drag's. pan-y would hand it to the
+                // list on the first move, as nothing else stops the browser in the middle of a touch.
+                let guard = (e) => { if g != null && e.cancelable { e.preventDefault() } }
+                me.addEventListener("touchmove", guard, { passive: false })
+                () => { me.removeEventListener("touchmove", guard) }
+            }}
+            @contextmenu={(e) => { if press != null || g != null { e.preventDefault() } }}
+            @selectstart={(e) => { if press != null || g != null { e.preventDefault() } }}
+            @pointerdown={(e) => {
+                let row = e.target.closest(".ui-drag-reorder-row")
+                let on_move = e.target.closest(".ui-drag-reorder-moves") != null
+                if row != null && !on_move && e.isPrimary && e.button == 0 && g == null {
+                    if e.target.closest(".ui-drag-reorder-grip") != null {
+                        e.preventDefault()
+                        lift(row, e.pointerId, e.clientY)
+                    } else {
+                        press = { id: e.pointerId, row, x: e.clientX, y: e.clientY, mouse: e.pointerType == "mouse" }
+                    }
+                }
+            }}
+            @pointermove={(e) => {
+                if press != null && e.pointerId == press.id {
+                    let far = abs(e.clientX - press.x) + abs(e.clientY - press.y)
+                    // A mouse needs no long press; a finger that moves first is scrolling.
+                    if far > 4 && press.mouse { lift(press.row, press.id, press.y) } else { if far > 10 { press = null } }
+                }
+                if g != null && e.pointerId == g.pid {
+                    g = { ...g, py: e.clientY }
+                    follow()
+                }
+            }}
+            @pointerup={(e) => {
+                if press != null && e.pointerId == press.id { press = null }
+                if g != null && e.pointerId == g.pid { drop(false) }
+            }}
+            @pointercancel={(e) => {
+                if press != null && e.pointerId == press.id { press = null }
+                if g != null && e.pointerId == g.pid { drop(true) }
+            }}
+            @keydown={(e) => { if e.key == "Escape" && g != null { drop(true) } }}>
+            {for [i, it] in enumerate(shown) => <li key={it.id} data-id={it.id}
+                    class={ui_cls(["ui-drag-reorder-row", press != null && press.row.dataset.id == it.id && "ui-drag-reorder-pressing", lifted == it.id && "ui-drag-reorder-lifted"])}>
+                <button.ui-drag-reorder-grip type="button" aria-label={`Move ${it.title}, place ${i + 1} of ${len(shown)}. Use the up and down arrows.`}
+                        @keydown={(e) => { by_key(e, it.id) }}>
+                    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>
+                </button>
+                <span.ui-drag-reorder-text>
+                    <span.ui-drag-reorder-title>{it.title}</span>
+                    {get(it, "subtitle") != null && <span.ui-drag-reorder-sub>{it.subtitle}</span>}
+                </span>
+                // data-small-target: on a phone these are a pixel, for screen readers alone.
+                <span.ui-drag-reorder-moves data-small-target="true">
+                    <button.ui-drag-reorder-move type="button" aria-label={`Move ${it.title} up`} aria-disabled={i == 0 ? "true" : null} @click={() => { step(it.id, -1) }}>Up</button>
+                    <button.ui-drag-reorder-move type="button" aria-label={`Move ${it.title} down`} aria-disabled={i == len(shown) - 1 ? "true" : null} @click={() => { step(it.id, 1) }}>Down</button>
+                </span>
+            </li>}
+        </ul>
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

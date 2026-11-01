@@ -1,0 +1,221 @@
+// CoachOverlay: a short lesson on the real screen, shown once: the screen dims but for one
+// real element, a card says what it is, and a tap anywhere goes on. The light follows the
+// element as the page scrolls or the phone turns, and the page under it still scrolls by finger.
+// Skip is always there, and so are the Escape key and the arrow keys.
+//
+//   <button id="add-note">New note</button>
+//   <CoachOverlay remember="coach-1" on_done={(how) => { started = true }} steps={[
+//       { target: "add-note", title: "Start here", text: "Every note begins with this button." },
+//       { target: "search", title: "Find anything", text: "Search looks through your notes, photos and places." }
+//   ]}/>
+//
+// steps: a list of { target, title, text }; target is an element's id. A step whose element is
+// not on the page, or not showing, is left out, so a lesson written for a full screen
+// survives a smaller one. remember: the name it is remembered under; null shows it every time.
+// active: false holds it back, as behind a WelcomeCarousel, until the app says. pad: the room
+// left around the element, in pixels (6). next_label ("Next"), done_label ("Got it"),
+// skip_label ("Skip"). label: what screen readers call it ("A tip").
+// on_done(how): inside one of your components, once, with "finished", "skipped", or "none"
+// when no step could be shown (then nothing is remembered). on_step(i): as each step shows.
+//
+// The overlay lets every touch through, so a finger on it scrolls what is under it, and takes
+// only the click that ends a tap, at the document, before the app's own handlers. So a tap on the
+// lit element goes on to the next step and does not press the element. On a tablet the card
+// sits beside the element when there is room.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/welcome_carousel.qwe use welcome_carousel_keep, welcome_carousel_recall
+
+let coach_overlay_css = css`
+.ui-coach-overlay-host { display: contents; }
+.ui-coach-overlay { position: fixed; inset: 0; z-index: 65; overflow: hidden; pointer-events: none; font: 15px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-coach-overlay-hole {
+  position: absolute; left: 0; top: 0; width: 0; height: 0; border-radius: var(--ui-radius-sm); box-shadow: 0 0 0 200vmax var(--ui-overlay), 0 0 0 3px var(--ui-accent);
+}
+.ui-coach-overlay-card {
+  position: absolute; left: 0; top: 0; display: grid; gap: 6px; box-sizing: border-box; width: min(320px, calc(100% - 24px)); padding: 14px; pointer-events: auto;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); box-shadow: var(--ui-shadow-lg); touch-action: manipulation;
+}
+.ui-coach-overlay-card h3 { margin: 0; font-size: 17px; line-height: 1.3; }
+.ui-coach-overlay-card p { margin: 0; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-coach-overlay-foot { display: flex; align-items: center; justify-content: space-between; gap: 4px; }
+.ui-coach-overlay-count { color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-coach-overlay-acts { display: flex; gap: 4px; }
+`
+
+// The element's box inside the overlay, with room around it. Both are in the window's
+// coordinates, so a transformed frame around the overlay makes no difference.
+fn coach_overlay_rect(r, o, pad: num) =
+    { x: r.left - o.left - pad, y: r.top - o.top - pad, w: r.width + pad * 2, h: r.height + pad * 2 }
+
+fn coach_overlay_clamp(v: num, low: num, high: num) -> num = high < low ? low : max([low, min([v, high])])
+
+// Where the card goes, for a hole in a w by h overlay: { x, y, side }. Under or over the hole,
+// in whichever has room, and the larger if neither has; beside it where the overlay is wide.
+// It stays inside by 12 px, whatever the hole does, as the element may scroll away.
+fn coach_overlay_place(hole, w: num, h: num, cw: num, ch: num, gap: num = 12) {
+    let room_below = h - (hole.y + hole.h) - gap - 12
+    let room_above = hole.y - gap - 12
+    let room_right = w - (hole.x + hole.w) - gap - 12
+    let room_left = hole.x - gap - 12
+    let middle_x = hole.x + hole.w / 2 - cw / 2
+    let middle_y = hole.y + hole.h / 2 - ch / 2
+    if w >= 600 && room_right >= cw { return { x: hole.x + hole.w + gap, y: coach_overlay_clamp(middle_y, 12, h - ch - 12), side: "right" } }
+    if w >= 600 && room_left >= cw { return { x: hole.x - gap - cw, y: coach_overlay_clamp(middle_y, 12, h - ch - 12), side: "left" } }
+    let below = room_below >= ch || room_below >= room_above
+    { x: coach_overlay_clamp(middle_x, 12, w - cw - 12),
+      y: coach_overlay_clamp(below ? hole.y + hole.h + gap : hole.y - gap - ch, 12, h - ch - 12),
+      side: below ? "below" : "above" }
+}
+
+// Whether the element of that id is on the page and showing. A top-level fn: a component's
+// `let` function that calls js() may wait, and `filter` cannot call one that may.
+fn coach_overlay_shows(target) -> bool {
+    let found = js("document.getElementById", target ?? "")
+    found != null && found.getClientRects().length > 0 && js("getComputedStyle", found).visibility != "hidden"
+}
+
+component CoachOverlay(steps: list = [], remember: str? = null, active: bool = true, pad: int = 6, next_label: str = "Next", done_label: str = "Got it",
+                       skip_label: str = "Skip", label: str = "A tip", on_done = null, on_step = null, class: str? = null) {
+    style global coach_overlay_css
+    state phase = "waiting"     // "waiting" for the browser's answer, "ready", "on", "over"
+    state at = 0
+    state total = 0
+    state number = 0            // of those shown, from 1
+    state box = null
+    state hole = null
+    state card = null
+    let node = null             // the lit element
+    let shown = []              // the steps that could be shown: found once, as the page does not change under a lesson
+    let before = null           // what had the focus, which it goes back to
+    let doc = null              // kept, as reading it through js() would wait, and Tab cannot
+    let n = len(steps)
+    let step = at < n ? steps[at] : { title: "", text: "" }
+    let measure = (_e = null) => {
+        if node != null && box != null && hole != null && card != null {
+            let o = box.getBoundingClientRect()
+            let c = coach_overlay_rect(node.getBoundingClientRect(), o, pad)
+            hole.style.transform = `translate(${c.x}px, ${c.y}px)`
+            hole.style.width = `${c.w}px`
+            hole.style.height = `${c.h}px`
+            let p = coach_overlay_place(c, o.width, o.height, card.offsetWidth, card.offsetHeight)
+            card.style.transform = `translate(${p.x}px, ${p.y}px)`
+            card.setAttribute("data-side", p.side)
+        }
+    }
+    let end = (how: str) => {
+        if phase == "on" {
+            phase = "over"
+            node = null
+            if before != null { before.focus({ preventScroll: true }) }
+            if remember != null { welcome_carousel_keep(remember, "1") }
+            on_done && on_done(how)
+        }
+    }
+    let show = (place: int) => {
+        number = place + 1
+        at = shown[place]
+        node = js("document.getElementById", steps[at].target)
+        let r = node.getBoundingClientRect()
+        let o = box != null ? box.getBoundingClientRect() : null
+        if o == null || r.top < o.top || r.bottom > o.bottom { node.scrollIntoView({ block: "center", behavior: "instant" }) }
+        on_step && on_step(at)
+    }
+    let forward = () => {
+        if number < total { show(number) } else { end("finished") }
+    }
+    let begin = () => {
+        shown = range(0, n) | filter((i) => coach_overlay_shows(get(steps[i], "target")))
+        total = len(shown)
+        if total == 0 {
+            phase = "over"
+            on_done && on_done("none")
+        } else {
+            before = js("document.activeElement")
+            phase = "on"
+            show(0)
+        }
+    }
+    if phase == "ready" && active { begin() }
+    // The element can move for reasons nothing tells of: a picture loading, a rotation settling.
+    if phase == "on" { every(200, measure) }
+    <div.ui-coach-overlay-host
+         @mount={() => {
+             let seen = remember != null ? js("Promise.resolve", welcome_carousel_recall(remember)) : null
+             phase = !is_err(seen) && seen == "1" ? "over" : "ready"
+             let d = js("document")
+             doc = d
+             let tapped = (e) => {
+                 if phase == "on" && box != null && !card.contains(e.target) {
+                     let o = box.getBoundingClientRect()
+                     if e.clientX >= o.left && e.clientX <= o.right && e.clientY >= o.top && e.clientY <= o.bottom {
+                         e.preventDefault()
+                         e.stopPropagation()
+                         forward()
+                     }
+                 }
+             }
+             let keyed = (e) => {
+                 if phase == "on" {
+                     if e.key == "Escape" { e.preventDefault(); end("skipped") }
+                     if e.key == "ArrowRight" { e.preventDefault(); forward() }
+                     if e.key == "ArrowLeft" && number > 1 { e.preventDefault(); show(number - 2) }
+                 }
+             }
+             let vv = js("window").visualViewport
+             d.addEventListener("click", tapped, { capture: true })
+             d.addEventListener("keydown", keyed)
+             js("window.addEventListener", "scroll", measure, { capture: true, passive: true })
+             js("window.addEventListener", "resize", measure)
+             js("window.addEventListener", "orientationchange", measure)
+             if vv != null {
+                 vv.addEventListener("resize", measure)
+                 vv.addEventListener("scroll", measure)
+             }
+             () => {
+                 d.removeEventListener("click", tapped, { capture: true })
+                 d.removeEventListener("keydown", keyed)
+                 js("window.removeEventListener", "scroll", measure, { capture: true })
+                 js("window.removeEventListener", "resize", measure)
+                 js("window.removeEventListener", "orientationchange", measure)
+                 if vv != null {
+                     vv.removeEventListener("resize", measure)
+                     vv.removeEventListener("scroll", measure)
+                 }
+             }
+         }}>
+        {phase == "on" && <div class={ui_cls(["ui-coach-overlay", class])} @mount={(el) => { box = el; measure() }}>
+            <div.ui-coach-overlay-hole aria-hidden="true" @mount={(el) => { hole = el; measure() }}></div>
+            <div.ui-coach-overlay-card role="dialog" aria-label={label} aria-modal="false" @mount={(el) => { card = el; measure() }}
+                 @keydown={(e) => {
+                     // Tab goes round the card's two buttons: the app is dimmed, and out of play. Two
+                     // buttons, so either way it is the other one. No js() here: it would wait, and
+                     // preventDefault after a wait comes too late. And isSameNode, as `==` on two
+                     // elements is always true.
+                     if e.key == "Tab" {
+                         e.preventDefault()
+                         let inside = card.querySelectorAll("button")
+                         let one = inside.item(0)
+                         let two = inside.item(inside.length - 1)
+                         if one.isSameNode(doc.activeElement) { two.focus() } else { one.focus() }
+                     }
+                 }}>
+                <div aria-live="polite">
+                    <h3>{get(step, "title") ?? ""}</h3>
+                    {get(step, "text") != null && <p>{step.text}</p>}
+                </div>
+                <div.ui-coach-overlay-foot>
+                    <span.ui-coach-overlay-count>{number} of {total}</span>
+                    <span.ui-coach-overlay-acts @mount={(el) => {
+                        let b = el.querySelector(".ui-btn-solid")
+                        if b != null { b.focus({ preventScroll: true }) }
+                    }}>
+                        <Button size="lg" variant="ghost" tone="neutral" on_click={() => { end("skipped") }}>{skip_label}</Button>
+                        <Button size="lg" on_click={() => { forward() }}>{number < total ? next_label : done_label}</Button>
+                    </span>
+                </div>
+            </div>
+        </div>}
+    </div>
+}

@@ -1,0 +1,480 @@
+// BottomSheet: a sheet with detents, as a phone's own apps have: it rests at peek, half
+// or full height and is moved by a finger. It follows the finger, stretches and resists
+// past its last stop, goes by how fast it was flicked as well as how far, and shares the
+// finger with the list inside it: dragged up, it grows until it is full and the list then
+// scrolls on; dragged down with the list at its top, it shrinks. It is the browser's own
+// <dialog>, so focus stays in it and Escape closes it. It lifts above the on-screen
+// keyboard and goes up a stop when a field in it needs the room.
+//
+//   import ui/bottom_sheet.qwe use BottomSheet
+//
+//   <BottomSheet title="Nearby" trigger="Show places">
+//       <p>12 places within a mile.</p>
+//   </BottomSheet>
+//   <BottomSheet title="Route" open={showing} detents={["half", "full"]} start="half"
+//                on_detent={(name) => { stop = name }} on_close={() => { showing = false }}> ... </BottomSheet>
+//
+// The equal of the gesture: the handle is a button that goes to the next stop, and on it
+// ArrowUp and ArrowDown go up and down a stop (down from the lowest closes it, when
+// dismissable). Close is a button, and the phone's back gesture closes it too.
+//
+// title: its heading, and its name for screen readers. trigger: the text of a button that
+// opens it. Inside one of your components, open it from your own state instead: open={...}
+// and on_close(). detents: which of "peek", "half", "full" it stops at (all three). start:
+// the stop it opens at ("half"). peek: how tall "peek" is, in pixels (132). dismissable:
+// dragging it off, or a tap above it, closes it (true); false keeps it at its lowest stop.
+// width: how wide it may be on a large screen, in pixels (640): on a tablet it stands in the
+// middle at that width. on_detent(name): called when it comes to rest at another stop.
+// on_close(): called when it has closed. children: what it holds.
+//
+// The other sheets of the kit take these pure functions from here: bottom_sheet_track and
+// bottom_sheet_track_move (a finger, its axis and its last moves), bottom_sheet_speed,
+// bottom_sheet_rubber, bottom_sheet_dismissed, bottom_sheet_haptic, bottom_sheet_back and
+// bottom_sheet_keyboard_watch.
+
+import ui/button.qwe use Button
+
+let bottom_sheet_css = css`
+html:has(.ui-bottom-sheet[open]) { overflow: hidden; }
+.ui-bottom-sheet-host { display: contents; }
+.ui-bottom-sheet {
+  position: fixed; inset: auto 0 var(--ui-bottom-sheet-kb, 0px) 0; box-sizing: border-box; flex-direction: column;
+  width: min(var(--ui-bottom-sheet-w, 640px), 100vw); max-width: 100vw;
+  height: calc(100dvh - var(--ui-bottom-sheet-kb, 0px) - max(12px, env(safe-area-inset-top))); max-height: none;
+  margin: 0 auto; padding: 0; overflow: hidden; border: 1px solid var(--ui-border); border-bottom: 0; overscroll-behavior: contain;
+  border-radius: calc(var(--ui-radius) + 8px) calc(var(--ui-radius) + 8px) 0 0; background: var(--ui-surface); color: var(--ui-fg);
+  /* The shadow below is what shows when the sheet is pulled above its top stop. */
+  box-shadow: var(--ui-shadow-lg), 0 160px 0 0 var(--ui-surface); font: 15px/1.5 var(--ui-font);
+  transform: translateY(100%); will-change: transform;
+  transition: transform .32s cubic-bezier(.22, 1, .36, 1), overlay .32s allow-discrete, display .32s allow-discrete;
+}
+.ui-bottom-sheet[open] { display: flex; transform: translateY(var(--ui-bottom-sheet-y, 50%)); }
+@starting-style { .ui-bottom-sheet[open] { transform: translateY(100%); } }
+.ui-bottom-sheet::backdrop { background: var(--ui-overlay); }
+.ui-bottom-sheet-grip {
+  display: grid; place-items: center; flex: none; width: 100%; height: 44px; padding: 0; border: 0; background: transparent;
+  cursor: grab; touch-action: none; -webkit-touch-callout: none; user-select: none;
+}
+.ui-bottom-sheet-grip span { width: 40px; height: 5px; border-radius: 999px; background: var(--ui-strong); }
+.ui-bottom-sheet-grip:focus-visible { outline: none; }
+.ui-bottom-sheet-grip:focus-visible span { background: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-bottom-sheet-head {
+  position: relative; display: flex; align-items: center; gap: 8px; flex: none; margin-top: -8px; padding: 0 8px 8px 20px;
+  border-bottom: 1px solid var(--ui-border); touch-action: none; -webkit-touch-callout: none; user-select: none;
+}
+.ui-bottom-sheet-head h2 { flex: 1; min-width: 0; margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; }
+.ui-bottom-sheet-close {
+  display: grid; place-items: center; flex: none; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); cursor: pointer;
+}
+@media (hover: hover) { .ui-bottom-sheet-close:hover { background: var(--ui-subtle); color: var(--ui-fg); } }
+.ui-bottom-sheet-close:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-bottom-sheet-close svg { width: 18px; height: 18px; }
+.ui-bottom-sheet-body {
+  flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+  /* --hide is the part of the sheet below the screen at this stop, so that the end of a list can still be reached. */
+  padding: 16px 20px calc(24px + env(safe-area-inset-bottom) + var(--ui-bottom-sheet-hide, 0px));
+}
+.ui-bottom-sheet-body > :first-child { margin-top: 0; }
+.ui-bottom-sheet-body > :last-child { margin-bottom: 0; }
+@media (prefers-reduced-motion: reduce) { .ui-bottom-sheet { transition: none; } }
+`
+
+// A finger as it goes: where it started, which axis it took (null until it has moved
+// `slop` pixels) and its last few places, to tell how fast it was going.
+fn bottom_sheet_track(x: num, y: num, at: num) = { x0: x, y0: y, x: x, y: y, lock: null, samples: [[at, x, y]] }
+
+fn bottom_sheet_track_move(track, x: num, y: num, at: num, slop: num = 6) {
+    let dx = abs(x - track.x0)
+    let dy = abs(y - track.y0)
+    let lock = track.lock
+    if lock == null && max([dx, dy]) >= slop { lock = dx > dy ? "x" : "y" }
+    let kept = slice(track.samples, -5, len(track.samples))
+    { x0: track.x0, y0: track.y0, x: x, y: y, lock: lock, samples: kept + [[at, x, y]] }
+}
+
+// Pixels a millisecond along an axis ("x" or "y"), over the last tenth of a second. A
+// finger that stopped before it lifted (`now` is when it lifted) was not going anywhere.
+fn bottom_sheet_speed(track, axis: str = "y", now: num? = null) {
+    let s = track.samples
+    let last = s[len(s) - 1]
+    if now != null && now - last[0] > 80 { return 0 }
+    let recent = s | filter((p) => last[0] - p[0] <= 100)
+    // A slow phone may send less than two moves in that time: the one before will do.
+    let first = len(recent) > 1 || len(s) < 2 ? recent[0] : s[len(s) - 2]
+    let gone = axis == "x" ? last[1] - first[1] : last[2] - first[2]
+    let took = last[0] - first[0]
+    took <= 0 ? 0 : gone / took
+}
+
+// How far something goes when pulled `over` pixels past its end: it keeps moving and
+// never reaches `limit`. It is the curve iOS's scroll views use.
+fn bottom_sheet_rubber(over: num, limit: num = 120) {
+    if over <= 0 || limit <= 0 { return 0 }
+    round((1 - 1 / (over * 0.55 / limit + 1)) * limit, 2)
+}
+
+// Bad names are dropped, the order is put right, and a sheet always has a stop.
+fn bottom_sheet_detents(names) {
+    let given = type_of(names) == "list" ? names : []
+    let known = ["peek", "half", "full"] | filter((n) => contains(given, n))
+    len(known) > 0 ? known : ["half"]
+}
+
+// Heights in pixels, lowest first, for a sheet that is `full` pixels tall at most.
+fn bottom_sheet_heights(names, full: num, peek: num = 132) {
+    let half = round(full / 2)
+    let low = max([44, min([peek, half])])
+    names | map((n) => n == "peek" ? low : n == "half" ? half : full)
+}
+
+fn bottom_sheet_label(name: str) = name == "peek" ? "Peek" : name == "half" ? "Half height" : "Full height"
+
+// Which stop a sheet let go at height `h` comes to rest at, with its speed in pixels a
+// millisecond (more than nothing is downward). -1 means it closes. A flick goes on to the
+// next stop that way, however short it was; otherwise the nearest stop to where it would
+// have coasted to wins. `h` is what was showing, so a slow drag past half a stop keeps it.
+fn bottom_sheet_snap(heights, h: num, speed: num, closable: bool = true) {
+    let count = len(heights)
+    let flicked = abs(speed) >= 0.5
+    if flicked && speed > 0 {
+        let lower = range(count) | filter((i) => heights[i] < h)
+        if len(lower) > 0 { return lower[len(lower) - 1] }
+        return closable ? -1 : 0
+    }
+    if flicked {
+        let upper = range(count) | filter((i) => heights[i] > h)
+        return len(upper) > 0 ? upper[0] : count - 1
+    }
+    let coast = h - speed * 180
+    if closable && coast < heights[0] / 2 { return -1 }
+    let best = 0
+    for i in range(count) {
+        if abs(heights[i] - coast) < abs(heights[best] - coast) { best = i }
+    }
+    best
+}
+
+// Whether a thing dragged `gone` pixels towards leaving, at `speed` pixels a millisecond
+// the same way, has left: a flick does it however short, a drag past `share` of its
+// `size` does, unless it was on its way back when the finger lifted.
+fn bottom_sheet_dismissed(gone: num, size: num, speed: num, share: num = 0.35) {
+    if speed >= 0.5 { return true }
+    gone >= size * share && speed > -0.2
+}
+
+// A tap felt: the app's own, or the web's on Android, or nothing, as on iOS's browsers,
+// where it is missed by no one. Chrome refuses vibrate before a first tap, and says so.
+fn bottom_sheet_haptic(win, kind: str = "selection") {
+    if win.quilloNative != null {
+        win.quilloNative.haptic(kind)
+        return null
+    }
+    if win.navigator.vibrate != null && win.navigator.userActivation.hasBeenActive {
+        win.navigator.vibrate(kind == "selection" ? 6 : 12)
+    }
+    null
+}
+
+// The height the on-screen keyboard takes. iOS and Chrome keep the layout's height and
+// shrink the visual viewport, so the difference is the keyboard; where the layout itself
+// shrinks (an Android web view that resizes), nothing need be done and this says 0. A
+// page pinched larger has a small visual viewport too, which is no keyboard, and a gap
+// of a toolbar's size is not one either.
+fn bottom_sheet_keyboard(inner: num, height: num, top: num, scale: num = 1) {
+    if scale > 1.01 { return 0 }
+    let gap = round(inner - height - top)
+    gap < 60 ? 0 : gap
+}
+
+// Calls changed(pixels) now and whenever the keyboard's height changes, until the function
+// it gives back is called. Where there is no visualViewport it never says anything but 0.
+fn bottom_sheet_keyboard_watch(win, changed) {
+    let vv = win.visualViewport
+    if vv == null {
+        changed(0)
+        return () => { null }
+    }
+    let read = (_e) => { changed(bottom_sheet_keyboard(win.innerHeight, vv.height, vv.offsetTop, vv.scale)) }
+    vv.addEventListener("resize", read)
+    vv.addEventListener("scroll", read)
+    read(null)
+    () => {
+        vv.removeEventListener("resize", read)
+        vv.removeEventListener("scroll", read)
+    }
+}
+
+// The phone's back gesture on something that covers the page: Android's back and Safari's
+// edge swipe go back in the history, so an open sheet takes one entry of its own, and going
+// back closes it and not the page. `layer` says how deep an entry is, so that going back
+// closes the top sheet of two. The function it gives back ends this: it goes back over the
+// entry if the sheet closed some other way, unless the page has gone on somewhere since,
+// when it leaves the history alone.
+fn bottom_sheet_back(win, close) {
+    let mine = (win.history.state.quillo_layer ?? 0) + 1
+    win.history.pushState({ quillo_layer: mine }, "")
+    let here = true
+    let popped = (_e) => {
+        if (win.history.state.quillo_layer ?? 0) < mine {
+            here = false
+            close()
+        }
+    }
+    win.addEventListener("popstate", popped)
+    () => {
+        win.removeEventListener("popstate", popped)
+        if here && win.history.state.quillo_layer == mine { win.history.back() }
+    }
+}
+
+component BottomSheet(title: str, trigger: str? = null, open: bool = false, detents = ["peek", "half", "full"],
+                      start: str = "half", peek: int = 132, dismissable: bool = true, width: int = 640,
+                      on_detent = null, on_close = null, children) {
+    style global bottom_sheet_css
+    state dlg = null
+    state body = null
+    state win = null
+    state at = 0                // the stop it rests at, an index into names
+    state heights = []
+    state kb = 0
+    state track = null          // the finger, while one is down
+    state zone = null           // what it started on: "handle", "body", then "drag" once it moves the sheet
+    state from = 0              // the height it started from
+    state now_h = 0             // the height showing now
+    state lifted = 0            // how far above the top stop a drag from the list has scrolled that list
+    state moved = false
+    state scrolling = false     // the list has this finger; if it gets to the list's top, the sheet takes it
+    state undo_back = null
+    state undo_kb = null
+    let names = bottom_sheet_detents(detents)
+    let top = len(names) - 1
+    // Puts the sheet at a height by its CSS, so the transition carries it there.
+    let rest = (h: num) => {
+        let full = dlg.offsetHeight
+        now_h = h
+        dlg.style.setProperty("--ui-bottom-sheet-y", `${full - h}px`)
+        dlg.style.setProperty("--ui-bottom-sheet-hide", `${full - h}px`)
+        dlg.style.removeProperty("transform")
+        dlg.style.removeProperty("transition")
+    }
+    let measure = () => {
+        heights = bottom_sheet_heights(names, dlg.offsetHeight, peek)
+        rest(heights[min([at, top])])
+    }
+    let go = (i: int) => {
+        let was = at
+        at = i
+        rest(heights[i])
+        if was != i && on_detent != null { on_detent(names[i]) }
+    }
+    let shut = () => { dlg.close() }
+    let resized = (_e) => { measure() }
+    let forget = () => {
+        win.removeEventListener("resize", resized)
+        undo_kb && undo_kb()
+        undo_kb = null
+        undo_back && undo_back()
+        undo_back = null
+    }
+    let show = () => {
+        // index_of gives null when it is not there, not -1.
+        at = index_of(names, start) ?? 0
+        dlg.showModal()
+        win.addEventListener("resize", resized)
+        undo_kb = bottom_sheet_keyboard_watch(win, (px) => {
+            if px != kb {
+                kb = px
+                // Set by hand so the height is right when it is measured, just below.
+                dlg.style.setProperty("--ui-bottom-sheet-kb", `${px}px`)
+                if px > 0 && at == 0 && top > 0 {
+                    at = 1
+                    on_detent && on_detent(names[1])
+                }
+            }
+            measure()
+            let active = win.document.activeElement
+            if px > 0 && active != null && body.contains(active) { active.scrollIntoView({ block: "nearest" }) }
+        })
+        measure()
+        undo_back = bottom_sheet_back(win, shut)
+    }
+    if open && dlg != null && !dlg.open { show() }
+    if !open && dlg != null && dlg.open && trigger == null { shut() }
+    // Whether this finger moves the sheet or scrolls the list. Decided once, by the way it
+    // first went. A pointer event cannot keep the browser from scrolling, so @touchmove
+    // below, which is the only thing that can, asks the same question.
+    let decide = (e) => {
+        if zone == "body" {
+            let up = track.y < track.y0
+            let list_owns = up ? at == top : body.scrollTop > 0
+            if list_owns {
+                track = null
+                zone = null
+                scrolling = !up
+            } else {
+                zone = "drag"
+            }
+        } else {
+            if zone == "handle" { zone = "drag" }
+        }
+        if zone == "drag" {
+            moved = true
+            // iOS may say touchmove first, and a touch has no pointerId.
+            if e.pointerId != null { dlg.setPointerCapture(e.pointerId) }
+            dlg.style.transition = "none"
+        }
+    }
+    let follow = () => {
+        let want = from - (track.y - track.y0)
+        let ceiling = heights[top]
+        let floor_h = heights[0]
+        let h = want
+        if want > ceiling {
+            if lifted >= 0 && body.scrollHeight > body.clientHeight && from < ceiling {
+                // From the list: the finger goes on, so the list does.
+                lifted = want - ceiling
+                body.scrollTop = lifted
+                h = ceiling
+            } else {
+                h = ceiling + bottom_sheet_rubber(want - ceiling, 90)
+            }
+        }
+        if want < floor_h && !dismissable { h = floor_h - bottom_sheet_rubber(floor_h - want, 90) }
+        now_h = h
+        dlg.style.transform = `translateY(${round(dlg.offsetHeight - h, 2)}px)`
+    }
+    let moving = (e) => {
+        if track != null {
+            track = bottom_sheet_track_move(track, e.clientX, e.clientY, e.timeStamp)
+            if track.lock == "x" && zone != "drag" {
+                track = null
+                zone = null
+            }
+            if track != null && track.lock == "y" {
+                if zone != "drag" { decide(e) }
+                if zone == "drag" { follow() }
+            }
+        }
+    }
+    let ended = (e) => {
+        if track != null && zone == "drag" {
+            let speed = bottom_sheet_speed(track, "y", e.timeStamp)
+            let i = bottom_sheet_snap(heights, now_h, speed, dismissable)
+            track = null
+            zone = null
+            if i < 0 { shut() } else { go(i) }
+        } else {
+            track = null
+            zone = null
+        }
+    }
+    let cancelled = () => {
+        if zone == "drag" { rest(heights[at]) }
+        track = null
+        zone = null
+    }
+    // The list got to its top under a finger going down. The browser is scrolling, so no
+    // pointer events come, nor can it be stopped; touchmove still does, at the browser's pace.
+    let took_over = (e) => {
+        if scrolling && body.scrollTop <= 0 {
+            let f = e.touches[0]
+            scrolling = false
+            track = bottom_sheet_track(f.clientX, f.clientY, e.timeStamp)
+            zone = "drag"
+            from = now_h
+            moved = true
+            dlg.style.transition = "none"
+        }
+    }
+    // The width is on the host, which nothing here touches by hand: the dialog's own style
+    // holds where it stands, and an attribute that follows a prop is rewritten whole.
+    <div.ui-bottom-sheet-host style={`--ui-bottom-sheet-w: ${width}px`}>
+        {trigger != null && <Button variant="outline" size="lg" on_click={show}>{trigger}</Button>}
+        <dialog.ui-bottom-sheet aria-label={title}
+                @mount={(el) => {
+                    // win first: giving dlg a value sets off the `if open` above.
+                    win = js("window")
+                    dlg = el
+                    if open && !dlg.open { show() }
+                    // Taken off the page while open, it must not leave anything on the window.
+                    () => { forget() }
+                }}
+                @close={() => {
+                    forget()
+                    track = null
+                    zone = null
+                    kb = 0
+                    dlg.style.removeProperty("--ui-bottom-sheet-kb")
+                    dlg.style.removeProperty("transform")
+                    dlg.style.removeProperty("transition")
+                    on_close && on_close()
+                }}
+                @click={(e) => {
+                    // A tap above the sheet lands on the dialog itself; so does the click a
+                    // drag ends in, when a mouse did it, which `moved` tells apart.
+                    if dismissable && e.target.isSameNode(dlg) && !moved && e.clientY < dlg.getBoundingClientRect().top { shut() }
+                    moved = false
+                }}
+                @pointerdown={(e) => {
+                    let t = e.target
+                    let on_handle = t.closest(".ui-bottom-sheet-grip, .ui-bottom-sheet-head") != null
+                    let on_button = t.closest(".ui-bottom-sheet-close") != null
+                    let on_body = t.closest(".ui-bottom-sheet-body") != null
+                    moved = false
+                    // A mouse in the list selects text and its wheel scrolls.
+                    if e.button == 0 && !on_button && (on_handle || (on_body && e.pointerType == "touch")) {
+                        track = bottom_sheet_track(e.clientX, e.clientY, e.timeStamp)
+                        zone = on_handle ? "handle" : "body"
+                        from = now_h
+                        lifted = 0
+                    }
+                }}
+                @pointermove={moving}
+                @pointerup={ended}
+                @pointercancel={cancelled}
+                @touchmove={(e) => {
+                    took_over(e)
+                    if track != null && e.touches.length == 1 {
+                        // Pointer events carry the finger when they can; these say only that
+                        // it is not a scroll, or carry it when the browser is scrolling.
+                        if zone != "drag" || !e.cancelable {
+                            let f = e.touches[0]
+                            track = bottom_sheet_track_move(track, f.clientX, f.clientY, e.timeStamp)
+                        }
+                        if track.lock == "y" && zone == "body" { decide(e) }
+                        if zone == "drag" {
+                            if e.cancelable { e.preventDefault() } else { follow() }
+                        }
+                    }
+                }}
+                @touchend={(e) => {
+                    scrolling = false
+                    if track != null && zone == "drag" && !e.cancelable { ended(e) }
+                }}>
+            <button.ui-bottom-sheet-grip type="button" aria-label={`${bottom_sheet_label(names[min([at, top])])}: go to the next size`}
+                    @click={() => {
+                        if !moved { go(at == top ? 0 : at + 1) }
+                        moved = false
+                    }}
+                    @keydown={(e) => {
+                        if e.key == "ArrowUp" {
+                            e.preventDefault()
+                            if at < top { go(at + 1) }
+                        }
+                        if e.key == "ArrowDown" {
+                            e.preventDefault()
+                            if at > 0 { go(at - 1) } else { if dismissable { shut() } }
+                        }
+                    }}><span aria-hidden="true"></span></button>
+            <div.ui-bottom-sheet-head>
+                <h2>{title}</h2>
+                <button.ui-bottom-sheet-close type="button" aria-label="Close" @click={shut}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                         aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div.ui-bottom-sheet-body @mount={(el) => { body = el }}>{children}</div>
+        </dialog>
+    </div>
+}

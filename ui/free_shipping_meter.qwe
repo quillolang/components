@@ -1,0 +1,243 @@
+// FreeShippingMeter: how far a cart is from free shipping and the rewards after
+// it, on a bar with a mark for each tier, and the cheapest thing that would get it
+// there: the cheapest single item that reaches the next tier, and a set of two or
+// three when no single item does or the set comes cheaper. Reaching a tier is exact:
+// a cart of 50.00 has reached 50.00, as these are decimals. Amounts may be given
+// per currency, and a threshold is rounded up to what the currency can be charged
+// in, so 49.995 is not reached by 49.99. Adding what it suggests moves the bar
+// at once, and an added item can be taken off.
+//
+//   <FreeShippingMeter total="38.50" fee="5.99" tiers={[
+//       { at: 50, label: "Free shipping", shipping: true }, { at: 100, label: "A free gift" }]}
+//       items={[{ id: "socks", name: "Socks", price: 12 }, { id: "pin", name: "Pin", price: 2.75 }]}/>
+//   <FreeShippingMeter total="5800" currency="JPY" tiers={[{ at: { USD: 50, JPY: 6000 }, label: "Free shipping" }]}/>
+//
+// total: the cart so far, a number, decimal or text (0 when left out). tiers: a list of
+// { at, label, shipping? }: at the amount, or a map from currency to amount, a tier
+// without this currency being left out and said; shipping marks the tier that waives
+// `fee`. items: what could be added, { id, name, price }, price an amount or a map
+// from currency to amount, an item without this currency being left out quietly.
+// fee: what shipping costs now, to say when an item is cheaper than paying it.
+// currency: ISO code ("USD"). locale: how to write amounts (the program's). title: a
+// heading (none). id: a prefix for its ids ("free-shipping-meter"), unique on the
+// page. name: the hidden field's name ("added"), holding the ids added with commas,
+// so a form around it sends them. on_add(item): inside one of your components, given
+// the item added. on_change({ total, reached, next, short }): after an item is added
+// or taken off, with total and short decimals, reached the labels of the tiers
+// reached and next the next one's.
+//
+// Sets are looked for among the 30 cheapest items, which keeps a change quick, and
+// it says so past that. free_shipping_meter_model(tiers, items, currency) reads the
+// data, free_shipping_meter_status(model, total) gives { reached, next, short,
+// percent, top }, and free_shipping_meter_cheapest(items, short, limit) the suggestion,
+// for a program's own use.
+
+import ui/theme.qwe use ui_cls
+
+let free_shipping_meter_css = css`
+.ui-fsmeter { display: grid; gap: 12px; min-width: 0; max-width: 560px; padding: 16px 18px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-fsmeter .ui-fsmeter-title { display: block; margin: 0; font-size: 15px; font-weight: 650; }
+.ui-fsmeter-say { margin: 0; font-weight: 600; }
+.ui-fsmeter-done { color: var(--ui-success); }
+.ui-fsmeter-track { position: relative; height: 10px; border-radius: 999px; background: var(--ui-subtle); box-shadow: inset 0 0 0 1px var(--ui-border); }
+.ui-fsmeter-fill { position: absolute; inset: 0 auto 0 0; min-width: 0; border-radius: 999px; background: var(--ui-accent); transition: width .25s; }
+.ui-fsmeter-full .ui-fsmeter-fill { background: var(--ui-success); }
+.ui-fsmeter-tick { position: absolute; top: -2px; bottom: -2px; width: 2px; margin-left: -1px; background: var(--ui-strong); }
+.ui-fsmeter-tiers { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-fsmeter-tiers li { display: flex; justify-content: space-between; gap: 12px; color: var(--ui-muted); }
+.ui-fsmeter-tiers .ui-fsmeter-got { color: var(--ui-success); font-weight: 600; }
+.ui-fsmeter-tiers span:last-child { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-fsmeter-offer { display: grid; gap: 6px; padding-top: 10px; border-top: 1px solid var(--ui-border); }
+.ui-fsmeter-offer h4 { margin: 0; color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-fsmeter-why { margin: 0; color: var(--ui-muted); font-size: 12px; }
+.ui-fsmeter-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.ui-fsmeter-row span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ui-fsmeter-btn { flex: none; min-height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-fsmeter-btn:hover { border-color: var(--ui-accent); color: var(--ui-accent); }
+.ui-fsmeter-btn:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-fsmeter-problems { margin: 0; padding: 8px 12px 8px 26px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 12px; }
+.ui-fsmeter-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+@media (prefers-reduced-motion: reduce) { .ui-fsmeter-fill { transition: none; } }
+`
+
+// An amount of 0 or more as a decimal, or null.
+fn free_shipping_meter_read(x) {
+    let t = re.replace(trim(str(x ?? "")), ",", "")
+    if !re.test(t, "^\\d{1,12}(\\.\\d{1,8})?$") { return null }
+    dec(t)
+}
+
+// An amount as given for this currency: plain, or one of a map of them.
+fn free_shipping_meter_for(x, code: str) = type_of(x) == "map" ? get(x, code) : x
+
+// The tiers and items for one currency, in order of amount: { tiers, items, code, problems }.
+fn free_shipping_meter_model(tiers, items, currency: str) {
+    let problems = []
+    let asked = upper(trim(currency))
+    let known = !is_err(money.minor_units(asked))
+    let code = known ? asked : "USD"
+    if !known { problems = problems | push(`The currency "${currency}" is not known, so USD is used.`) }
+    let minor = money.minor_units(code)
+    let good = []
+    for t in type_of(tiers) == "list" ? tiers : [] {
+        let label = type_of(t) == "map" ? str(t.label ?? "This tier") : "This tier"
+        let raw = type_of(t) == "map" ? free_shipping_meter_for(t.at, code) : null
+        let at = free_shipping_meter_read(raw)
+        if at == null || at == 0 {
+            problems = problems | push(raw == null ? `${label} has no amount in ${code}, so it is left out.` : `${label} has no amount above 0, so it is left out.`)
+        } else {
+            // Rounded up: a threshold between two cents cannot be met by the lower.
+            good = good | push({ at: round(at, minor, "ceiling"), label, shipping: t.shipping == true })
+        }
+    }
+    let goods = []
+    for i in type_of(items) == "list" ? items : [] {
+        let price = type_of(i) == "map" && i.id != null ? free_shipping_meter_read(free_shipping_meter_for(i.price, code)) : null
+        if price != null && price > 0 {
+            goods = goods | push({ id: str(i.id), name: str(i.name ?? i.id), price: round(price, minor, "half_up") })
+        }
+    }
+    let many = len(goods) > free_shipping_meter_limit
+    if many { problems = problems | push(`Sets are looked for among the ${free_shipping_meter_limit} cheapest of the ${len(goods)} items.`) }
+    { tiers: sort_by(good, (t) => t.at), items: sort_by(goods, (i) => i.price), code, minor, problems }
+}
+
+let free_shipping_meter_limit = 30
+
+// Where a total stands: { reached, next, short, percent, top }. percent is the bar's
+// width, cut rather than rounded so that it shows full only when the last tier is met.
+fn free_shipping_meter_status(model, total) {
+    let reached = model.tiers | filter((t) => total >= t.at)
+    let next = model.tiers | find((t) => total < t.at)
+    let top = len(model.tiers) > 0 ? last(model.tiers).at : 0m
+    let share = top > 0 ? total * 100 / top : 0m
+    { reached, next, short: next != null ? next.at - total : 0m, top, percent: share >= 100 ? 100m : round(share, 2, "down") }
+}
+
+// The cheapest way to at least `short`: { single, set }: the cheapest item that does
+// it alone, and the cheapest two or three together when that is less or the only
+// way, each { items, cost, over }, or null. Items come in order of price.
+fn free_shipping_meter_cheapest(items, short, limit: int = 30) {
+    let single = items | find((i) => i.price >= short)
+    let pool = take(items, limit)
+    let n = len(pool)
+    let best = null
+    let best_cost = null
+    let better = (cost) => cost >= short && (best_cost == null || cost < best_cost)
+    for a in range(n) {
+        for b in range(a + 1, n) {
+            let two = pool[a].price + pool[b].price
+            if better(two) {
+                best = [a, b]
+                best_cost = two
+            }
+            // Past a pair that gets there, a third item only adds.
+            if two < short {
+                for c in range(b + 1, n) {
+                    let three = two + pool[c].price
+                    if better(three) {
+                        best = [a, b, c]
+                        best_cost = three
+                    }
+                }
+            }
+        }
+    }
+    let way = (list, cost) => ({ items: list, cost, over: cost - short })
+    { single: single != null ? way([single], single.price) : null,
+      set: best != null && (single == null || best_cost < single.price) ? way(best | map((i) => pool[i]), best_cost) : null }
+}
+
+component FreeShippingMeter(total = 0, tiers = [], items = [], fee = null, currency: str = "USD", locale: str? = null, title: str? = null,
+                            id: str = "free-shipping-meter", name: str = "added", on_add = null, on_change = null, class: str? = null) {
+    style global free_shipping_meter_css
+    state added = []
+    let model = free_shipping_meter_model(tiers, items, currency)
+    let shown = (x) => {
+        let m = money.of(x, model.code, "half_up")
+        is_err(m) ? "a very large amount" : locale != null ? money.format(m, locale) : money.format(m)
+    }
+    let base = free_shipping_meter_read(total ?? 0)
+    let fee_read = fee == null ? null : free_shipping_meter_read(fee)
+    let extra = sum(added | map((i) => i.price)) + 0m
+    let cart = base != null ? round(base, model.minor, "half_up") + extra : null
+    let s = cart != null ? free_shipping_meter_status(model, cart) : null
+    let left = model.items | filter((i) => !any(added, (a) => a.id == i.id))
+    let way = s != null && s.next != null ? free_shipping_meter_cheapest(left, s.short, free_shipping_meter_limit) : null
+    let tell = (list) => {
+        if on_change != null && base != null {
+            let t = round(base, model.minor, "half_up") + sum(list | map((i) => i.price))
+            let g = free_shipping_meter_status(model, t)
+            on_change({ total: t, reached: g.reached | map((x) => x.label), next: g.next != null ? g.next.label : null, short: g.short })
+        }
+    }
+    let add = (list) => {
+        let next = added + list
+        added = next
+        if on_add != null { for i in list { on_add(i) } }
+        tell(next)
+    }
+    let drop = (i) => {
+        let next = added | filter((a) => a.id != i.id)
+        added = next
+        tell(next)
+    }
+    // What reaching the next tier by this way comes to, against the shipping it waives.
+    let reach = (w) => {
+        let exact = w.over == 0 ? "gets you there exactly" : `goes ${shown(w.over)} past it`
+        let waives = s.next.shipping && fee_read != null && w.cost < fee_read
+        waives ? `This ${exact}, for less than the ${shown(fee_read)} shipping.` : `This ${exact}.`
+    }
+    let say = () => {
+        if s == null || len(model.tiers) == 0 { return null }
+        if s.next == null { return len(model.tiers) == 1 ? `You have ${lower(s.reached[0].label)}.` : "You have every reward." }
+        let now = len(s.reached) > 0 ? `You have ${lower(last(s.reached).label)}. ` : ""
+        `${now}${shown(s.short)} more for ${lower(s.next.label)}.`
+    }
+    <section class={ui_cls(["ui-fsmeter", s != null && s.next == null && "ui-fsmeter-full", class])} aria-labelledby={title != null ? `${id}-title` : null} aria-label={title == null ? "Rewards for this cart" : null}>
+        {title != null && <h3.ui-fsmeter-title id={`${id}-title`}>{title}</h3>}
+        <input type="hidden" name={name} value={added | map((i) => i.id) | join(",")}/>
+        {len(model.problems) > 0 && <ul.ui-fsmeter-problems>{for p in model.problems => <li>{p}</li>}</ul>}
+        {base == null && <p.ui-fsmeter-error role="alert">The cart total is not an amount of 0 or more, so nothing can be worked out.</p>}
+        {base != null && len(model.tiers) == 0 && <p.ui-fsmeter-error role="alert">There are no tiers to reach in {model.code}.</p>}
+        <div aria-live="polite">
+            {say() != null && <p class={ui_cls(["ui-fsmeter-say", s.next == null && "ui-fsmeter-done"])}>{say()}</p>}
+        </div>
+        {s != null && len(model.tiers) > 0 && <div.ui-fsmeter-track role="progressbar" aria-label="Spent towards the last tier" aria-valuemin="0" aria-valuemax="100" aria-valuenow={str(s.percent)}
+                aria-valuetext={`${shown(cart)} of ${shown(s.top)}`}>
+            <div.ui-fsmeter-fill style={`width: ${str(s.percent)}%`}></div>
+            {for t in model.tiers => <span.ui-fsmeter-tick key={t.label} style={`left: ${str(round(t.at * 100 / s.top, 2, "down"))}%`}></span>}
+        </div>}
+        {s != null && len(model.tiers) > 1 && <ul.ui-fsmeter-tiers>
+            {for t in model.tiers => <li key={t.label} class={cart >= t.at ? "ui-fsmeter-got" : null}>
+                <span>{t.label}</span><span>{cart >= t.at ? "Reached" : `${shown(t.at - cart)} to go`}</span>
+            </li>}
+        </ul>}
+        {way != null && way.single != null && <div.ui-fsmeter-offer>
+            <h4>Cheapest item that gets you there</h4>
+            <div.ui-fsmeter-row>
+                <span>{way.single.items[0].name}, {shown(way.single.cost)}</span>
+                <button.ui-fsmeter-btn type="button" aria-label={`Add ${way.single.items[0].name}`} @click={() => { add(way.single.items) }}>Add</button>
+            </div>
+            <p.ui-fsmeter-why>{reach(way.single)}</p>
+        </div>}
+        {way != null && way.set != null && <div.ui-fsmeter-offer>
+            <h4>{way.single != null ? "Cheaper as a set" : "No single item gets you there. The cheapest set"}</h4>
+            <div.ui-fsmeter-row>
+                <span>{way.set.items | map((i) => i.name) | join(" + ")}, {shown(way.set.cost)}</span>
+                <button.ui-fsmeter-btn type="button" aria-label={`Add ${way.set.items | map((i) => i.name) | join(" and ")}`} @click={() => { add(way.set.items) }}>Add all</button>
+            </div>
+            <p.ui-fsmeter-why>{reach(way.set)}</p>
+        </div>}
+        {way != null && way.single == null && way.set == null && len(left) > 0 && <p.ui-fsmeter-why>Nothing here gets you to {lower(s.next.label)} with up to three items.</p>}
+        {len(added) > 0 && <div.ui-fsmeter-offer>
+            <h4>Added here</h4>
+            {for i in added => <div.ui-fsmeter-row key={i.id}>
+                <span>{i.name}, {shown(i.price)}</span>
+                <button.ui-fsmeter-btn type="button" aria-label={`Take off ${i.name}`} @click={() => { drop(i) }}>Take off</button>
+            </div>}
+        </div>}
+    </section>
+}

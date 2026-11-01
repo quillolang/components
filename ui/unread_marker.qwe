@@ -1,0 +1,197 @@
+// UnreadMarker: a conversation opened where you left it, with a "New messages" line above
+// the first one you have not read. The line stays where it was as you read and as more
+// arrive, so that you can find your place again. Each message counts as read once it has
+// really been on screen, in a page being looked at; a button says how many are left and
+// goes to the first of them, and then to the latest.
+//
+//   <UnreadMarker messages={msgs} last_read={me.last_read} on_read={(ids, left) => { save(ids) }}/>
+//
+// messages: oldest first, a list of { id, name?, text, time?, mine? }; a message of yours
+// is never unread. last_read: the id of the last one read: null means none has been, and
+// an id it cannot find means it cannot say, so no line is drawn and nothing counts as unread.
+// It is read once, as the line must not move when your own on_read moves it: to start
+// over, give the component a new `key`.
+// line_label ("New messages"). label: what screen readers call the list ("Messages").
+// on_read(ids, left): inside one of your components, the ids newly seen, a batch at a time
+// about a third of a second after they were, and how many unread are left.
+// id, class: for the outer element. It fills its parent, which needs a height.
+// Messages that come later, while you are up the list with nothing unread, start a line
+// of their own. Without JavaScript the messages and the line are there, and nothing is
+// marked read.
+
+import ui/theme.qwe use ui_cls
+import ui/message_bubble.qwe use MessageBubble
+
+let unread_marker_css = css`
+.ui-unread-marker { position: relative; container-type: inline-size; box-sizing: border-box; width: 100%; height: 100%; min-height: 0; overflow: hidden; background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.45 var(--ui-font); }
+.ui-unread-marker-scroll { box-sizing: border-box; width: 100%; height: 100%; overflow-y: auto; overscroll-behavior: contain; }
+.ui-unread-marker-scroll:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-unread-marker-list { position: relative; box-sizing: border-box; max-width: 720px; margin: 0 auto; padding: 8px 12px 64px; }
+.ui-unread-marker-row { position: relative; padding: 3px 0; }
+.ui-unread-marker-fresh::before { content: ""; position: absolute; top: 50%; left: -6px; width: 6px; height: 6px; margin-top: -3px; border-radius: 50%; background: var(--ui-accent); }
+.ui-unread-marker-line { display: flex; align-items: center; gap: 10px; margin: 10px 0 6px; color: var(--ui-danger); font-size: 12px; font-weight: 700; line-height: 18px; }
+.ui-unread-marker-line::before, .ui-unread-marker-line::after { content: ""; flex: 1; height: 1px; background: currentColor; opacity: .55; }
+.ui-unread-marker-jump {
+  position: absolute; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); z-index: 3; display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 44px; min-height: 44px;
+  padding: 0 14px; border: 0; border-radius: 999px; background: var(--ui-accent); color: var(--ui-accent-fg); box-shadow: var(--ui-shadow); font: 600 14px var(--ui-font); cursor: pointer;
+}
+.ui-unread-marker-jump svg { width: 18px; height: 18px; transition: transform .15s; }
+.ui-unread-marker-jump[data-way="up"] svg { transform: rotate(180deg); }
+.ui-unread-marker-jump:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@container (min-width: 640px) { .ui-unread-marker-jump { right: 24px; } }
+@media (prefers-reduced-motion: reduce) { .ui-unread-marker-jump svg { transition: none; } }
+`
+
+// The messages that can be shown, each once, with its id as text.
+fn unread_marker_clean(messages) {
+    let kept = (type_of(messages) == "list" ? messages : []) | filter((m) => type_of(m) == "map" && m.id != null)
+    let seq = for i in range(len(kept)) => { ...kept[i], seq: i, uid: str(kept[i].id) }
+    let by_id = group_by(seq, (m) => m.uid)
+    seq | filter((m) => get(by_id, m.uid, [m])[0].seq == m.seq)
+}
+
+// Where unread messages begin: the place in the list after `last_read`, the start when
+// nothing has been read, and the end, so none, when last_read cannot be found.
+fn unread_marker_start(rows: list, last_read) -> int {
+    if last_read == null { return 0 }
+    let at = index_of(rows | map((r) => r.uid), str(last_read))
+    at == null ? len(rows) : at + 1
+}
+
+// The id above which the line goes, or null when nothing is unread: the first message
+// from someone else at or after `start`.
+fn unread_marker_line(rows: list, start: int) {
+    let hit = find(slice(rows, start, len(rows)), (r) => r.mine != true)
+    hit != null ? hit.uid : null
+}
+
+// The ids still unread, oldest first.
+fn unread_marker_left(rows: list, line, seen) {
+    if line == null { return [] }
+    let ids = rows | map((r) => r.uid)
+    let from = index_of(ids, line)
+    if from == null { return [] }
+    slice(rows, from, len(rows)) | filter((r) => r.mine != true && !get(seen, r.uid, false)) | map((r) => r.uid)
+}
+
+// Whether a message has been seen: most of it in sight, or, for one too tall for that,
+// as much of it as the list can show.
+fn unread_marker_seen(ratio: num, height: num, room: num) -> bool {
+    if ratio >= 0.6 { return true }
+    height > 0 && room > 0 && ratio * height >= room * 0.6
+}
+
+// What the button says: "3 new", and 99+ at most.
+fn unread_marker_label(left: int) -> str = left > 99 ? "99+ new" : `${left} new`
+
+component UnreadMarker(messages: list = [], last_read = null, line_label: str = "New messages", label: str = "Messages",
+                       on_read = null, id: str? = null, class: str? = null) {
+    style global unread_marker_css
+    state start_rows = unread_marker_clean(messages)
+    state line = unread_marker_line(start_rows, unread_marker_start(start_rows, last_read))
+    state seen = {}
+    state fresh = []
+    state box = null
+    state list = null
+    state watcher = null
+    state low = true        // at the bottom
+    state known = len(start_rows)
+    state way = "down"
+    let rows = unread_marker_clean(messages)
+    let left = unread_marker_left(rows, line, seen)
+    let count = len(left)
+    let flush = () => {
+        let ids = fresh
+        fresh = []
+        on_read && on_read(ids, count)
+    }
+    if len(fresh) > 0 { every(320, flush) }
+    let row_of = (uid) => find(js("Array.from", list.querySelectorAll("[data-uid]")), (r) => r.dataset.uid == uid)
+    let reckon = () => {
+        low = box.scrollHeight - box.clientHeight - box.scrollTop < 40
+        if count > 0 {
+            let r = row_of(left[0])
+            if r != null { way = r.getBoundingClientRect().bottom < box.getBoundingClientRect().top ? "up" : "down" }
+        }
+    }
+    let watch = () => {
+        for r in js("Array.from", list.querySelectorAll("[data-unread]")) { watcher.observe(r) }
+    }
+    let read = (entries) => {
+        if js("document.visibilityState") == "visible" {
+            let room = box.clientHeight
+            let ids = entries | filter((e) => e.isIntersecting && unread_marker_seen(e.intersectionRatio, e.boundingClientRect.height, room)) | map((e) => e.target.dataset.uid)
+            let more = ids | filter((u) => !get(seen, u, false))
+            if len(more) > 0 {
+                seen = reduce(more, seen, (m, u) => set(m, u, true))
+                fresh = fresh + more
+                for e in entries { if contains(more, e.target.dataset.uid) { watcher.unobserve(e.target) } }
+            }
+        }
+    }
+    let go = (place: num) => {
+        let still = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+        box.scrollTo({ top: place, behavior: still ? "auto" : "smooth" })
+    }
+    <div class={ui_cls(["ui-unread-marker", class])} id={id}
+         @mount={(el) => {
+             let d = js("document")
+             let back = (_e = null) => {
+                 if d.visibilityState == "visible" {
+                     // Observing again reports what is in sight now.
+                     watcher.disconnect()
+                     watch()
+                 }
+             }
+             d.addEventListener("visibilitychange", back)
+             () => { d.removeEventListener("visibilitychange", back) }
+         }}>
+        <div.ui-unread-marker-scroll role="log" aria-label={label} tabindex="0"
+             @mount={(el) => { box = el }}
+             @scroll={reckon}>
+            <div.ui-unread-marker-list
+                 @mount={(el) => {
+                     list = el
+                     watcher = js_new("IntersectionObserver", read, { root: box, threshold: [0, 0.3, 0.6, 1] })
+                     let mark = el.querySelector("[role=separator]")
+                     box.scrollTop = mark != null ? mark.offsetTop - 12 : box.scrollHeight
+                     watch()
+                     reckon()
+                     let was = el.offsetHeight
+                     let sized = js_new("ResizeObserver", (_r = null) => {
+                         // Messages arrived. At the bottom, stay there; elsewhere nothing need move.
+                         let grew = el.offsetHeight > was
+                         was = el.offsetHeight
+                         if grew && low { box.scrollTop = box.scrollHeight }
+                         // With no line yet, what came while you were away from the bottom starts one.
+                         if line == null && !low { line = unread_marker_line(rows, known) }
+                         known = len(rows)
+                         watch()
+                         reckon()
+                     })
+                     sized.observe(el)
+                     () => {
+                         sized.disconnect()
+                         watcher.disconnect()
+                     }
+                 }}>
+                {for r in rows => <div key={r.uid}>
+                    {r.uid == line && <div.ui-unread-marker-line role="separator" aria-label={line_label}>{line_label}</div>}
+                    <div class={ui_cls(["ui-unread-marker-row", contains(left, r.uid) && "ui-unread-marker-fresh"])} data-uid={r.uid}
+                         data-unread={contains(left, r.uid) ? "true" : null}>
+                        <MessageBubble mine={r.mine == true} name={r.name} time={r.time}>{str(r.text ?? "")}</MessageBubble>
+                    </div>
+                </div>}
+            </div>
+        </div>
+        {(count > 0 || !low) && <button.ui-unread-marker-jump type="button" data-way={count > 0 ? way : "down"}
+                aria-label={count > 0 ? `${unread_marker_label(count)}, go to the first` : "Go to the latest"}
+                @click={() => {
+                    let r = count > 0 ? row_of(left[0]) : null
+                    go(r != null ? r.offsetTop - 12 : box.scrollHeight)
+                }}>
+            {count > 0 && <span>{unread_marker_label(count)}</span>}
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+        </button>}
+    </div>
+}

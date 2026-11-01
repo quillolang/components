@@ -1,0 +1,231 @@
+// PinPad: the passcode screen of a phone: dots for what has been typed and a keypad. A
+// wrong code shakes the dots and clears them, too many wrong in a row lock the pad for a
+// countdown, longer with each lock-out, which survives a reload, the phone sleeping and an
+// app being started again, as it is kept in a cookie (an app's localStorage is empty each launch).
+// The code is held only in the component's memory until it is checked: no input, no
+// text, no attribute of the page ever has a digit of it, and the keys' own light
+// goes as the finger lifts.
+//
+//   component Lock() {
+//       state open = false
+//       open ? <Home/> : <PinPad length={4} check={(code) => check_pin(code)} on_success={() => { open = true }}/>
+//   }
+//
+// check(code): required, gives true or false, and may be a `server fn`; an error value (no
+// network) says so and costs no try. length: digits (6). tries: wrong codes before
+// a lock-out (5). lock_seconds: the first lock-out (30); each one after is twice as long, to an
+// hour at most, until a right code. title: above the dots ("Enter passcode"). remember: the
+// name of the cookie that keeps tries and the lock-out, for 30 days, one per pad; null keeps
+// them in memory. disabled, class as for every field. on_success(): the code was right.
+// on_locked(seconds): a lock-out began.
+//
+// The lock-out here is a courtesy: it slows a person at the keys, not someone who can clear
+// the page's cookies or call the server. A server must count tries and lock for itself.
+// It stores only counts and a time. It needs number_pad.qwe. The keys
+// never move; there is no shuffled pad.
+//
+// pin_pad_lock_ms, pin_pad_load, pin_pad_save, pin_pad_cookie and pin_pad_time are the logic.
+
+import ui/theme.qwe use ui_cls
+import ui/number_pad.qwe use NumberPadKeys, number_pad_feel
+
+let pin_pad_css = css`
+.ui-pin-pad { container-type: inline-size; min-width: 0; font: 15px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-pin-pad-body { display: grid; gap: 18px; min-width: 0; }
+.ui-pin-pad-head { display: grid; gap: 10px; justify-items: center; text-align: center; }
+.ui-pin-pad-title { margin: 0; font-size: 18px; font-weight: 600; }
+.ui-pin-pad-dots { display: flex; justify-content: center; gap: 14px; padding: 6px 0; }
+.ui-pin-pad-dot { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--ui-strong); box-sizing: border-box; transition: background .1s; }
+.ui-pin-pad-on { border-color: var(--ui-accent); background: var(--ui-accent); }
+.ui-pin-pad-wrong .ui-pin-pad-dot { border-color: var(--ui-danger); }
+.ui-pin-pad-shake-1 { animation: ui-pin-pad-shake-a .4s ease-in-out; }
+.ui-pin-pad-shake-2 { animation: ui-pin-pad-shake-b .4s ease-in-out; }
+/* Two names for one shake: changing the class is what starts it again. */
+@keyframes ui-pin-pad-shake-a { 0%, 100% { transform: none; } 20%, 60% { transform: translateX(-10px); } 40%, 80% { transform: translateX(10px); } }
+@keyframes ui-pin-pad-shake-b { 0%, 100% { transform: none; } 20%, 60% { transform: translateX(-10px); } 40%, 80% { transform: translateX(10px); } }
+.ui-pin-pad-said { min-height: 21px; margin: 0; color: var(--ui-muted); }
+.ui-pin-pad-said[data-bad] { color: var(--ui-danger); }
+.ui-pin-pad-keys .ui-number-pad-key { border-radius: 50%; aspect-ratio: 1; min-height: 64px; max-width: 76px; justify-self: center; width: 100%; }
+.ui-pin-pad-keys .ui-number-pad-blank { min-height: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .ui-pin-pad-shake-1, .ui-pin-pad-shake-2 { animation: none; }
+  .ui-pin-pad-dot { transition: none; }
+}
+@container (min-width: 440px) {
+  .ui-pin-pad-body { grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); align-items: center; gap: 16px; }
+}
+`
+
+// How long a lock-out lasts, in ms: seconds, then twice that each time, an hour at most.
+fn pin_pad_lock_ms(seconds: int, locks: int) -> int {
+    let base = max([1, seconds])
+    let doubled = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+    min([base * doubled[min([max([0, locks - 1]), 12])], 3600]) * 1000
+}
+
+// Tries and lock-out as a cookie's value, and back: { wrong, locks, until }, with
+// nothing for text that is not ours.
+fn pin_pad_save(wrong: int, locks: int, until: int) -> str = `${wrong}.${locks}.${until}`
+
+fn pin_pad_load(text) {
+    let blank = { wrong: 0, locks: 0, until: 0 }
+    if type_of(text) != "str" || !re.test(text, "^[0-9]{1,4}[.][0-9]{1,4}[.][0-9]{1,15}$") { return blank }
+    let p = split(text, ".") | map((s) => int(s))
+    { wrong: p[0], locks: p[1], until: p[2] }
+}
+
+// A cookie's name made safe, as it comes from a prop.
+fn pin_pad_name(remember: str) -> str = re.replace(remember, "[^A-Za-z0-9_-]", "_")
+
+// The value of one cookie in `document.cookie`, or null.
+fn pin_pad_cookie(all, name: str) {
+    if type_of(all) != "str" { return null }
+    let hits = split(all, ";") | map((c) => trim(c)) | filter((c) => starts_with(c, `${name}=`))
+    len(hits) > 0 ? slice(hits[0], len(name) + 1, len(hits[0])) : null
+}
+
+// Seconds as "0:27" or "1:05:00".
+fn pin_pad_time(seconds: int) -> str {
+    let m = floor(seconds / 60)
+    let s = seconds % 60
+    `${m}:${s < 10 ? "0" : ""}${s}`
+}
+
+fn pin_pad_clock() -> int = js("Date.now")
+
+component PinPad(check = null, length: int = 6, tries: int = 5, lock_seconds: int = 30, title: str = "Enter passcode", remember: str? = "quillo-pin-pad",
+                 disabled: bool = false, on_success = null, on_locked = null, class: str? = null) {
+    style global pin_pad_css
+    state entered = []          // the digits: only ever here, in memory
+    state count = 0
+    state busy = false
+    state opened = false
+    state wrong = 0
+    state locks = 0
+    state until = 0
+    state left = 0
+    state shakes = 0
+    state bad = false
+    state said = ""
+    state due = false           // full, and to be checked just after the finger is off
+    let keep = () => {
+        if remember != null {
+            let d = js("document")
+            d.cookie = `${pin_pad_name(remember)}=${pin_pad_save(wrong, locks, until)}; path=/; max-age=2592000; samesite=strict`
+        }
+    }
+    let tick = () => {
+        let ms = until - pin_pad_clock()
+        // A clock set back cannot make a lock-out longer than it was.
+        left = min([ceil(ms / 1000), floor(pin_pad_lock_ms(lock_seconds, locks) / 1000)])
+        if left <= 0 {
+            until = 0
+            left = 0
+            bad = false
+            said = ""
+            keep()
+        }
+    }
+    if until > 0 { every(250, tick) }
+    // null by default: a Promise of nothing calls this with nothing.
+    let settle = (ok = null) => {
+        busy = false
+        count = 0
+        if is_err(ok) {
+            bad = true
+            said = "Could not check it. Try again."
+        } else {
+            if ok == true {
+                wrong = 0
+                locks = 0
+                opened = true
+                bad = false
+                said = "Unlocked"
+                keep()
+                on_success && on_success()
+                number_pad_feel("success")
+            } else {
+                wrong += 1
+                shakes += 1
+                bad = true
+                if wrong >= tries {
+                    wrong = 0
+                    locks += 1
+                    let ms = pin_pad_lock_ms(lock_seconds, locks)
+                    until = pin_pad_clock() + ms
+                    left = floor(ms / 1000)
+                    said = "Too many wrong codes."
+                    keep()
+                    on_locked && on_locked(left)
+                } else {
+                    let more = tries - wrong
+                    said = `Wrong code. ${more} ${more == 1 ? "try" : "tries"} left.`
+                    keep()
+                }
+                number_pad_feel("error")
+            }
+        }
+    }
+    let submit = () => {
+        let code = join(entered, "")
+        entered = []
+        busy = true
+        let answer = check != null ? check(code) : false
+        // A function given as a prop is not waited for, even a `server fn`: it comes as a Promise.
+        if type_of(answer) == "promise" {
+            answer.then(settle, (_why = null) => { settle(err("no answer")) })
+        } else {
+            settle(answer)
+        }
+    }
+    // Past the click that ends the tap: a pad that opened on the touch would leave that
+    // click to land on whatever came up under the finger.
+    let send_it = () => {
+        due = false
+        submit()
+    }
+    if due { every(60, send_it) }
+    let locked = until > 0
+    <div class={ui_cls(["ui-pin-pad", class])}
+         @mount={() => {
+             if remember != null {
+                 let was = pin_pad_load(pin_pad_cookie(js("document").cookie, pin_pad_name(remember)))
+                 wrong = was.wrong
+                 locks = was.locks
+                 if was.until > pin_pad_clock() {
+                     until = was.until
+                     tick()
+                 }
+             }
+         }}>
+        <div.ui-pin-pad-body>
+            <div.ui-pin-pad-head>
+                <p.ui-pin-pad-title>{title}</p>
+                <div class={ui_cls(["ui-pin-pad-dots", shakes > 0 && `ui-pin-pad-shake-${shakes % 2 + 1}`, bad && count == 0 && "ui-pin-pad-wrong"])}
+                     role="img" aria-label={`${count} of ${length} digits entered`}>
+                    {for i in range(length) => <span key={i} class={ui_cls(["ui-pin-pad-dot", i < count && "ui-pin-pad-on"])}></span>}
+                </div>
+                <p.ui-pin-pad-said aria-live="polite" data-bad={bad ? "" : null}>{locked ? `Try again in ${pin_pad_time(left)}` : said}</p>
+            </div>
+            <NumberPadKeys class="ui-pin-pad-keys" disabled={disabled || locked || opened} label={title} quiet={true}
+                           on_key={(k) => {
+                               if !busy && !locked && !opened {
+                                   if k == "back" {
+                                       entered = slice(entered, 0, max([0, len(entered) - 1]))
+                                       count = len(entered)
+                                   } else {
+                                       if said != "" {
+                                           said = ""
+                                           bad = false
+                                       }
+                                       if count < length {
+                                           entered = entered + [k]
+                                           count = len(entered)
+                                       }
+                                   }
+                               }
+                           }}
+                           on_lift={() => { if count >= length && !busy && !due { due = true } }}/>
+        </div>
+    </div>
+}

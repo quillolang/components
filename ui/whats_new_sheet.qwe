@@ -1,0 +1,202 @@
+// WhatsNewSheet: what has been added since the version a person last saw, in a sheet that
+// comes up by itself once for each version, and never for someone who has just installed the
+// app, for whom everything is new. The list is yours, kept with the app.
+//
+//   <WhatsNewSheet current="2.3.0" remember="seen-version" more="/changelog" entries={[
+//       { version: "2.3.0", title: "Voice memos", text: "Keep a recording with any note.", art: "🎙" },
+//       { version: "2.2.0", title: "Dark mode", text: "It follows your phone's setting." }
+//   ]}/>
+//
+// current: this version: a `server fn` can give it from `platform().app.version`. entries: a list of
+// { version, title, text, art }, in any order: art is a character or an emoji, or an SVG path
+// (24x24, stroked) when it starts with "M". remember: the name the last version seen is kept
+// under. limit: the most shown at once (6), newest first, with how many more. more: an address
+// for the whole list. title ("What's new"), done_label ("Got it"). trigger: the text of a button
+// that shows every entry on request, whatever was seen. open: from your own state, with on_close().
+// on_seen(version): inside one of your components, called when a sheet that came up by itself is
+// closed. on_close(): whenever it closes. id ("whats-new-sheet").
+//
+// Versions compare as numbers (force_update.qwe), and an entry whose version cannot be read
+// is left out. whats_new_sheet_due(entries, last, current) gives what would show.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/force_update.qwe use force_update_compare, force_update_key
+import ui/welcome_carousel.qwe use welcome_carousel_keep, welcome_carousel_recall
+
+let whats_new_sheet_css = css`
+.ui-whats-new-host { display: contents; }
+.ui-whats-new {
+  box-sizing: border-box; inset: auto 0 0 0; width: 100%; max-width: 100vw; max-height: min(80dvh, calc(100dvh - env(safe-area-inset-top) - 16px)); margin: 0 auto; padding: 0;
+  overflow: hidden; border: 1px solid var(--ui-border); border-bottom: 0; border-radius: calc(var(--ui-radius) + 8px) calc(var(--ui-radius) + 8px) 0 0;
+  background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 15px/1.45 var(--ui-font); transition: transform .26s cubic-bezier(.2, .8, .2, 1);
+}
+.ui-whats-new[open] { display: flex; flex-direction: column; animation: ui-whats-new-up .28s cubic-bezier(.2, .8, .2, 1); }
+.ui-whats-new::backdrop { background: var(--ui-overlay); }
+.ui-whats-new-held { transition: none; }
+@keyframes ui-whats-new-up { from { transform: translateY(100%); } }
+.ui-whats-new-grip {
+  flex: none; display: grid; place-items: center; width: 100%; height: 44px; padding: 0; border: 0; background: transparent; cursor: grab;
+  touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ui-whats-new-grip span { width: 40px; height: 5px; border-radius: 999px; background: var(--ui-strong); }
+.ui-whats-new-grip:focus-visible { outline: none; }
+.ui-whats-new-grip:focus-visible span { background: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-whats-new-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 0 20px 8px; container: ui-whats-new / inline-size; }
+.ui-whats-new-body h2 { margin: 0 0 12px; font-size: 24px; line-height: 1.25; }
+.ui-whats-new-list { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; }
+.ui-whats-new-item { display: grid; grid-template-columns: 44px minmax(0, 1fr); grid-template-rows: auto 1fr; gap: 0 12px; min-width: 0; }
+.ui-whats-new-art { display: grid; place-items: center; grid-row: span 2; width: 44px; height: 44px; border-radius: 12px; background: var(--ui-accent-soft); color: var(--ui-accent); font-size: 22px; line-height: 1; }
+.ui-whats-new-art svg { width: 24px; height: 24px; }
+.ui-whats-new-item h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; margin: 0; font-size: 16px; line-height: 1.3; }
+.ui-whats-new-item small { color: var(--ui-muted); font-size: 12px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.ui-whats-new-item p { margin: 2px 0 0; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-whats-new-more { display: inline-flex; align-items: center; min-height: 44px; margin-top: 6px; color: var(--ui-accent); font-size: 14px; }
+.ui-whats-new-rest { margin: 12px 0 0; color: var(--ui-muted); font-size: 14px; }
+.ui-whats-new-foot { flex: none; padding: 8px 20px max(12px, env(safe-area-inset-bottom)); border-top: 1px solid var(--ui-border); }
+@container ui-whats-new (min-width: 520px) { .ui-whats-new-list { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 24px; } }
+@media (min-width: 700px) {
+  .ui-whats-new { inset: 0; width: min(640px, 90vw); height: fit-content; margin: auto; border-bottom: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 6px); }
+  .ui-whats-new-grip { display: none; }
+  .ui-whats-new-body { padding-top: 20px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-whats-new { transition: none; } .ui-whats-new[open] { animation: none; } }
+`
+
+// The entries after `last` and not after `current`, newest first. With no `last`, all up to `current`.
+fn whats_new_sheet_due(entries: list, last, current) -> list {
+    let fits = entries | filter((e) => {
+        let v = get(e, "version")
+        force_update_key(v) != null && (force_update_compare(v, current) ?? 1) <= 0 && (last == null || force_update_compare(v, last) == 1)
+    })
+    fits | sort_by((e) => force_update_key(e.version)) | reverse()
+}
+
+// Whether a sheet should come up by itself. A version kept that cannot be read is treated as
+// a new install, as nothing can be said about what was seen.
+fn whats_new_sheet_show(entries: list, last, current) -> bool {
+    if force_update_key(current) == null || force_update_key(last) == null { return false }
+    len(whats_new_sheet_due(entries, last, current)) > 0
+}
+
+// Whether letting go closes it: `dy` pixels down, at `speed`, with `height` to go.
+fn whats_new_sheet_closes(dy: num, speed: num, height: num) -> bool =
+    dy >= height / 3 || (dy >= 12 && speed >= 0.5)
+
+view WhatsNewSheetArt(art) =
+    <span.ui-whats-new-art aria-hidden="true">
+        {art == null
+            ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.5 6 6.5.5-5 4.2 1.6 6.3-5.6-3.4-5.6 3.4 1.6-6.3-5-4.2 6.5-.5z"/></svg>
+            : starts_with(art, "M") && len(art) > 2
+                ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d={art}/></svg>
+                : art}
+    </span>
+
+component WhatsNewSheet(current: str? = null, entries: list = [], remember: str? = "ui-whats-new", limit: int = 6, more: str? = null,
+                        title: str = "What's new", done_label: str = "Got it", trigger: str? = null, open: bool = false, id: str = "whats-new-sheet",
+                        on_seen = null, on_close = null, class: str? = null) {
+    style global whats_new_sheet_css
+    state dlg = null
+    state shown = []
+    state by_itself = false
+    state held = false
+    let finger = null
+    let y0 = 0
+    let last_y = 0
+    let last_t = 0
+    let speed = 0
+    let all = whats_new_sheet_due(entries, null, current)
+    let few = slice(shown, 0, min([limit, len(shown)]))
+    let extra = len(shown) - len(few)
+    let show_all = () => {
+        by_itself = false
+        shown = all
+        dlg.showModal()
+    }
+    if open && dlg != null && !dlg.open { show_all() }
+    if !open && dlg != null && dlg.open && trigger == null && !by_itself { dlg.close() }
+    let spring = () => {
+        finger = null
+        held = false
+        dlg.style.transform = ""
+    }
+    <div.ui-whats-new-host>
+        {trigger != null && <button.ui-btn.ui-btn-outline.ui-btn-lg type="button" aria-haspopup="dialog" @click={show_all}>{trigger}</button>}
+        <dialog class={ui_cls(["ui-whats-new", held && "ui-whats-new-held", class])} aria-labelledby={`${id}-title`}
+                @mount={(el) => {
+                    dlg = el
+                    if remember != null && force_update_key(current) != null {
+                        let kept = js("Promise.resolve", welcome_carousel_recall(remember))
+                        let last = is_err(kept) ? null : kept
+                        if whats_new_sheet_show(entries, last, current) {
+                            by_itself = true
+                            shown = whats_new_sheet_due(entries, last, current)
+                            // `open` may have shown it during the wait above.
+                            if !el.open { el.showModal() }
+                        } else if force_update_compare(current, last) != -1 {
+                            // A new install, or a version with nothing to tell: noted, so
+                            // that the next version tells only what is new since this one.
+                            welcome_carousel_keep(remember, current)
+                        }
+                    }
+                }}
+                @close={() => {
+                    if by_itself {
+                        by_itself = false
+                        if remember != null { welcome_carousel_keep(remember, current) }
+                        on_seen && on_seen(current)
+                    }
+                    on_close && on_close()
+                }}
+                @click={(e) => { if e.target.tagName == "DIALOG" { dlg.close() } }}>
+            <button.ui-whats-new-grip type="button" aria-label="Close"
+                    @pointerdown={(e) => {
+                        if finger == null {
+                            finger = e.pointerId
+                            e.target.closest("button").setPointerCapture(e.pointerId)
+                            y0 = e.clientY
+                            last_y = e.clientY
+                            last_t = e.timeStamp
+                            speed = 0
+                            held = true
+                        }
+                    }}
+                    @pointermove={(e) => {
+                        if e.pointerId == finger {
+                            let gap = e.timeStamp - last_t
+                            if gap > 0 { speed = speed * 0.4 + (e.clientY - last_y) / gap * 0.6 }
+                            last_y = e.clientY
+                            last_t = e.timeStamp
+                            dlg.style.transform = `translateY(${max([0, e.clientY - y0])}px)`
+                        }
+                    }}
+                    @pointerup={(e) => {
+                        if e.pointerId == finger {
+                            let dy = e.clientY - y0
+                            let moving = e.timeStamp - last_t > 80 ? 0 : speed
+                            let height = dlg.offsetHeight
+                            spring()
+                            if whats_new_sheet_closes(dy, moving, height) { dlg.close() }
+                        }
+                    }}
+                    @pointercancel={(e) => { if e.pointerId == finger { spring() } }}
+                    @click={(e) => { if e.detail == 0 { dlg.close() } }}><span aria-hidden="true"></span></button>
+            <div.ui-whats-new-body>
+                <h2 id={`${id}-title`}>{title}</h2>
+                <ul.ui-whats-new-list>
+                    {for e in few =>
+                        <li.ui-whats-new-item key={`${e.version}-${get(e, "title")}`} data-version={e.version}>
+                            <WhatsNewSheetArt art={get(e, "art")}/>
+                            <h3>{get(e, "title") ?? ""} <small>{e.version}</small></h3>
+                            {get(e, "text") != null && <p>{e.text}</p>}
+                        </li>}
+                </ul>
+                {extra > 0 && <p.ui-whats-new-rest>And {extra} more.</p>}
+                {more != null && <a.ui-whats-new-more href={more}>See everything that changed</a>}
+            </div>
+            <div.ui-whats-new-foot>
+                <Button size="lg" full={true} on_click={() => { dlg.close() }}>{done_label}</Button>
+            </div>
+        </dialog>
+    </div>
+}

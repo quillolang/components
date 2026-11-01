@@ -1,0 +1,318 @@
+// BalanceCard: the top of a banking app's first screen. One account's balance at a time on a
+// phone, swiped between, each written exactly in its currency; on a tablet all of them side by
+// side with a total for each currency. A tap on the amount, or on the eye, hides every balance
+// or brings it back; a hold on a hidden amount shows it only for as long as the finger stays,
+// so a balance can be looked at on a train and is gone at the lift.
+//
+//   import ui/balance_card.qwe use BalanceCard
+//
+//   <BalanceCard now_at="2026-11-01T09:42:00Z" updated_at="2026-11-01T09:37:00Z" accounts={[
+//       { id: "main", name: "Everyday", last4: "4021", balance: 2481.07m, available: 2231.07m, currency: "USD" },
+//       { id: "save", name: "Savings", balance: "15200.50", currency: "USD" }]}/>
+//
+// accounts: each { id, name, balance, currency ("USD"), last4, available }. balance and
+// available: a decimal, an int or numeric text; anything else shows as a dash and counts for
+// nothing in a total. updated_at: when the balances were read, as a date-time, from your page.
+// now_at: the time now, as a date-time, so the page the server sends says the same as the
+// browser's; the words then keep up by themselves. Without it the time itself is shown. hidden:
+// whether balances start hidden; pass what on_hide told you last time, kept in your database,
+// since browser storage does not last in the phone apps. locale. hold_ms: how long a hold takes
+// to show a hidden amount (450). label: what screen readers call it ("Your balances").
+// on_change(id): the account swiped to. on_hide(hidden): the person hid or showed them.
+//
+// A hidden amount is not on the page, but `accounts` is in its HTML, as any prop is: "hidden"
+// means from the person beside you, not from whoever has the phone's memory.
+//
+// balance_card_ago(updated_at, now_at), balance_card_totals(accounts) and
+// balance_card_turn(dx, speed, width) are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/price.qwe use price_text
+
+let balance_card_css = css`
+.ui-balcard { display: grid; gap: 10px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 14px/1.4 var(--ui-font); }
+.ui-balcard-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 44px; }
+.ui-balcard-title { margin: 0; color: var(--ui-muted); font-size: 13px; font-weight: 600; }
+.ui-balcard-eye {
+  display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ui-muted); cursor: pointer;
+  touch-action: manipulation;
+}
+.ui-balcard-eye svg { width: 22px; height: 22px; pointer-events: none; }
+.ui-balcard-eye:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-balcard-eye:hover { background: var(--ui-subtle); color: var(--ui-fg); } }
+/* The row of cards moves under a finger on the phone; the page keeps its up and down. */
+.ui-balcard-view { position: relative; min-width: 0; overflow: hidden; border-radius: var(--ui-radius); touch-action: pan-y; outline: none; }
+.ui-balcard-view:focus-visible { box-shadow: var(--ui-focus); }
+.ui-balcard-track { display: flex; transform: translateX(calc(var(--ui-balcard-at) * -100%)); transition: transform .26s cubic-bezier(.2, .8, .2, 1); will-change: transform; }
+.ui-balcard-moving { transition: none; }
+.ui-balcard-card {
+  box-sizing: border-box; display: grid; align-content: start; gap: 6px; flex: 0 0 100%; min-width: 0; padding: 14px 16px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface);
+}
+.ui-balcard-name { display: flex; justify-content: space-between; gap: 8px; margin: 0; font-size: 15px; font-weight: 600; }
+.ui-balcard-name span { min-width: 0; overflow-wrap: anywhere; }
+.ui-balcard-last { flex: none; color: var(--ui-muted); font-weight: 400; font-variant-numeric: tabular-nums; }
+/* A hold is the finger's: no selection or callout may take it, as the amount is what it is on. */
+.ui-balcard-amt {
+  display: block; width: 100%; min-height: 56px; padding: 4px 0; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg);
+  font: 700 min(34px, 9.4cqw)/1.2 var(--ui-font); font-variant-numeric: tabular-nums; text-align: left; overflow-wrap: anywhere; cursor: pointer;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: pan-y;
+}
+.ui-balcard-amt:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-balcard-neg { color: var(--ui-danger); }
+.ui-balcard-low { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; margin: 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-balcard-nav { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ui-balcard-step {
+  display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid var(--ui-border); border-radius: 50%; background: var(--ui-surface); color: var(--ui-fg);
+  cursor: pointer; font: 20px/1 var(--ui-font); touch-action: manipulation;
+}
+.ui-balcard-step:disabled { opacity: .4; cursor: default; }
+.ui-balcard-step:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-balcard-where { display: grid; justify-items: center; gap: 4px; color: var(--ui-muted); font-size: 13px; }
+.ui-balcard-dots { display: flex; gap: 6px; }
+.ui-balcard-dots i { width: 7px; height: 7px; border-radius: 50%; background: var(--ui-strong); }
+.ui-balcard-dots i.ui-balcard-dot-on { background: var(--ui-accent); }
+.ui-balcard-totals { display: none; }
+.ui-balcard-empty { margin: 0; padding: 16px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius); color: var(--ui-muted); text-align: center; }
+/* Space for them all: no swiping, nothing to page through, and the totals a row of one cannot have. */
+@container (min-width: 560px) {
+  .ui-balcard-view { touch-action: auto; overflow: visible; }
+  .ui-balcard-track { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; transform: none; }
+  .ui-balcard-nav { display: none; }
+  .ui-balcard-totals { display: flex; flex-wrap: wrap; gap: 4px 24px; margin: 0; padding: 0; list-style: none; font-variant-numeric: tabular-nums; }
+  .ui-balcard-totals strong { font-size: 18px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-balcard-track { transition: none; } }
+`
+
+// What a balance is as a decimal, or null: bad data shows a dash and is not added up.
+fn balance_card_dec(v) {
+    let kind = type_of(v)
+    if kind != "dec" && kind != "int" && kind != "float" && kind != "str" { return null }
+    let d = dec(v)
+    is_err(d) ? null : d
+}
+
+// An amount in its currency, or a dash for one that is not a number.
+fn balance_card_text(v, currency, locale) -> str {
+    let d = balance_card_dec(v)
+    d == null ? "—" : price_text(d, str(currency ?? "USD"), locale)
+}
+
+// A total for each currency, in the order the currencies first come.
+fn balance_card_totals(accounts: list) -> list {
+    let good = accounts | filter((a) => balance_card_dec(a.balance) != null)
+    let by = good | group_by((a) => str(a.currency ?? "USD"))
+    good | map((a) => str(a.currency ?? "USD")) | unique() | map((c) => {
+        { currency: c, amount: get(by, c, []) | map((a) => balance_card_dec(a.balance)) | sum() }
+    })
+}
+
+// How long ago the balances were read, in words; the time itself without a now; "" for a time
+// that is not one. A time ahead of now is a clock out of step, and reads as just now.
+fn balance_card_ago(updated_at, now_at, extra: int = 0) -> str {
+    if type_of(updated_at) != "str" || !date.valid(updated_at, "date-time") { return "" }
+    if type_of(now_at) != "str" || !date.valid(now_at, "date-time") { return `Updated ${date.format(updated_at, "MMM D, HH:mm")}` }
+    let mins = int(floor((date.ms(now_at) + extra - date.ms(updated_at)) / 60000))
+    if mins < 1 { return "Updated just now" }
+    if mins < 60 { return `Updated ${mins} min ago` }
+    if mins < 1440 { return `Updated ${int(floor(mins / 60))} h ago` }
+    `Updated ${date.format(updated_at, "MMM D")}`
+}
+
+// Which way a release turns: 1 to the next, -1 back, 0 to spring home. A third of the way
+// does it, or a flick that has moved enough not to be a shaky tap.
+fn balance_card_turn(dx: num, speed: num, width: num) -> int {
+    let far = abs(dx) >= width / 3
+    let flick = abs(speed) >= 0.5 && abs(dx) >= 24 && (speed < 0) == (dx < 0)
+    if !far && !flick { return 0 }
+    dx < 0 ? 1 : -1
+}
+
+// How far the row follows the finger: past either end it gives a third as much.
+fn balance_card_rubber(dx: num, at: int, count_of: int) -> num {
+    let at_end = (dx > 0 && at == 0) || (dx < 0 && at >= count_of - 1)
+    at_end ? dx / 3 : dx
+}
+
+// The last few points of a drag, for the speed at the release.
+fn balance_card_trail(trail: list, x: num, at_ms: num) -> list {
+    let all = trail + [{ x: x, at: at_ms }]
+    slice(all, max([0, len(all) - 6]), len(all))
+}
+
+// Pixels a millisecond over the last moments, from a point old enough to measure by, as the
+// last move can be in the same instant as the release.
+fn balance_card_speed(trail: list, x: num, at_ms: num) -> num {
+    let old = trail | filter((p) => at_ms - p.at >= 16 && at_ms - p.at <= 120)
+    if len(old) == 0 { return 0 }
+    (x - old[0].x) / (at_ms - old[0].at)
+}
+
+component BalanceCard(accounts: list = [], updated_at: str? = null, now_at: str? = null, hidden: bool = false, locale: str? = null,
+                      hold_ms: int = 450, label: str = "Your balances", on_change = null, on_hide = null) {
+    style global balance_card_css
+    state at = 0
+    state covered = hidden
+    state peek = false       // a hold is showing a hidden amount
+    state holding = false    // the finger is down on an amount, not long enough yet
+    state held = false       // a hold ran its time, so the release is not a tap
+    state skip = false       // a drag ended, so the click after it is not a tap
+    state press = null       // { x, y, id }: where the finger went down
+    state axis = null
+    state trail = []
+    state wide = false       // room for them all
+    state view_el = null
+    state track_el = null
+    state born = 0
+    state gone = 0           // ms since the page came, added to now_at
+    let n = len(accounts)
+    let totals = balance_card_totals(accounts)
+    let ago = balance_card_ago(updated_at, now_at, gone)
+    let showing = !covered || peek
+    let go = (i: int) => {
+        let next = max([0, min([i, n - 1])])
+        if next != at {
+            at = next
+            on_change && on_change(accounts[next].id)
+        }
+    }
+    let flip = () => {
+        covered = !covered
+        peek = false
+        on_hide && on_hide(covered)
+    }
+    let finish = (e) => {
+        if press != null && e.pointerId == press.id {
+            let dx = e.clientX - press.x
+            let was = axis
+            let w = view_el.clientWidth
+            let speed = balance_card_speed(trail, e.clientX, e.timeStamp)
+            press = null
+            axis = null
+            holding = false
+            peek = false
+            track_el.classList.remove("ui-balcard-moving")
+            track_el.style.transform = ""
+            if was == "x" {
+                skip = true
+                if e.type == "pointerup" && !wide { go(at + balance_card_turn(dx, speed, w)) }
+            }
+        }
+    }
+    if holding {
+        every(hold_ms, () => {
+            holding = false
+            held = true
+            peek = covered
+        })
+    }
+    // The words on the time are worked out again each half minute: a bank's "5 min ago" must not stay.
+    if born > 0 { every(30000, () => { gone = now() - born }) }
+    <section.ui-balcard aria-label={label}
+             @mount={(el) => {
+                 born = now()
+                 let measure = (_e = null) => { wide = el.clientWidth >= 560 }
+                 measure()
+                 let watch = js_new("ResizeObserver", measure)
+                 watch.observe(el)
+                 let d = js("document")
+                 let away = (_e = null) => {
+                     if d.visibilityState == "hidden" {
+                         peek = false
+                         holding = false
+                     }
+                 }
+                 d.addEventListener("visibilitychange", away)
+                 () => {
+                     watch.disconnect()
+                     d.removeEventListener("visibilitychange", away)
+                 }
+             }}>
+        <div.ui-balcard-top>
+            <p.ui-balcard-title>{ago}</p>
+            <button.ui-balcard-eye type="button" aria-pressed={covered ? "true" : "false"} aria-label="Hide balances" @click={flip}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"></path>
+                    <circle cx="12" cy="12" r="3"></circle>
+                    {covered && <path d="M4 4l16 16"></path>}
+                </svg>
+            </button>
+        </div>
+        {n == 0 && <p.ui-balcard-empty>No accounts to show.</p>}
+        {n > 0 && <div.ui-balcard-view role="group" aria-roledescription="carousel" aria-label={label} tabindex="0"
+             @mount={(el) => { view_el = el }}
+             @pointerdown={(e) => {
+                 if e.button == 0 && press == null {
+                     press = { x: e.clientX, y: e.clientY, id: e.pointerId }
+                     trail = balance_card_trail([], e.clientX, e.timeStamp)
+                     axis = null
+                     skip = false
+                     held = false
+                     holding = e.target.closest(".ui-balcard-amt") != null
+                 }
+             }}
+             @pointermove={(e) => {
+                 if press != null && e.pointerId == press.id {
+                     let dx = e.clientX - press.x
+                     let dy = e.clientY - press.y
+                     if axis == null && (abs(dx) > 8 || abs(dy) > 8) {
+                         axis = abs(dx) > abs(dy) ? "x" : "y"
+                         holding = false
+                         if axis == "x" && !wide {
+                             view_el.setPointerCapture(e.pointerId)
+                             track_el.classList.add("ui-balcard-moving")
+                         }
+                     }
+                     if axis == "x" && !wide {
+                         let x = -at * view_el.clientWidth + balance_card_rubber(dx, at, n)
+                         track_el.style.transform = `translateX(${x}px)`
+                         trail = balance_card_trail(trail, e.clientX, e.timeStamp)
+                     }
+                 }
+             }}
+             @pointerup={finish}
+             @pointercancel={finish}
+             @contextmenu={(e) => { if held || holding { e.preventDefault() } }}
+             @keydown={(e) => {
+                 if !wide && e.key == "ArrowRight" {
+                     e.preventDefault()
+                     go(at + 1)
+                 } else if !wide && e.key == "ArrowLeft" {
+                     e.preventDefault()
+                     go(at - 1)
+                 }
+             }}>
+            <div.ui-balcard-track style={`--ui-balcard-at: ${at}`} @mount={(el) => { track_el = el }}>
+                {for p in enumerate(accounts) => <article.ui-balcard-card key={p[1].id} inert={!wide && p[0] != at} aria-label={str(p[1].name)}>
+                    <h3.ui-balcard-name>
+                        <span>{p[1].name}</span>
+                        {p[1].last4 != null && <span.ui-balcard-last>•• {p[1].last4}</span>}
+                    </h3>
+                    <button type="button" class={ui_cls(["ui-balcard-amt", showing && balance_card_dec(p[1].balance) != null && balance_card_dec(p[1].balance) < 0 && "ui-balcard-neg"])}
+                            aria-label={showing ? `${balance_card_text(p[1].balance, p[1].currency, locale)}. Press to hide.` : "Balance hidden. Press to show, or hold to see it for a moment."}
+                            @click={() => {
+                                if held || skip {
+                                    held = false
+                                    skip = false
+                                } else {
+                                    flip()
+                                }
+                            }}>{showing ? balance_card_text(p[1].balance, p[1].currency, locale) : "••••••"}</button>
+                    {p[1].available != null && <p.ui-balcard-low><span>Available</span><span>{showing ? balance_card_text(p[1].available, p[1].currency, locale) : "••••"}</span></p>}
+                </article>}
+            </div>
+        </div>}
+        {n > 1 && <div.ui-balcard-nav>
+            <button.ui-balcard-step type="button" aria-label="Previous account" disabled={at == 0} @click={() => { go(at - 1) }}>‹</button>
+            <div.ui-balcard-where>
+                <span aria-live="polite">{`${at + 1} of ${n}: ${accounts[at].name}`}</span>
+                <span.ui-balcard-dots aria-hidden="true">{for p in enumerate(accounts) => <i key={p[1].id} class={p[0] == at ? "ui-balcard-dot-on" : null}></i>}</span>
+            </div>
+            <button.ui-balcard-step type="button" aria-label="Next account" disabled={at >= n - 1} @click={() => { go(at + 1) }}>›</button>
+        </div>}
+        {n > 1 && <ul.ui-balcard-totals aria-label="Totals">
+            {for t in totals => <li key={t.currency}>Total {t.currency} <strong>{showing ? price_text(t.amount, t.currency, locale) : "••••••"}</strong></li>}
+        </ul>}
+    </section>
+}

@@ -1,0 +1,155 @@
+// TorchToggle: turns the light beside the camera on and off, through the camera track's
+// `torch` constraint, which is the only way a page reaches it. Where the phone allows that
+// (Chrome on most Android phones) it is a switch; where it does not (iPhones and iPads in
+// most versions, most computers) it says so plainly and points to the phone's own control.
+//
+//   <TorchToggle/>
+//   <TorchToggle label="Light" on_change={(on) => { lit = on }}/>
+//
+// label: the button's name ("Torch"). on_change(on): inside one of your components, called
+// with true or false when the light changes. The camera is opened only while the light is
+// on, since the track must stay alive to hold it, and the first tap asks for the camera.
+// The light goes off when it is turned off, when the app leaves the screen and when the
+// component leaves the page: a light left on is a flat battery.
+
+import ui/theme.qwe use ui_cls
+
+let torch_toggle_css = css`
+.ui-torch-toggle { display: inline-grid; justify-items: center; gap: 8px; max-width: 280px; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); text-align: center; }
+.ui-torch-toggle-btn {
+  display: grid; place-items: center; width: 76px; height: 76px; padding: 0; border: 1px solid var(--ui-border); border-radius: 50%;
+  background: var(--ui-surface); color: var(--ui-fg); cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+}
+.ui-torch-toggle-btn svg { width: 32px; height: 32px; }
+.ui-torch-toggle-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-torch-toggle-btn[aria-pressed="true"] { border-color: transparent; background: #ffd34d; color: #3a2c00; box-shadow: 0 0 0 6px rgba(255, 211, 77, .3); }
+.ui-torch-toggle-btn:disabled { opacity: .55; cursor: not-allowed; }
+.ui-torch-toggle-say { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-torch-toggle-why { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-torch-toggle-settings {
+  min-height: 44px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 14px/1 var(--ui-font); cursor: pointer;
+}
+.ui-torch-toggle-settings:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+`
+
+// Whether a track's capabilities offer the light: a boolean in Chrome, a list in the spec's first form.
+fn torch_toggle_can(caps) -> bool {
+    if caps == null || is_err(caps) { return false }
+    let t = get(caps, "torch", false)
+    t == true || (type_of(t) == "list" && contains(t, true))
+}
+
+// What a refusal of the camera means.
+fn torch_toggle_why(name) -> str = name == "NotAllowedError" || name == "SecurityError" ? "refused" : "none"
+
+component TorchToggle(label: str = "Torch", on_change = null, class: str? = null) {
+    style global torch_toggle_css
+    state status = "off"        // off, starting, on, none (no light here), refused
+    state stream = null
+    state track = null
+    state settings = false
+    state said = ""
+    let release = () => {
+        if stream != null {
+            for t in js("Array.from", stream.getTracks()) { t.stop() }
+            stream = null
+            track = null
+        }
+    }
+    // Asks for the light and says whether it took: a phone may offer it and still refuse.
+    let light = (on: bool) => js("Promise.resolve", js_new("Promise", (done) => {
+        done(track.applyConstraints({ advanced: [{ torch: on }] }).then((_ = null) => true, (_ = null) => false))
+    }))
+    let off = (words: str) => {
+        if status == "on" {
+            let t = track
+            // Not waited for: the page may be going. Stopping the track puts the light out anyway.
+            t.applyConstraints({ advanced: [{ torch: false }] }).catch((_ = null) => { said = "" })
+            release()
+            status = "off"
+            said = words
+            on_change && on_change(false)
+        }
+    }
+    let cannot = (kind: str, words: str) => {
+        release()
+        settings = kind == "refused" && js("window").quilloNative != null
+        said = words
+        status = kind
+    }
+    let no_light = "This phone does not let a page reach its light. Use the torch in the phone's own controls."
+    let on = () => {
+        said = ""
+        if js("navigator").mediaDevices == null {
+            cannot("none", no_light)
+            return null
+        }
+        status = "starting"
+        let got = js("Promise.resolve", js_new("Promise", (done) => {
+            done(js("navigator.mediaDevices.getUserMedia", { video: { facingMode: { ideal: "environment" } }, audio: false }).then(
+                (s) => { stream: s, why: null }, (e) => { stream: null, why: e.name }))
+        }))
+        if got.stream == null {
+            let kind = torch_toggle_why(got.why)
+            cannot(kind, kind == "refused"
+                ? "The camera was not allowed, and the light goes with it. Allow it in Settings."
+                : no_light)
+            return null
+        }
+        stream = got.stream
+        track = js("Array.from", stream.getVideoTracks())[0]
+        // Android fills in a track's capabilities only once the camera has started; this waits for that.
+        // In Promises, as either may throw, which would stop the handler and leave the button stuck.
+        if js("window").ImageCapture != null {
+            js("Promise.resolve", js_new("Promise", (done) => { done(js_new("ImageCapture", track).getPhotoCapabilities()) }))
+        }
+        let caps = js("Promise.resolve", js_new("Promise", (done) => { done(track.getCapabilities != null ? track.getCapabilities() : null) }))
+        if !torch_toggle_can(caps) {
+            cannot("none", no_light)
+            return null
+        }
+        if light(true) != true {
+            cannot("none", "The light would not turn on. Another app may be using the camera.")
+            return null
+        }
+        track.addEventListener("ended", (_e = null) => {
+            if status == "on" {
+                stream = null
+                track = null
+                status = "off"
+                said = "The camera stopped, so the light went out."
+                on_change && on_change(false)
+            }
+        })
+        status = "on"
+        if js("window").quilloNative != null { js("quilloNative.haptic", "light") }
+        on_change && on_change(true)
+    }
+    <div class={ui_cls(["ui-torch-toggle", class])} data-state={status}
+         @mount={(_el) => {
+             let d = js("document")
+             let seen = (_e = null) => { if d.hidden { off("The light went out when the app left the screen.") } }
+             d.addEventListener("visibilitychange", seen)
+             () => {
+                 d.removeEventListener("visibilitychange", seen)
+                 off("")
+                 release()
+             }
+         }}>
+        <button.ui-torch-toggle-btn type="button" aria-label={label} aria-pressed={status == "on" ? "true" : "false"} disabled={status == "starting"}
+                @click={() => { if status == "on" { off("") } else { on() } }}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M7 3h10v4l-3 4v9a1 1 0 0 1-1 1h-2a1 1 0 0 1-1-1v-9L7 7V3ZM7 7h10M12 14v2"/></svg>
+        </button>
+        <p.ui-torch-toggle-say role="status">{match status {
+            "on" => "The light is on"
+            "starting" => "Asking for the camera…"
+            "none" => "No light here"
+            "refused" => "The light is off"
+            _ => "The light is off"
+        }}</p>
+        {said != "" && <p.ui-torch-toggle-why role="alert">{said}</p>}
+        {status == "refused" && settings && <button.ui-torch-toggle-settings type="button" @click={() => { js("quilloNative.openSettings") }}>Open Settings</button>}
+    </div>
+}

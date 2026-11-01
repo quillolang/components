@@ -1,0 +1,260 @@
+// DownloadsList: what is downloading and what is done, each with its size, progress and the right
+// button: pause, resume, retry. It shows the space downloads take and the room left on the device, and
+// holds to Wi-Fi only: on a phone's data network what is running waits, says why, and goes on
+// by itself when Wi-Fi comes back. A tablet keeps the storage and the setting in a column beside the list.
+//
+//   import ui/downloads_list.qwe use DownloadsList
+//
+//   <DownloadsList items={downloads} wifi_only={true}
+//                  on_pause={(d) => { pause(d.id) }} on_resume={(d) => { resume(d.id) }} on_retry={(d) => { resume(d.id) }}
+//                  on_remove={(d) => { remove(d.id) }} on_wifi_only={(on) => { save_setting(on) }}
+//                  on_hold={(held) => { hold_all(held) }}/>
+//
+// It shows and decides; the bytes are yours, because where they should go depends on the app. In a phone app
+// the program's own server is on the phone, so a `server fn` is the place that survives a launch.
+// items: each { id, title, size, done, state, error }, with size and done in bytes, and state one of
+// "queued", "loading", "paused", "failed" or "done". wifi_only: start with the setting on (false).
+// quota: bytes the app allows itself, for "used of"; without it the device's own estimate is used.
+// label: what screen readers call it.
+//
+// on_pause(item), on_resume(item), on_retry(item), on_remove(item): inside one of your components, on
+// those buttons. The row changes at once, and your next `items` has the last word. on_wifi_only(on): the
+// setting changed. on_hold(held): true when downloads must stop for the network, false when they may go on.
+// on_clear(items): Clear finished was pressed.
+//
+// iPhones and many browsers do not say which network they are on. Where that is so, it says on screen that
+// Wi-Fi only cannot be kept to, and goes by online and offline alone.
+
+import ui/theme.qwe use ui_cls
+
+let downloads_list_css = css`
+.ui-dlist { min-width: 0; container: ui-dlist / inline-size; color: var(--ui-fg); font: 14px/1.35 var(--ui-font); }
+.ui-dlist-in { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr); }
+.ui-dlist-side { display: grid; gap: 10px; align-content: start; padding: 12px 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-dlist-used { margin: 0; font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-dlist-free { margin: 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-dlist-meter { height: 8px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-dlist-meter i { display: block; height: 100%; background: var(--ui-accent); transform-origin: 0 50%; }
+.ui-dlist-full i { background: var(--ui-danger); }
+.ui-dlist-wifi { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 48px; cursor: pointer; font-weight: 600; }
+/* A real input, drawn as a switch, and 44 px tall itself: the track is the part that shows. */
+.ui-dlist-wifi input { position: relative; flex: none; width: 52px; height: 44px; margin: 0; appearance: none; -webkit-appearance: none; background: none; cursor: pointer; touch-action: manipulation; }
+.ui-dlist-wifi input::before { content: ""; position: absolute; top: 8px; left: 0; right: 0; height: 28px; border-radius: 999px; background: var(--ui-strong); transition: background .15s; }
+.ui-dlist-wifi input::after { content: ""; position: absolute; top: 10px; left: 2px; width: 24px; height: 24px; border-radius: 50%; background: #fff; box-shadow: var(--ui-shadow); transition: transform .15s; }
+.ui-dlist-wifi input:checked::before { background: var(--ui-accent); }
+.ui-dlist-wifi input:checked::after { transform: translateX(24px); }
+.ui-dlist .ui-dlist-wifi input:focus-visible { box-shadow: none; }
+.ui-dlist-wifi input:focus-visible::before { box-shadow: var(--ui-focus); }
+.ui-dlist-why { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-dlist-held { color: var(--ui-warning); font-weight: 600; }
+.ui-dlist-list { display: grid; margin: 0; padding: 0; list-style: none; }
+.ui-dlist-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; align-items: center; padding: 10px 2px; border-bottom: 1px solid var(--ui-border); }
+.ui-dlist-title { margin: 0; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-dlist-state { margin: 0; color: var(--ui-muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.ui-dlist-failed .ui-dlist-state { color: var(--ui-danger); }
+.ui-dlist-waiting .ui-dlist-state { color: var(--ui-warning); }
+.ui-dlist-bar { grid-column: 1; height: 4px; margin-top: 4px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-dlist-bar i { display: block; height: 100%; background: var(--ui-accent); transform-origin: 0 50%; }
+.ui-dlist-paused .ui-dlist-bar i, .ui-dlist-waiting .ui-dlist-bar i { background: var(--ui-strong); }
+.ui-dlist-failed .ui-dlist-bar i { background: var(--ui-danger); }
+.ui-dlist-acts { grid-column: 2; grid-row: 1 / span 3; display: flex; gap: 2px; }
+.ui-dlist-btn { display: grid; place-items: center; min-width: 46px; min-height: 46px; padding: 0 6px; border: 0; border-radius: 12px; background: none; color: var(--ui-fg); font: 600 13px var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-dlist-btn svg { width: 22px; height: 22px; }
+.ui-dlist-clear { justify-self: start; min-height: 46px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: 12px; background: var(--ui-surface); color: var(--ui-fg); font: 600 14px var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-dlist-empty { margin: 0; padding: 32px 16px; text-align: center; color: var(--ui-muted); }
+.ui-dlist :focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-dlist-btn:hover { background: var(--ui-subtle); } }
+@media (prefers-reduced-motion: reduce) { .ui-dlist-wifi input::before, .ui-dlist-wifi input::after { transition: none; } }
+/* Wide: the storage and the setting keep a column of their own, and a row has room for its size. */
+@container ui-dlist (min-width: 640px) {
+  .ui-dlist-in { grid-template-columns: minmax(0, 1fr) 260px; gap: 20px; }
+  .ui-dlist-side { grid-column: 2; grid-row: 1; align-self: start; position: sticky; top: 12px; }
+  .ui-dlist-main { grid-column: 1; grid-row: 1; }
+}
+`
+
+fn downloads_list_num(v) {
+    let t = type_of(v)
+    if t != "int" && t != "float" { return 0 }
+    math.isfinite(v) && v > 0 ? v : 0
+}
+
+let downloads_list_states = ["queued", "loading", "paused", "failed", "done"]
+
+// Items that can be shown: each a map with an id, in a state it knows, done kept within size, once each.
+fn downloads_list_clean(items) -> list {
+    if type_of(items) != "list" { return [] }
+    let rows = items | filter((x) => type_of(x) == "map" && get(x, "id") != null) | map((x) => {
+        let size = downloads_list_num(get(x, "size"))
+        let st = contains(downloads_list_states, get(x, "state")) ? x.state : "queued"
+        let got = st == "done" ? size : downloads_list_num(get(x, "done"))
+        { id: str(x.id), title: str(get(x, "title") ?? "Untitled"), size: size, done: size > 0 ? min([got, size]) : got, state: st, error: str(get(x, "error") ?? "") }
+    })
+    let ids = rows | map((r) => r.id)
+    rows | enumerate() | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// Bytes as a person says them, by thousands, as phones do.
+fn downloads_list_size(b) -> str {
+    let n = downloads_list_num(b)
+    if n < 1000 { return `${floor(n)} B` }
+    if n < 1000000 { return `${round(n / 1000)} KB` }
+    if n < 1000000000 { return `${round(n / 1000000, 1)} MB` }
+    `${round(n / 1000000000, 2)} GB`
+}
+
+// How far along, as a share.
+fn downloads_list_share(d: map) = d.size > 0 ? min([d.done / d.size, 1]) : 0
+
+// Whether the network stops a download: on data with Wi-Fi only, or with no network at all.
+fn downloads_list_hold(wifi_only: bool, kind, online: bool) -> str {
+    if !online { return "offline" }
+    if wifi_only && kind == "cellular" { return "data" }
+    ""
+}
+
+// What a row says.
+fn downloads_list_says(d: map, held: str) -> str {
+    let of = `${downloads_list_size(d.done)} of ${downloads_list_size(d.size)}`
+    if d.state == "done" { return downloads_list_size(d.size) }
+    if d.state == "failed" { return d.error != "" ? `${d.error}, ${of}` : `Failed, ${of}` }
+    if d.state == "paused" { return `Paused, ${of}` }
+    if held == "data" { return `Waiting for Wi-Fi, ${of}` }
+    if held == "offline" { return `Waiting for a connection, ${of}` }
+    if d.state == "queued" { return `Queued, ${downloads_list_size(d.size)}` }
+    `${round(downloads_list_share(d) * 100)}%, ${of}`
+}
+
+let downloads_list_pause = "M6 4h4v16H6zM14 4h4v16h-4z"
+let downloads_list_play = "M7 4v16l14-8z"
+
+component DownloadsList(items = [], wifi_only: bool = false, quota = null, label: str = "Downloads", on_pause = null, on_resume = null, on_retry = null,
+                        on_remove = null, on_wifi_only = null, on_hold = null, on_clear = null, class: str? = null) {
+    style global downloads_list_css
+    let from_page = downloads_list_clean(items)
+    state changed = []        // what a press changed, until the page's next `items`: { id, state } or { id, gone }
+    state wifi = wifi_only
+    state kind = null         // "wifi", "cellular" or null for not known
+    state told_kind = false   // the browser can say which network this is
+    state online = true
+    state spare = null        // what the device's own estimate leaves
+    state told_hold = false
+    let list_now = from_page | filter((d) => find(changed, (c) => c.id == d.id && c.gone) == null) | map((d) => {
+        let c = find(changed, (x) => x.id == d.id)
+        c == null ? d : set(d, "state", c.state)
+    })
+    let held = downloads_list_hold(wifi, kind, online)
+    let on_disk = sum(list_now | map((d) => d.done))
+    let limit = downloads_list_num(quota)
+    let share = limit > 0 ? min([on_disk / limit, 1]) : 0
+    let finished = list_now | filter((d) => d.state == "done")
+    let going = len(list_now | filter((d) => d.state == "loading" || d.state == "queued"))
+    let local_change = (d, st) => { changed = (changed | filter((c) => c.id != d.id)) | push({ id: d.id, state: st, gone: false }) }
+    let look = () => {
+        let nav = js("navigator")
+        let net = nav.connection
+        online = nav.onLine != false
+        if net != null && net.type != null {
+            told_kind = true
+            kind = net.type
+        }
+    }
+    // A new list from the page is the truth: what a press changed was only until it came.
+    let sig = join(from_page | map((d) => `${d.id}:${d.state}`), ",")
+    state seen = sig
+    if sig != seen {
+        seen = sig
+        changed = []
+    }
+    let stopped_now = held != ""
+    if stopped_now != told_hold {
+        told_hold = stopped_now
+        on_hold && on_hold(stopped_now)
+    }
+    <div class={ui_cls(["ui-dlist", class])} role="region" aria-label={label}
+         @mount={(el) => {
+             let win = js("window")
+             look()
+             let net = win.navigator.connection
+             let changed_net = (_e = null) => { look() }
+             win.addEventListener("online", changed_net)
+             win.addEventListener("offline", changed_net)
+             if net != null && net.addEventListener != null { net.addEventListener("change", changed_net) }
+             // Not on every system, and a refusal is only an empty line.
+             let st = win.navigator.storage
+             if st != null && st.estimate != null {
+                 st.estimate().then((e = null) => {
+                     if e != null && e.quota != null { spare = max([0, e.quota - e.usage]) }
+                 }, (_x = null) => { spare = null })
+             }
+             () => {
+                 win.removeEventListener("online", changed_net)
+                 win.removeEventListener("offline", changed_net)
+                 if net != null && net.removeEventListener != null { net.removeEventListener("change", changed_net) }
+             }
+         }}>
+        <div.ui-dlist-in>
+            <div.ui-dlist-side>
+                <p.ui-dlist-used>{downloads_list_size(on_disk)} used{limit > 0 ? ` of ${downloads_list_size(limit)}` : ""}</p>
+                {limit > 0 && <div class={ui_cls(["ui-dlist-meter", share >= 0.95 && "ui-dlist-full"])} role="meter" aria-label="Storage used" aria-valuemin="0" aria-valuemax="100" aria-valuenow={round(share * 100)}>
+                    <i style={`transform: scaleX(${share})`}></i>
+                </div>}
+                {spare != null && <p.ui-dlist-free>{downloads_list_size(spare)} free for this app</p>}
+                <label.ui-dlist-wifi>
+                    <span>Wi-Fi only</span>
+                    <input type="checkbox" role="switch" checked={wifi} @change={(e) => {
+                        wifi = e.checked
+                        on_wifi_only && on_wifi_only(e.checked)
+                    }}/>
+                </label>
+                {wifi && !told_kind && <p.ui-dlist-why>This device does not say which network it is on, so Wi-Fi only cannot be kept to here.</p>}
+                <p.ui-dlist-why.ui-dlist-held role="status">{held == "data" ? "On mobile data: waiting for Wi-Fi." : held == "offline" ? "No connection: waiting." : ""}</p>
+            </div>
+            <div.ui-dlist-main>
+                {len(list_now) == 0 && <p.ui-dlist-empty>Nothing downloaded yet.</p>}
+                <ul.ui-dlist-list>
+                    {for d in list_now => {
+                        let waits = held != "" && (d.state == "loading" || d.state == "queued")
+                        <li class={ui_cls(["ui-dlist-item", `ui-dlist-${d.state}`, waits && "ui-dlist-waiting"])} key={d.id} data-id={d.id}>
+                            <p.ui-dlist-title>{d.title}</p>
+                            <p.ui-dlist-state>{downloads_list_says(d, held)}</p>
+                            {d.state != "done" && <div.ui-dlist-bar role="progressbar" aria-label={`${d.title}: progress`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={round(downloads_list_share(d) * 100)}>
+                                <i style={`transform: scaleX(${downloads_list_share(d)})`}></i>
+                            </div>}
+                            <div.ui-dlist-acts>
+                                {(d.state == "loading" || d.state == "queued") && <button.ui-dlist-btn type="button" aria-label={`Pause ${d.title}`} @click={() => {
+                                    local_change(d, "paused")
+                                    on_pause && on_pause(d)
+                                }}>
+                                    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={downloads_list_pause}/></svg>
+                                </button>}
+                                {d.state == "paused" && <button.ui-dlist-btn type="button" aria-label={`Resume ${d.title}`} disabled={held != ""} @click={() => {
+                                    local_change(d, "loading")
+                                    on_resume && on_resume(d)
+                                }}>
+                                    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={downloads_list_play}/></svg>
+                                </button>}
+                                {d.state == "failed" && <button.ui-dlist-btn type="button" aria-label={`Retry ${d.title}`} disabled={held != ""} @click={() => {
+                                    local_change(d, "loading")
+                                    on_retry && on_retry(d)
+                                }}>
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.700L21 8M21 3v5h-5"/></svg>
+                                </button>}
+                                <button.ui-dlist-btn type="button" aria-label={`Remove ${d.title}`} @click={() => {
+                                    changed = changed | push({ id: d.id, state: d.state, gone: true })
+                                    on_remove && on_remove(d)
+                                }}>
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                                </button>
+                            </div>
+                        </li>
+                    }}
+                </ul>
+                {len(finished) > 0 && on_clear != null && <div style="padding-top: 10px">
+                    <button.ui-dlist-clear type="button" @click={() => { on_clear(finished) }}>Clear finished</button>
+                </div>}
+                <p.ui-sr role="status">{going} {going == 1 ? "download" : "downloads"} going</p>
+            </div>
+        </div>
+    </div>
+}

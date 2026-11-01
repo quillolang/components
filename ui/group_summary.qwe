@@ -1,0 +1,327 @@
+// GroupSummary: sums up rows by the columns picked: nested groups, each with its
+// subtotals, and a grand total. Columns to group by and aggregations (sum, avg, min,
+// max, count, distinct) are chosen on the page, groups fold away, and the result can be
+// saved as CSV. Totals are exact decimals: subtotals add up to the grand total to the
+// last digit, and an average is of the rows beneath it, never an average of averages.
+//
+//   <GroupSummary id="sales" rows={orders} groups={["region", "city"]}
+//                 measures={[{ key: "total", fn: "sum" }, { key: "total", fn: "avg" }, { key: "id", fn: "count" }]}/>
+//
+// id: a prefix for its ids, unique on the page. rows: a list of maps; anything else is
+// counted and left out. columns: which columns can be picked, keys or { key, label }
+// (left out, every key of the rows). groups: the keys it starts grouped by, outermost
+// first. measures: what it starts adding up, each { key, fn }, fn being sum, avg, min,
+// max, count or distinct. places: the decimals of an average, rounded half up (2).
+// locale: how numbers are written on the page ("en-US"; the file keeps plain digits).
+// limit: the most rows read (20,000); past it, it says so. title: the heading
+// ("Summary"). filename: the file's name without .csv ("summary"). name: a hidden
+// field with the CSV, its lines ending in LF as HTML reads them, so a plain <form> sends it. on_change(result): inside one of your
+// components, as the choice changes, given { groups, measures, lines, csv }, each line
+// { id, depth, label, rows, cells }. class: more classes for its outer element.
+//
+// Numbers may be text ("12.50", "1,200"). A value that is not one is left out of sum and
+// avg, and it says how many; min and max of a column with text in it go by text, which
+// suits ISO dates. Count is the values that are there, distinct the different ones.
+// A group of no value shows as (empty) and comes last; numbers sort as numbers.
+//
+// group_summary_lines(rows, groups, measures, places) and
+// group_summary_csv(lines, groups, measures, labels) are the logic, for a program.
+
+import ui/theme.qwe use ui_cls
+
+let group_summary_css = css`
+.ui-gsum { display: grid; gap: 12px; min-width: 0; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-gsum .ui-gsum-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-gsum-setup { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 10px 16px; }
+.ui-gsum-part { display: grid; align-content: start; gap: 6px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-gsum-part legend { padding: 0 0 4px; font-size: 13px; font-weight: 600; }
+.ui-gsum-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.ui-gsum-chip { display: inline-flex; align-items: center; gap: 2px; padding: 2px 4px 2px 10px; border-radius: 999px; background: var(--ui-accent-soft); color: var(--ui-accent); font-size: 13px; }
+.ui-gsum-x { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 999px; background: none; color: inherit; font: 13px var(--ui-font); cursor: pointer; }
+.ui-gsum-x:hover:not(:disabled) { background: color-mix(in srgb, var(--ui-accent) 18%, transparent); }
+.ui-gsum-x:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-gsum-x:disabled { opacity: .35; cursor: default; }
+.ui-gsum select { box-sizing: border-box; max-width: 100%; height: 32px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); }
+.ui-gsum select:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-gsum-btn { height: 32px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 13px var(--ui-font); white-space: nowrap; cursor: pointer; }
+.ui-gsum-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-gsum-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-gsum-btn:disabled { opacity: .5; cursor: not-allowed; }
+.ui-gsum-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.ui-gsum-sum { flex: 1; min-width: 180px; color: var(--ui-muted); font-size: 13px; }
+.ui-gsum-note { margin: 0; color: var(--ui-warning); font-size: 13px; }
+.ui-gsum-empty { margin: 0; padding: 20px; border: 1px dashed var(--ui-strong); border-radius: var(--ui-radius-sm); color: var(--ui-muted); text-align: center; }
+.ui-gsum-scroll { overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-gsum-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-gsum table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-gsum th, .ui-gsum td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--ui-border); white-space: nowrap; }
+.ui-gsum thead th { background: var(--ui-subtle); font-weight: 600; }
+.ui-gsum .ui-gsum-num { text-align: right; }
+.ui-gsum tbody th { font-weight: 500; }
+.ui-gsum-sub th, .ui-gsum-sub td { background: color-mix(in srgb, var(--ui-subtle) 60%, transparent); font-weight: 600; }
+.ui-gsum tfoot th, .ui-gsum tfoot td { border-top: 2px solid var(--ui-strong); border-bottom: 0; background: var(--ui-subtle); font-weight: 700; }
+.ui-gsum-fold { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.ui-gsum-fold:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 3px; }
+.ui-gsum-fold svg { width: 10px; height: 10px; color: var(--ui-muted); transition: transform .15s; }
+.ui-gsum-fold[aria-expanded="true"] svg { transform: rotate(90deg); }
+.ui-gsum-file { display: grid; gap: 4px; min-width: 0; margin: 0; }
+.ui-gsum-file figcaption { color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-gsum-file pre { max-height: 200px; margin: 0; padding: 10px 12px; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font: 12px/1.5 var(--ui-mono); }
+.ui-gsum-file pre:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-gsum-said { color: var(--ui-muted); font-size: 13px; }
+@media (prefers-reduced-motion: reduce) { .ui-gsum-fold svg { transition: none; } }
+`
+
+let group_summary_fns = [
+    { id: "sum", name: "Sum" }, { id: "avg", name: "Average" }, { id: "min", name: "Minimum" },
+    { id: "max", name: "Maximum" }, { id: "count", name: "Count" }, { id: "distinct", name: "Distinct" },
+]
+
+fn group_summary_fn_name(id: str) -> str = (find(group_summary_fns, (f) => f.id == id) ?? { name: id }).name
+
+// A value as text: "" for nothing, numbers by their decimal, so 1, 1.0 and "1" are one group.
+fn group_summary_key(v) -> str {
+    let t = type_of(v)
+    if t == "null" { return "" }
+    if t == "str" {
+        let s = trim(v)
+        let d = group_summary_num(s)
+        return d != null ? re.replace(str(d), "(\\.\\d*[1-9])0+$|\\.0+$", "$1") : s
+    }
+    if t == "bool" { return v ? "true" : "false" }
+    if t == "list" || t == "map" { return json.stringify(v) }
+    let d = group_summary_num(v)
+    d != null ? re.replace(str(d), "(\\.\\d*[1-9])0+$|\\.0+$", "$1") : str(v)
+}
+
+// A number or numeric text as a decimal, or null. Values past 24 digits count as text:
+// a sum of many could overflow, and that would stop the page.
+fn group_summary_num(v) {
+    let t = type_of(v)
+    if t == "dec" || t == "int" {
+        let d = dec(v)
+        return is_err(d) || len(str(floor(abs(d)))) > 24 ? null : d
+    }
+    if t == "float" {
+        if abs(v) >= 1000000000000000000000000.0 { return null }
+        let d = dec(v)
+        return is_err(d) ? null : d
+    }
+    if t != "str" { return null }
+    let s = replace(trim(v), ",", "")
+    if len(s) > 40 || !re.test(s, "^[-+]?(\\d+\\.?\\d*|\\.\\d+)$") { return null }
+    let d = dec(s)
+    is_err(d) || len(str(floor(abs(d)))) > 24 ? null : d
+}
+
+// One aggregate over rows: { v, skipped } where skipped counts values that are no numbers.
+fn group_summary_cell(rows: list, m: map, places: int) -> map {
+    let there = rows | map((r) => get(r, m.key)) | filter((v) => group_summary_key(v) != "")
+    let nums = there | map(group_summary_num) | filter((d) => d != null)
+    let skipped = len(there) - len(nums)
+    match m.fn {
+        "count" => { v: len(there), skipped: 0 }
+        "distinct" => { v: len(unique(there | map(group_summary_key))), skipped: 0 }
+        "sum" => { v: len(nums) > 0 ? sum(nums) : null, skipped }
+        "avg" => { v: len(nums) > 0 ? round(sum(nums) / len(nums), places, "half_up") : null, skipped }
+        _ => {
+            if len(there) == 0 { return { v: null, skipped: 0 } }
+            if skipped == 0 { return { v: m.fn == "min" ? min(nums) : max(nums), skipped: 0 } }
+            let words = sort(there | map(group_summary_key))
+            { v: m.fn == "min" ? words[0] : words[-1], skipped: 0 }
+        }
+    }
+}
+
+// Group keys in order: numbers as numbers, then text, then nothing.
+fn group_summary_order(names: list) -> list {
+    let nums = names | filter((k) => group_summary_num(k) != null)
+    let words = names | filter((k) => k != "" && group_summary_num(k) == null)
+    let sorted = sort_by(nums, (k) => group_summary_num(k)) + sort_by(words, (k) => lower(k))
+    contains(names, "") ? push(sorted, "") : sorted
+}
+
+// The lines under a set of rows, depth first: a line for each group, then its own.
+fn group_summary_walk(rows: list, groups: list, measures: list, places: int, depth: int, parent: str, values_above: list, ids_above: list) -> list {
+    if depth >= len(groups) { return [] }
+    let key = groups[depth]
+    let parts = group_by(rows, (r) => group_summary_key(get(r, key)))
+    flatten(group_summary_order(keys(parts)) | map((k) => {
+        let inside = get(parts, k)
+        let lid = `${parent}/${k}`
+        let cells = measures | map((m) => group_summary_cell(inside, m, places))
+        let path = push(values_above, k)
+        [{ id: lid, depth, label: filled(k) ?? "(empty)", rows: len(inside), cells: cells | map((c) => c.v), skipped: sum(cells | map((c) => c.skipped)), path,
+           above: ids_above, leaf: depth == len(groups) - 1 },
+         ...group_summary_walk(inside, groups, measures, places, depth + 1, lid, path, push(ids_above, lid))]
+    }))
+}
+
+// Every line, the grand total last, with id "total".
+fn group_summary_lines(rows: list, groups: list, measures: list, places: int = 2) -> list {
+    let inner = group_summary_walk(rows, groups, measures, places, 0, "", [], [])
+    let totals = measures | map((m) => group_summary_cell(rows, m, places))
+    push(inner, { id: "total", depth: 0, label: "Total", rows: len(rows), cells: totals | map((c) => c.v), skipped: sum(totals | map((c) => c.skipped)), path: [], above: [], leaf: true })
+}
+
+fn group_summary_measure_label(m: map, labels: map) -> str = `${group_summary_fn_name(m.fn)} of ${get(labels, m.key) ?? m.key}`
+
+fn group_summary_csv_field(s: str) -> str = re.test(s, "[\",\\r\\n]") ? `"${replace(s, "\"", "\"\"")}"` : s
+
+// A value for a file: plain digits, nothing for nothing.
+fn group_summary_plain(v) -> str = v == null ? "" : str(v)
+
+// The result as CSV (RFC 4180): a column for each group, then Rows and the measures. A
+// subtotal leaves its deeper groups empty; the total says Total in the first.
+fn group_summary_csv(lines: list, groups: list, measures: list, labels: map) -> str {
+    let head = (groups | map((g) => get(labels, g) ?? g)) + ["Rows"] + (measures | map((m) => group_summary_measure_label(m, labels)))
+    let rows = lines | map((l) => {
+        let names = l.id == "total" ? ["Total"] : l.path | map((k) => filled(k) ?? "(empty)")
+        let padded = len(groups) == 0 ? [] : names + (for _i in len(names)..len(groups) => "")
+        padded + [str(l.rows)] + (l.cells | map(group_summary_plain))
+    })
+    join(([head] + rows) | map((r) => join(r | map(group_summary_csv_field), ",")), "\r\n") + "\r\n"
+}
+
+// How many decimals a decimal is written with.
+fn group_summary_scale(d) -> int {
+    let s = str(d)
+    let at = index_of(s, ".")
+    at == null ? 0 : len(s) - at - 1
+}
+
+// A value for the page.
+fn group_summary_show(v, locale: str) -> str = match type_of(v) {
+    "null" => "–"
+    "dec" => format_number(v, locale, group_summary_scale(v))
+    "int" => format_number(v, locale, 0)
+    _ => str(v)
+}
+
+component GroupSummary(id: str, rows = [], columns: list? = null, groups: list = [], measures: list = [], places: int = 2, locale: str = "en-US",
+                       limit: int = 20000, title: str = "Summary", filename: str = "summary", name: str? = null, on_change = null, class: str? = null) {
+    style global group_summary_css
+    let given = type_of(rows) == "list" ? rows : []
+    let cut = take(given, limit)
+    let records = cut | filter((r) => type_of(r) == "map")
+    let cols = (columns ?? unique(flatten(take(records, 2000) | map((r) => keys(r))))) | map((c) => type_of(c) == "map" ? { key: str(c.key), label: c.label ?? str(c.key) } : { key: str(c), label: str(c) })
+    let labels = reduce(cols, {}, (m, c) => set(m, c.key, c.label))
+    state by = groups | filter((g) => any(cols, (c) => c.key == g))
+    state wanted = measures | filter((m) => type_of(m) == "map" && any(cols, (c) => c.key == m.key) && any(group_summary_fns, (f) => f.id == m.fn))
+    state closed = []
+    state said = ""
+    let lines = group_summary_lines(records, by, wanted, places)
+    let total = lines[-1]
+    let inner = take(lines, len(lines) - 1)
+    let parents = inner | filter((l) => !l.leaf) | map((l) => l.id)
+    let shown = inner | filter((l) => !any(l.above, (a) => contains(closed, a)))
+    let csv = group_summary_csv(lines, by, wanted, labels)
+    let skipped = sum(lines | map((l) => l.id == "total" ? l.skipped : 0))
+    let spare = cols | filter((c) => !contains(by, c.key))
+    let tell = () => {
+        if on_change != null {
+            let now_lines = group_summary_lines(records, by, wanted, places)
+            on_change({ groups: by, measures: wanted, lines: now_lines, csv: group_summary_csv(now_lines, by, wanted, labels) })
+        }
+    }
+    let move = (i: int) => {
+        let a = by[i - 1]
+        by = set(set(by, i - 1, by[i]), i, a)
+        closed = []
+        tell()
+    }
+    let save = () => {
+        let url = js("URL.createObjectURL", js_new("Blob", [csv], { type: "text/csv;charset=utf-8" }))
+        let a = js("document.createElement", "a")
+        a.href = url
+        a.download = `${filename}.csv`
+        a.click()
+        js("requestAnimationFrame", (t = null) => { js("URL.revokeObjectURL", url) })
+        said = `Saved ${filename}.csv`
+    }
+    <section class={ui_cls(["ui-gsum", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-gsum-title id={`${id}-title`}>{title}</h3>
+        {len(given) > limit && <p.ui-gsum-note>{`Only the first ${format_number(limit, "en-US", 0)} of ${format_number(len(given), "en-US", 0)} rows are read.`}</p>}
+        {len(cut) > len(records) && <p.ui-gsum-note>{`${len(cut) - len(records)} item${len(cut) - len(records) == 1 ? " is" : "s are"} not a record, and left out.`}</p>}
+        <div.ui-gsum-setup>
+            <fieldset.ui-gsum-part>
+                <legend>Group by</legend>
+                <div.ui-gsum-line>
+                    {for [i, g] in enumerate(by) => <span.ui-gsum-chip key={g} data-group={g}>
+                        {get(labels, g) ?? g}
+                        <button.ui-gsum-x type="button" disabled={i == 0} aria-label={`Move ${get(labels, g) ?? g} outward`} @click={() => { move(i) }}>↑</button>
+                        <button.ui-gsum-x type="button" aria-label={`Stop grouping by ${get(labels, g) ?? g}`}
+                                @click={() => { by = remove(by, g); closed = []; tell() }}>×</button>
+                    </span>}
+                    <select id={`${id}-add`} aria-label="Add a column to group by"
+                            @change={(e) => { if e.value != "" { by = push(by, e.value); e.value = ""; closed = []; tell() } }}>
+                        <option value="">Add a column</option>
+                        {for c in spare => <option key={c.key} value={c.key}>{c.label}</option>}
+                    </select>
+                </div>
+            </fieldset>
+            <fieldset.ui-gsum-part>
+                <legend>Add up</legend>
+                {for [i, m] in enumerate(wanted) => <div.ui-gsum-line key={i} data-measure={i}>
+                    <select aria-label={`Aggregation ${i + 1}`} @change={(e) => { wanted = set(wanted, i, { ...m, fn: e.value }); tell() }}>
+                        {for f in group_summary_fns => <option key={f.id} value={f.id} selected={f.id == m.fn}>{f.name}</option>}
+                    </select>
+                    <select aria-label={`Column of aggregation ${i + 1}`} @change={(e) => { wanted = set(wanted, i, { ...m, key: e.value }); tell() }}>
+                        {for c in cols => <option key={c.key} value={c.key} selected={c.key == m.key}>{c.label}</option>}
+                    </select>
+                    <button.ui-gsum-btn type="button" aria-label={`Remove aggregation ${i + 1}`} @click={() => { wanted = take(wanted, i) + drop(wanted, i + 1); tell() }}>Remove</button>
+                </div>}
+                <div.ui-gsum-line>
+                    <button.ui-gsum-btn type="button" disabled={len(cols) == 0 || len(wanted) >= 12} @click={() => { wanted = push(wanted, { key: cols[0].key, fn: "count" }); tell() }}>Add an aggregation</button>
+                </div>
+            </fieldset>
+        </div>
+        {len(records) == 0 && <p.ui-gsum-empty>No rows to sum up.</p>}
+        {len(records) > 0 && <div.ui-gsum-bar>
+            <span.ui-gsum-sum aria-live="polite">{`${format_number(len(records), locale, 0)} row${len(records) == 1 ? "" : "s"} in ${len(inner | filter((l) => l.depth == 0))} group${len(inner | filter((l) => l.depth == 0)) == 1 ? "" : "s"}`}</span>
+            <button.ui-gsum-btn type="button" disabled={len(closed) == 0} @click={() => { closed = [] }}>Open all</button>
+            <button.ui-gsum-btn type="button" disabled={len(parents) == 0 || len(closed) == len(parents)} @click={() => { closed = parents }}>Close all</button>
+            <button.ui-gsum-btn type="button" @click={save}>Save as CSV</button>
+        </div>}
+        {skipped > 0 && <p.ui-gsum-note>{`${skipped} value${skipped == 1 ? " is" : "s are"} not a number, and left out of the sums and averages.`}</p>}
+        {len(records) > 0 && <div.ui-gsum-scroll tabindex="0" role="region" aria-label="Summary table">
+            <table>
+                <thead>
+                    <tr>
+                        <th scope="col">{len(by) > 0 ? join(by | map((g) => get(labels, g) ?? g), " / ") : "All rows"}</th>
+                        <th.ui-gsum-num scope="col">Rows</th>
+                        {for [i, m] in enumerate(wanted) => <th.ui-gsum-num key={i} scope="col">{group_summary_measure_label(m, labels)}</th>}
+                    </tr>
+                </thead>
+                <tbody>
+                    {for l in shown => <tr key={l.id} data-line={l.id} class={!l.leaf && "ui-gsum-sub"}>
+                        <th scope="row" style={`padding-left: ${10 + l.depth * 18}px`}>
+                            {l.leaf ? l.label : <button.ui-gsum-fold type="button" aria-expanded={contains(closed, l.id) ? "false" : "true"}
+                                    @click={() => { closed = contains(closed, l.id) ? remove(closed, l.id) : push(closed, l.id) }}>
+                                <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 2L7 5 3.5 8"/></svg>
+                                {l.label}
+                            </button>}
+                        </th>
+                        <td.ui-gsum-num>{format_number(l.rows, locale, 0)}</td>
+                        {for [i, v] in enumerate(l.cells) => <td.ui-gsum-num key={i}>{group_summary_show(v, locale)}</td>}
+                    </tr>}
+                </tbody>
+                <tfoot>
+                    <tr data-line="total">
+                        <th scope="row">Total</th>
+                        <td.ui-gsum-num>{format_number(total.rows, locale, 0)}</td>
+                        {for [i, v] in enumerate(total.cells) => <td.ui-gsum-num key={i}>{group_summary_show(v, locale)}</td>}
+                    </tr>
+                </tfoot>
+            </table>
+        </div>}
+        {len(records) > 0 && <figure.ui-gsum-file>
+            <figcaption>{`${filename}.csv`}</figcaption>
+            <pre tabindex="0" id={`${id}-csv`}>{replace(csv, "\r\n", "\n")}</pre>
+        </figure>}
+        <span.ui-gsum-said role="status">{said}</span>
+        {name != null && <input type="hidden" {name} value={replace(csv, "\r\n", "\n")}/>}
+    </section>
+}

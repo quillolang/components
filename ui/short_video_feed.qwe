@@ -1,0 +1,373 @@
+// ShortVideoFeed: clips one above the other, each a screen tall, swiped up and down. The browser
+// does the swiping, by scroll snap, so it feels like the phone's own. One clip plays at a time and
+// starts over when you come back to it; the next is already loading, and those further
+// off hold no video at all, as phones allow only a few at once. A tap pauses; two tap a like.
+// On a tablet the clip keeps its shape, with what it is and what comes next beside it.
+//
+//   import ui/short_video_feed.qwe use ShortVideoFeed
+//
+//   <ShortVideoFeed clips={[
+//       { id: 1, src: "/clips/1.mp4", poster: "/clips/1.jpg", title: "Bread in one minute", author: "Ada", likes: 1200 },
+//   ]} on_change={(i) => { seen = i }}/>
+//
+// clips: each { id, src, poster, title, author, likes }. start: the clip to begin on (0). sound: begin with
+// sound on (false). label: what screen readers call it. on_change(index): inside one of your components,
+// when a new clip settles. on_like(clip, liked): a like given or taken back.
+//
+// The box needs a height: `--ui-svfeed-height`, 100dvh unless set.
+//
+// Autoplay is never left to chance. Each start is tried with sound if you asked for it, then
+// silent if that is refused, with a button to bring sound back, and then, if a silent start is
+// refused too, as in Low Power Mode on iPhones, a button to press on the clip's first frame. With "reduce motion" on
+// nothing starts by itself. It also pauses when it scrolls out of view or the app leaves the
+// screen, and goes on when it is back, unless you had paused it. With Save-Data on, only the
+// clip you are on loads ahead.
+//
+// Every gesture has its equal: the Next and Previous buttons, and the keys. ArrowUp, ArrowDown, PageUp and
+// PageDown change clip, Space plays and pauses, and M is the sound.
+
+import ui/theme.qwe use ui_cls
+
+let short_video_feed_css = css`
+.ui-svfeed { position: relative; height: var(--ui-svfeed-height, 100dvh); min-width: 0; overflow: hidden; container: ui-svfeed / size; background: #000; color: #fff; font: 14px/1.35 var(--ui-font); }
+/* The browser does the swipe: stop on every clip, and leave the page out of it. */
+.ui-svfeed-scroll { height: 100%; overflow-y: auto; overscroll-behavior: contain; scroll-snap-type: y mandatory; scrollbar-width: none; outline: none; touch-action: pan-y; }
+.ui-svfeed-scroll::-webkit-scrollbar { display: none; }
+.ui-svfeed-scroll:focus-visible { box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-svfeed-slide { position: relative; display: flex; justify-content: center; height: 100%; overflow: hidden; scroll-snap-align: start; scroll-snap-stop: always; }
+.ui-svfeed-stage { position: relative; width: 100%; height: 100%; overflow: hidden; background: #111; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+.ui-svfeed-stage video, .ui-svfeed-stage > img { display: block; width: 100%; height: 100%; object-fit: cover; -webkit-user-drag: none; }
+.ui-svfeed-cap {
+  position: absolute; left: 0; right: 64px; bottom: 0; padding: 40px 14px calc(14px + env(safe-area-inset-bottom, 0px)); background: linear-gradient(to top, rgba(0, 0, 0, .65), transparent); pointer-events: none;
+}
+.ui-svfeed-cap h3, .ui-svfeed-info h3 { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-svfeed-cap p, .ui-svfeed-info p { margin: 2px 0 0; opacity: .85; }
+.ui-svfeed-line { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255, 255, 255, .25); pointer-events: none; }
+.ui-svfeed-line i { display: block; height: 100%; background: #fff; transform-origin: 0 50%; transform: scaleX(0); }
+.ui-svfeed-big {
+  position: absolute; top: 50%; left: 50%; display: grid; place-items: center; min-width: 76px; height: 76px; padding: 0 10px; border: 0; border-radius: 999px; background: rgba(0, 0, 0, .55); color: #fff;
+  font: 600 14px var(--ui-font); transform: translate(-50%, -50%); cursor: pointer; touch-action: manipulation;
+}
+.ui-svfeed-big svg { width: 38px; height: 38px; }
+.ui-svfeed-big:focus-visible, .ui-svfeed-tool:focus-visible, .ui-svfeed-chip:focus-visible, .ui-svfeed-up:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+.ui-svfeed-heart { position: absolute; top: 50%; left: 50%; width: 96px; height: 96px; margin: -48px 0 0 -48px; color: #fff; opacity: 0; pointer-events: none; }
+.ui-svfeed-beat { animation: ui-svfeed-beat .7s ease-out; }
+@keyframes ui-svfeed-beat { 0% { opacity: 0; transform: scale(.5); } 25% { opacity: .95; transform: scale(1.15); } 100% { opacity: 0; transform: scale(1); } }
+.ui-svfeed-bad { position: absolute; inset: 0; display: grid; place-content: center; gap: 10px; justify-items: center; padding: 24px; background: rgba(0, 0, 0, .7); text-align: center; }
+.ui-svfeed-bad p { margin: 0; }
+.ui-svfeed-busy { position: absolute; top: 50%; left: 50%; width: 42px; height: 42px; margin: -21px 0 0 -21px; border: 3px solid rgba(255, 255, 255, .25); border-top-color: #fff; border-radius: 50%; animation: ui-svfeed-spin .9s linear infinite; pointer-events: none; }
+@keyframes ui-svfeed-spin { to { transform: rotate(360deg); } }
+.ui-svfeed-rail {
+  position: absolute; right: max(8px, env(safe-area-inset-right, 0px)); bottom: calc(64px + env(safe-area-inset-bottom, 0px)); display: grid; gap: 6px; justify-items: center; z-index: 2;
+}
+.ui-svfeed-tool {
+  display: grid; place-items: center; width: 48px; min-height: 48px; padding: 0; border: 0; border-radius: 50%; background: rgba(0, 0, 0, .45); color: #fff; font: 600 11px var(--ui-font); cursor: pointer; touch-action: manipulation;
+}
+.ui-svfeed-tool:disabled { opacity: .4; cursor: default; }
+.ui-svfeed-tool svg { width: 24px; height: 24px; }
+.ui-svfeed-tool[aria-pressed="true"] svg { color: #ff5c7a; }
+.ui-svfeed-count { margin-top: -4px; font-size: 12px; font-variant-numeric: tabular-nums; text-shadow: 0 1px 2px #000; }
+.ui-svfeed-chip { position: absolute; top: calc(10px + env(safe-area-inset-top, 0px)); left: 50%; min-height: 44px; padding: 0 14px; border: 0; border-radius: 999px; background: rgba(0, 0, 0, .65); color: #fff; font: 600 13px var(--ui-font); transform: translateX(-50%); cursor: pointer; z-index: 2; white-space: nowrap; }
+.ui-svfeed-info { display: none; }
+@media (hover: hover) { .ui-svfeed-tool:hover:not(:disabled) { background: rgba(0, 0, 0, .7); } }
+/* A wide box: the clip keeps its upright shape, and the room beside it says what comes next. */
+@container ui-svfeed (min-width: 640px) {
+  .ui-svfeed-slide { align-items: center; gap: 24px; padding: 0 16px; box-sizing: border-box; }
+  .ui-svfeed-stage { flex: none; width: min(58cqw, 56.25cqh); height: auto; aspect-ratio: 9 / 16; border-radius: 14px; }
+  .ui-svfeed-cap { display: none; }
+  .ui-svfeed-info { display: grid; align-content: center; flex: 0 1 300px; gap: 12px; min-width: 0; padding-right: 64px; }
+  .ui-svfeed-next { display: grid; gap: 6px; }
+  .ui-svfeed-next b { font-size: 13px; opacity: .7; }
+}
+.ui-svfeed-up { display: block; width: 100%; min-height: 48px; padding: 6px 10px; border: 1px solid rgba(255, 255, 255, .25); border-radius: 10px; background: none; color: #fff; font: inherit; text-align: left; cursor: pointer; touch-action: manipulation; }
+@media (prefers-reduced-motion: reduce) { .ui-svfeed-beat { animation: none; } .ui-svfeed-busy { animation: none; } }
+`
+
+// A clip list that can be used: each a map with a src, its id as text.
+fn short_video_feed_clean(clips) -> list {
+    if type_of(clips) != "list" { return [] }
+    clips | filter((c) => type_of(c) == "map" && type_of(get(c, "src")) == "str" && c.src != "")
+          | enumerate()
+          | map((p) => {
+              let c = p[1]
+              let n = get(c, "likes")
+              { id: str(get(c, "id") ?? p[0]), src: c.src, poster: str(get(c, "poster") ?? ""), title: str(get(c, "title") ?? ""), author: str(get(c, "author") ?? ""),
+                likes: type_of(n) == "int" && n > 0 ? n : 0 }
+          })
+}
+
+// A place in the list, kept within it; what cannot be read is the first.
+fn short_video_feed_place(v, count: int) -> int {
+    let t = type_of(v)
+    if count <= 0 || (t != "int" && t != "float") { return 0 }
+    max([0, min([floor(v), count - 1])])
+}
+
+// Whether a clip is near enough to hold a video: this one, the one before, the two after,
+// or with Save-Data only this one and the one after.
+fn short_video_feed_near(i: int, at: int, saving: bool) -> bool = saving ? i == at || i == at + 1 : i >= at - 1 && i <= at + 2
+
+// How much of a video to fetch ahead: all of this one and the next; of those around it, only enough to
+// show. Saving data, the next waits until it is reached.
+fn short_video_feed_preload(i: int, at: int, saving: bool) -> str {
+    if i == at { return "auto" }
+    if i == at + 1 { return saving ? "metadata" : "auto" }
+    "metadata"
+}
+
+// A count as a person reads it: 950, 1.2K, 3.4M.
+fn short_video_feed_count(n: int) -> str {
+    if n < 1000 { return str(n) }
+    if n < 1000000 { return `${floor(n / 100) / 10}K` }
+    `${floor(n / 100000) / 10}M`
+}
+
+let short_video_feed_play = "M7 4v16l14-8z"
+
+component ShortVideoFeed(clips = [], start = 0, sound: bool = false, label: str = "Clips", on_change = null, on_like = null, class: str? = null) {
+    style global short_video_feed_css
+    let list_of = short_video_feed_clean(clips)
+    let count = len(list_of)
+    state at = short_video_feed_place(start, count)
+    state box = null
+    state doc = null
+    state tall = 0            // the height last seen: a scroll while it changes is the turn of the phone
+    state saving = false
+    state still = false       // reduce motion: nothing starts by itself
+    state hear = sound        // what the person wants
+    state lost_sound = false  // the system refused sound on the last start
+    state stopped = false     // the person paused it
+    state blocked = false     // the system refused to start it at all
+    state in_view = true
+    state ready = false       // what the first start needs to know is known
+    state failed = []
+    state liked = []
+    state beat = false
+    state busy = false
+    state last_tap = null
+    let clip = count > 0 ? list_of[min([at, count - 1])] : null
+    let is_liked = clip != null && contains(liked, clip.id)
+    let video_at = (i) => box == null ? null : box.querySelector(`video[data-i="${i}"]`)
+    // Only this clip plays: whatever else is playing stops, and starts over when it comes back.
+    let hush_others = () => {
+        let all = box.querySelectorAll("video")
+        let n = 0
+        while n < all.length {
+            let v = all[n]
+            if v.dataset.i != str(at) {
+                v.pause()
+                if v.readyState > 0 { v.currentTime = 0 }
+                v.muted = true
+            }
+            n += 1
+        }
+    }
+    let run = (v) => {
+        blocked = false
+        v.muted = !hear
+        v.play().then((_x = null) => { stopped = false }, (err) => {
+            // AbortError is a newer play or pause taking over, which needs nothing.
+            if err.name == "NotAllowedError" {
+                if !v.muted {
+                    v.muted = true
+                    lost_sound = true
+                    v.play().catch((again) => { if again.name == "NotAllowedError" { blocked = true } })
+                } else {
+                    blocked = true
+                }
+            }
+        })
+    }
+    let begin_here = () => {
+        hush_others()
+        let v = video_at(at)
+        if v != null && in_view && ready {
+            if still || stopped { blocked = still } else { run(v) }
+        }
+    }
+    let settled = (i) => {
+        at = i
+        stopped = false
+        busy = false
+        on_change && on_change(i)
+        begin_here()
+    }
+    let go = (i) => {
+        let to = short_video_feed_place(i, count)
+        box.scrollTo({ top: to * box.clientHeight, behavior: still ? "instant" : "smooth" })
+    }
+    let toggle = () => {
+        let v = video_at(at)
+        if v != null {
+            if v.paused {
+                stopped = false
+                run(v)
+            } else {
+                stopped = true
+                v.pause()
+            }
+        }
+    }
+    let flip_sound = () => {
+        let v = video_at(at)
+        hear = lost_sound ? true : !hear
+        lost_sound = false
+        if v != null {
+            v.muted = !hear
+            // Bringing sound to a clip that was stopped starts it: this press is what the system wanted.
+            if hear && v.paused && !stopped { run(v) }
+        }
+    }
+    let give_like = () => {
+        if clip != null {
+            let on = !is_liked
+            liked = on ? liked | push(clip.id) : liked | filter((x) => x != clip.id)
+            on_like && on_like(clip, on)
+        }
+    }
+    if beat { every(700, () => { beat = false }) }
+    {count == 0
+        ? <div class={ui_cls(["ui-svfeed", class])}><p style="margin: 0; padding: 32px; text-align: center">No clips yet.</p></div>
+        : <div class={ui_cls(["ui-svfeed", class])} role="region" aria-roledescription="clips" aria-label={label}
+               @keydown={(e) => {
+                   let k = e.key
+                   let on_button = e.target.closest("button") != null
+                   if k == "ArrowDown" || k == "PageDown" { e.preventDefault(); go(at + 1) }
+                   if k == "ArrowUp" || k == "PageUp" { e.preventDefault(); go(at - 1) }
+                   if k == " " && !on_button { e.preventDefault(); toggle() }
+                   if lower(k) == "m" { flip_sound() }
+               }}>
+        <div.ui-svfeed-scroll tabindex="0" aria-label="Clips, use the arrow keys"
+             @mount={(el) => {
+                 box = el
+                 doc = js("document")
+                 still = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+                 let net = js("navigator").connection
+                 saving = net != null && net.saveData == true
+                 tall = el.clientHeight
+                 if at > 0 { el.scrollTo({ top: at * el.clientHeight, behavior: "instant" }) }
+                 ready = true
+                 begin_here()
+                 // A turn of the phone changes the height: the clip stays, and the scroll follows it.
+                 let grown = js_new("ResizeObserver", (_x) => {
+                     if el.clientHeight != tall {
+                         tall = el.clientHeight
+                         el.scrollTo({ top: at * tall, behavior: "instant" })
+                     }
+                 })
+                 grown.observe(el)
+                 let seen_it = js_new("IntersectionObserver", (entries) => {
+                     in_view = entries[len(entries) - 1].isIntersecting
+                     let v = video_at(at)
+                     if v != null {
+                         if !in_view { v.pause() } else if !stopped { begin_here() }
+                     }
+                 }, { threshold: 0.5 })
+                 seen_it.observe(el)
+                 let shown = (_e) => {
+                     let v = video_at(at)
+                     if v != null {
+                         if doc.hidden { v.pause() } else if !stopped && in_view { begin_here() }
+                     }
+                 }
+                 doc.addEventListener("visibilitychange", shown)
+                 () => {
+                     grown.disconnect()
+                     seen_it.disconnect()
+                     doc.removeEventListener("visibilitychange", shown)
+                 }
+             }}
+             @scroll={(e) => {
+                 if e.clientHeight == tall && tall > 0 {
+                     let top = e.scrollTop
+                     let i = short_video_feed_place(round(top / tall), count)
+                     if abs(top - i * tall) < 2 && i != at { settled(i) }
+                 }
+             }}>
+            {for [i, c] in enumerate(list_of) => {
+                let bad = contains(failed, c.id)
+                <section.ui-svfeed-slide key={c.id} aria-label={`Clip ${i + 1} of ${count}: ${c.title}`}>
+                    <div.ui-svfeed-stage
+                         @click={(e) => {
+                             // The play button lands under the first of two taps, so its clicks come here too.
+                             if e.target.closest(".ui-svfeed-bad") == null {
+                                 let t = e.timeStamp
+                                 let was = last_tap
+                                 if was != null && t - was < 300 {
+                                     // The first tap toggled at once, so as to start inside the press: undo it.
+                                     last_tap = null
+                                     toggle()
+                                     if !is_liked { give_like() }
+                                     beat = true
+                                 } else {
+                                     last_tap = t
+                                     toggle()
+                                 }
+                             }
+                         }}>
+                        {short_video_feed_near(i, at, saving)
+                            ? <video data-i={i} src={c.src} poster={c.poster != "" ? c.poster : null} preload={short_video_feed_preload(i, at, saving)} muted playsinline loop
+                                     aria-label={c.title}
+                                     @mount={(v) => {
+                                         if ready && i == at && in_view && !still && !stopped { run(v) }
+                                         // A phone keeps a few decoders: giving one back takes this, not just leaving the page.
+                                         () => {
+                                             v.pause()
+                                             v.removeAttribute("src")
+                                             v.load()
+                                         }
+                                     }}
+                                     @timeupdate={(e) => {
+                                         if i == at {
+                                             let bar = e.target.parentNode.querySelector(".ui-svfeed-line i")
+                                             bar.style.transform = `scaleX(${e.duration > 0 ? e.currentTime / e.duration : 0})`
+                                         }
+                                     }}
+                                     @waiting={() => { if i == at { busy = true } }}
+                                     @playing={() => { if i == at { busy = false } }}
+                                     @error={() => {
+                                         failed = failed | push(c.id)
+                                         busy = false
+                                     }}></video>
+                            : <img src={c.poster != "" ? c.poster : "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="} alt="" loading="lazy" draggable="false"/>}
+                        <div.ui-svfeed-cap><h3>{c.title}</h3><p>{c.author}</p></div>
+                        <div.ui-svfeed-line><i></i></div>
+                        <svg class={ui_cls(["ui-svfeed-heart", beat && i == at && "ui-svfeed-beat"])} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.7-9.2C.9 8.7 2.7 5 6.3 5c2.2 0 3.9 1.300 5.700 3.400C13.800 6.300 15.500 5 17.700 5c3.600 0 5.400 3.700 4 6.800C19.500 16.400 12 21 12 21z"/></svg>
+                        {i == at && busy && !stopped && <div.ui-svfeed-busy></div>}
+                        {i == at && (blocked || stopped) && !bad && <button.ui-svfeed-big type="button" aria-label={blocked ? "Play this clip" : "Play"}>
+                            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={short_video_feed_play}/></svg>
+                        </button>}
+                        {bad && <div.ui-svfeed-bad>
+                            <p>This clip cannot be played.</p>
+                            {i + 1 < count && <button.ui-svfeed-up type="button" style="width: auto" @click={() => { go(i + 1) }}>Next clip</button>}
+                        </div>}
+                    </div>
+                    <div.ui-svfeed-info>
+                        <div><h3>{c.title}</h3><p>{c.author}</p></div>
+                        {i + 1 < count && <div.ui-svfeed-next>
+                            <b>Up next</b>
+                            <button.ui-svfeed-up type="button" @click={() => { go(i + 1) }}>{list_of[i + 1].title}</button>
+                        </div>}
+                    </div>
+                </section>
+            }}
+        </div>
+        {lost_sound && <button.ui-svfeed-chip type="button" @click={() => { flip_sound() }}>Tap for sound</button>}
+        <div.ui-svfeed-rail>
+            <button.ui-svfeed-tool type="button" aria-label="Like" aria-pressed={is_liked ? "true" : "false"} @click={() => { give_like() }}>
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.7-9.200C.9 8.700 2.700 5 6.300 5c2.200 0 3.900 1.300 5.700 3.400C13.800 6.300 15.500 5 17.700 5c3.600 0 5.400 3.700 4 6.800C19.500 16.400 12 21 12 21z"/></svg>
+            </button>
+            <span.ui-svfeed-count>{clip == null ? "" : short_video_feed_count(clip.likes + (is_liked ? 1 : 0))}</span>
+            <button.ui-svfeed-tool type="button" aria-label={hear && !lost_sound ? "Turn sound off" : "Turn sound on"} @click={() => { flip_sound() }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9z"/><path d={hear && !lost_sound ? "M16 9a4 4 0 0 1 0 6M18.500 6.500a8 8 0 0 1 0 11" : "m17 9 5 6M22 9l-5 6"}/></svg>
+            </button>
+            <button.ui-svfeed-tool type="button" aria-label="Previous clip" disabled={at == 0} @click={() => { go(at - 1) }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 15 6-6 6 6"/></svg>
+            </button>
+            <button.ui-svfeed-tool type="button" aria-label="Next clip" disabled={at + 1 >= count} @click={() => { go(at + 1) }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+        </div>
+        <p.ui-sr role="status">{clip == null ? "" : `Clip ${at + 1} of ${count}: ${clip.title}`}</p>
+        </div>}
+}

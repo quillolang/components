@@ -1,0 +1,497 @@
+// PhoneSignIn: signing in with a phone number. The first step takes the country and the
+// number, formatted as it is typed; the second takes the code from the text message, which
+// the phone can fill by itself. It calls no server: on_send and on_verify are yours.
+//
+//   component SignIn() {
+//       <PhoneSignIn country="PT"
+//           on_send={(phone) => send_code(phone)}
+//           on_verify={(phone, code) => check_code(phone, code)}
+//           on_signed_in={(phone, answer) => { navigate("/") }}/>
+//   }
+//
+// on_send(phone): given the number in international form ("+351912345678"). on_verify(phone,
+// code): given it and the code. Each may be a `server fn`, and gives true or { ok: true } when
+// it worked, or { ok: false, reason, retry, left, message }: reason is "invalid", "blocked"
+// (a number that cannot get codes), "rate" (too many asked for), "wrong", "expired" or "locked"
+// (too many wrong codes); retry is how many seconds to wait; left, how many tries remain;
+// message, your own words in place of the usual ones. An error value or null means it never
+// got there. on_signed_in(phone, answer): when the code was right, with on_verify's answer.
+//
+// country: where it starts, as ISO 3166; null guesses from the browser's language. countries:
+// the ISO codes offered (the list in phone_input.qwe by default). length: the code's digits
+// (6). resend_after: seconds before another code may be asked for (30). max_sends: how many
+// codes in all, after which it says to wait or use another number (5). timeout: seconds to
+// wait for an answer (20). note: a line under the number on what will happen. help: an https
+// address offered when codes have run out (a phone app's web view opens nothing else, so
+// neither mailto: nor tel: would do anything). The form sits where
+// written, and is moved clear of the on-screen keyboard. id: the start of its ids ("phone-sign-in").
+//
+// Written for: a number too short or too long, with its country's code pasted in, autofilled
+// whole, or with a leading 0; a separator deleted; a person offline; a slow or lost answer; two
+// taps on Send; wrong, expired and locked codes; a code asked for again too soon; a number
+// changed and changed back within the wait.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/phone_input.qwe use phone_input_countries
+
+let phone_sign_in_css = css`
+.ui-phone-sign-in {
+  position: relative; display: grid; gap: 14px; min-width: 0; color: var(--ui-fg); font: 16px/1.45 var(--ui-font);
+  padding-bottom: var(--ui-phone-sign-in-keyboard, 0px); container: ui-phone-sign-in / inline-size;
+}
+.ui-phone-sign-in h2 { margin: 0; font-size: 22px; line-height: 1.25; outline: none; }
+.ui-phone-sign-in-lead { margin: -8px 0 0; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-phone-sign-in-form { display: grid; gap: 12px; min-width: 0; margin: 0; }
+.ui-phone-sign-in-field { display: grid; gap: 4px; min-width: 0; }
+.ui-phone-sign-in-field label { font-size: 14px; font-weight: 500; }
+/* 16 px at least: iOS zooms the page into a smaller field. */
+.ui-phone-sign-in-field select, .ui-phone-sign-in-num input, .ui-phone-sign-in-code {
+  box-sizing: border-box; width: 100%; min-width: 0; height: 50px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 17px var(--ui-font); font-variant-numeric: tabular-nums;
+}
+.ui-phone-sign-in-field select:focus, .ui-phone-sign-in-num:focus-within, .ui-phone-sign-in-code:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-phone-sign-in-num { display: flex; align-items: center; min-width: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-phone-sign-in-num span { flex: none; padding-inline-start: 12px; color: var(--ui-muted); font-size: 17px; font-variant-numeric: tabular-nums; }
+.ui-phone-sign-in-num input { flex: 1; border: 0; background: transparent; padding-inline-start: 8px; outline: none; box-shadow: none; }
+.ui-phone-sign-in-bad .ui-phone-sign-in-num, .ui-phone-sign-in-bad .ui-phone-sign-in-code { border-color: var(--ui-danger); }
+.ui-phone-sign-in-code { height: 60px; text-align: center; font: 600 26px var(--ui-mono); letter-spacing: .32em; text-indent: .32em; caret-color: var(--ui-accent); }
+.ui-phone-sign-in-note, .ui-phone-sign-in-wait { margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-phone-sign-in-note a { display: inline-flex; align-items: center; min-height: 44px; min-width: 44px; color: var(--ui-accent); }
+.ui-phone-sign-in-off { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 14px; }
+.ui-phone-sign-in-error { margin: 0; color: var(--ui-danger); font-size: 14px; }
+.ui-phone-sign-in-more { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; justify-content: space-between; }
+.ui-phone-sign-in-done { display: grid; justify-items: center; gap: 8px; padding: 24px 0; text-align: center; }
+.ui-phone-sign-in-tick { display: grid; place-items: center; width: 64px; height: 64px; border-radius: 50%; background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-phone-sign-in-tick svg { width: 32px; height: 32px; }
+.ui-phone-sign-in-pair { display: grid; gap: 12px; min-width: 0; }
+/* A tablet: the country beside the number, in a form of a readable width and not one across the screen. */
+@container ui-phone-sign-in (min-width: 560px) {
+  .ui-phone-sign-in-form, .ui-phone-sign-in-done { width: 100%; max-width: 480px; margin-inline: auto; }
+  .ui-phone-sign-in-pair { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
+}
+`
+
+// Each country's way of writing a number: mask, the fewest and the most digits, and the
+// digit dialled first at home that the international form leaves out. One not listed is
+// written in threes and takes what E.164 allows.
+let phone_sign_in_rules = [
+    { iso: "US", mask: "(###) ###-####", low: 10, high: 10 }, { iso: "CA", mask: "(###) ###-####", low: 10, high: 10 },
+    { iso: "GB", mask: "#### ######", low: 10, high: 10, trunk: "0" }, { iso: "IE", mask: "## ### ####", low: 9, high: 9, trunk: "0" },
+    { iso: "PT", mask: "### ### ###", low: 9, high: 9 }, { iso: "ES", mask: "### ### ###", low: 9, high: 9 },
+    { iso: "FR", mask: "# ## ## ## ##", low: 9, high: 9, trunk: "0" }, { iso: "DE", mask: "### ########", low: 10, high: 11, trunk: "0" },
+    { iso: "IT", mask: "### ### ####", low: 9, high: 10 }, { iso: "NL", mask: "# ########", low: 9, high: 9, trunk: "0" },
+    { iso: "BE", mask: "### ## ## ##", low: 9, high: 9, trunk: "0" }, { iso: "CH", mask: "## ### ## ##", low: 9, high: 9, trunk: "0" },
+    { iso: "DK", mask: "## ## ## ##", low: 8, high: 8 }, { iso: "SE", mask: "##-### ## ##", low: 9, high: 9, trunk: "0" },
+    { iso: "NO", mask: "### ## ###", low: 8, high: 8 }, { iso: "PL", mask: "### ### ###", low: 9, high: 9 },
+    { iso: "AU", mask: "### ### ###", low: 9, high: 9, trunk: "0" }, { iso: "NZ", mask: "## ### ####", low: 8, high: 10, trunk: "0" },
+    { iso: "IN", mask: "##### #####", low: 10, high: 10, trunk: "0" }, { iso: "JP", mask: "##-####-####", low: 10, high: 10, trunk: "0" },
+    { iso: "CN", mask: "### #### ####", low: 11, high: 11 }, { iso: "KR", mask: "##-####-####", low: 9, high: 10, trunk: "0" },
+    { iso: "BR", mask: "(##) #####-####", low: 10, high: 11 }, { iso: "MX", mask: "## #### ####", low: 10, high: 10 },
+    { iso: "ZA", mask: "## ### ####", low: 9, high: 9, trunk: "0" }, { iso: "SG", mask: "#### ####", low: 8, high: 8 },
+    { iso: "AE", mask: "## ### ####", low: 9, high: 9, trunk: "0" },
+]
+
+fn phone_sign_in_rule(iso: str) {
+    let hit = phone_sign_in_rules | filter((r) => r.iso == iso)
+    len(hit) > 0 ? hit[0] : { iso: iso, mask: "### ### ### ### ###", low: 6, high: 14 }
+}
+
+fn phone_sign_in_digits(text: str?) -> str = re.replace(text ?? "", "[^0-9]", "")
+
+// `digits` written over a mask, stopping at the last digit so the caret has nothing to
+// step over. Digits past the mask's end follow as they are.
+fn phone_sign_in_mask(digits: str, mask: str) -> str {
+    if digits == "" { return "" }
+    let ds = split(digits, "")
+    let out = ""
+    let i = 0
+    for c in split(mask, "") {
+        if i < len(ds) {
+            if c == "#" {
+                out = out + ds[i]
+                i = i + 1
+            } else {
+                out = out + c
+            }
+        }
+    }
+    out + join(slice(ds, i, len(ds)), "")
+}
+
+// The digits without the one dialled only at home.
+fn phone_sign_in_bare(digits: str, rule) -> str {
+    let trunk = get(rule, "trunk")
+    trunk != null && starts_with(digits, trunk) ? slice(digits, len(trunk)) : digits
+}
+
+// As much of `digits` as a number here can hold, written the country's way.
+fn phone_sign_in_format(digits: str, rule) -> str {
+    let trunk = get(rule, "trunk")
+    let has = trunk != null && starts_with(digits, trunk)
+    let bare = phone_sign_in_bare(digits, rule)
+    let kept = slice(bare, 0, min([len(bare), rule.high]))
+    `${has ? trunk : ""}${phone_sign_in_mask(kept, rule.mask)}`
+}
+
+// The place after the `n`th digit of `text`.
+fn phone_sign_in_after(text: str, n: int) -> int {
+    if n <= 0 { return 0 }
+    let seen = 0
+    let at = 0
+    for [i, c] in enumerate(split(text, "")) {
+        if seen < n {
+            at = i + 1
+            if contains("0123456789", c) { seen = seen + 1 }
+        }
+    }
+    at
+}
+
+// What an edit leaves: the box held `old`, now holds `now`, with `before` digits ahead of the
+// caret. Backspace over a separator takes the digit before it, or it would only come back.
+fn phone_sign_in_edit(old: str, now: str, before: int, rule) {
+    let was = phone_sign_in_digits(old)
+    let digits = phone_sign_in_digits(now)
+    let gone_mark = digits == was && len(now) < len(old) && before > 0
+    let kept = gone_mark ? `${slice(digits, 0, before - 1)}${slice(digits, before)}` : digits
+    let place = gone_mark ? before - 1 : before
+    let text = phone_sign_in_format(kept, rule)
+    { text: text, caret: phone_sign_in_after(text, place) }
+}
+
+// A whole number with its country's code, as autofill and pasting give it: { iso, digits },
+// or null when `text` is none, or its code is not one of `offered`. A code shared by
+// several stays on `iso` when that is one of them.
+fn phone_sign_in_whole(text: str, iso: str, offered: list) {
+    let t = trim(text)
+    let plus = starts_with(t, "+") || (starts_with(t, "00") && len(phone_sign_in_digits(t)) > 4)
+    if !plus { return null }
+    let all = phone_sign_in_digits(t)
+    let digits = starts_with(t, "+") ? all : slice(all, 2)
+    let fits = offered | filter((c) => starts_with(digits, c.code))
+    if len(fits) == 0 { return null }
+    let longest = max(fits | map((c) => len(c.code)))
+    let best = fits | filter((c) => len(c.code) == longest)
+    let same = best | filter((c) => c.iso == iso)
+    let pick = len(same) > 0 ? same[0] : best[0]
+    { iso: pick.iso, digits: slice(digits, len(pick.code)) }
+}
+
+// What is wrong with a number, or "".
+fn phone_sign_in_check(text: str, rule) -> str {
+    if starts_with(trim(text), "+") { return "code" }
+    let digits = phone_sign_in_bare(phone_sign_in_digits(text), rule)
+    if digits == "" { return "empty" }
+    if len(digits) < rule.low { return "short" }
+    if len(digits) > rule.high { return "long" }
+    ""
+}
+
+// A callback's answer as { ok, reason, retry, left, message }. Only true or ok: true is
+// success, so a mistake in a program cannot sign anyone in.
+fn phone_sign_in_answer(said) {
+    if is_err(said) || said == null { return { ok: false, reason: "network" } }
+    if said == true { return { ok: true, reason: "" } }
+    if type_of(said) != "map" { return { ok: false, reason: "unknown" } }
+    let ok = get(said, "ok") == true
+    { ok: ok, reason: ok ? "" : (get(said, "reason") ?? "unknown"), retry: get(said, "retry"), left: get(said, "left"), message: get(said, "message") }
+}
+
+// The seconds an answer says to wait, or `fallback`: it comes from outside, and a text in it
+// would stop the handler at the multiplication.
+fn phone_sign_in_seconds(retry, fallback: int) -> int = type_of(retry) == "int" && retry > 0 && retry < 86400 ? retry : fallback
+
+// 65 seconds as "1:05".
+fn phone_sign_in_clock(seconds: int) -> str {
+    let s = max([0, seconds])
+    let rest = s % 60
+    `${floor(s / 60)}:${rest < 10 ? "0" : ""}${rest}`
+}
+
+// The words for a failure.
+fn phone_sign_in_says(reason: str, retry = null, left = null, message = null) -> str {
+    if message != null && message != "" { return message }
+    let later = type_of(retry) == "int" && retry > 0 ? ` in ${phone_sign_in_clock(retry)}` : " later"
+    let tries = type_of(left) == "int" ? (left == 1 ? " 1 try left." : ` ${left} tries left.`) : ""
+    match reason {
+        "empty" => "Enter your phone number."
+        "short" => "That number is too short for this country."
+        "long" => "That number is too long for this country."
+        "code" => "Pick the country from the list, then enter the rest of the number."
+        "invalid" => "That number does not look right. Check it and try again."
+        "blocked" => "We cannot send a code to this number. Try another one."
+        "rate" => `Too many codes asked for. Try again${later}.`
+        "network" => "That did not go through. Check your connection and try again."
+        "timeout" => "That took too long. Check your connection and try again."
+        "offline" => "You are offline. Connect, then try again."
+        "wrong" => `That code is not right.${tries}`
+        "expired" => "That code has run out. Ask for a new one."
+        "locked" => `Too many wrong codes. Try again${later}, or use another number.`
+        "spent" => "That is all the codes for now. Try again later, or use another number."
+        "unset" => "This form has nothing to send codes with yet."
+        _ => "Something went wrong. Try again."
+    }
+}
+
+component PhoneSignIn(country: str? = null, countries: list? = null, length: int = 6, resend_after: int = 30, max_sends: int = 5,
+                      timeout: int = 20, note: str? = "We will text you a code. Your carrier's rates may apply.", help: str? = null,
+                      id: str = "phone-sign-in", on_send = null, on_verify = null, on_signed_in = null, class: str? = null) {
+    style global phone_sign_in_css
+    let offered = countries == null ? phone_input_countries
+        : countries | map((k) => (phone_input_countries | filter((c) => c.iso == upper(k)))[0]) | filter((c) => c != null)
+    state step = "number"
+    state iso = upper(country ?? "US")
+    state typed = ""
+    state code = ""
+    state problem = ""
+    state busy = false
+    state waited = 0
+    state offline = false
+    state sent_to = ""          // the number the code went to
+    state sends = 0             // codes sent to it
+    state until = 0             // when another may be asked for, in ms: a time, not a count, so a suspended app is right when it wakes
+    state stop_until = 0        // the same, for a "rate" or "locked" answer
+    state tick = 0              // the clock, while something waits on it
+    state code_box = null
+    let ask_no = 0              // which call an answer belongs to: one that came too late is dropped
+    let tried = ""              // the last code sent to on_verify, so a filled box is not sent twice
+    let listen_sms = null       // stops the browser waiting for the text message
+    let cur = (offered | filter((c) => c.iso == iso))[0] ?? (len(offered) > 0 ? offered[0] : { iso: "US", name: "United States", code: "1", flag: "" })
+    let rule = phone_sign_in_rule(cur.iso)
+    let phone = `+${cur.code}${phone_sign_in_bare(phone_sign_in_digits(typed), rule)}`
+    let resend_in = until > tick ? ceil((until - tick) / 1000) : 0
+    let stop_in = stop_until > tick ? ceil((stop_until - tick) / 1000) : 0
+    let spent = sends >= max_sends
+    if until > tick || stop_until > tick { every(500, () => { tick = js("Date.now") }) }
+    if busy {
+        every(1000, () => {
+            waited = waited + 1
+            if waited >= timeout {
+                busy = false
+                ask_no = ask_no + 1
+                problem = phone_sign_in_says("timeout")
+            }
+        })
+    }
+    let stop_sms = () => {
+        if listen_sms != null {
+            listen_sms.abort()
+            listen_sms = null
+        }
+    }
+    // Android's browser can hand over the text message's code. Not its WebView, nor iOS,
+    // where the keyboard offers it to the box instead (autocomplete="one-time-code").
+    let verify = () => {
+        let mine = code
+        if !busy && len(mine) == length && mine != tried && stop_in == 0 {
+            tried = mine
+            ask_no = ask_no + 1
+            let this_ask = ask_no
+            busy = true
+            waited = 0
+            problem = ""
+            let said = phone_sign_in_answer(js("Promise.resolve", on_verify != null ? on_verify(sent_to, mine) : null))
+            if this_ask == ask_no {
+                busy = false
+                if said.ok {
+                    stop_sms()
+                    step = "done"
+                    on_signed_in && on_signed_in(sent_to, said)
+                } else {
+                    code = ""
+                    tried = ""
+                    problem = phone_sign_in_says(said.reason, get(said, "retry"), get(said, "left"), get(said, "message"))
+                    if said.reason == "locked" || said.reason == "rate" {
+                        tick = js("Date.now")
+                        stop_until = tick + phone_sign_in_seconds(get(said, "retry"), 60) * 1000
+                    }
+                    if code_box != null { code_box.focus() }
+                }
+            }
+        }
+    }
+    let wait_sms = () => {
+        stop_sms()
+        if js("window").OTPCredential != null {
+            let stopper = js_new("AbortController")
+            listen_sms = stopper
+            js("navigator.credentials.get", { otp: { transport: ["sms"] }, signal: stopper.signal }).then((got = null) => {
+                if got != null && step == "code" {
+                    code = slice(phone_sign_in_digits(got.code), 0, length)
+                    verify()
+                }
+            }).catch((_e = null) => null)
+        }
+    }
+    let send = (fresh: bool) => {
+        let wrong = phone_sign_in_check(typed, rule)
+        if !busy {
+            if fresh && wrong != "" {
+                problem = phone_sign_in_says(wrong)
+            } else if offline {
+                problem = phone_sign_in_says("offline")
+            } else if on_send == null {
+                problem = phone_sign_in_says("unset")
+            } else if fresh && sent_to == phone && resend_in > 0 {
+                // The same number within the wait: the code already sent still stands.
+                problem = ""
+                step = "code"
+            } else if spent && sent_to == phone {
+                problem = phone_sign_in_says("spent")
+            } else {
+                let to = fresh ? phone : sent_to
+                ask_no = ask_no + 1
+                let this_ask = ask_no
+                busy = true
+                waited = 0
+                problem = ""
+                let said = phone_sign_in_answer(js("Promise.resolve", on_send(to)))
+                if this_ask == ask_no {
+                    busy = false
+                    if said.ok {
+                        sends = to == sent_to ? sends + 1 : 1
+                        sent_to = to
+                        tick = js("Date.now")
+                        until = tick + resend_after * 1000
+                        tried = ""
+                        code = ""
+                        step = "code"
+                        wait_sms()
+                    } else {
+                        problem = phone_sign_in_says(said.reason, get(said, "retry"), get(said, "left"), get(said, "message"))
+                        if said.reason == "rate" {
+                            tick = js("Date.now")
+                            stop_until = tick + phone_sign_in_seconds(get(said, "retry"), 60) * 1000
+                        }
+                    }
+                }
+            }
+        }
+    }
+    <section class={ui_cls(["ui-phone-sign-in", problem != "" && "ui-phone-sign-in-bad", class])} aria-label="Sign in with your phone"
+             @mount={(el) => {
+                 offline = !js("navigator.onLine")
+                 if country == null {
+                     let region = re.replace(js("navigator.language") ?? "", "^[A-Za-z]+[-_]?", "")
+                     if len(offered | filter((c) => c.iso == upper(region))) > 0 { iso = upper(region) }
+                 }
+                 tick = js("Date.now")
+                 let on = (_e) => { offline = false; problem = "" }
+                 let off = (_e) => { offline = true }
+                 // iOS slides the keyboard over the page, with no resize of the layout; Android
+                 // may do either. Only visualViewport tells both, and the form is moved clear of it.
+                 let vv = js("window").visualViewport
+                 let shift = (_e) => {
+                     let hidden = max([0, round(js("innerHeight") - vv.height - vv.offsetTop)])
+                     el.style.setProperty("--ui-phone-sign-in-keyboard", `${hidden}px`)
+                     let held = js("document").activeElement
+                     if hidden > 0 && held != null && el.contains(held) { held.scrollIntoView({ block: "center", behavior: "instant" }) }
+                 }
+                 js("window.addEventListener", "online", on)
+                 js("window.addEventListener", "offline", off)
+                 if vv != null { vv.addEventListener("resize", shift) }
+                 () => {
+                     stop_sms()
+                     js("window.removeEventListener", "online", on)
+                     js("window.removeEventListener", "offline", off)
+                     if vv != null { vv.removeEventListener("resize", shift) }
+                 }
+             }}>
+        {offline && <p.ui-phone-sign-in-off role="status">You are offline.</p>}
+        {step == "number" && <form.ui-phone-sign-in-form novalidate="true" @submit={(e) => { e.preventDefault(); send(true) }}>
+            <h2>Sign in with your phone</h2>
+            <div.ui-phone-sign-in-pair>
+                <div.ui-phone-sign-in-field>
+                    <label for={`${id}-country`}>Country</label>
+                    <select id={`${id}-country`} autocomplete="tel-country-code" value={iso}
+                            @change={(e) => {
+                                iso = e.value
+                                problem = ""
+                                typed = phone_sign_in_format(phone_sign_in_digits(typed), phone_sign_in_rule(e.value))
+                            }}>
+                        {for c in offered => <option key={c.iso} value={c.iso} selected={c.iso == iso}>{c.flag} {c.name} (+{c.code})</option>}
+                    </select>
+                </div>
+                <div.ui-phone-sign-in-field>
+                    <label for={`${id}-number`}>Phone number</label>
+                    <div.ui-phone-sign-in-num>
+                        <span aria-hidden="true">+{cur.code}</span>
+                        <input id={`${id}-number`} type="tel" inputmode="tel" autocomplete="tel" enterkeyhint="send" value={typed}
+                               aria-invalid={problem != "" ? "true" : null} aria-describedby={`${id}-said`}
+                               @input={(e) => {
+                                   let raw = e.value
+                                   let caret = e.target.selectionStart
+                                   problem = ""
+                                   let whole = phone_sign_in_whole(raw, iso, offered)
+                                   if whole != null {
+                                       iso = whole.iso
+                                       let text = phone_sign_in_format(whole.digits, phone_sign_in_rule(whole.iso))
+                                       typed = text
+                                       e.target.value = text
+                                   } else if starts_with(trim(raw), "+") {
+                                       typed = raw
+                                   } else {
+                                       // By the browser's own string: selectionStart counts UTF-16 units, and an
+                                       // emoji pasted ahead of the caret is two of those and one character here.
+                                       let ahead = phone_sign_in_digits(js_new("String", raw).slice(0, caret))
+                                       let edit = phone_sign_in_edit(typed, raw, len(ahead), rule)
+                                       typed = edit.text
+                                       e.target.value = edit.text
+                                       e.target.setSelectionRange(edit.caret, edit.caret)
+                                   }
+                               }}/>
+                    </div>
+                </div>
+            </div>
+            <p.ui-phone-sign-in-error id={`${id}-said`} role="alert">{problem}</p>
+            {stop_in > 0 && <p.ui-phone-sign-in-wait>You can try again in {phone_sign_in_clock(stop_in)}.</p>}
+            <Button size="lg" full={true} type="submit" loading={busy} disabled={stop_in > 0}>Send code</Button>
+            {note != null && <p.ui-phone-sign-in-note>{note}</p>}
+        </form>}
+        {step == "code" && <form.ui-phone-sign-in-form novalidate="true" @submit={(e) => { e.preventDefault(); verify() }}>
+            <h2>Enter the code</h2>
+            <p.ui-phone-sign-in-lead>We sent {length} digits to {sent_to}.</p>
+            <div.ui-phone-sign-in-field>
+                <label for={`${id}-code`}>Code from the text message</label>
+                <input.ui-phone-sign-in-code id={`${id}-code`} type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code"
+                       enterkeyhint="done" value={code} disabled={stop_in > 0} aria-invalid={problem != "" ? "true" : null} aria-describedby={`${id}-said`}
+                       @mount={(el) => { code_box = el; el.focus() }}
+                       @input={(e) => {
+                           let clean = slice(phone_sign_in_digits(e.value), 0, length)
+                           problem = ""
+                           code = clean
+                           e.target.value = clean
+                           if len(clean) == length { verify() }
+                       }}/>
+            </div>
+            <p.ui-phone-sign-in-error id={`${id}-said`} role="alert">{problem}</p>
+            {stop_in > 0 && <p.ui-phone-sign-in-wait>You can try again in {phone_sign_in_clock(stop_in)}.</p>}
+            <Button size="lg" full={true} type="submit" loading={busy} disabled={len(code) != length || stop_in > 0}>Verify</Button>
+            <div.ui-phone-sign-in-more>
+                <Button size="lg" variant="ghost" disabled={busy || resend_in > 0 || spent || stop_in > 0} on_click={() => { send(false) }}>
+                    {spent ? "No more codes" : resend_in > 0 ? `Send again in ${phone_sign_in_clock(resend_in)}` : "Send a new code"}
+                </Button>
+                <Button size="lg" variant="ghost" tone="neutral" on_click={() => {
+                    ask_no = ask_no + 1
+                    busy = false
+                    problem = ""
+                    code = ""
+                    tried = ""
+                    stop_sms()
+                    step = "number"
+                }}>Change number</Button>
+            </div>
+            {spent && <p.ui-phone-sign-in-note>
+                {phone_sign_in_says("spent")}{help != null && [" ", <a href={help}>Get help</a>]}
+            </p>}
+        </form>}
+        {step == "done" && <div.ui-phone-sign-in-done role="status">
+            <span.ui-phone-sign-in-tick aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>
+            </span>
+            <h2>You are signed in</h2>
+            <p.ui-phone-sign-in-lead>{sent_to}</p>
+        </div>}
+    </section>
+}

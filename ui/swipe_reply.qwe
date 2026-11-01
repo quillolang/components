@@ -1,0 +1,268 @@
+// SwipeReply: a message you can drag sideways to quote it in your reply, as in a
+// phone's chat app. Past the threshold a tap is felt and the arrow fills; let go and
+// the message springs back and on_reply is called. Short of it, it only springs back.
+// The ⋯ button beside the message opens a menu with Reply on it, so nobody needs the
+// gesture: keys and screen readers use the menu, and a right click opens it too.
+//
+//   <SwipeReply from="Ana" text={m.text} message_id={m.id} on_reply={(q) => { quote = q }}>
+//       <MessageBubble name="Ana">{m.text}</MessageBubble>
+//   </SwipeReply>
+//   <SwipeReply mine={true} text={m.text} actions={[{ id: "copy", label: "Copy" }]}
+//               on_reply={quote_it} on_action={(id, q) => { act(id, q) }}><MessageBubble mine={true}>{m.text}</MessageBubble></SwipeReply>
+//
+// from: who wrote it, said in the menu's name and handed on in the quote. text: the
+// message, which the quote cuts to 120 characters. message_id: yours, handed back.
+// mine: yours, so it drags to the left (right for others'; both swap in a right-to-left
+// page). threshold: pixels to drag (64). A quick flick counts from a third of that.
+// actions: more rows for the menu, a list of { id, label }. reply_label ("Reply").
+// disabled: no drag and no menu. children: the message.
+// id is `message_id` here, as a component's own `id` is no use on a row. class: for the outer element.
+// on_reply(quote): given { id, from, text }, once. on_action(id, quote): a row of
+// `actions` was picked. Both work inside one of your components.
+//
+// The tap comes from quilloNative.haptic in the phone apps, navigator.vibrate on Android's
+// browsers; on iOS's browsers there is neither, and the arrow filling is the only sign.
+// The message moves with touch-action: pan-y, so a list around it scrolls as usual.
+
+import ui/theme.qwe use ui_cls
+
+let swipe_reply_css = css`
+.ui-swipe-reply { position: relative; display: flex; align-items: center; gap: 2px; min-width: 0; }
+.ui-swipe-reply-mine { flex-direction: row-reverse; }
+.ui-swipe-reply-cue {
+  position: absolute; top: 50%; left: 6px; display: grid; place-items: center; width: 32px; height: 32px; margin-top: -16px;
+  border-radius: 50%; background: var(--ui-subtle); color: var(--ui-muted); opacity: 0; transform: scale(.6); pointer-events: none;
+}
+.ui-swipe-reply-mine .ui-swipe-reply-cue { left: auto; right: 6px; }
+:dir(rtl).ui-swipe-reply .ui-swipe-reply-cue { left: auto; right: 6px; }
+:dir(rtl).ui-swipe-reply-mine .ui-swipe-reply-cue { left: 6px; right: auto; }
+.ui-swipe-reply-cue svg { width: 18px; height: 18px; }
+.ui-swipe-reply-cue.ui-swipe-reply-ready { background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-swipe-reply-body {
+  position: relative; flex: 1; min-width: 0; touch-action: pan-y; background: transparent;
+  transition: transform .28s cubic-bezier(.2, 1.3, .4, 1);
+}
+.ui-swipe-reply-body.ui-swipe-reply-on { transition: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-swipe-reply-more {
+  flex: none; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%;
+  background: transparent; color: var(--ui-muted); cursor: pointer;
+}
+.ui-swipe-reply-more svg { width: 20px; height: 20px; }
+.ui-swipe-reply-more:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-swipe-reply-more:hover { background: var(--ui-subtle); color: var(--ui-fg); } }
+.ui-swipe-reply-menu {
+  position: fixed; inset: auto; min-width: 180px; max-width: calc(100vw - 16px); margin: 0; padding: 6px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 16px/1.3 var(--ui-font);
+}
+.ui-swipe-reply-item {
+  display: block; width: 100%; min-height: 44px; padding: 10px 12px; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.ui-swipe-reply-item:focus-visible { outline: none; background: var(--ui-accent-soft); }
+@media (hover: hover) { .ui-swipe-reply-item:hover { background: var(--ui-subtle); } }
+@media (prefers-reduced-motion: reduce) { .ui-swipe-reply-body { transition: none; } }
+`
+
+// Which way the finger means to go, once it has gone `slop` pixels: "x", "y", or null
+// while it is still too soon to say.
+fn swipe_reply_axis(dx: num, dy: num, slop: num) {
+    if abs(dx) < slop && abs(dy) < slop { return null }
+    abs(dx) > abs(dy) ? "x" : "y"
+}
+
+// +1 when a reply is dragged to the right, -1 to the left.
+fn swipe_reply_sign(mine: bool, rtl: bool) -> int = mine != rtl ? -1 : 1
+
+// How far the message moves for a finger that went `dist` the right way: all of it up
+// to the threshold, then a third, so that it feels held, and never past 1.6 thresholds.
+fn swipe_reply_offset(dist: num, threshold: num) -> num {
+    if dist <= 0 { return 0 }
+    if dist <= threshold { return dist }
+    min([threshold + (dist - threshold) / 3, threshold * 1.6])
+}
+
+// Whether letting go here replies. Speed is in pixels a millisecond: a flick counts from
+// a third of the threshold, so that a slow drag of the same length does not.
+fn swipe_reply_commits(dist: num, speed: num, threshold: num) -> bool =
+    dist >= threshold || (speed >= 0.4 && dist >= threshold / 3)
+
+// Speed from the last tenth of a second or so, not from the last two events, which can be
+// a moment apart or several together. `m` holds two marks, { p0, t0, p1, t1 }, the older
+// being what speed is measured from, and where it began: { from, since }.
+fn swipe_reply_marks(pos: num, at: num) = { from: pos, since: at, p0: pos, t0: at, p1: pos, t1: at }
+fn swipe_reply_track(m, pos: num, at: num) =
+    at - m.t1 >= 40 ? { ...m, p0: m.p1, t0: m.t1, p1: pos, t1: at } : m
+
+// Pixels a millisecond: since the older mark, or over the whole gesture if that is quicker,
+// as a phone that is busy hands a flick over in few events.
+fn swipe_reply_speed(m, pos: num, at: num) -> num {
+    let recent = (pos - m.p0) / max([at - m.t0, 1])
+    let whole = (pos - m.from) / max([at - m.since, 1])
+    abs(whole) > abs(recent) ? whole : recent
+}
+
+// A quote is for a line above the box: short, and on one line.
+fn swipe_reply_excerpt(text, limit: int) -> str {
+    let flat = trim(re.replace(str(text ?? ""), "\\s+", " "))
+    len(flat) > limit ? trim(slice(flat, 0, limit)) + "…" : flat
+}
+
+// Which of `rows` is `el`: page elements cannot be told apart with ==, so index_of cannot.
+fn swipe_reply_place(rows: list, el) -> int {
+    let hits = range(len(rows)) | filter((i) => rows[i].isSameNode(el))
+    len(hits) > 0 ? hits[0] : 0
+}
+
+// A tap felt: the app's, else Android's, else nothing, which is why the arrow changes too.
+fn swipe_reply_haptic(kind: str, ms: int) {
+    let felt = js("quilloNative.haptic", kind)
+    if is_err(felt) { js("navigator.vibrate", ms) }
+    // The app answers later, and in a plain function nothing waits for it: a refusal needs a home.
+    if type_of(felt) == "promise" { felt.then((_v = null) => null, (_e = null) => null) }
+}
+
+component SwipeReply(from: str = "", text: str = "", message_id = null, mine: bool = false, threshold: int = 64,
+                     actions: list = [], reply_label: str = "Reply", disabled: bool = false, on_reply = null,
+                     on_action = null, class: str? = null, children) {
+    style global swipe_reply_css
+    state host = null
+    state body = null
+    state cue = null
+    state more = null
+    state menu = null
+    state menu_open = false
+    state win = null
+    state grip = null        // the finger: { id, x, y, sign, axis, at, last, speed, over }
+    let reach = max([threshold, 24])
+    let quote = () => { { id: message_id, from: from, text: swipe_reply_excerpt(text, 120) } }
+    let paint = (shown: num) => {
+        body.style.transform = shown == 0 ? "" : `translateX(${shown}px)`
+        let part = min([shown * grip.sign / reach, 1])
+        cue.style.opacity = str(part)
+        cue.style.transform = `scale(${0.6 + 0.4 * part})`
+    }
+    let settle = () => {
+        // Marked on these two, whose class is fixed: the outer one's is written again whenever a prop it reads changes.
+        body.classList.remove("ui-swipe-reply-on")
+        cue.classList.remove("ui-swipe-reply-ready")
+        body.style.transform = ""
+        cue.style.opacity = ""
+        cue.style.transform = ""
+    }
+    let place = (x: num, y: num) => {
+        menu.style.left = `${max([8, min([x, win.innerWidth - menu.offsetWidth - 8])])}px`
+        menu.style.top = `${max([8, min([y, win.innerHeight - menu.offsetHeight - 8])])}px`
+    }
+    let open_menu = (x, y) => {
+        if !disabled && !menu_open {
+            menu.showPopover()
+            let r = more.getBoundingClientRect()
+            place(x ?? r.left, y ?? r.bottom + 4)
+            menu.querySelector("button").focus()
+        }
+    }
+    let close_menu = () => {
+        if menu_open {
+            menu.hidePopover()
+            more.focus()
+        }
+    }
+    let pick = (id) => {
+        close_menu()
+        if id == null { on_reply && on_reply(quote()) } else { on_action && on_action(id, quote()) }
+    }
+    <div class={ui_cls(["ui-swipe-reply", mine && "ui-swipe-reply-mine", class])} role="group"
+         aria-label={from != "" ? `Message from ${from}` : "Message"}
+         @mount={(el) => {
+             win = js("window")
+             host = el
+         }}
+         @contextmenu={(e) => {
+             if !disabled && e.pointerType != "touch" {
+                 e.preventDefault()
+                 open_menu(e.clientX, e.clientY)
+             }
+         }}>
+        <span.ui-swipe-reply-cue aria-hidden="true" @mount={(el) => { cue = el }}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 7 4 12l6 5M4 12h11a5 5 0 0 1 5 5v1"/></svg>
+        </span>
+        <div.ui-swipe-reply-body
+             @mount={(el) => { body = el }}
+             @pointerdown={(e) => {
+                 if !disabled && e.button == 0 && e.isPrimary {
+                     let rtl = win.getComputedStyle(host).direction == "rtl"
+                     grip = { id: e.pointerId, x: e.clientX, y: e.clientY, sign: swipe_reply_sign(mine, rtl), axis: null, over: false,
+                              marks: swipe_reply_marks(e.clientX, e.timeStamp) }
+                 }
+             }}
+             @pointermove={(e) => {
+                 if grip != null && e.pointerId == grip.id {
+                     let dx = e.clientX - grip.x
+                     let axis = grip.axis ?? swipe_reply_axis(dx, e.clientY - grip.y, 10)
+                     if axis == "y" {
+                         // The list's to scroll: the system takes the finger from here on.
+                         grip = null
+                     } else if axis == "x" {
+                         if grip.axis == null {
+                             // Capture only now, so that a tap on a link in the message is still that link's.
+                             body.setPointerCapture(e.pointerId)
+                             body.classList.add("ui-swipe-reply-on")
+                         }
+                         let dist = dx * grip.sign
+                         let over = dist >= reach
+                         if over && !grip.over { swipe_reply_haptic("light", 12) }
+                         cue.classList.toggle("ui-swipe-reply-ready", over)
+                         grip = { ...grip, axis: "x", over, marks: swipe_reply_track(grip.marks, e.clientX, e.timeStamp) }
+                         paint(swipe_reply_offset(dist, reach) * grip.sign)
+                     }
+                 }
+             }}
+             @pointerup={(e) => {
+                 if grip != null && e.pointerId == grip.id {
+                     let moved = grip.axis == "x"
+                     let dist = (e.clientX - grip.x) * grip.sign
+                     let speed = swipe_reply_speed(grip.marks, e.clientX, e.timeStamp) * grip.sign
+                     grip = null
+                     if moved {
+                         settle()
+                         if swipe_reply_commits(dist, speed, reach) {
+                             if on_reply != null { on_reply(quote()) }
+                         }
+                     }
+                 }
+             }}
+             @pointercancel={(e) => {
+                 if grip != null && e.pointerId == grip.id {
+                     grip = null
+                     settle()
+                 }
+             }}>{children}</div>
+        {!disabled && <button.ui-swipe-reply-more type="button" aria-haspopup="menu" aria-expanded={menu_open ? "true" : "false"}
+                              aria-label={from != "" ? `Actions for the message from ${from}` : "Actions for this message"}
+                              @mount={(el) => { more = el }} @click={() => { if menu_open { close_menu() } else { open_menu(null, null) } }}>
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
+        </button>}
+        <div.ui-swipe-reply-menu popover="auto" role="menu" aria-label="Message actions"
+             @mount={(el) => { menu = el }}
+             @toggle={(e) => { menu_open = e.newState == "open" }}
+             @keydown={(e) => {
+                 // No js() before this: it would wait, and the browser would have moved the page.
+                 let moves = e.key == "ArrowDown" || e.key == "ArrowUp" || e.key == "Home" || e.key == "End"
+                 if moves { e.preventDefault() }
+                 let rows = js("Array.from", menu.querySelectorAll("button"))
+                 let on = win.document.activeElement
+                 let at = swipe_reply_place(rows, on)
+                 let to = match e.key {
+                     "ArrowDown" => (at + 1) % len(rows)
+                     "ArrowUp" => (at + len(rows) - 1) % len(rows)
+                     "Home" => 0
+                     "End" => len(rows) - 1
+                     _ => -1
+                 }
+                 if to >= 0 { rows[to].focus() }
+             }}>
+            <button.ui-swipe-reply-item type="button" role="menuitem" @click={() => { pick(null) }}>{reply_label}</button>
+            {for a in actions => <button.ui-swipe-reply-item key={a.id} type="button" role="menuitem" @click={() => { pick(a.id) }}>{a.label}</button>}
+        </div>
+    </div>
+}

@@ -1,0 +1,281 @@
+// VoiceMessage: a voice message in a chat: a play button, its waveform to scrub with a
+// finger, the time, and a speed button. The waveform comes from the sound itself, or
+// from `peaks`. One not yet heard shows a dot until most of it has been; and only
+// one plays at a time, on the whole page: starting any sound or video stops this one.
+//
+//   <VoiceMessage src="/voice/812.m4a" seconds={14} from="Ana" time="09:41" played={m.heard} on_played={() => { mark(m.id) }}/>
+//   <VoiceMessage mine={true} src={clip.url} seconds={clip.seconds} peaks={clip.peaks}/>
+//
+// src: the sound. seconds: how long it is, shown before it has loaded, and needed for what
+// MediaRecorder makes, which does not say. peaks: its loudness, a list of numbers from 0
+// to 1 of any length: left out, the sound is fetched and measured in the page, which needs
+// a same-origin (or CORS-open) src. bars: how many bars are drawn (36).
+// played: it has been heard already. mine: yours, in the accent colour. from, time: who
+// and when, for the line under it and the name screen readers hear. speed: 1, 1.5 or 2
+// to start at. on_played(): once, as more than half has been heard. on_speed(rate): the
+// speed was changed. Both work inside one of your components. id, class: for the outer element.
+//
+// The waveform is a slider: a finger dragged along it seeks, leaving up and down to the
+// page; arrow keys move five seconds; Home and End go to the ends; Space plays and pauses.
+
+import ui/theme.qwe use ui_cls
+
+let voice_message_css = css`
+.ui-voice-message {
+  position: relative; display: inline-grid; grid-template-columns: 44px 1fr 48px; align-items: center; gap: 2px 6px; box-sizing: border-box; width: min(340px, 100%); padding: 6px 8px;
+  border-radius: 18px; background: var(--ui-subtle); color: var(--ui-fg); font: 12px/16px var(--ui-font);
+}
+.ui-voice-message-mine { background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-voice-message-play, .ui-voice-message-speed {
+  display: grid; place-items: center; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; font: 600 13px var(--ui-font);
+  cursor: pointer; touch-action: manipulation; font-variant-numeric: tabular-nums;
+}
+.ui-voice-message-play { width: 44px; }
+.ui-voice-message-play svg { width: 26px; height: 26px; }
+.ui-voice-message-speed { width: 48px; border-radius: 22px; }
+.ui-voice-message-play:focus-visible, .ui-voice-message-speed:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-voice-message-play:disabled { opacity: .5; cursor: default; }
+.ui-voice-message-wave {
+  position: relative; display: block; height: 44px; min-width: 0; touch-action: pan-y; cursor: pointer; outline: none; border-radius: 8px; -webkit-touch-callout: none;
+  user-select: none; -webkit-user-select: none;
+}
+.ui-voice-message-wave:focus-visible { box-shadow: var(--ui-focus); }
+.ui-voice-message-bars { position: absolute; inset: 0; display: flex; align-items: center; gap: 2px; color: inherit; opacity: .35; }
+.ui-voice-message-bars i { flex: 1; min-width: 1px; max-width: 5px; border-radius: 2px; background: currentColor; }
+.ui-voice-message-over { opacity: 1; color: var(--ui-accent); clip-path: inset(0 calc(100% - var(--ui-voice-message-at, 0%)) 0 0); }
+:dir(rtl).ui-voice-message-over { clip-path: inset(0 0 0 calc(100% - var(--ui-voice-message-at, 0%))); }
+.ui-voice-message-mine .ui-voice-message-over { color: inherit; }
+.ui-voice-message-foot { grid-column: 2 / 4; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0 2px; opacity: .85; font-variant-numeric: tabular-nums; }
+.ui-voice-message-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ui-accent); }
+.ui-voice-message-mine .ui-voice-message-dot { background: currentColor; }
+.ui-voice-message-who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-voice-message-when { margin-left: auto; }
+.ui-voice-message-trouble { grid-column: 1 / 4; margin: 0; padding: 0 4px; color: var(--ui-danger); }
+.ui-voice-message-mine .ui-voice-message-trouble { color: inherit; }
+.ui-voice-message-trouble:empty { display: none; }
+`
+
+// 7 seconds is 0:07.
+fn voice_message_clock(seconds: num) -> str {
+    let s = max([floor(seconds), 0])
+    let rest = s % 60
+    `${floor(s / 60)}:${rest < 10 ? "0" : ""}${rest}`
+}
+
+// How long it is: what the browser says, or what we were told. A recording in the
+// browser reports Infinity, and one not yet loaded NaN.
+fn voice_message_length(reported, told: num) -> num {
+    let usable = type_of(reported) != "null" && reported == reported && reported > 0 && reported < 86400
+    usable ? reported : told
+}
+
+// The share of the way along for a finger at x: 0 to 1, reversed in a right-to-left page.
+fn voice_message_fraction(x: num, left: num, width: num, rtl: bool) -> num {
+    if width <= 0 { return 0 }
+    let part = max([0, min([(x - left) / width, 1])])
+    rtl ? 1 - part : part
+}
+
+// The next speed along.
+fn voice_message_next_speed(rate: num) -> num = rate == 1 ? 1.5 : (rate == 1.5 ? 2 : 1)
+
+// The loudest of samples[from..to], looking at every stride-th one.
+fn voice_message_loudest(samples: list, from: int, to: int, stride: int) -> num {
+    let top = 0
+    let j = from
+    while j < to {
+        let v = abs(samples[j])
+        if v > top { top = v }
+        j = j + stride
+    }
+    top
+}
+
+// Bars of loudness, from 0 to 1 with the loudest at 1, from a sound's samples.
+fn voice_message_peaks(samples: list, n: int) {
+    let total = len(samples)
+    if total == 0 || n < 1 { return [] }
+    let raw = for i in range(n) => {
+        let from = floor(i * total / n)
+        let to = max([from + 1, floor((i + 1) * total / n)])
+        // A bar need not look at each sample of a long message.
+        voice_message_loudest(samples, from, to, max([floor((to - from) / 200), 1]))
+    }
+    let top = max(raw)
+    if top <= 0 { return raw | map((_v) => 0) }
+    raw | map((v) => round(v / top, 2))
+}
+
+// `peaks` of any length as n bars from 0 to 1. What is not a number counts as nothing.
+fn voice_message_bars(peaks, n: int) {
+    let given = (type_of(peaks) == "list" ? peaks : []) | map((p) => type_of(p) == "int" || type_of(p) == "float" ? max([0, min([p, 1])]) : 0)
+    let total = len(given)
+    if total == 0 { return for _i in range(n) => 0.3 }
+    for i in range(n) => given[floor(i * total / n)]
+}
+
+component VoiceMessage(src: str? = null, seconds: num = 0, peaks: list = [], bars: int = 36, played: bool = false, mine: bool = false,
+                       from: str? = null, time: str? = null, speed: num = 1, on_played = null, on_speed = null, id: str? = null, class: str? = null) {
+    style global voice_message_css
+    state win = null
+    state audio = null
+    state wave = null
+    state playing = false
+    state heard = played
+    state rate = speed
+    state length = seconds
+    state at = 0              // whole seconds in, for what is read out
+    state trouble = ""
+    state found = []          // what measuring the sound gave
+    state grip = null         // { id, x, y, axis }
+    let shape = voice_message_bars(len(peaks) > 0 ? peaks : found, bars)
+    let hear = () => {
+        if !heard {
+            heard = true
+            on_played && on_played()
+        }
+    }
+    let show = (t: num) => {
+        let part = length > 0 ? min([t / length, 1]) : 0
+        wave.style.setProperty("--ui-voice-message-at", `${round(part * 1000) / 10}%`)
+        at = floor(t)
+    }
+    let seek = (t: num) => {
+        let to = max([0, min([t, length])])
+        audio.currentTime = to
+        show(to)
+    }
+    if playing { every(100, () => {
+        if grip == null || grip.axis == null {
+            show(audio.currentTime)
+            if length > 0 && audio.currentTime / length > 0.5 { hear() }
+        }
+    }) }
+    let toggle = () => {
+        if playing { audio.pause() } else {
+            trouble = ""
+            // A method's promise is not waited for as js()'s is, so a refusal needs its own handler.
+            audio.play().then((_v = null) => null, (_e = null) => { trouble = "This message cannot be played here." })
+        }
+    }
+    <div class={ui_cls(["ui-voice-message", mine && "ui-voice-message-mine", class])} id={id} role="group"
+         aria-label={`${from != null ? `Voice message from ${from}` : "Voice message"}, ${voice_message_clock(length)}`}
+         @mount={(_el) => {
+             win = js("window")
+             let d = win.document
+             // Page elements cannot be told apart with !=.
+             let others = (e) => {
+                 if !e.target.isSameNode(audio) && !audio.paused { audio.pause() }
+             }
+             // Media events do not bubble, but they do pass through the document on the way down.
+             d.addEventListener("play", others, true)
+             if len(peaks) == 0 && src != null {
+                 // Some engines refuse so low a rate by throwing, which would stop this function.
+                 let ear = js("Promise.resolve", js_new("Promise", (done) => { done(js_new("OfflineAudioContext", 1, 1, 3000)) }))
+                 if !is_err(ear) {
+                     js("fetch", src).then((r) => r.arrayBuffer()).then((b) => ear.decodeAudioData(b)).then(
+                         (sound) => { found = voice_message_peaks(js("Array.from", sound.getChannelData(0)), bars) },
+                         (_e = null) => null)
+                 }
+             }
+             () => { d.removeEventListener("play", others, true) }
+         }}>
+        <audio preload="metadata" src={src}
+               @mount={(el) => {
+                   audio = el
+                   // What the server's element did before this component started is not told again.
+                   if el.readyState >= 1 { length = voice_message_length(el.duration, seconds) }
+                   if el.error != null { trouble = "This message could not be loaded." }
+               }}
+               @loadedmetadata={() => { length = voice_message_length(audio.duration, seconds) }}
+               @durationchange={() => { length = voice_message_length(audio.duration, seconds) }}
+               @play={() => { playing = true }}
+               @pause={() => {
+                   playing = false
+                   show(audio.currentTime)
+               }}
+               @ended={() => {
+                   playing = false
+                   hear()
+                   audio.currentTime = 0
+                   show(0)
+               }}
+               @error={() => { trouble = "This message could not be loaded." }}></audio>
+        <button.ui-voice-message-play type="button" aria-label={playing ? "Pause" : "Play"} disabled={src == null} @click={toggle}>
+            {playing
+                ? <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+                : <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l11-6.5a1 1 0 0 0 0-1.72l-11-6.5A1 1 0 0 0 8 5.5z"/></svg>}
+        </button>
+        <div.ui-voice-message-wave role="slider" tabindex="0" aria-label="Position in the message" aria-valuemin="0" aria-valuemax={round(length)}
+             aria-valuenow={at} aria-valuetext={`${voice_message_clock(at)} of ${voice_message_clock(length)}`}
+             @mount={(el) => { wave = el }}
+             @pointerdown={(e) => { if e.button == 0 && e.isPrimary { grip = { id: e.pointerId, x: e.clientX, y: e.clientY, axis: null } } }}
+             @pointermove={(e) => {
+                 if grip != null && e.pointerId == grip.id {
+                     let dx = abs(e.clientX - grip.x)
+                     let dy = abs(e.clientY - grip.y)
+                     if grip.axis == null && (dx >= 8 || dy >= 8) {
+                         if dx > dy {
+                             wave.setPointerCapture(e.pointerId)
+                             grip = { ...grip, axis: "x" }
+                         } else {
+                             // The list's to scroll.
+                             grip = null
+                         }
+                     }
+                     if grip != null && grip.axis == "x" {
+                         let r = wave.getBoundingClientRect()
+                         let rtl = win.getComputedStyle(wave).direction == "rtl"
+                         show(voice_message_fraction(e.clientX, r.left, r.width, rtl) * length)
+                     }
+                 }
+             }}
+             @pointerup={(e) => {
+                 if grip != null && e.pointerId == grip.id {
+                     let r = wave.getBoundingClientRect()
+                     let rtl = win.getComputedStyle(wave).direction == "rtl"
+                     grip = null
+                     seek(voice_message_fraction(e.clientX, r.left, r.width, rtl) * length)
+                 }
+             }}
+             @pointercancel={() => {
+                 grip = null
+                 show(audio.currentTime)
+             }}
+             @keydown={(e) => {
+                 let t = audio.currentTime
+                 let to = match e.key {
+                     "ArrowRight" => t + 5
+                     "ArrowUp" => t + 5
+                     "ArrowLeft" => t - 5
+                     "ArrowDown" => t - 5
+                     "Home" => 0
+                     "End" => length
+                     _ => null
+                 }
+                 if to != null {
+                     e.preventDefault()
+                     seek(to)
+                 } else if e.key == " " || e.key == "Enter" {
+                     e.preventDefault()
+                     toggle()
+                 }
+             }}>
+            <span.ui-voice-message-bars aria-hidden="true">{for h in shape => <i style={`height: ${max([round(h * 100), 8])}%`}></i>}</span>
+            <span.ui-voice-message-bars.ui-voice-message-over aria-hidden="true">{for h in shape => <i style={`height: ${max([round(h * 100), 8])}%`}></i>}</span>
+        </div>
+        <button.ui-voice-message-speed type="button" aria-label={`Speed, now ${rate} times`}
+                @click={() => {
+                    rate = voice_message_next_speed(rate)
+                    audio.playbackRate = rate
+                    on_speed && on_speed(rate)
+                }}>{rate}×</button>
+        <span.ui-voice-message-foot>
+            {!heard && <span.ui-voice-message-dot role="img" aria-label="Not heard yet"></span>}
+            <span>{voice_message_clock(playing || at > 0 ? at : length)}</span>
+            {from != null && <span.ui-voice-message-who>{from}</span>}
+            {time != null && <span.ui-voice-message-when>{time}</span>}
+        </span>
+        <p.ui-voice-message-trouble role="status">{trouble}</p>
+    </div>
+}

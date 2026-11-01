@@ -1,0 +1,224 @@
+// BreakEvenCalc: how many units cover the costs. From fixed costs, the variable cost of a
+// unit and the price it works out the margin on a unit, the break-even in whole units
+// (rounded up, since 312.5 units do not cover the costs) and the revenue there. At a
+// planned volume it gives the profit and the margin of safety, how far sales could fall
+// before a loss, and with a target profit the lowest price, up to the cent, that reaches it
+// at that volume. A small chart draws revenue against total cost. A price at or below the
+// variable cost never breaks even, and it says so rather than giving a negative answer.
+//
+//   <BreakEvenCalc fixed="12000" variable="7.50" price="12.50" volume={3000} target="10000"/>
+//   <BreakEvenCalc fixed={rent} variable="3" price="6.25" currency="EUR" on_change={(b) => { units = b.units }}/>
+//
+// fixed, variable, price, volume, target: where the fields start (numbers, decimals or
+// numeric text; empty counts as 0). volume is in whole units. Amounts are in the currency;
+// fixed and target go up to 10 billion, variable and price to a million, volume to 10 million.
+// unit: the word for what is sold ("unit"). currency: ISO code ("USD"; one Quillo does not know
+// falls back to it). locale: how to write amounts (the program's). title: the heading ("Break-even").
+// id: a prefix for its ids ("break-even-calc"), unique on the page. name: a prefix for the
+// names of its fields ("break_even": break_even_fixed, break_even_variable, break_even_price,
+// break_even_volume, break_even_target). on_change(b): inside one of your components, after each
+// change, given { margin, units, revenue, profit, safety_units, safety_percent, target_price } when
+// the figures are good: decimals but for units and safety_units; units is null when it never breaks
+// even, target_price null without a volume. class: more classes for its outer element.
+//
+// break_even_calc_figures(fixed, variable, price, volume, target, code) is the arithmetic, for
+// a program's own use.
+
+import ui/theme.qwe use ui_cls
+
+let break_even_calc_css = css`
+.ui-break-even { container-type: inline-size; display: grid; gap: 16px; min-width: 0; max-width: 640px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-break-even .ui-break-even-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-break-even-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px 14px; }
+.ui-break-even-field { display: grid; gap: 5px; min-width: 0; align-content: start; }
+.ui-break-even-field label { font-size: 13px; font-weight: 500; }
+.ui-break-even-field input { box-sizing: border-box; width: 100%; min-width: 0; height: 36px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-break-even-field input:hover { border-color: var(--ui-strong); }
+.ui-break-even-field input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-break-even-field input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-break-even-errors { margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-break-even-out { display: grid; gap: 12px; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-break-even-never { margin: 0; padding: 8px 10px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-weight: 600; }
+.ui-break-even-sums { display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; margin: 0; }
+.ui-break-even-sums dt { color: var(--ui-muted); }
+.ui-break-even-sums dd { margin: 0; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-break-even-main { color: var(--ui-fg) !important; font-size: 16px; font-weight: 700; }
+.ui-break-even-note { margin: 0; font-size: 13px; }
+.ui-break-even-chart { display: block; width: 100%; height: auto; max-height: 220px; }
+.ui-break-even-axis { stroke: var(--ui-strong); stroke-width: 1; }
+.ui-break-even-revenue { fill: none; stroke: var(--ui-accent); stroke-width: 2; }
+.ui-break-even-cost { fill: none; stroke: var(--ui-warning); stroke-width: 2; }
+.ui-break-even-fixed { fill: none; stroke: var(--ui-muted); stroke-width: 1; stroke-dasharray: 4 3; }
+.ui-break-even-dot { fill: var(--ui-fg); }
+.ui-break-even-plan { stroke: var(--ui-muted); stroke-width: 1; stroke-dasharray: 2 3; }
+.ui-break-even-key { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 12px; }
+.ui-break-even-key li { display: inline-flex; align-items: center; gap: 6px; }
+.ui-break-even-key i { width: 14px; height: 0; border-top: 2px solid var(--ui-accent); }
+.ui-break-even-key li + li i { border-top-color: var(--ui-warning); }
+`
+
+// The currency's code, USD when Quillo does not know it.
+fn break_even_calc_code(currency) -> str {
+    let c = upper(trim(str(currency ?? "")))
+    type_of(money.minor_units(c)) == "error" ? "USD" : c
+}
+
+// What was typed as a decimal: 0 when empty, null when it is not a plain number from
+// 0 to most. A comma counts only as a thousands comma, so "12,50" is refused, not 1250.
+fn break_even_calc_read(text, most) {
+    let t = trim(str(text ?? ""))
+    if t == "" { return 0m }
+    if len(t) > 40 { return null }
+    let plain = re.test(t, "^[0-9]{1,3}(,[0-9]{3})+(\\.[0-9]*)?$") ? replace(t, ",", "") : t
+    if !re.test(plain, "^([0-9]+\\.?[0-9]*|\\.[0-9]+)$") { return null }
+    let d = dec(plain)
+    is_err(d) || d > most ? null : d
+}
+
+// The figures, decimals in and out, amounts rounded half up to the currency but for the
+// target price, rounded up so that it does reach the target. Gives { margin, ratio, exact,
+// units, revenue, cost, income, profit, safety_units, safety_percent, safety_revenue,
+// target_price, too_large }: units and those from it are null when a unit makes no margin,
+// target_price null without a volume, too_large true past what an amount can hold exactly.
+fn break_even_calc_figures(fixed: dec, variable: dec, price: dec, volume: dec, target: dec, code: str) -> map {
+    let units_of = money.minor_units(code)
+    let cash = (x: dec) => round(x, units_of, "half_up")
+    let margin = price - variable
+    let income = cash(price * volume)
+    let cost = cash(fixed + variable * volume)
+    let profit = income - cost
+    let target_price = volume > 0m ? round(variable + (fixed + target) / volume, units_of, "ceiling") : null
+    if margin <= 0m {
+        return { margin, ratio: null, exact: null, units: null, revenue: null, income, cost, profit, safety_units: null, safety_percent: null, safety_revenue: null, target_price, too_large: false }
+    }
+    let exact = fixed / margin
+    let units = ceil(exact)
+    let revenue = units * price
+    if revenue > 10000000000000m { return { margin, ratio: null, exact, units: null, revenue: null, income, cost, profit, safety_units: null, safety_percent: null, safety_revenue: null, target_price, too_large: true } }
+    { margin, ratio: round(margin * 100 / price, 1, "half_up"), exact, units, revenue: cash(revenue), income, cost, profit, safety_units: volume - units,
+      safety_percent: volume > 0m ? round((volume - exact) * 100 / volume, 1, "half_up") : null, safety_revenue: cash((volume - units) * price), target_price, too_large: false }
+}
+
+// The chart's lines, on a 320 by 160 drawing with room for the axes: { revenue, cost, fixed,
+// dot, plan, top } as SVG points. Worked in decimals so that the server and the browser write
+// the same text.
+fn break_even_calc_chart(fixed: dec, variable: dec, price: dec, volume: dec, units) -> map {
+    let reach = max([volume, units ?? 0m, 10m])
+    let end = ceil(reach * 1.25m)
+    let high = max([end * price, fixed + end * variable, 1m])
+    let x = (u: dec) => round(8m + u * 304m / end, 1)
+    let y = (v: dec) => round(150m - v * 140m / high, 1)
+    { revenue: `${x(0m)},${y(0m)} ${x(end)},${y(end * price)}`, cost: `${x(0m)},${y(fixed)} ${x(end)},${y(fixed + end * variable)}`, fixed: `${x(0m)},${y(fixed)} ${x(end)},${y(fixed)}`,
+      dot_x: units == null ? null : x(units), dot_y: units == null ? null : y(units * price), plan_x: volume > 0m ? x(volume) : null }
+}
+
+// All the figures from the fields as typed: { errors, figures, inputs }; figures is null with errors.
+fn break_even_calc_work(fixed_text, variable_text, price_text, volume_text, target_text, code: str) -> map {
+    let errors = []
+    let fixed = break_even_calc_read(fixed_text, 10000000000m)
+    let variable = break_even_calc_read(variable_text, 1000000m)
+    let price = break_even_calc_read(price_text, 1000000m)
+    let volume = break_even_calc_read(volume_text, 10000000m)
+    let target = break_even_calc_read(target_text, 10000000000m)
+    if fixed == null { errors = errors | push({ field: "fixed", text: "The fixed costs must be a number of 0 or more, up to 10,000,000,000." }) }
+    if variable == null { errors = errors | push({ field: "variable", text: "The variable cost must be a number of 0 or more, up to 1,000,000." }) }
+    if price == null { errors = errors | push({ field: "price", text: "The price must be a number of 0 or more, up to 1,000,000." }) }
+    if volume == null || (volume != null && volume != floor(volume)) { errors = errors | push({ field: "volume", text: "The volume must be a whole number from 0 to 10,000,000." }) }
+    if target == null { errors = errors | push({ field: "target", text: "The target profit must be a number of 0 or more, up to 10,000,000,000." }) }
+    if len(errors) > 0 { return { errors, figures: null, inputs: null } }
+    let figures = break_even_calc_figures(fixed, variable, price, volume, target, code)
+    if figures.too_large { return { errors: [{ field: "price", text: "The margin on a unit is too small: the break-even is too far out to show." }], figures: null, inputs: null } }
+    { errors, figures, inputs: { fixed, variable, price, volume, target } }
+}
+
+component BreakEvenCalc(fixed = null, variable = null, price = null, volume = null, target = null, unit: str = "unit", currency: str = "USD", locale: str? = null,
+                        title: str = "Break-even", id: str = "break-even-calc", name: str = "break_even", on_change = null, class: str? = null) {
+    style global break_even_calc_css
+    state fixed_text = fixed == null ? "" : str(fixed)
+    state variable_text = variable == null ? "" : str(variable)
+    state price_text = price == null ? "" : str(price)
+    state volume_text = volume == null ? "" : str(volume)
+    state target_text = target == null ? "" : str(target)
+    let code = break_even_calc_code(currency)
+    let work = break_even_calc_work(fixed_text, variable_text, price_text, volume_text, target_text, code)
+    let f = work.figures
+    let ok = f != null
+    let can = ok && f.units != null
+    let shown = (x: dec) => locale != null ? money.format(money.of(x, code, "half_up"), locale) : money.format(money.of(x, code, "half_up"))
+    let whole = (x: dec) => format_number(x, locale ?? "en-US", 0)
+    let units_word = (x: dec) => x == 1m ? unit : `${unit}s`
+    let chart = ok && work.inputs.price > 0m ? break_even_calc_chart(work.inputs.fixed, work.inputs.variable, work.inputs.price, work.inputs.volume, f.units) : null
+    let bad = (field: str) => work.errors | any((e) => e.field == field)
+    let field_id = (part: str) => `${id}-${part}`
+    let named = (part: str) => `${name}_${part}`
+    let tell = () => {
+        if on_change != null && ok {
+            on_change({ margin: f.margin, units: can ? int(f.units) : null, revenue: f.revenue, profit: f.profit, safety_units: can ? int(f.safety_units) : null, safety_percent: f.safety_percent, target_price: f.target_price })
+        }
+    }
+    <section class={ui_cls(["ui-break-even", class])} aria-labelledby={field_id("title")}>
+        <h3.ui-break-even-title id={field_id("title")}>{title}</h3>
+        <div.ui-break-even-grid>
+            <div.ui-break-even-field>
+                <label for={field_id("fixed")}>Fixed costs ({code})</label>
+                <input type="text" inputmode="decimal" autocomplete="off" id={field_id("fixed")} name={named("fixed")} value={fixed_text} placeholder="0.00" aria-invalid={bad("fixed") ? "true" : null}
+                       @input={(e) => { fixed_text = e.value; tell() }}/>
+            </div>
+            <div.ui-break-even-field>
+                <label for={field_id("variable")}>Variable cost a {unit}</label>
+                <input type="text" inputmode="decimal" autocomplete="off" id={field_id("variable")} name={named("variable")} value={variable_text} placeholder="0.00" aria-invalid={bad("variable") ? "true" : null}
+                       @input={(e) => { variable_text = e.value; tell() }}/>
+            </div>
+            <div.ui-break-even-field>
+                <label for={field_id("price")}>Price a {unit}</label>
+                <input type="text" inputmode="decimal" autocomplete="off" id={field_id("price")} name={named("price")} value={price_text} placeholder="0.00" aria-invalid={bad("price") ? "true" : null}
+                       @input={(e) => { price_text = e.value; tell() }}/>
+            </div>
+            <div.ui-break-even-field>
+                <label for={field_id("volume")}>Planned {unit}s</label>
+                <input type="text" inputmode="numeric" autocomplete="off" id={field_id("volume")} name={named("volume")} value={volume_text} placeholder="0" aria-invalid={bad("volume") ? "true" : null}
+                       @input={(e) => { volume_text = e.value; tell() }}/>
+            </div>
+            <div.ui-break-even-field>
+                <label for={field_id("target")}>Target profit ({code})</label>
+                <input type="text" inputmode="decimal" autocomplete="off" id={field_id("target")} name={named("target")} value={target_text} placeholder="0.00" aria-invalid={bad("target") ? "true" : null}
+                       @input={(e) => { target_text = e.value; tell() }}/>
+            </div>
+        </div>
+        {len(work.errors) > 0 && <ul.ui-break-even-errors role="alert">{for e in work.errors => <li key={e.field}>{e.text}</li>}</ul>}
+        {ok && <div.ui-break-even-out aria-live="polite">
+            {!can && <p.ui-break-even-never data-key="never">
+                {work.inputs.price <= 0m ? "Enter a price to work out the break-even." : `${f.margin == 0m ? `At this price each ${unit} only pays for itself` : `At this price each ${unit} loses ${shown(0m - f.margin)}`}, so no volume breaks even. The price must be above ${shown(work.inputs.variable)}.`}
+            </p>}
+            <dl.ui-break-even-sums>
+                <dt>Margin on a {unit}</dt><dd data-key="margin">{shown(f.margin)}{can ? ` (${f.ratio}%)` : ""}</dd>
+                {can && <dt.ui-break-even-main>Break-even</dt>}
+                {can && <dd.ui-break-even-main data-key="units">{whole(f.units)} {units_word(f.units)}</dd>}
+                {can && <dt>Revenue at break-even</dt>}
+                {can && <dd data-key="revenue">{shown(f.revenue)}</dd>}
+                <dt>Profit at the planned volume</dt><dd data-key="profit">{shown(f.profit)}</dd>
+                {can && work.inputs.volume > 0m && <dt>Margin of safety</dt>}
+                {can && work.inputs.volume > 0m && <dd data-key="safety">{whole(f.safety_units)} {units_word(abs(f.safety_units))}, {f.safety_percent}%</dd>}
+                {can && work.inputs.volume > 0m && <dt>Sales above break-even</dt>}
+                {can && work.inputs.volume > 0m && <dd data-key="safety_revenue">{shown(f.safety_revenue)}</dd>}
+            </dl>
+            {can && f.exact != f.units && <p.ui-break-even-note data-key="exact">Exactly {round(f.exact, 2, "half_up")} {unit}s, rounded up: whole {unit}s are sold.</p>}
+            {can && work.inputs.volume > 0m && f.safety_units < 0m && <p.ui-break-even-note data-key="below">The planned volume is below break-even.</p>}
+            {f.target_price != null
+                ? <p.ui-break-even-note data-key="target">{`A profit of ${shown(work.inputs.target)} on ${whole(work.inputs.volume)} ${units_word(work.inputs.volume)} takes a price of ${shown(f.target_price)}.`}</p>
+                : <p.ui-break-even-note data-key="target">Enter a planned volume to see the price a target profit needs.</p>}
+            {chart != null && <svg.ui-break-even-chart viewBox="0 0 320 160" role="img" aria-label={can ? `Revenue meets total cost at ${whole(f.units)} ${unit}s.` : "Revenue stays below total cost."}>
+                <line.ui-break-even-axis x1="8" y1="150" x2="312" y2="150"/>
+                <line.ui-break-even-axis x1="8" y1="10" x2="8" y2="150"/>
+                <polyline.ui-break-even-fixed points={chart.fixed}/>
+                <polyline.ui-break-even-cost points={chart.cost}/>
+                <polyline.ui-break-even-revenue points={chart.revenue}/>
+                {chart.plan_x != null && <line.ui-break-even-plan x1={chart.plan_x} y1="10" x2={chart.plan_x} y2="150"/>}
+                {chart.dot_x != null && <circle.ui-break-even-dot cx={chart.dot_x} cy={chart.dot_y} r="4"/>}
+            </svg>}
+            {chart != null && <ul.ui-break-even-key aria-hidden="true"><li><i></i>Revenue</li><li><i></i>Total cost</li></ul>}
+        </div>}
+    </section>
+}

@@ -1,0 +1,473 @@
+// RuleForm: a whole form from a description in data. Each field can be shown, or
+// required, by a rule on the others; each is validated by its type and its own rules,
+// and checks can compare fields with each other. What it sends leaves out every field
+// that is hidden: a hidden field counts as empty in the rules too, so hiding one can
+// hide what hung on it. The description is checked as well: rules that go round in a
+// circle, names that repeat, rules on fields that do not exist and bad patterns are
+// listed above the form, and it goes on working.
+//
+//   import ui/rule_form.qwe use RuleForm
+//
+//   <RuleForm id="signup" action="/signup" fields={[
+//       { name: "kind", label: "I am", type: "radio", options: ["a person", "a company"], required: true },
+//       { name: "company", label: "Company", show_if: { field: "kind", is: "a company" }, required: true },
+//       { name: "vat", label: "VAT number", show_if: { field: "kind", is: "a company" },
+//         required_if: { field: "country", in: ["PT", "ES"] }, rules: [{ pattern: "^[A-Z0-9]{8,12}$", message: "8 to 12 letters and digits." }] },
+//       { name: "from", label: "From", type: "date", required: true },
+//       { name: "to", label: "To", type: "date", required: true },
+//   ]} checks={[{ rule: { field: "to", gte_field: "from" }, fields: ["to"], message: "To comes on or after From." }]}/>
+//
+// A field: name (what it sends; unique), label, type ("text", "email", "url", "tel",
+// "number", "integer", "date", "textarea", "select", "radio", "checkbox", "multi", a
+// group of checkboxes), options (for select, radio and multi: strings or { label,
+// value }), value (where it starts), placeholder, hint, required (true), show_if and
+// required_if (a condition), rules (a list).
+//
+// A condition: { field: "x" } with one of is, not, in (a list), gt, gte, lt, lte (a
+// value), is_field, not_field, gt_field, gte_field, lt_field, lte_field (another
+// field's name), filled (true or false), matches (a pattern as `re` takes them); or
+// { all: [...] }, { any: [...] }, { none: [...] } of conditions. Numbers compare as
+// exact decimals, and other values as text, which puts ISO dates in order. A multi is
+// `is` a value when it holds it.
+//
+// A rule: one of min, max (a number, or a date for a date field), min_length,
+// max_length, pattern (flags in `flags`), one_of (a list), with `message` to say
+// instead of the one it makes. A check: { rule: a condition, message, fields: where
+// to show it (left out: above the button) }; it is judged only when every field it
+// reads is shown and filled.
+//
+// Rules that can go round are those of show_if, where a field's being shown decides
+// another's value: `a shown if b filled`, `b shown if a filled`. The fields of such a
+// circle are always shown and the problem is reported. required_if cannot decide a
+// value, so two fields each required by the other are fine, and only noted.
+//
+// id: a prefix for its ids ("rule-form"), unique on the page. fields, checks: as
+// above. initial: a map of starting values, over each field's value. action, method
+// ("post"): where a plain form sends it; with an action, it sends once it is valid.
+// submit: the button's words ("Submit"). report: lists the description's problems
+// (true). class: more classes for its outer element.
+// on_submit(values): inside one of your components, called with the shown fields'
+// values when it is valid. on_change(values): the same, after each change.
+//
+// rule_form_resolve(fields, checks, values) is the logic, for a program's own use, so
+// a route can judge what was sent by the same description: { visible, required, errors,
+// form_errors, out, ok }. rule_form_problems(fields, checks) gives what is wrong with
+// a description.
+
+import ui/theme.qwe use ui_cls
+import ui/regex_tester.qwe use regex_tester_parse
+
+let rule_form_css = css`
+.ui-rform { display: grid; gap: 14px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-rform-problems { margin: 0; padding: 10px 12px 10px 28px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; overflow-wrap: anywhere; }
+.ui-rform-field { display: grid; gap: 5px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-rform-label { padding: 0; font-size: 13px; font-weight: 500; }
+.ui-rform-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-rform-input { box-sizing: border-box; width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); transition: border-color .15s, box-shadow .15s; }
+textarea.ui-rform-input { height: auto; min-height: 80px; padding: 8px 10px; resize: vertical; }
+.ui-rform-input:hover { border-color: var(--ui-strong); }
+.ui-rform-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-rform-input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-rform-choices { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.ui-rform-check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.ui-rform-check input { margin: 0; accent-color: var(--ui-accent); }
+.ui-rform-check input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-rform-hint { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-rform-error { margin: 0; color: var(--ui-danger); font-size: 13px; overflow-wrap: anywhere; }
+.ui-rform-summary { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-rform-submit { justify-self: start; height: 38px; padding: 0 16px; border: 1px solid var(--ui-accent); border-radius: var(--ui-radius-sm); background: var(--ui-accent);
+  color: var(--ui-accent-fg); font: 600 14px/1 var(--ui-font); cursor: pointer; }
+.ui-rform-submit:hover { background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-rform-submit:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) { .ui-rform-input { transition: none; } }
+`
+
+let rule_form_types = ["text", "email", "url", "tel", "number", "integer", "date", "textarea", "select", "radio", "checkbox", "multi"]
+let rule_form_tests = ["is", "not", "in", "gt", "gte", "lt", "lte", "is_field", "not_field", "gt_field", "gte_field", "lt_field", "lte_field", "filled", "matches"]
+let rule_form_most_fields = 500
+
+fn rule_form_is_map(x) -> bool = type_of(x) == "map"
+
+fn rule_form_is_text(x) -> bool = type_of(x) == "str"
+
+// The fields of a description that can be used: maps with a name, each name once.
+fn rule_form_clean(fields) -> list {
+    let seen = []
+    let out = []
+    for f in type_of(fields) == "list" ? take(fields, rule_form_most_fields) : [] {
+        if rule_form_is_map(f) && rule_form_is_text(f.name) && trim(f.name) != "" && !contains(seen, f.name) {
+            seen = push(seen, f.name)
+            out = push(out, { ...f, type: contains(rule_form_types, f.type) ? f.type : "text", label: rule_form_is_text(f.label) ? f.label : f.name })
+        }
+    }
+    out
+}
+
+// Options as { label, value } of text.
+fn rule_form_options(f: map) -> list =
+    (type_of(f.options) == "list" ? f.options : []) | map((o) => rule_form_is_map(o) ? { label: str(o.label ?? o.value), value: str(o.value ?? o.label) } : { label: str(o), value: str(o) })
+
+// Each field's starting value: its `value`, or nothing of its kind.
+fn rule_form_defaults(fields: list) -> map =
+    reduce(fields, {}, (m, f) => set(m, f.name, f.value ?? (f.type == "checkbox" ? false : (f.type == "multi" ? [] : ""))))
+
+// Whether a value counts as empty: spaces, an unticked box, a list with nothing.
+fn rule_form_empty(v) -> bool {
+    let t = type_of(v)
+    v == null || v == false || (t == "str" && trim(v) == "") || (t == "list" && len(v) == 0)
+}
+
+// A value as a decimal, or null: digits with an optional sign and point, nothing else.
+fn rule_form_number(v) {
+    let t = type_of(v)
+    if t == "dec" { return v }
+    if t != "int" && t != "float" && t != "str" { return null }
+    let s = trim(str(v))
+    if !re.test(s, "^[+-]?\\d+(\\.\\d+)?$") { return null }
+    let d = dec(replace(s, "+", ""))
+    is_err(d) ? null : d
+}
+
+// -1, 0 or 1, or null when they cannot be compared: numbers exactly, else text.
+fn rule_form_compare(a, b) {
+    let x = rule_form_number(a)
+    let y = rule_form_number(b)
+    if x != null && y != null { return x < y ? -1 : (x > y ? 1 : 0) }
+    if rule_form_is_text(a) && rule_form_is_text(b) { return a < b ? -1 : (a > b ? 1 : 0) }
+    null
+}
+
+// Whether a value is another: numbers by value, a multi by holding it.
+fn rule_form_same(v, want) -> bool {
+    if type_of(v) == "list" { return any(v, (x) => rule_form_same(x, want)) }
+    let c = rule_form_compare(v, want)
+    c != null ? c == 0 : v == want
+}
+
+// Whether a pattern can be given to `re`, which throws on a bad one.
+fn rule_form_pattern_ok(p) -> bool = rule_form_is_text(p) && regex_tester_parse(p).error == null
+
+// A condition on the values.
+fn rule_form_test(c, vals: map) -> bool {
+    if !rule_form_is_map(c) { return false }
+    if type_of(c.all) == "list" { return all(c.all, (x) => rule_form_test(x, vals)) }
+    if type_of(c.any) == "list" { return any(c.any, (x) => rule_form_test(x, vals)) }
+    if type_of(c.none) == "list" { return !any(c.none, (x) => rule_form_test(x, vals)) }
+    let v = get(vals, str(c.field))
+    let order = (other, test) => {
+        let k = rule_form_compare(v, other)
+        !rule_form_empty(v) && k != null && test(k)
+    }
+    let other = (key: str) => get(vals, str(get(c, key)))
+    if has(c, "is") { return rule_form_same(v, c.is) }
+    if has(c, "not") { return !rule_form_same(v, c.not) }
+    if has(c, "in") { return type_of(c["in"]) == "list" && any(c["in"], (x) => rule_form_same(v, x)) }
+    if has(c, "gt") { return order(c.gt, (k) => k > 0) }
+    if has(c, "gte") { return order(c.gte, (k) => k >= 0) }
+    if has(c, "lt") { return order(c.lt, (k) => k < 0) }
+    if has(c, "lte") { return order(c.lte, (k) => k <= 0) }
+    if has(c, "is_field") { return rule_form_same(v, other("is_field")) }
+    if has(c, "not_field") { return !rule_form_same(v, other("not_field")) }
+    if has(c, "gt_field") { return order(other("gt_field"), (k) => k > 0) }
+    if has(c, "gte_field") { return order(other("gte_field"), (k) => k >= 0) }
+    if has(c, "lt_field") { return order(other("lt_field"), (k) => k < 0) }
+    if has(c, "lte_field") { return order(other("lte_field"), (k) => k <= 0) }
+    if has(c, "filled") { return rule_form_empty(v) != (c.filled == true) }
+    if has(c, "matches") { return rule_form_pattern_ok(c.matches) && rule_form_is_text(v) && re.test(v, c.matches) }
+    !rule_form_empty(v)
+}
+
+// The fields a condition reads.
+fn rule_form_refs(c) -> list {
+    if !rule_form_is_map(c) { return [] }
+    let parts = flatten(["all", "any", "none"] | map((k) => type_of(get(c, k)) == "list" ? get(c, k) | map(rule_form_refs) : []))
+    let own = rule_form_is_text(c.field) ? [c.field] : []
+    let others = rule_form_tests | filter((k) => ends_with(k, "_field") && rule_form_is_text(get(c, k))) | map((k) => get(c, k))
+    unique(own + others + flatten(parts))
+}
+
+// What is wrong with one condition itself, as sentences about `where`.
+fn rule_form_cond_problems(c, where: str) -> list {
+    if !rule_form_is_map(c) { return [`${where} is not a condition.`] }
+    let joined = ["all", "any", "none"] | filter((k) => has(c, k))
+    if len(joined) > 0 {
+        let inner = get(c, joined[0])
+        if type_of(inner) != "list" { return [`${where}: ${joined[0]} takes a list of conditions.`] }
+        return flatten(inner | map((x) => rule_form_cond_problems(x, where)))
+    }
+    if !rule_form_is_text(c.field) { return [`${where} names no field.`] }
+    let bad_pattern = has(c, "matches") && !rule_form_pattern_ok(c.matches)
+    bad_pattern ? [`${where}: its pattern is not one \`re\` takes.`] : []
+}
+
+// One step of a walk through the rules: st is { seen, path, loops }.
+fn rule_form_walk(name: str, edges: map, st: map) -> map {
+    let out = { ...st, seen: set(st.seen, name, 1), path: push(st.path, name) }
+    for next in get(edges, name) ?? [] {
+        let mark = get(out.seen, next)
+        if mark == 1 {
+            let from = index_of(out.path, next)
+            out = { ...out, loops: push(out.loops, push(slice(out.path, from, len(out.path)), next)) }
+        } else if mark == null {
+            out = rule_form_walk(next, edges, out)
+        }
+    }
+    { ...out, seen: set(out.seen, name, 2), path: take(out.path, len(out.path) - 1) }
+}
+
+// The circles in a graph of names: each a list that ends where it starts.
+fn rule_form_loops(names: list, edges: map) -> list {
+    let st = reduce(names, { seen: {}, path: [], loops: [] }, (s, n) => get(s.seen, n) == null ? rule_form_walk(n, edges, s) : s)
+    st.loops
+}
+
+fn rule_form_edges(fields: list, key: str) -> map {
+    let names = fields | map((f) => f.name)
+    reduce(fields, {}, (m, f) => set(m, f.name, rule_form_refs(get(f, key)) | filter((r) => contains(names, r))))
+}
+
+// The fields in a circle of show_if, which are shown whatever their rules say.
+fn rule_form_stuck(fields: list) -> list =
+    unique(flatten(rule_form_loops(fields | map((f) => f.name), rule_form_edges(fields, "show_if"))))
+
+// What is wrong with a description, as { level: "problem" or "note", text }.
+fn rule_form_problems(fields, checks = []) -> list {
+    if type_of(fields) != "list" { return [{ level: "problem", text: "The description's fields must be a list." }] }
+    let problem = (text: str) => { level: "problem", text }
+    let out = []
+    if len(fields) > rule_form_most_fields { out = push(out, problem(`Only the first ${rule_form_most_fields} fields are used.`)) }
+    let seen = []
+    for [i, f] in enumerate(take(fields, rule_form_most_fields)) {
+        if !rule_form_is_map(f) {
+            out = push(out, problem(`Field ${i + 1} is not a map.`))
+        } else if !rule_form_is_text(f.name) || trim(f.name) == "" {
+            out = push(out, problem(`Field ${i + 1} has no name.`))
+        } else if contains(seen, f.name) {
+            out = push(out, problem(`Two fields are named ${f.name}: the second is left out.`))
+        } else {
+            seen = push(seen, f.name)
+            if f.type != null && !contains(rule_form_types, f.type) { out = push(out, problem(`${f.name}: there is no type "${str(f.type)}", so it is a text field.`)) }
+            if contains(["select", "radio", "multi"], f.type) && len(rule_form_options(f)) == 0 { out = push(out, problem(`${f.name} has no options.`)) }
+        }
+    }
+    let clean = rule_form_clean(fields)
+    let names = clean | map((f) => f.name)
+    let refs_in = (where: str, c) => (rule_form_refs(c) | filter((r) => !contains(names, r))) | map((r) => problem(`${where} reads ${r}, which is no field.`))
+    for f in clean {
+        for key in ["show_if", "required_if"] {
+            let c = get(f, key)
+            if c != null {
+                out = out + (rule_form_cond_problems(c, `${f.name}'s ${key}`) | map(problem)) + refs_in(`${f.name}'s ${key}`, c)
+            }
+        }
+        for [i, r] in enumerate(type_of(f.rules) == "list" ? f.rules : []) {
+            if !rule_form_is_map(r) {
+                out = push(out, problem(`${f.name}: rule ${i + 1} is not a map.`))
+            } else if has(r, "pattern") && !rule_form_pattern_ok(r.pattern) {
+                out = push(out, problem(`${f.name}: rule ${i + 1}'s pattern is not one \`re\` takes.`))
+            }
+        }
+    }
+    for [i, k] in enumerate(type_of(checks) == "list" ? checks : []) {
+        let where = `Check ${i + 1}`
+        out = out + (rule_form_cond_problems(rule_form_is_map(k) ? k.rule : null, where) | map(problem)) + refs_in(where, rule_form_is_map(k) ? k.rule : null)
+    }
+    let shown = rule_form_loops(names, rule_form_edges(clean, "show_if"))
+    let needed = rule_form_loops(names, rule_form_edges(clean, "required_if"))
+    out = out + (shown | map((l) => problem(`The show_if rules go round: ${join(l, " → ")}. These fields are always shown.`)))
+    out + (needed | map((l) => { level: "note", text: `The required_if rules go round: ${join(l, " → ")}. That works, but check it is meant.` }))
+}
+
+// Which fields are shown: worked out again until nothing changes, as a field hidden
+// empties what hung on it. A chain of n fields takes n rounds; a circle's are held out.
+fn rule_form_shown(fields: list, vals: map, stuck: list) -> map {
+    let shown = reduce(fields, {}, (m, f) => set(m, f.name, true))
+    let live = (s: map) => reduce(fields, {}, (m, f) => set(m, f.name, get(s, f.name) ? get(vals, f.name) : null))
+    let round = 0
+    let changed = true
+    while changed && round <= len(fields) {
+        let seen = live(shown)
+        let next = reduce(fields, {}, (m, f) => set(m, f.name, f.show_if == null || contains(stuck, f.name) || rule_form_test(f.show_if, seen)))
+        changed = next != shown
+        shown = next
+        round += 1
+    }
+    shown
+}
+
+// What is wrong with one field's value, or null.
+fn rule_form_field_error(f: map, v, required: bool) {
+    let label = f.label
+    if rule_form_empty(v) { return required ? (f.required_message ?? `${label} is required.`) : null }
+    let text = type_of(v) == "str" ? trim(v) : str(v)
+    let t = f.type
+    if (t == "number" || t == "integer") && rule_form_number(v) == null { return `${label} is not a number.` }
+    if t == "integer" && !re.test(text, "^[+-]?\\d+$") { return `${label} is a whole number.` }
+    if t == "email" && !re.test(text, "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") { return `${label} is not an email address.` }
+    if t == "url" && !re.test(text, "^https?://\\S+$", "i") { return `${label} is not a link starting http:// or https://.` }
+    if t == "date" && !date.valid(text, "date") { return `${label} is not a date.` }
+    let wrong = find(type_of(f.rules) == "list" ? f.rules : [], (r) => rule_form_is_map(r) && rule_form_rule_fails(r, v, text, label) != null)
+    wrong == null ? null : (wrong.message ?? rule_form_rule_fails(wrong, v, text, label))
+}
+
+// What a rule says of a value, or null when it holds.
+fn rule_form_rule_fails(r: map, v, text: str, label: str) {
+    let size = len(text)
+    if has(r, "min") {
+        let k = rule_form_compare(v, r.min)
+        if k == null || k < 0 { return `${label} is at least ${r.min}.` }
+    }
+    if has(r, "max") {
+        let k = rule_form_compare(v, r.max)
+        if k == null || k > 0 { return `${label} is at most ${r.max}.` }
+    }
+    if type_of(r.min_length) == "int" && size < r.min_length { return `${label} has at least ${r.min_length} characters.` }
+    if type_of(r.max_length) == "int" && size > r.max_length { return `${label} has at most ${r.max_length} characters.` }
+    if has(r, "pattern") && rule_form_pattern_ok(r.pattern) && !re.test(text, r.pattern, join(unique(split(re.replace(str(r.flags ?? ""), "[^ims]", ""), "")), "")) { return `${label} is not in the right form.` }
+    if has(r, "one_of") && type_of(r.one_of) == "list" && !any(r.one_of, (x) => rule_form_same(v, x)) { return `${label} is not one of the choices.` }
+    null
+}
+
+// The whole judgement: { visible, required (maps of name to bool), errors (name to
+// text), form_errors (a list), out (what is sent), ok }. `checks` that read a hidden
+// or empty field are not judged.
+fn rule_form_resolve(given, checks, values: map) -> map {
+    let fields = rule_form_clean(given)
+    let vals = merge(rule_form_defaults(fields), values)
+    let visible = rule_form_shown(fields, vals, rule_form_stuck(fields))
+    let seen = reduce(fields, {}, (m, f) => set(m, f.name, get(visible, f.name) ? get(vals, f.name) : null))
+    let required = reduce(fields, {}, (m, f) => set(m, f.name, get(visible, f.name) && (f.required == true || (f.required_if != null && rule_form_test(f.required_if, seen)))))
+    let errors = reduce(fields, {}, (m, f) => {
+        let e = get(visible, f.name) ? rule_form_field_error(f, get(vals, f.name), get(required, f.name)) : null
+        e != null ? set(m, f.name, e) : m
+    })
+    let form_errors = []
+    let all_errors = errors
+    for k in type_of(checks) == "list" ? checks : [] {
+        if rule_form_is_map(k) && rule_form_is_map(k.rule) {
+            let reads = rule_form_refs(k.rule)
+            let judged = all(reads, (r) => has(seen, r) && !rule_form_empty(get(seen, r)) && !has(errors, r))
+            if judged && !rule_form_test(k.rule, seen) {
+                let text = str(k.message ?? "These fields do not agree.")
+                let at = find(type_of(k.fields) == "list" ? k.fields : [], (n) => has(seen, n))
+                if at != null {
+                    all_errors = has(all_errors, at) ? all_errors : set(all_errors, at, text)
+                } else {
+                    form_errors = push(form_errors, text)
+                }
+            }
+        }
+    }
+    let out = reduce(fields, {}, (m, f) => get(visible, f.name) ? set(m, f.name, get(vals, f.name)) : m)
+    { visible, required, errors: all_errors, form_errors, out, ok: len(keys(all_errors)) == 0 && len(form_errors) == 0 }
+}
+
+// One field: its label (a legend for a group), control, hint and error.
+view RuleFormField(id: str, f: map, value = null, error: str? = null, required: bool = false, on_value = null, on_leave = null) {
+    let t = f.type
+    let fid = `${id}-${f.name}`
+    let hint_id = f.hint != null ? `${fid}-hint` : null
+    let error_id = `${fid}-error`
+    let about = ui_cls([f.hint != null && hint_id, error != null && error_id])
+    let said = about != "" ? about : null
+    let bad = error != null ? "true" : null
+    let wanted = required ? "true" : null
+    let star = required && <span.ui-rform-req aria-hidden="true">*</span>
+    let keep = (x) => { on_value(f.name, x) }
+    let left = () => { on_leave(f.name) }
+    let opts = rule_form_options(f)
+    let held = type_of(value) == "list" ? value : []
+    let group = t == "radio" || t == "multi"
+    <div.ui-rform-field data-field={f.name}>
+        {group
+            ? <fieldset.ui-rform-field aria-describedby={said} aria-invalid={bad} aria-required={wanted}>
+                <legend.ui-rform-label>{f.label}{star}</legend>
+                <div.ui-rform-choices>
+                    {for [i, o] in enumerate(opts) => <label.ui-rform-check key={o.value}>
+                        {t == "radio"
+                            ? <input type="radio" id={`${fid}-${i}`} name={f.name} value={o.value} checked={o.value == str(value ?? "")}
+                                     @change={(e) => keep(e.value)} @blur={left}/>
+                            : <input type="checkbox" id={`${fid}-${i}`} name={f.name} value={o.value} checked={contains(held, o.value)}
+                                     @change={(e) => keep(e.checked ? push(held, o.value) : remove(held, o.value))} @blur={left}/>}
+                        {o.label}
+                    </label>}
+                </div>
+            </fieldset>
+            : <div.ui-rform-field>
+                {t != "checkbox" && <label.ui-rform-label for={fid}>{f.label}{star}</label>}
+                {match t {
+                    "textarea" => <textarea.ui-rform-input id={fid} name={f.name} rows="3" placeholder={f.placeholder} value={str(value ?? "")}
+                                            aria-required={wanted} aria-invalid={bad} aria-describedby={said}
+                                            @input={(e) => keep(e.value)} @blur={left}></textarea>
+                    "select" => <select.ui-rform-input id={fid} name={f.name} aria-required={wanted} aria-invalid={bad} aria-describedby={said}
+                                        @change={(e) => keep(e.value)} @blur={left}>
+                        <option value="" selected={str(value ?? "") == ""}>{f.placeholder ?? "Choose one"}</option>
+                        {for o in opts => <option key={o.value} value={o.value} selected={o.value == str(value ?? "")}>{o.label}</option>}
+                    </select>
+                    "checkbox" => <label.ui-rform-check>
+                        <input type="checkbox" id={fid} name={f.name} value="on" checked={value == true} aria-required={wanted} aria-invalid={bad} aria-describedby={said}
+                               @change={(e) => keep(e.checked)} @blur={left}/>
+                        <span>{f.label}{star}</span>
+                    </label>
+                    _ => <input.ui-rform-input type={t == "number" || t == "integer" ? "text" : t} inputmode={t == "number" ? "decimal" : (t == "integer" ? "numeric" : null)}
+                                id={fid} name={f.name} value={str(value ?? "")} placeholder={f.placeholder} aria-required={wanted} aria-invalid={bad} aria-describedby={said}
+                                @input={(e) => keep(e.value)} @blur={left}/>
+                }}
+            </div>}
+        {f.hint != null && <p.ui-rform-hint id={hint_id}>{f.hint}</p>}
+        {error != null && <p.ui-rform-error id={error_id}>{error}</p>}
+    </div>
+}
+
+component RuleForm(id: str = "rule-form", fields = [], checks: list = [], initial: map = {}, action: str? = null, method: str = "post",
+                   submit: str = "Submit", report: bool = true, on_submit = null, on_change = null, class: str? = null) {
+    style global rule_form_css
+    state vals = initial
+    state touched = {}
+    state tried = false
+    state said = ""
+    let clean = rule_form_clean(fields)
+    let problems = report ? rule_form_problems(fields, checks) : []
+    let judged = rule_form_resolve(fields, checks, vals)
+    let current = merge(rule_form_defaults(clean), vals)
+    let shown_fields = clean | filter((f) => get(judged.visible, f.name))
+    let on_value = (name: str, v) => {
+        vals = set(vals, name, v)
+        touched = set(touched, name, true)
+        said = ""
+        on_change && on_change(rule_form_resolve(fields, checks, vals).out)
+    }
+    let on_leave = (name: str) => { touched = set(touched, name, true) }
+    <form class={ui_cls(["ui-rform", class])} id={id} action={action} method={method} novalidate="true"
+          @submit={(e) => {
+              e.preventDefault()
+              tried = true
+              let r = rule_form_resolve(fields, checks, vals)
+              if r.ok {
+                  said = ""
+                  on_submit && on_submit(r.out)
+                  if action != null { e.target.submit() }
+              } else {
+                  let n = len(keys(r.errors)) + len(r.form_errors)
+                  said = `${n} thing${n == 1 ? "" : "s"} to fix before this can be sent.`
+                  let first_bad = find(rule_form_clean(fields), (f) => has(r.errors, f.name))
+                  if first_bad != null {
+                      let el = e.target.querySelector(`[data-field="${first_bad.name}"] input, [data-field="${first_bad.name}"] select, [data-field="${first_bad.name}"] textarea`)
+                      el && el.focus()
+                  }
+              }
+          }}>
+        {len(problems) > 0 && <ul.ui-rform-problems>
+            {for [i, p] in enumerate(problems) => <li key={i} data-level={p.level}>{p.text}</li>}
+        </ul>}
+        {for f in shown_fields => <RuleFormField key={f.name} id={id} f={f} value={get(current, f.name)} required={get(judged.required, f.name) ?? false}
+                                                 error={tried || get(touched, f.name) == true ? get(judged.errors, f.name) : null}
+                                                 on_value={on_value} on_leave={on_leave}/>}
+        {tried && len(judged.form_errors) > 0 && <ul.ui-rform-summary>
+            {for [i, t] in enumerate(judged.form_errors) => <li key={i}>{t}</li>}
+        </ul>}
+        <p.ui-rform-summary role="status" aria-live="polite">{said}</p>
+        <button.ui-rform-submit type="submit">{submit}</button>
+    </form>
+}

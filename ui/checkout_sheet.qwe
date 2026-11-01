@@ -1,0 +1,491 @@
+// CheckoutSheet: all of a checkout on one screen, in a sheet: the address, how it comes,
+// how to pay, and the total, which follows each choice. Each part is checked as it is
+// left, and says when it is done. Paying is a slide across, which cannot be done by
+// accident; while something is missing the slide does not go, and letting go takes the
+// person to the first thing to put right. A button does the same for those who cannot
+// slide. On a tablet it is a dialog in two columns.
+//
+//   import ui/checkout_sheet.qwe use CheckoutSheet
+//
+//   <CheckoutSheet lines={cart} today="2026-11-01" tax_rate="0.08"
+//                  deliveries={[{ id: "std", label: "Standard", price: "4.95", days: 5 }, { id: "fast", label: "Next day", price: "12.00", days: 1 }]}
+//                  cards={[{ id: "c1", label: "Visa ending 4242" }]}
+//                  on_pay={(order) => { place_order(order) }}/>
+//
+// lines: what is bought, as CartSheet's items: { id, name, price, qty }. deliveries: each
+// { id, label, price, days }, days until it comes. cards: saved cards, each { id, label };
+// a new card can always be typed. countries: each { code, name }, whose code sets what a
+// postcode must look like; the list below by default. address: what to start from, { name,
+// street, city, postcode, country }. today: "YYYY-MM-DD", from your page, for delivery dates
+// and a card's expiry. tax_rate: a share of the subtotal ("0.08"). currency ("USD"), locale.
+// title ("Checkout"). trigger: the text of a button that opens it ("Checkout"; null for
+// none, then open it by open={...} and on_close()). id: a prefix for its ids, unique on the
+// page, and the radio buttons' groups ("ui-chksh").
+//
+// on_pay(order): called once per payment, with { address, delivery, payment, lines, totals }.
+// payment is { kind: "saved", id } or { kind: "card", number, expiry, cvc, last4 }, to hand
+// to your payment service at once and never keep. It may wait for a server fn; an error
+// value or false says the payment failed and lets the person try again, and anything else
+// shows it as done.
+//
+// checkout_sheet_errors(form, today) gives each field's message, as a map, for the same checks
+// on a server; checkout_sheet_luhn(digits) checks a card's number.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/price.qwe use price_text
+import ui/cart_sheet.qwe use CartSheetFrame, cart_sheet_clean, cart_sheet_totals, cart_sheet_mark, cart_sheet_marked, cart_sheet_speed
+
+let checkout_sheet_css = css`
+.ui-chksh-host { display: contents; }
+.ui-chksh-open {
+  display: inline-flex; align-items: center; min-width: 44px; min-height: 46px; padding: 0 18px; border: 0; border-radius: var(--ui-radius);
+  background: var(--ui-accent); color: var(--ui-accent-fg); font: 600 15px var(--ui-font); cursor: pointer; touch-action: manipulation;
+}
+.ui-chksh-open:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-chksh-form { display: grid; gap: 20px; min-width: 0; margin: 0; }
+.ui-chksh-col { display: grid; gap: 20px; min-width: 0; align-content: start; }
+.ui-chksh-part { display: grid; gap: 10px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-chksh-part legend { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; padding: 0 0 6px; font-size: 16px; font-weight: 600; }
+.ui-chksh-state { color: var(--ui-muted); font-size: 12px; font-weight: 500; }
+.ui-chksh-ok { color: var(--ui-success); }
+.ui-chksh-field { display: grid; gap: 2px; min-width: 0; }
+.ui-chksh-field label { color: var(--ui-muted); font-size: 13px; }
+/* 16 px: anything smaller and iOS zooms the page when the field is touched. */
+.ui-chksh-field input, .ui-chksh-field select {
+  box-sizing: border-box; width: 100%; min-width: 0; height: 46px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 16px var(--ui-font);
+}
+.ui-chksh-field input:focus, .ui-chksh-field select:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-chksh-field input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-chksh-err { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-chksh-two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.ui-chksh-choice {
+  position: relative; display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; align-items: center; gap: 0 10px; min-height: 52px; padding: 6px 12px; box-sizing: border-box;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); cursor: pointer; touch-action: manipulation;
+}
+.ui-chksh-choice:has(input:checked) { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-chksh-choice:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-chksh-choice input { width: 20px; height: 20px; margin: 0; accent-color: var(--ui-accent); }
+.ui-chksh-choice small { display: block; color: var(--ui-muted); font-size: 12px; }
+.ui-chksh-choice b { font-variant-numeric: tabular-nums; font-weight: 600; }
+.ui-chksh-sums { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; margin: 0; font-size: 14px; font-variant-numeric: tabular-nums; }
+.ui-chksh-sums div { display: contents; }
+.ui-chksh-sums dt { color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-chksh-sums dd { margin: 0; text-align: right; }
+.ui-chksh-sums .ui-chksh-grand { color: var(--ui-fg); font-size: 16px; font-weight: 700; }
+.ui-chksh-foot { display: grid; gap: 8px; }
+.ui-chksh-total { display: flex; justify-content: space-between; gap: 12px; font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ui-chksh-said { margin: 0; color: var(--ui-danger); font-size: 14px; }
+.ui-chksh-need { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-chksh-done { display: grid; gap: 10px; padding: 24px 0; text-align: center; }
+.ui-chksh-done h3 { margin: 0; color: var(--ui-success); font-size: 20px; }
+.ui-chksh-done p { margin: 0; color: var(--ui-muted); }
+/* The slide. The track shows how far it has gone; the thumb is what the finger holds. */
+.ui-chksh-slide {
+  position: relative; height: 56px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ui-chksh-fill { position: absolute; inset: 0; background: var(--ui-accent); opacity: .25; transform: scaleX(0); transform-origin: 0 50%; transition: transform .2s cubic-bezier(.2, .8, .2, 1); }
+.ui-chksh-words { position: absolute; inset: 0; display: grid; place-items: center; padding: 0 16px 0 60px; font-weight: 600; pointer-events: none; }
+.ui-chksh-thumb {
+  position: absolute; left: 4px; top: 4px; display: grid; place-items: center; width: 48px; height: 48px; padding: 0; border: 0; border-radius: 50%; background: var(--ui-accent);
+  color: var(--ui-accent-fg); cursor: grab; touch-action: none; box-shadow: var(--ui-shadow); transition: transform .2s cubic-bezier(.2, .8, .2, 1);
+}
+.ui-chksh-thumb svg { width: 22px; height: 22px; }
+.ui-chksh-thumb:focus-visible { outline: 3px solid var(--ui-fg); outline-offset: 1px; }
+.ui-chksh-sliding .ui-chksh-thumb, .ui-chksh-sliding .ui-chksh-fill { transition: none; }
+.ui-chksh-locked .ui-chksh-thumb { background: var(--ui-strong); color: var(--ui-fg); }
+.ui-chksh-locked .ui-chksh-words { color: var(--ui-muted); }
+.ui-chksh-busy .ui-chksh-thumb { cursor: progress; }
+@container (min-width: 560px) { .ui-chksh-form { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 24px; } }
+@media (prefers-reduced-motion: reduce) { .ui-chksh-fill, .ui-chksh-thumb { transition: none; } }
+`
+
+let checkout_sheet_countries = [
+    { code: "US", name: "United States" }, { code: "GB", name: "United Kingdom" }, { code: "CA", name: "Canada" }, { code: "DE", name: "Germany" },
+    { code: "FR", name: "France" }, { code: "AU", name: "Australia" }, { code: "PH", name: "Philippines" },
+]
+
+// The Luhn check on a card's digits.
+fn checkout_sheet_luhn(digits: str) -> bool {
+    if !re.test(digits, "^[0-9]{12,19}$") { return false }
+    let total = reverse(split(digits, "")) | enumerate() | reduce(0, (a, p) => {
+        let d = int(p[1])
+        let x = p[0] % 2 == 1 ? d * 2 : d
+        a + (x > 9 ? x - 9 : x)
+    })
+    total % 10 == 0
+}
+
+fn checkout_sheet_digits(text) -> str = re.replace(slice(str(text ?? ""), 0, 40), "[^0-9]", "")
+
+fn checkout_sheet_is_amex(digits: str) -> bool = len(digits) >= 2 && (starts_with(digits, "34") || starts_with(digits, "37"))
+
+// A number as it is printed: fours, or American Express's 4, 6 and 5.
+fn checkout_sheet_card_text(text) -> str {
+    let d = checkout_sheet_digits(text)
+    if checkout_sheet_is_amex(d) {
+        return [slice(d, 0, 4), slice(d, 4, 10), slice(d, 10, 15)] | filter((p) => p != "") | join(" ")
+    }
+    range(0, ceil(len(d) / 4)) | map((i) => slice(d, i * 4, min([(i + 1) * 4, len(d)]))) | join(" ")
+}
+
+// What is wrong with a card's date, or null. It runs to the end of the month printed.
+fn checkout_sheet_expiry(text, today) {
+    let d = checkout_sheet_digits(text)
+    if len(d) != 4 { return "Enter the date as MM/YY." }
+    let month = int(slice(d, 0, 2))
+    if month < 1 || month > 12 { return "The month is 01 to 12." }
+    if type_of(today) != "str" || !date.valid(today, "date") { return null }
+    let last = date.end_of_month(date.of(2000 + int(slice(d, 2, 4)), month, 1))
+    date.days_between(last, today) > 0 ? "This card has expired." : null
+}
+
+fn checkout_sheet_expiry_text(text) -> str {
+    let d = checkout_sheet_digits(text)
+    len(d) == 4 ? `${slice(d, 0, 2)}/${slice(d, 2, 4)}` : str(text ?? "")
+}
+
+// What is wrong with a postcode for a country, or null.
+fn checkout_sheet_postcode(country: str, text) {
+    let t = upper(trim(slice(str(text ?? ""), 0, 16)))
+    if t == "" { return "Enter a postcode." }
+    let pattern = match country {
+        "US" => "^[0-9]{5}(-[0-9]{4})?$"
+        "CA" => "^[A-Z][0-9][A-Z] ?[0-9][A-Z][0-9]$"
+        "GB" => "^[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2}$"
+        "DE" => "^[0-9]{5}$"
+        "FR" => "^[0-9]{5}$"
+        "AU" => "^[0-9]{4}$"
+        "PH" => "^[0-9]{4}$"
+        _ => "^[A-Z0-9 -]{2,12}$"
+    }
+    re.test(t, pattern) ? null : "That does not look like a postcode here."
+}
+
+// Each field's message, as a map: a field that is right is not in it. form is { name,
+// street, city, postcode, country, delivery, pay, number, expiry, cvc }, with pay "new"
+// for a card typed in.
+fn checkout_sheet_errors(form: map, today = null) -> map {
+    let text = (k) => trim(str(get(form, k) ?? ""))
+    let number = checkout_sheet_digits(get(form, "number"))
+    let cvc = checkout_sheet_digits(get(form, "cvc"))
+    let want = checkout_sheet_is_amex(number) ? 4 : 3
+    let list = [
+        ["name", len(text("name")) < 2 ? "Enter your name." : null],
+        ["street", len(text("street")) < 4 ? "Enter your street and number." : null],
+        ["city", len(text("city")) < 2 ? "Enter your town or city." : null],
+        ["postcode", checkout_sheet_postcode(text("country"), text("postcode"))],
+        ["delivery", text("delivery") == "" ? "Choose how it comes." : null],
+        ["pay", text("pay") == "" ? "Choose how to pay." : null],
+    ]
+    let card = text("pay") != "new" ? [] : [
+        ["number", !checkout_sheet_luhn(number) ? "That card number is not right: check the digits." : null],
+        ["expiry", checkout_sheet_expiry(get(form, "expiry"), today)],
+        ["cvc", len(cvc) != want ? `The code on the card has ${want} digits.` : null],
+    ]
+    (list + card) | filter((p) => p[1] != null) | reduce({}, (m, p) => set(m, p[0], p[1]))
+}
+
+// Choices that can be used: each needs an id.
+fn checkout_sheet_clean(xs) -> list =
+    type_of(xs) != "list" ? [] : xs | filter((x) => type_of(x) == "map" && get(x, "id") != null)
+        | map((x) => set(set(x, "id", str(x.id)), "label", str(get(x, "label") ?? x.id)))
+
+// A delivery's price as a decimal: what cannot be read is free, and the total shows it.
+fn checkout_sheet_fee(d) {
+    let p = d != null ? dec(get(d, "price") ?? 0) : dec("0")
+    is_err(p) || p < 0 ? dec("0") : p
+}
+
+// The fields of each part, in the order to go through them.
+let checkout_sheet_parts = [["name", "street", "city", "postcode"], ["delivery"], ["pay", "number", "expiry", "cvc"]]
+
+fn checkout_sheet_part_ok(errors: map, part: int) -> bool = !(checkout_sheet_parts[part] | any((k) => has(errors, k)))
+
+// What the slide says is missing, first thing first.
+fn checkout_sheet_missing(errors: map) -> str {
+    let names = ["your address", "how it comes", "how to pay"]
+    let parts = range(0, 3) | filter((i) => !checkout_sheet_part_ok(errors, i)) | map((i) => names[i])
+    len(parts) == 0 ? "" : `Still needed: ${join(parts, ", ")}`
+}
+
+// How far along a slide goes at a release to pay: nearly all the way, or a flick of 1 px/ms
+// past halfway.
+fn checkout_sheet_slid(x, room, speed) -> bool = room > 0 && (x >= room * 0.9 || (x >= room * 0.5 && speed >= 1))
+
+// A date a delivery comes, or null.
+fn checkout_sheet_when(today, days) {
+    if type_of(today) != "str" || !date.valid(today, "date") || type_of(days) != "int" { return null }
+    date.format(date.add_days(today, days), "ddd D MMM")
+}
+
+view CheckoutSheetField(id: str, label: str, value, error, kind: str = "text", inputmode: str? = null, autocomplete: str? = null, hint: str? = null,
+                        name: str? = null, on_input, on_blur) =
+    <div.ui-chksh-field>
+        <label for={id}>{label}</label>
+        <input id={id} name={name} type={kind} inputmode={inputmode} autocomplete={autocomplete} enterkeyhint="next" placeholder={hint} value={str(value ?? "")}
+               aria-invalid={error != null ? "true" : null} aria-describedby={error != null ? `${id}-err` : null}
+               @input={(e) => { on_input(e.value) }} @blur={() => { on_blur() }}/>
+        {error != null && <p.ui-chksh-err id={`${id}-err`}>{error}</p>}
+    </div>
+
+view CheckoutSheetChoice(group: str, id: str, on: bool, title: str, note: str?, right: str?, on_pick) =
+    <label.ui-chksh-choice for={id}>
+        <input type="radio" name={group} id={id} checked={on} @change={() => { on_pick() }}/>
+        <span>{title}{note != null && <small>{note}</small>}</span>
+        {right != null && <b>{right}</b>}
+    </label>
+
+// The slide across: on_done() when it goes all the way, on_refused() when it was let go
+// with something missing. While `ready` is false it moves a little and comes back.
+component CheckoutSheetSlide(words: str, ready: bool = true, busy: bool = false, on_done = null, on_refused = null) {
+    state track = null
+    state thumb = null
+    state fill = null
+    state grab = null        // where the finger went down: { x, y }
+    state mark = null        // points not long ago, for the speed at release
+    state axis = null
+    state keyed = 0          // how far the arrow keys have brought it, in px
+    state sliding = false    // state, not a class set by hand: the class below is rewritten whole when `ready` changes
+    let room = () => track.clientWidth - thumb.offsetWidth - 8
+    let put = (x) => {
+        thumb.style.transform = `translateX(${x}px)`
+        fill.style.transform = `scaleX(${(x + thumb.offsetWidth) / track.clientWidth})`
+        thumb.setAttribute("aria-valuenow", str(round(x * 100 / max([1, room()]))))
+    }
+    let home = () => {
+        sliding = false
+        thumb.style.transform = ""
+        fill.style.transform = ""
+        thumb.setAttribute("aria-valuenow", "0")
+        keyed = 0
+    }
+    if !busy && track != null && keyed == 0 { home() }
+    let finish = (e) => {
+        if grab != null {
+            let dx = e.clientX - grab.x
+            let speed = cart_sheet_speed(mark, e.clientX, e.timeStamp)
+            let was = axis
+            grab = null
+            axis = null
+            sliding = false
+            let moved = max([0, min([dx, room()])])
+            if e.type == "pointerup" && was == "x" && ready && checkout_sheet_slid(moved, room(), speed) {
+                put(room())
+                on_done && on_done()
+            } else {
+                home()
+                if e.type == "pointerup" && !ready { on_refused && on_refused() }
+            }
+        }
+    }
+    <div class={ui_cls(["ui-chksh-slide", !ready && "ui-chksh-locked", busy && "ui-chksh-busy", sliding && "ui-chksh-sliding"])} @mount={(el) => { track = el }}>
+        <span.ui-chksh-fill aria-hidden="true" @mount={(el) => { fill = el }}></span>
+        <span.ui-chksh-words>{busy ? "Paying…" : words}</span>
+        <button.ui-chksh-thumb type="button" role="slider" aria-label={words} aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" disabled={busy}
+                aria-keyshortcuts="ArrowRight"
+                @mount={(el) => { thumb = el }}
+                @pointerdown={(e) => {
+                    if e.button == 0 && !busy {
+                        thumb.setPointerCapture(e.pointerId)
+                        grab = { x: e.clientX, y: e.clientY }
+                        mark = cart_sheet_mark(e.clientX, e.timeStamp)
+                        axis = null
+                    }
+                }}
+                @pointermove={(e) => {
+                    if grab != null {
+                        let dx = e.clientX - grab.x
+                        if axis == null && (abs(dx) > 6 || abs(e.clientY - grab.y) > 6) {
+                            axis = abs(dx) >= abs(e.clientY - grab.y) ? "x" : "y"
+                            if axis == "x" { sliding = true }
+                        }
+                        if axis == "x" {
+                            // Not ready, it gives a little and no more, so it plainly will not go.
+                            put(max([0, min([dx, ready ? room() : 18])]))
+                            mark = cart_sheet_marked(mark, e.clientX, e.timeStamp)
+                        }
+                    }
+                }}
+                @pointerup={finish}
+                @pointercancel={finish}
+                @keydown={(e) => {
+                    if e.key == "ArrowRight" && !busy {
+                        e.preventDefault()
+                        if !ready {
+                            on_refused && on_refused()
+                        } else {
+                            let to = keyed + room() / 4
+                            if to >= room() * 0.99 {
+                                keyed = 0
+                                put(room())
+                                on_done && on_done()
+                            } else {
+                                keyed = to
+                                put(to)
+                            }
+                        }
+                    }
+                    if (e.key == "ArrowLeft" || e.key == "Home") && !busy {
+                        e.preventDefault()
+                        home()
+                    }
+                }}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+        </button>
+    </div>
+}
+
+component CheckoutSheet(lines = [], deliveries = [], cards = [], countries: list = [], address = null, today: str? = null, tax_rate = 0,
+                        currency: str = "USD", locale: str? = null, title: str = "Checkout", trigger: str? = "Checkout", open: bool = false, id: str = "ui-chksh",
+                        on_pay = null, on_close = null) {
+    style global checkout_sheet_css
+    let from = type_of(address) == "map" ? address : {}
+    let places = len(countries) > 0 ? countries : checkout_sheet_countries
+    let ways = checkout_sheet_clean(deliveries)
+    let saved = checkout_sheet_clean(cards)
+    state own = false
+    state form = { name: str(get(from, "name") ?? ""), street: str(get(from, "street") ?? ""), city: str(get(from, "city") ?? ""), postcode: str(get(from, "postcode") ?? ""),
+                   country: str(get(from, "country") ?? (len(countries) > 0 ? countries[0].code : "US")),
+                   delivery: len(ways) > 0 ? ways[0].id : "", pay: len(saved) > 0 ? saved[0].id : "new", number: "", expiry: "", cvc: "" }
+    state touched = []       // the fields left at least once
+    state tried = false      // the person tried to pay, so every message shows
+    state busy = false
+    state failed = ""
+    state paid = false
+    state sure = false       // the button's first press
+    let rows = cart_sheet_clean(lines)
+    let errors = checkout_sheet_errors(form, today)
+    let ready = len(keys(errors)) == 0 && len(rows) > 0
+    let chosen = ways | find((d) => d.id == form.delivery)
+    let fee = checkout_sheet_fee(chosen)
+    let totals = cart_sheet_totals(rows, fee, null, tax_rate, currency)
+    let cash = (v) => price_text(v, currency, locale)
+    let change = (k, v) => {
+        form = set(form, k, v)
+        sure = false
+        failed = ""
+    }
+    let left = (k) => { if !contains(touched, k) { touched = touched + [k] } }
+    let tidy = (k, v) => {
+        form = set(form, k, v)
+        left(k)
+    }
+    let refuse = () => {
+        tried = true
+        let first = flatten(checkout_sheet_parts) | find((k) => has(errors, k))
+        if first != null {
+            let el = js("document.getElementById", `${id}-${first}`)
+            if el != null && !is_err(el) {
+                el.scrollIntoView({ block: "center" })
+                el.focus()
+            }
+        }
+    }
+    let settle = (r = null) => {
+        busy = false
+        if r == false || is_err(r) {
+            failed = "The payment did not go through. Nothing was taken: try again, or use another card."
+        } else {
+            paid = true
+            let w = js("window")
+            if w.quilloNative != null { js("quilloNative.haptic", "success") }
+        }
+    }
+    let pay = () => {
+        if !busy && !paid {
+            sure = false
+            failed = ""
+            busy = true
+            let number = checkout_sheet_digits(form.number)
+            let payment = form.pay == "new"
+                ? { kind: "card", number: number, expiry: checkout_sheet_expiry_text(form.expiry), cvc: form.cvc, last4: slice(number, -4, len(number)) }
+                : { kind: "saved", id: form.pay }
+            let r = on_pay != null
+                ? on_pay({ address: { name: trim(form.name), street: trim(form.street), city: trim(form.city), postcode: upper(trim(form.postcode)), country: form.country },
+                           delivery: chosen, payment: payment, lines: rows, totals: totals })
+                : true
+            if type_of(r) == "promise" { r.then(settle, (_e = null) => { settle(false) }) } else { settle(r) }
+        }
+    }
+    let shows = (k) => tried || contains(touched, k) ? get(errors, k) : null
+    <div.ui-chksh-host>
+        {trigger != null && <button.ui-chksh-open type="button" aria-haspopup="dialog" @click={() => { own = true }}>{trigger}</button>}
+        <CartSheetFrame title={title} open={open || own} wide="center"
+                        on_close={() => {
+                            own = false
+                            on_close && on_close()
+                        }}
+                        footer={<div.ui-chksh-foot>
+                            {!paid && <div.ui-chksh-total><span>Total</span><span>{cash(totals.total)}</span></div>}
+                            {failed != "" && <p.ui-chksh-said role="alert">{failed}</p>}
+                            {!paid && <CheckoutSheetSlide words={ready ? `Slide to pay ${cash(totals.total)}` : "Slide to pay"} ready={ready} busy={busy}
+                                                          on_done={pay} on_refused={refuse}/>}
+                            {!paid && !ready && <p.ui-chksh-need role="status">{len(rows) == 0 ? "Your cart is empty." : checkout_sheet_missing(errors)}</p>}
+                            {!paid && ready && <Button variant="outline" size="lg" full={true} disabled={busy}
+                                on_click={() => { if sure { pay() } else { sure = true } }}>{sure ? `Press again to pay ${cash(totals.total)}` : "Pay by button"}</Button>}
+                            {paid && <Button full={true} size="lg" on_click={() => { own = false; on_close && on_close() }}>Done</Button>}
+                        </div>}>
+            {paid
+                ? <div.ui-chksh-done role="status"><h3>Paid</h3><p>Thank you. {cash(totals.total)} was paid.</p></div>
+                : <form.ui-chksh-form @submit={(e) => { e.preventDefault() }}>
+                    <div.ui-chksh-col>
+                        <fieldset.ui-chksh-part>
+                            <legend>Address <span class={ui_cls(["ui-chksh-state", checkout_sheet_part_ok(errors, 0) && "ui-chksh-ok"])}>{checkout_sheet_part_ok(errors, 0) ? "Done" : "To fill in"}</span></legend>
+                            <CheckoutSheetField id={`${id}-name`} name="name" label="Full name" autocomplete="name" value={form.name} error={shows("name")}
+                                                on_input={(v) => { change("name", v) }} on_blur={() => { left("name") }}/>
+                            <CheckoutSheetField id={`${id}-street`} name="street" label="Street and number" autocomplete="street-address" value={form.street} error={shows("street")}
+                                                on_input={(v) => { change("street", v) }} on_blur={() => { left("street") }}/>
+                            <div.ui-chksh-two>
+                                <CheckoutSheetField id={`${id}-city`} name="city" label="Town or city" autocomplete="address-level2" value={form.city} error={shows("city")}
+                                                    on_input={(v) => { change("city", v) }} on_blur={() => { left("city") }}/>
+                                <CheckoutSheetField id={`${id}-postcode`} name="postcode" label="Postcode" autocomplete="postal-code" value={form.postcode} error={shows("postcode")}
+                                                    on_input={(v) => { change("postcode", v) }} on_blur={() => { left("postcode") }}/>
+                            </div>
+                            <div.ui-chksh-field>
+                                <label for={`${id}-country`}>Country</label>
+                                <select id={`${id}-country`} name="country" autocomplete="country" @change={(e) => { change("country", e.value) }}>
+                                    {for c in places => <option key={c.code} value={c.code} selected={c.code == form.country}>{c.name}</option>}
+                                </select>
+                            </div>
+                        </fieldset>
+                        <fieldset.ui-chksh-part>
+                            <legend>Delivery <span class={ui_cls(["ui-chksh-state", checkout_sheet_part_ok(errors, 1) && "ui-chksh-ok"])}>{checkout_sheet_part_ok(errors, 1) ? "Done" : "To choose"}</span></legend>
+                            {for d in ways => <CheckoutSheetChoice key={d.id} group={`${id}-delivery`} id={`${id}-delivery-${d.id}`} on={form.delivery == d.id}
+                                title={d.label} note={checkout_sheet_when(today, get(d, "days"))} right={cash(checkout_sheet_fee(d))}
+                                on_pick={() => { change("delivery", d.id) }}/>}
+                            {shows("delivery") != null && <p.ui-chksh-err>{shows("delivery")}</p>}
+                        </fieldset>
+                    </div>
+                    <div.ui-chksh-col>
+                        <fieldset.ui-chksh-part>
+                            <legend>Payment <span class={ui_cls(["ui-chksh-state", checkout_sheet_part_ok(errors, 2) && "ui-chksh-ok"])}>{checkout_sheet_part_ok(errors, 2) ? "Done" : "To fill in"}</span></legend>
+                            {for c in saved => <CheckoutSheetChoice key={c.id} group={`${id}-pay`} id={`${id}-pay-${c.id}`} on={form.pay == c.id}
+                                title={c.label} note={null} right={null} on_pick={() => { change("pay", c.id) }}/>}
+                            <CheckoutSheetChoice group={`${id}-pay`} id={`${id}-pay-new`} on={form.pay == "new"} title="A new card" note={null} right={null}
+                                on_pick={() => { change("pay", "new") }}/>
+                            {form.pay == "new" && <CheckoutSheetField id={`${id}-number`} label="Card number" inputmode="numeric" autocomplete="cc-number" value={form.number} error={shows("number")}
+                                on_input={(v) => { change("number", v) }} on_blur={() => { tidy("number", checkout_sheet_card_text(form.number)) }}/>}
+                            {form.pay == "new" && <div.ui-chksh-two>
+                                <CheckoutSheetField id={`${id}-expiry`} label="Expires" hint="MM/YY" inputmode="numeric" autocomplete="cc-exp" value={form.expiry} error={shows("expiry")}
+                                    on_input={(v) => { change("expiry", v) }} on_blur={() => { tidy("expiry", checkout_sheet_expiry_text(form.expiry)) }}/>
+                                <CheckoutSheetField id={`${id}-cvc`} label="Code on the card" inputmode="numeric" autocomplete="cc-csc" value={form.cvc} error={shows("cvc")}
+                                    on_input={(v) => { change("cvc", v) }} on_blur={() => { left("cvc") }}/>
+                            </div>}
+                        </fieldset>
+                        <fieldset.ui-chksh-part>
+                            <legend>Your order</legend>
+                            <dl.ui-chksh-sums>
+                                {for l in rows => <div key={l.id}><dt>{l.name} × {l.qty}</dt><dd>{cash(l.price != null ? l.price * l.qty : dec("0"))}</dd></div>}
+                                <dt>Delivery</dt><dd>{cash(totals.shipping)}</dd>
+                                {totals.tax > 0 && <dt>Tax</dt>}
+                                {totals.tax > 0 && <dd>{cash(totals.tax)}</dd>}
+                                <dt.ui-chksh-grand>Total</dt><dd.ui-chksh-grand>{cash(totals.total)}</dd>
+                            </dl>
+                        </fieldset>
+                    </div>
+                </form>}
+        </CartSheetFrame>
+    </div>
+}

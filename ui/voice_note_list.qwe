@@ -1,0 +1,474 @@
+// VoiceNoteList: recordings in a list, each with its title, when it was made and how long it
+// is, and one player: a scrub bar for the finger, 15 seconds back and on, speed, and the
+// transcript. Only one note plays at a time, and each keeps its place. The bar follows a finger
+// sideways and leaves up and down to the page; a screen reader and a keyboard get a slider,
+// with arrow keys, Page Up, Page Down, Home and End. A phone's lock screen shows the note and
+// its buttons where the system has a media session. On a phone the player stays at the
+// bottom of the screen; on a tablet the list and the player stand side by side, the
+// transcript with room to read. It plays what it is given; recording is VoiceRecorder's.
+//
+//   component Notes() {
+//       state notes = load_notes()
+//       <VoiceNoteList notes={notes} today="2026-11-01"
+//                      on_rename={(id, title) => { rename(id, title) }}
+//                      on_transcribe={(id) => { ask_for_transcript(id) }}/>
+//   }
+//
+// The transcript is a slot, as nothing here calls a service: a note's `transcript` shows when it
+// is there, and with none, and on_transcribe given, a button asks for one, and it waits until
+// a `notes` that has it arrives, or the callback gives false or an error.
+//
+// notes: each { id, src, title?, seconds?, at? ("YYYY-MM-DDTHH:MM:SSZ"), transcript? }. src: the
+// recording's address. seconds: its length, used until the audio says, and always for a stream
+// that cannot, as a MediaRecorder's WebM does not. transcript: text, or a list of { at, text }, at
+// being seconds, and a tap on one goes there. Followed when it changes. today: "YYYY-MM-DD", for
+// the words on each row; left out, the server's when it renders. label: its name for screen
+// readers. empty_text: what shows with no notes. speeds: the speeds a press goes through ([1, 1.5, 2]). class.
+// on_play(id): inside one of your components, a note began to play. on_rename(id, title): a note
+// was given a new title. on_transcribe(id): see above; a function that waits is waited for.
+
+import ui/theme.qwe use ui_cls
+
+let voice_note_list_css = css`
+.ui-voice-notes { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.35 var(--ui-font); }
+.ui-voice-notes-inner { display: grid; gap: 12px; }
+.ui-voice-notes-list { margin: 0; padding: 0; list-style: none; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); overflow: hidden; }
+.ui-voice-notes-row { position: relative; display: flex; align-items: center; gap: 4px; min-height: 64px; padding: 4px 8px 4px 6px; }
+.ui-voice-notes-row + .ui-voice-notes-row { border-top: 1px solid var(--ui-border); }
+.ui-voice-notes-row[aria-current="true"] { background: var(--ui-accent-soft); }
+.ui-voice-notes-play { display: grid; flex: none; place-items: center; width: 48px; height: 48px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ui-accent); cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.ui-voice-notes-play:disabled { color: var(--ui-strong); cursor: default; }
+.ui-voice-notes-play svg { width: 26px; height: 26px; }
+.ui-voice-notes-play .ui-voice-notes-pause { display: none; }
+.ui-voice-notes-play[aria-pressed="true"] .ui-voice-notes-pause { display: block; }
+.ui-voice-notes-play[aria-pressed="true"] .ui-voice-notes-tri { display: none; }
+.ui-voice-notes-open { flex: 1; min-width: 0; min-height: 48px; padding: 4px 6px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.ui-voice-notes-title { display: block; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-voice-notes-meta { display: block; color: var(--ui-muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-voice-notes-len { flex: none; color: var(--ui-muted); font-size: 14px; font-variant-numeric: tabular-nums; }
+.ui-voice-notes-line { position: absolute; left: 0; bottom: 0; width: 100%; height: 2px; background: var(--ui-accent); transform-origin: left; }
+.ui-voice-notes-none { padding: 26px 16px; color: var(--ui-muted); text-align: center; }
+.ui-voice-notes-player { position: sticky; bottom: max(0px, env(safe-area-inset-bottom)); z-index: 2; display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); box-shadow: var(--ui-shadow); }
+.ui-voice-notes-head { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.ui-voice-notes-name { flex: 1; min-width: 0; margin: 0; overflow: hidden; font-size: 16px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-voice-notes-btn { display: grid; flex: none; place-items: center; min-width: 44px; min-height: 44px; padding: 0 8px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 600 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-voice-notes-btn svg { width: 22px; height: 22px; }
+.ui-voice-notes-field { flex: 1; min-width: 0; min-height: 44px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-bg); color: var(--ui-fg); font: 16px/1.2 var(--ui-font); }
+/* The whole 44 px is the bar to a finger; only the middle is drawn. Sideways is the bar's, up and down the page's. */
+.ui-voice-notes-scrub { position: relative; height: 44px; outline: none; cursor: pointer; touch-action: pan-y; -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
+.ui-voice-notes-scrub::before { content: ""; position: absolute; left: 0; right: 0; top: 20px; height: 4px; border-radius: 2px; background: var(--ui-border); }
+/* The share is a variable on the bar, as a handler moves these two: a style= here would be rewritten under the finger. */
+.ui-voice-notes-fill { position: absolute; left: 0; right: 0; top: 20px; height: 4px; border-radius: 2px; background: var(--ui-accent); transform: scaleX(var(--share, 0)); transform-origin: left; }
+.ui-voice-notes-thumb { position: absolute; top: 14px; left: calc(var(--share, 0) * 100%); width: 16px; height: 16px; margin-left: -8px; border-radius: 50%; background: var(--ui-accent); box-shadow: var(--ui-shadow); transition: transform .12s; }
+.ui-voice-notes-scrub:focus-visible .ui-voice-notes-thumb { box-shadow: var(--ui-focus); }
+.ui-voice-notes-held .ui-voice-notes-thumb { transform: scale(1.4); }
+.ui-voice-notes-scrub[aria-disabled="true"] { cursor: default; opacity: .5; }
+.ui-voice-notes-times { display: flex; justify-content: space-between; margin-top: -8px; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-voice-notes-keys { display: flex; align-items: center; justify-content: center; gap: 8px; }
+.ui-voice-notes-keys .ui-voice-notes-play { background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-voice-notes-script { display: grid; gap: 2px; max-height: 26dvh; overflow-y: auto; overscroll-behavior: contain; padding-top: 6px; border-top: 1px solid var(--ui-border); }
+.ui-voice-notes-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-voice-notes-seg { display: flex; gap: 8px; width: 100%; min-height: 44px; padding: 6px 8px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.ui-voice-notes-seg[aria-current="true"] { background: var(--ui-accent-soft); }
+.ui-voice-notes-seg span:first-child { flex: none; width: 40px; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; padding-top: 1px; }
+.ui-voice-notes-ask { min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-voice-notes-say { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-voice-notes-say:empty { display: none; }
+.ui-voice-notes-say[data-bad] { color: var(--ui-danger); }
+.ui-voice-notes :is(.ui-voice-notes-play, .ui-voice-notes-open, .ui-voice-notes-btn, .ui-voice-notes-seg, .ui-voice-notes-ask):focus-visible { outline: none; box-shadow: var(--ui-focus); }
+/* A tablet reads and listens at once: the player beside the list, the transcript as long as it likes. */
+@container (min-width: 640px) {
+  .ui-voice-notes-inner { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); align-items: start; gap: 16px; }
+  .ui-voice-notes-player { position: sticky; top: 8px; bottom: auto; }
+  .ui-voice-notes-script { max-height: 60dvh; }
+}
+@media (hover: hover) {
+  .ui-voice-notes-btn:hover, .ui-voice-notes-seg:hover, .ui-voice-notes-open:hover { background: var(--ui-subtle); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-voice-notes-thumb { transition: none; } }
+`
+
+fn voice_note_list_pad(n: int) -> str = n < 10 ? `0${n}` : str(n)
+
+// 0:07, 12:03, 1:02:03.
+fn voice_note_list_time(s) -> str {
+    let all = type_of(s) == "int" || type_of(s) == "float" ? int(max([0, min([s, 359999])])) : 0
+    let h = int(all / 3600)
+    let m = int((all % 3600) / 60)
+    let rest = voice_note_list_pad(all % 60)
+    h > 0 ? `${h}:${voice_note_list_pad(m)}:${rest}` : `${m}:${rest}`
+}
+
+fn voice_note_list_stamp(at) -> bool = type_of(at) == "str" && date.valid(at, "date-time")
+
+// What a row says of when it was made, reading the time as it is written.
+fn voice_note_list_when(at, today: str) -> str {
+    if !voice_note_list_stamp(at) { return "" }
+    let d = slice(at, 0, 10)
+    let t = slice(at, 11, 16)
+    let n = date.days_between(d, today)
+    if n == 0 { return `Today ${t}` }
+    if n == 1 { return `Yesterday ${t}` }
+    if slice(d, 0, 4) == slice(today, 0, 4) { return date.format(d, "ddd D MMM") }
+    date.format(d, "D MMM YYYY")
+}
+
+// A title for one with none.
+fn voice_note_list_name(n, i: int) -> str {
+    let t = get(n, "title")
+    if t != null && trim(str(t)) != "" { return str(t) }
+    let at = get(n, "at")
+    voice_note_list_stamp(at) ? `Recording, ${date.format(slice(at, 0, 10), "D MMM")} at ${slice(at, 11, 16)}` : `Recording ${i + 1}`
+}
+
+// A transcript's timed parts in time order, or [] for plain text or none.
+fn voice_note_list_lines(t) -> list {
+    if type_of(t) != "list" { return [] }
+    let good = t | filter((x) => type_of(x) == "map" && get(x, "text") != null && (type_of(get(x, "at")) == "int" || type_of(get(x, "at")) == "float"))
+    sort_by(good, (x) => x.at)
+}
+
+// The place of the part being spoken at pos, or -1 before the first.
+fn voice_note_list_line_at(lines: list, pos: num) -> int {
+    let past = enumerate(lines) | filter((p) => p[1].at <= pos)
+    len(past) > 0 ? past[len(past) - 1][0] : -1
+}
+
+// The notes that can be listed, each id once; `names` holds the titles given here.
+fn voice_note_list_clean(notes, names) -> list {
+    if type_of(notes) != "list" { return [] }
+    let all = enumerate(notes | filter((n) => type_of(n) == "map")) | map((p) => {
+        let n = p[1]
+        let i = p[0]
+        let id = get(n, "id") != null ? str(n.id) : `_${i}`
+        let s = get(n, "seconds")
+        let t = get(n, "transcript")
+        ({ id, src: type_of(get(n, "src")) == "str" && get(n, "src") != "" ? n.src : null, seconds: (type_of(s) == "int" || type_of(s) == "float") && s > 0 ? s : 0,
+           at: get(n, "at"), title: get(names, id, voice_note_list_name(n, i)), text: type_of(t) == "str" && trim(t) != "" ? t : null, lines: voice_note_list_lines(t) })
+    })
+    let ids = all | map((n) => n.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// Where a finger is along the bar, 0 to 1.
+fn voice_note_list_share(x: num, left: num, width: num) -> num = width > 0 ? max([0, min([1, (x - left) / width])]) : 0
+
+fn voice_note_list_axis(dx: num, dy: num, slop: num) -> str {
+    if abs(dx) < slop && abs(dy) < slop { return "" }
+    abs(dx) > abs(dy) ? "x" : "y"
+}
+
+// Where a key sends the bar, or null.
+fn voice_note_list_key(k: str, pos: num, length: num) = match k {
+    "ArrowLeft" => max([0, pos - 5])
+    "ArrowDown" => max([0, pos - 5])
+    "ArrowRight" => min([length, pos + 5])
+    "ArrowUp" => min([length, pos + 5])
+    "PageDown" => max([0, pos - 30])
+    "PageUp" => min([length, pos + 30])
+    "Home" => 0
+    "End" => length
+    _ => null
+}
+
+fn voice_note_list_speeds(s) -> list {
+    let good = type_of(s) == "list" ? s | filter((x) => (type_of(x) == "int" || type_of(x) == "float") && x >= 0.25 && x <= 4) : []
+    len(good) > 0 ? good : [1]
+}
+
+component VoiceNoteList(notes = [], today: str = "", label: str = "Voice notes", empty_text: str = "No recordings yet.", speeds = [1, 1.5, 2],
+                        on_play = null, on_rename = null, on_transcribe = null, class: str? = null) {
+    style global voice_note_list_css
+    state day = date.valid(today, "date") ? today : date.today()
+    state cur = null         // the note in the player
+    state playing = false
+    state pos = 0
+    state peek = null        // the whole second under a scrubbing finger
+    state seek_to = null     // where to go once the audio can
+    state lens = {}          // lengths the audio itself gave, by id
+    state names = {}         // titles given here, by id
+    state places = {}        // where each note was left, by id
+    state failed = []        // ids that would not play
+    state asked = []         // ids waiting for a transcript
+    state refused = []       // ids whose transcript did not come
+    state rate_at = 0
+    state renaming = false
+    state draft = ""
+    state said = ""
+    state audio = null
+    state win = null
+    state g = null
+    let rows = voice_note_list_clean(notes, names)
+    let note = cur != null ? find(rows, (n) => n.id == cur) : null
+    let length = note != null ? get(lens, cur, note.seconds) : 0
+    let rates = voice_note_list_speeds(speeds)
+    let rate = rates[rate_at % len(rates)]
+    let shown = peek != null ? peek : pos
+    let share = length > 0 ? min([1, pos / length]) : 0
+    let bad = note != null && (note.src == null || contains(failed, note.id))
+    let spoken = note != null ? voice_note_list_line_at(note.lines, pos) : -1
+    let keep_place = () => { if cur != null { places = set(places, cur, pos) } }
+    // Loading the audio only when a note is chosen: a long list costs a page nothing.
+    let load = (n) => {
+        keep_place()
+        renaming = false
+        cur = n.id
+        pos = get(places, n.id, 0)
+        seek_to = pos > 0 ? pos : null
+        said = ""
+        if n.src != null {
+            audio.src = n.src
+            audio.load()
+        } else {
+            audio.removeAttribute("src")
+            playing = false
+        }
+    }
+    let lock_screen = (n) => {
+        let ms = win.navigator.mediaSession
+        if ms != null {
+            ms.metadata = js_new("MediaMetadata", { title: n.title, artist: label })
+        }
+    }
+    let lock_state = (word: str) => {
+        let ms = win.navigator.mediaSession
+        if ms != null { ms.playbackState = word }
+    }
+    let play_note = (n) => {
+        if cur != n.id { load(n) }
+        if n.src != null && !contains(failed, n.id) {
+            audio.playbackRate = rate
+            // Called before anything waits: iOS lets it play only from the tap itself.
+            let r = js("Promise.resolve", audio.play())
+            if is_err(r) {
+                // Pausing or changing note while it starts is an error too, and no fault of the note's.
+                let why = lower(str(r.error))
+                if !contains(why, "interrupted") && !contains(why, "aborted") && !contains(failed, n.id) { said = "This recording would not start." }
+            } else {
+                lock_screen(n)
+                on_play && on_play(n.id)
+            }
+        }
+    }
+    let press = (n) => {
+        if cur == n.id && playing { audio.pause() } else { play_note(n) }
+    }
+    let seek = (t: num) => {
+        let to = max([0, min([length, t])])
+        pos = to
+        if audio.readyState >= 1 { audio.currentTime = to } else { seek_to = to }
+    }
+    let draw = (f: num) => {
+        let bar = g.el
+        bar.querySelector(".ui-voice-notes-fill").style.transform = `scaleX(${f})`
+        bar.querySelector(".ui-voice-notes-thumb").style.left = `${f * 100}%`
+        let whole = int(f * length)
+        if whole != peek { peek = whole }
+    }
+    // Lifted or cancelled: the bar's own --share takes over again.
+    let undraw = (bar) => {
+        bar.querySelector(".ui-voice-notes-fill").style.transform = ""
+        bar.querySelector(".ui-voice-notes-thumb").style.left = ""
+    }
+    let save_title = () => {
+        let t = trim(draft)
+        renaming = false
+        if t != "" && note != null && t != note.title {
+            names = set(names, cur, t)
+            on_rename && on_rename(cur, t)
+        }
+    }
+    let ask = (id: str) => {
+        asked = asked + [id]
+        refused = refused | filter((x) => x != id)
+        let r = js("Promise.resolve", on_transcribe(id))
+        if is_err(r) || r == false {
+            asked = asked | filter((x) => x != id)
+            refused = refused + [id]
+        }
+    }
+    let waiting = note != null && contains(asked, note.id) && note.text == null && len(note.lines) == 0
+    <div class={ui_cls(["ui-voice-notes", class])}
+         @mount={(me) => {
+             let w = js("window")
+             win = w
+             audio = me.querySelector("audio")
+             let ms = w.navigator.mediaSession
+             if ms != null {
+                 ms.setActionHandler("play", (_e = null) => { audio.play() })
+                 ms.setActionHandler("pause", (_e = null) => { audio.pause() })
+                 ms.setActionHandler("seekbackward", (_e = null) => { seek(pos - 15) })
+                 ms.setActionHandler("seekforward", (_e = null) => { seek(pos + 15) })
+             }
+             // A phone call or another app takes the sound without a word to the page, so its
+             // state is read again on coming back.
+             let d = js("document")
+             let back = (_e = null) => {
+                 if js("document.visibilityState") == "visible" && cur != null {
+                     playing = !audio.paused
+                     pos = audio.currentTime
+                 }
+             }
+             d.addEventListener("visibilitychange", back)
+             () => {
+                 d.removeEventListener("visibilitychange", back)
+                 audio.pause()
+             }
+         }}>
+        <audio preload="none"
+               @loadedmetadata={() => {
+                   let d = audio.duration
+                   if d > 0 && d < 360000 { lens = set(lens, cur, d) }
+                   if seek_to != null {
+                       audio.currentTime = min([seek_to, d > 0 && d < 360000 ? d : seek_to])
+                       seek_to = null
+                   }
+               }}
+               @durationchange={() => {
+                   let d = audio.duration
+                   if cur != null && d > 0 && d < 360000 { lens = set(lens, cur, d) }
+               }}
+               @timeupdate={() => { if g == null && seek_to == null && cur != null { pos = audio.currentTime } }}
+               @play={() => { playing = true; lock_state("playing") }}
+               @pause={() => { playing = false; keep_place(); lock_state("paused") }}
+               @ended={() => {
+                   playing = false
+                   pos = 0
+                   seek_to = null
+                   places = set(places, cur, 0)
+                   audio.currentTime = 0
+               }}
+               @error={() => {
+                   // With a src removed the element reports that too; only a chosen source counts.
+                   if cur != null && note != null && note.src != null {
+                       failed = failed + [cur]
+                       playing = false
+                       said = "This recording cannot be played."
+                   }
+               }}></audio>
+        <div.ui-voice-notes-inner>
+            <ul.ui-voice-notes-list aria-label={label}>
+                {len(rows) == 0 && <li.ui-voice-notes-none>{empty_text}</li>}
+                {for n in rows => <li.ui-voice-notes-row key={n.id} data-id={n.id} aria-current={n.id == cur ? "true" : "false"}>
+                    <button.ui-voice-notes-play type="button" aria-label={`Play ${n.title}`} aria-pressed={n.id == cur && playing ? "true" : "false"}
+                            disabled={n.src == null || contains(failed, n.id) ? true : null} @click={() => { press(n) }}>
+                        <svg.ui-voice-notes-tri viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l11-6.5a1 1 0 0 0 0-1.72l-11-6.5A1 1 0 0 0 8 5.5z"/></svg>
+                        <svg.ui-voice-notes-pause viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4.5" height="14" rx="1"/><rect x="13.5" y="5" width="4.5" height="14" rx="1"/></svg>
+                    </button>
+                    <button.ui-voice-notes-open type="button" aria-label={`Open ${n.title}`} @click={() => { if cur != n.id { audio.pause(); load(n) } }}>
+                        <span.ui-voice-notes-title>{n.title}</span>
+                        <span.ui-voice-notes-meta>{voice_note_list_when(n.at, day)}{n.text != null || len(n.lines) > 0 ? " · Transcript" : ""}</span>
+                    </button>
+                    <span.ui-voice-notes-len>{voice_note_list_time(get(lens, n.id, n.seconds))}</span>
+                    {n.id == cur && share > 0 && <span.ui-voice-notes-line aria-hidden="true" style={`transform: scaleX(${share})`}></span>}
+                </li>}
+            </ul>
+            {note != null && <div.ui-voice-notes-player role="group" aria-label="Player">
+                <div.ui-voice-notes-head>
+                    // Both stay on the page: iOS raises the keyboard only for a focus made in the tap itself.
+                    <input.ui-voice-notes-field type="text" value={draft} hidden={renaming ? null : "true"} aria-label="New title" maxlength="120" enterkeyhint="done"
+                           @input={(e) => { let v = e.value; draft = v }}
+                           @keydown={(e) => {
+                               if e.key == "Enter" { e.preventDefault(); save_title() }
+                               if e.key == "Escape" { e.preventDefault(); renaming = false }
+                           }}/>
+                    <h3.ui-voice-notes-name hidden={renaming ? "true" : null}>{note.title}</h3>
+                    <button.ui-voice-notes-btn type="button" aria-label={renaming ? "Save title" : "Rename"}
+                            @click={(e) => {
+                                if renaming {
+                                    save_title()
+                                } else {
+                                    draft = note.title
+                                    renaming = true
+                                    let f = e.target.closest(".ui-voice-notes-head").querySelector("input")
+                                    f.value = note.title
+                                    f.hidden = false
+                                    f.focus()
+                                    f.select()
+                                }
+                            }}>{renaming ? "Save" : <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16zM13 7l4 4"/></svg>}</button>
+                </div>
+                <div class={ui_cls(["ui-voice-notes-scrub", g != null && g.on && "ui-voice-notes-held"])} role="slider" tabindex="0" aria-label={`Place in ${note.title}`} style={`--share: ${share}`}
+                     aria-valuemin="0" aria-valuemax={int(length)} aria-valuenow={int(pos)} aria-valuetext={`${voice_note_list_time(pos)} of ${voice_note_list_time(length)}`}
+                     aria-disabled={bad ? "true" : null}
+                     @pointerdown={(e) => {
+                         g = !bad && e.isPrimary && e.button == 0 ? { pid: e.pointerId, el: e.currentTarget, x: e.clientX, y: e.clientY, on: false } : null
+                     }}
+                     @pointermove={(e) => {
+                         if g != null && e.pointerId == g.pid {
+                             if !g.on {
+                                 let way = voice_note_list_axis(e.clientX - g.x, e.clientY - g.y, 6)
+                                 if way == "y" { g = null }
+                                 if way == "x" {
+                                     g.el.setPointerCapture(e.pointerId)
+                                     g = { ...g, on: true }
+                                 }
+                             }
+                             if g != null && g.on {
+                                 let r = g.el.getBoundingClientRect()
+                                 draw(voice_note_list_share(e.clientX, r.left, r.width))
+                             }
+                         }
+                     }}
+                     @pointerup={(e) => {
+                         if g != null && e.pointerId == g.pid {
+                             let was = g
+                             let r = was.el.getBoundingClientRect()
+                             let f = voice_note_list_share(e.clientX, r.left, r.width)
+                             g = null
+                             peek = null
+                             seek(f * length)
+                             undraw(was.el)
+                         }
+                     }}
+                     @pointercancel={(e) => {
+                         if g != null && e.pointerId == g.pid {
+                             let was = g
+                             g = null
+                             peek = null
+                             undraw(was.el)
+                         }
+                     }}
+                     @keydown={(e) => {
+                         let to = !bad ? voice_note_list_key(e.key, pos, length) : null
+                         if to != null {
+                             e.preventDefault()
+                             seek(to)
+                         }
+                     }}>
+                    <span.ui-voice-notes-fill></span>
+                    <span.ui-voice-notes-thumb></span>
+                </div>
+                <div.ui-voice-notes-times>
+                    <span>{voice_note_list_time(shown)}</span>
+                    <span>{voice_note_list_time(length)}</span>
+                </div>
+                <div.ui-voice-notes-keys>
+                    <button.ui-voice-notes-btn type="button" aria-label="Back 15 seconds" disabled={bad ? true : null} @click={() => { seek(pos - 15) }}>−15</button>
+                    <button.ui-voice-notes-play type="button" aria-label={`Play ${note.title}`} aria-pressed={playing ? "true" : "false"} disabled={bad ? true : null} @click={() => { press(note) }}>
+                        <svg.ui-voice-notes-tri viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l11-6.5a1 1 0 0 0 0-1.72l-11-6.5A1 1 0 0 0 8 5.5z"/></svg>
+                        <svg.ui-voice-notes-pause viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4.5" height="14" rx="1"/><rect x="13.5" y="5" width="4.5" height="14" rx="1"/></svg>
+                    </button>
+                    <button.ui-voice-notes-btn type="button" aria-label="On 15 seconds" disabled={bad ? true : null} @click={() => { seek(pos + 15) }}>+15</button>
+                    <button.ui-voice-notes-btn type="button" aria-label={`Speed ${rate} times`}
+                            @click={() => {
+                                rate_at = (rate_at + 1) % len(rates)
+                                audio.playbackRate = rates[rate_at]
+                            }}>{rate}×</button>
+                </div>
+                <p.ui-voice-notes-say role="status" data-bad={said != "" ? "" : null}>{said}</p>
+                <div.ui-voice-notes-script aria-label="Transcript" role="group">
+                    {note.text != null && <p.ui-voice-notes-text>{note.text}</p>}
+                    {for [i, l] in enumerate(note.lines) => <button.ui-voice-notes-seg type="button" key={`${note.id}-${i}`} aria-current={i == spoken ? "true" : "false"} @click={() => { seek(l.at) }}>
+                        <span>{voice_note_list_time(l.at)}</span><span>{l.text}</span>
+                    </button>}
+                    {note.text == null && len(note.lines) == 0 && <div>
+                        {waiting ? <p.ui-voice-notes-say>Waiting for the transcript.</p>
+                            : on_transcribe != null ? <button.ui-voice-notes-ask type="button" @click={() => { ask(note.id) }}>{contains(refused, note.id) ? "Try the transcript again" : "Get a transcript"}</button>
+                            : <p.ui-voice-notes-say>No transcript.</p>}
+                    </div>}
+                </div>
+            </div>}
+        </div>
+    </div>
+}

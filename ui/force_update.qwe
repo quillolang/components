@@ -1,0 +1,202 @@
+// ForceUpdate: tells a person their app is too old. Below `minimum` it is a screen with no way
+// past it; below `latest` it is a sheet they can put off. It compares versions as numbers, so
+// 1.10 is newer than 1.9, and takes the person to the right store for their system.
+//
+//   <ForceUpdate current="1.9.2" minimum="1.8.0" latest="1.10.0" app_name="Fieldbook" remember="update"
+//       ios="https://apps.apple.com/app/id1234567890" android="https://play.google.com/store/apps/details?id=org.example.app"
+//       notes={["Faster sync", "Fixes a crash on opening a photo"]}/>
+//
+// current: this app's version: a `server fn` can give it from `platform().app.version`.
+// minimum: older than this cannot go on, and sees the hard screen. latest: older than this sees
+// the soft one. These two come from your own server, and a value that cannot be read counts as
+// no answer, so a bad setting never locks anyone out. app_name: its name in the words ("this app").
+// ios, android, web: the store's address for each, https in a phone app, whose web view opens
+// nothing else (itms-apps: and market: links do nothing). notes: a list of what is new.
+// remember: the name a "Later" is kept under, for snooze_days days (3) and for that version only;
+// null asks at every start. modal: the hard screen and the sheet shut out the page, as the browser's
+// modal dialog (true); false keeps them in a frame, for a demo.
+// on_update(link, platform): inside one of your components, as the store opens. on_later():
+// when the soft one is put off. platform is "ios", "android" or "web".
+//
+// A version is numbers with dots, with a `v` before it if you like; `-beta.1` makes it older than
+// the same numbers without, and `+build` is ignored. force_update_compare(a, b) gives -1,
+// 0 or 1, or null if one cannot be read; force_update_mode(current, minimum, latest) gives
+// "hard", "soft" or "none"; force_update_key(version) gives text that sorts as versions do.
+//
+// Android's back button is not the page's to stop: from the hard screen it goes back a page
+// or leaves the app, and the next start shows it again. Put this component on every page.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/welcome_carousel.qwe use welcome_carousel_keep, welcome_carousel_recall
+
+let force_update_css = css`
+.ui-force-update-host { display: contents; }
+.ui-force-update {
+  position: fixed; z-index: 70; box-sizing: border-box; margin: 0; padding: 0; border: 0; background: var(--ui-bg); color: var(--ui-fg); font: 16px/1.5 var(--ui-font);
+}
+.ui-force-update::backdrop { background: var(--ui-overlay); }
+.ui-force-update-hard { inset: 0; width: 100%; max-width: none; height: 100%; max-height: none; }
+.ui-force-update-hard[open] { display: flex; align-items: center; justify-content: center; }
+.ui-force-update-soft {
+  inset: auto 0 0 0; width: 100%; max-width: 100%; max-height: 100%; overflow: auto; overscroll-behavior: contain; border-top: 1px solid var(--ui-border);
+  border-radius: calc(var(--ui-radius) + 8px) calc(var(--ui-radius) + 8px) 0 0; background: var(--ui-surface); box-shadow: var(--ui-shadow-lg);
+}
+.ui-force-update-in {
+  display: grid; gap: 12px; box-sizing: border-box; width: 100%; max-width: 30em; margin: 0 auto;
+  padding: max(20px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));
+}
+.ui-force-update-hard .ui-force-update-in { justify-items: center; text-align: center; }
+.ui-force-update-mark { display: grid; place-items: center; width: 72px; height: 72px; border-radius: 50%; background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-force-update-mark svg { width: 36px; height: 36px; }
+.ui-force-update h2 { margin: 0; font-size: 24px; line-height: 1.25; }
+.ui-force-update p { margin: 0; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-force-update-notes { display: grid; gap: 2px; margin: 0; padding-inline-start: 20px; text-align: start; }
+.ui-force-update-acts { display: grid; gap: 8px; width: 100%; }
+@media (min-width: 700px) {
+  .ui-force-update-soft { inset: 0; width: min(480px, 90vw); height: fit-content; margin: auto; border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 6px); }
+  .ui-force-update-hard .ui-force-update-mark { width: 96px; height: 96px; }
+  .ui-force-update-hard .ui-force-update-mark svg { width: 48px; height: 48px; }
+}
+`
+
+// A number's text, padded so that text order is number order, at any length.
+fn force_update_pad(digits: str) -> str {
+    let bare = re.replace(digits, "^0+", "")
+    let room = 24 - len(bare)
+    `${repeat("0", room > 0 ? room : 0)}${bare}`
+}
+
+// Text for a version that sorts as versions do, or null when it cannot be read. Eight numbers
+// at the most, of twenty digits, which is more than any version, so a long bad value is
+// refused and never slow. A pre-release sorts before the same numbers without one.
+fn force_update_key(version) -> str? {
+    if type_of(version) != "str" { return null }
+    let t = re.replace(re.replace(trim(version), "^[vV]", ""), "[+].*$", "")
+    let cut = index_of(t, "-")
+    let main = cut != null ? slice(t, 0, cut) : t
+    let pre = cut != null ? slice(t, cut + 1) : null
+    if !re.test(main, "^[0-9]{1,20}([.][0-9]{1,20}){0,7}$") { return null }
+    if pre != null && !re.test(pre, "^[0-9A-Za-z.-]{1,40}$") { return null }
+    let nums = split(main, ".")
+    let filled = nums + (range(0, 8 - len(nums)) | map((_i) => "0"))
+    let head = filled | map((n) => force_update_pad(n)) | join(".")
+    if pre == null { return `${head}~1` }
+    let ids = split(pre, ".") | map((p) => re.test(p, "^[0-9]{1,20}$") ? `0${force_update_pad(p)}` : `1${p}`)
+    `${head}~0${join(ids, ".")}`
+}
+
+// -1 when a is older than b, 1 when newer, 0 when the same, null when either cannot be read.
+fn force_update_compare(a, b) {
+    let ka = force_update_key(a)
+    let kb = force_update_key(b)
+    if ka == null || kb == null { return null }
+    if ka == kb { return 0 }
+    ka < kb ? -1 : 1
+}
+
+fn force_update_mode(current, minimum, latest) -> str {
+    if force_update_compare(current, minimum) == -1 { return "hard" }
+    force_update_compare(current, latest) == -1 ? "soft" : "none"
+}
+
+// The system, from what the browser says of itself. An iPad's browser says it is a Mac,
+// and only a Mac with a touch screen gives it away.
+fn force_update_platform(agent: str?, touches: int) -> str {
+    let ua = lower(agent ?? "")
+    if contains(ua, "android") { return "android" }
+    if contains(ua, "iphone") || contains(ua, "ipad") || contains(ua, "ipod") { return "ios" }
+    contains(ua, "macintosh") && touches > 1 ? "ios" : "web"
+}
+
+// The address for a system, or null when there is none. Only https or http: a phone app's
+// web view does nothing with another scheme, and it may come from a remote setting.
+fn force_update_link(platform: str, ios, android, web) -> str? {
+    let own = platform == "ios" ? ios : platform == "android" ? android : web
+    let pick = own ?? web
+    type_of(pick) == "str" && re.test(pick, "^https?://") ? pick : null
+}
+
+// The words on the button.
+fn force_update_button(platform: str, link) -> str {
+    if link == null { return "Reload" }
+    platform == "ios" ? "Open the App Store" : platform == "android" ? "Open Google Play" : "Update now"
+}
+
+// Whether a "Later" kept as text still holds for `latest` at `now`, in ms.
+fn force_update_put_off(text, latest, now: num) -> bool {
+    if type_of(text) != "str" { return false }
+    let got = json.parse(text)
+    if is_err(got) || type_of(got) != "map" { return false }
+    let until = get(got, "until")
+    (type_of(until) == "int" || type_of(until) == "float") && get(got, "version") == latest && now < until
+}
+
+component ForceUpdate(current: str? = null, minimum: str? = null, latest: str? = null, app_name: str = "this app", ios: str? = null,
+                      android: str? = null, web: str? = null, notes: list = [], remember: str? = null, snooze_days: num = 3, modal: bool = true,
+                      id: str = "force-update", on_update = null, on_later = null, class: str? = null) {
+    style global force_update_css
+    state platform = "web"
+    state off = false           // put off, or not yet known not to be
+    state checked = false
+    let mode = force_update_mode(current, minimum, latest)
+    let link = force_update_link(platform, ios, android, web)
+    let hard = mode == "hard"
+    <div.ui-force-update-host data-mode={mode} data-platform={platform}
+         @mount={() => {
+             platform = force_update_platform(js("navigator.userAgent"), js("navigator.maxTouchPoints"))
+             if remember != null {
+                 let text = js("Promise.resolve", welcome_carousel_recall(remember))
+                 off = !is_err(text) && force_update_put_off(text, latest, js("Date.now"))
+             }
+             checked = true
+         }}>
+        {(hard || (mode == "soft" && checked && !off)) &&
+            <dialog key={mode} class={ui_cls(["ui-force-update", hard ? "ui-force-update-hard" : "ui-force-update-soft", class])}
+                    role="alertdialog" aria-labelledby={`${id}-title`} aria-describedby={`${id}-text`} open="open"
+                    closedby={hard ? "none" : "closerequest"}
+                    @mount={(el) => {
+                        // Written open, so that the screen is there before any script. Taken up
+                        // as modal, the page behind goes out of reach.
+                        if modal {
+                            el.close()
+                            el.showModal()
+                        }
+                    }}
+                    @cancel={(e) => { if hard { e.preventDefault() } }}
+                    @close={(e) => {
+                        // A browser lets a second Escape through whatever `cancel` said. Hard means hard.
+                        if hard {
+                            if modal { e.target.showModal() } else { e.target.show() }
+                        } else {
+                            // Escape on the soft one: gone for now, and asked again at the next start.
+                            off = true
+                        }
+                    }}>
+                <div.ui-force-update-in>
+                    {hard && <span.ui-force-update-mark aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M4 20h16"/></svg>
+                    </span>}
+                    <h2 id={`${id}-title`}>{hard ? "Update needed" : "A new version is out"}</h2>
+                    <p id={`${id}-text`}>
+                        {hard ? `This version of ${app_name} no longer works. You have ${current}, and it needs ${minimum} or newer.`
+                              : `Version ${latest} of ${app_name} is ready. You have ${current}.`}
+                    </p>
+                    {len(notes) > 0 && <ul.ui-force-update-notes>{for t in notes => <li key={t}>{t}</li>}</ul>}
+                    {link == null && platform != "web" && <p>Open your phone's app store and look for {app_name}.</p>}
+                    <div.ui-force-update-acts>
+                        {link != null
+                            ? <Button size="lg" full={true} href={link}>{force_update_button(platform, link)}</Button>
+                            : platform == "web" && <Button size="lg" full={true} on_click={() => { js("location.reload") }}>{force_update_button(platform, link)}</Button>}
+                        {!hard && <Button size="lg" full={true} variant="ghost" tone="neutral" on_click={() => {
+                            if remember != null {
+                                welcome_carousel_keep(remember, json.stringify({ version: latest, until: js("Date.now") + snooze_days * 86400000 }))
+                            }
+                            off = true
+                            on_later && on_later()
+                        }}>Later</Button>}
+                    </div>
+                </div>
+            </dialog>}
+    </div>
+}

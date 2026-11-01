@@ -1,0 +1,306 @@
+// FilterSheet: facets in a sheet, on a phone from the bottom and on a tablet in a dialog
+// with the facets side by side. Each option shows how many results it would give, and
+// these and the Show button change as options are picked, without touching the list
+// behind. Clear empties the choices, Show applies them, closing without Show leaves them
+// as they were, and the button that opens it counts what is on. What was applied can be
+// kept on the device for the next visit.
+//
+//   import ui/filter_sheet.qwe use FilterSheet
+//
+//   <FilterSheet items={products} save_key="shoes"
+//                facets={[{ key: "brand", label: "Brand" },
+//                         { key: "sizes", label: "Size", options: ["S", "M", "L"] },
+//                         { key: "price", label: "Price", kind: "range" },
+//                         { key: "in_stock", label: "In stock only", kind: "flag" }]}
+//                on_apply={(chosen, found) => { shown = found }}/>
+//
+// items: what is being filtered, each a map. facets: one for each thing to filter by:
+// key (the field of an item), label, and kind: "list" (the default: checkboxes, an item
+// passing with any of those ticked; its field may be one value or a list of them),
+// "range" (a lowest and a highest number) or "flag" (one switch, for a field that is true).
+// options: a list's values in the order to show them (else as they first appear in
+// items). trigger: the text of the button that opens it ("Filters"; null for none, then
+// open it by open={...} and on_close()). title: the sheet's heading ("Filters"). noun: what
+// the results are, in the plural ("results"). saved: what to start from, the chosen that
+// on_apply last gave. save_key: the name to keep it under in this browser's localStorage
+// instead (null keeps nothing). A phone app's localStorage comes back empty at each launch,
+// so there keep chosen yourself, through a server fn, and pass it as saved. on_apply(chosen,
+// found): after Show, and at the start when something saved came back: chosen is what
+// filter_sheet_on counts, found the items that pass. id: a prefix for its ids ("ui-filtsh"),
+// unique on the page.
+//
+// Facets work as a shop's do: ticks in one facet widen it (either brand), facets narrow
+// each other (this brand and that size), and the number beside an option is what ticking
+// it would give, so a facet's own ticks do not shrink it. An option giving none is off,
+// unless it is ticked already.
+//
+// filter_sheet_found(items, facets, chosen) and filter_sheet_counts(items, facets, chosen,
+// facet) are the same work, for a server's list of the same data.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/cart_sheet.qwe use CartSheetFrame
+
+let filter_sheet_css = css`
+.ui-filtsh-host { display: contents; }
+.ui-filtsh-open {
+  display: inline-flex; align-items: center; gap: 8px; min-width: 44px; min-height: 46px; padding: 0 16px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 600 15px var(--ui-font); cursor: pointer;
+  touch-action: manipulation;
+}
+.ui-filtsh-open:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-filtsh-on { border-color: var(--ui-accent); }
+.ui-filtsh-count {
+  display: inline-grid; place-items: center; min-width: 22px; height: 22px; padding: 0 6px; box-sizing: border-box; border-radius: 999px;
+  background: var(--ui-accent); color: var(--ui-accent-fg); font-size: 13px; font-variant-numeric: tabular-nums;
+}
+.ui-filtsh-facets { display: grid; gap: 18px; }
+.ui-filtsh-facet { min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-filtsh-facet legend { padding: 0 0 4px; font-weight: 600; }
+.ui-filtsh-opt {
+  position: relative; display: flex; align-items: center; gap: 12px; min-height: 44px; padding: 0 4px; border-radius: var(--ui-radius-sm); cursor: pointer;
+  touch-action: manipulation;
+}
+.ui-filtsh-opt input { flex: none; width: 20px; height: 20px; margin: 0; accent-color: var(--ui-accent); }
+.ui-filtsh-opt span:first-of-type { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.ui-filtsh-n { color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-filtsh-off { color: var(--ui-muted); cursor: default; }
+.ui-filtsh-opt:focus-within { box-shadow: var(--ui-focus); }
+.ui-filtsh-range { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.ui-filtsh-range label { display: grid; gap: 2px; min-width: 0; color: var(--ui-muted); font-size: 13px; }
+/* 16 px: anything smaller and iOS zooms the page when the field is touched. */
+.ui-filtsh-range input {
+  box-sizing: border-box; width: 100%; min-width: 0; height: 46px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 16px var(--ui-font);
+}
+.ui-filtsh-range input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-filtsh-bad { grid-column: 1 / -1; margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-filtsh-acts { display: grid; grid-template-columns: auto 1fr; gap: 10px; }
+.ui-filtsh-saved { margin: 0; color: var(--ui-muted); font-size: 13px; }
+@container (min-width: 520px) { .ui-filtsh-facets { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 18px 28px; } }
+`
+
+// The facets that can be used: each needs a key.
+fn filter_sheet_clean(facets) -> list =
+    type_of(facets) != "list" ? [] : facets | filter((f) => type_of(f) == "map" && get(f, "key") != null)
+        | map((f) => set(set(f, "key", str(f.key)), "label", str(get(f, "label", f.key))))
+
+// The options of a list facet: those it names, else as they first appear in the items.
+fn filter_sheet_values(x, key: str) -> list {
+    let v = get(x, key)
+    if v == null { return [] }
+    type_of(v) == "list" ? v | map((o) => str(o)) : [str(v)]
+}
+
+fn filter_sheet_options(items: list, facet: map) -> list {
+    let named = get(facet, "options")
+    type_of(named) == "list" ? named | map((o) => str(o)) : items | map((x) => filter_sheet_values(x, facet.key)) | flatten() | unique()
+}
+
+// A bound as a decimal, or null when it is empty or not a number.
+fn filter_sheet_number(v) {
+    let t = trim(str(v ?? ""))
+    if t == "" || len(t) > 18 || !re.test(t, "^-?[0-9]{1,14}([.][0-9]{1,6})?$") { return null }
+    dec(t)
+}
+
+// Whether an item passes one facet.
+fn filter_sheet_passes(x, facet: map, chosen: map) -> bool {
+    let kind = get(facet, "kind", "list")
+    let on = get(chosen, facet.key)
+    if on == null { return true }
+    if kind == "flag" { return on != true || get(x, facet.key) == true }
+    if kind == "range" {
+        let low = filter_sheet_number(get(on, "low"))
+        let high = filter_sheet_number(get(on, "high"))
+        if low == null && high == null { return true }
+        let n = filter_sheet_number(get(x, facet.key))
+        return n != null && (low == null || n >= low) && (high == null || n <= high)
+    }
+    if len(on) == 0 { return true }
+    filter_sheet_values(x, facet.key) | any((v) => contains(on, v))
+}
+
+// The items that pass every facet.
+fn filter_sheet_found(items: list, facets: list, chosen: map) -> list =
+    items | filter((x) => facets | all((f) => filter_sheet_passes(x, f, chosen)))
+
+// What each option of a list facet would give: [{ value, n }], in the facets' order.
+// Each facet counts over what the others leave, so ticking one brand leaves the other
+// brands' numbers as they were.
+fn filter_sheet_counts(items: list, facets: list, chosen: map, facet: map) -> list {
+    let others = facets | filter((f) => f.key != facet.key)
+    let left = filter_sheet_found(items, others, chosen) | map((x) => filter_sheet_values(x, facet.key))
+    filter_sheet_options(items, facet) | map((o) => { value: o, n: left | count((vs) => contains(vs, o)) })
+}
+
+// How many filters are on, for the button: each tick, each range and each flag is one.
+fn filter_sheet_on(facets: list, chosen: map) -> int =
+    facets | reduce(0, (n, f) => {
+        let on = get(chosen, f.key)
+        let kind = get(f, "kind", "list")
+        let adds = if on == null { 0 }
+            else if kind == "flag" { on == true ? 1 : 0 }
+            else if kind == "range" { filter_sheet_number(get(on, "low")) != null || filter_sheet_number(get(on, "high")) != null ? 1 : 0 }
+            else { len(on) }
+        n + adds
+    })
+
+// A range's message: what is wrong with it, or null.
+fn filter_sheet_range_note(on) {
+    if on == null { return null }
+    let lo = trim(str(get(on, "low") ?? ""))
+    let hi = trim(str(get(on, "high") ?? ""))
+    let low = filter_sheet_number(lo)
+    let high = filter_sheet_number(hi)
+    if (lo != "" && low == null) || (hi != "" && high == null) { return "Enter a number." }
+    low != null && high != null && low > high ? "The lowest is above the highest." : null
+}
+
+// What was kept, without anything that no longer fits the facets: a saved text may be
+// old or changed by hand, and options come and go.
+fn filter_sheet_restore(text, items: list, facets: list) -> map {
+    if type_of(text) != "str" || len(text) > 20000 { return {} }
+    let data = json.parse(text)
+    is_err(data) ? {} : filter_sheet_fit(data, items, facets)
+}
+
+fn filter_sheet_fit(data, items: list, facets: list) -> map {
+    if type_of(data) != "map" { return {} }
+    facets | reduce({}, (m, f) => {
+        let on = get(data, f.key)
+        let kind = get(f, "kind", "list")
+        if kind == "flag" { return on == true ? set(m, f.key, true) : m }
+        if kind == "range" {
+            if type_of(on) != "map" { return m }
+            let low = filter_sheet_number(get(on, "low"))
+            let high = filter_sheet_number(get(on, "high"))
+            return low == null && high == null ? m : set(m, f.key, { low: str(get(on, "low") ?? ""), high: str(get(on, "high") ?? "") })
+        }
+        if type_of(on) != "list" { return m }
+        let known = filter_sheet_options(items, f)
+        let kept = on | map((o) => str(o)) | filter((o) => contains(known, o))
+        len(kept) > 0 ? set(m, f.key, kept) : m
+    })
+}
+
+// A tick on or off.
+fn filter_sheet_toggle(chosen: map, key: str, value: str) -> map {
+    let on = get(chosen, key, [])
+    set(chosen, key, contains(on, value) ? on | filter((o) => o != value) : on | push(value))
+}
+
+fn filter_sheet_noun(n: int, noun: str) -> str = n == 1 && ends_with(noun, "s") ? slice(noun, 0, len(noun) - 1) : noun
+
+view FilterSheetOption(id: str, label: str, n: int, on: bool, on_toggle) {
+    let off = n == 0 && !on
+    <label class={ui_cls(["ui-filtsh-opt", off && "ui-filtsh-off"])} for={id}>
+        <input type="checkbox" id={id} checked={on} disabled={off} @change={() => { on_toggle() }}/>
+        <span>{label}</span>
+        <span.ui-filtsh-n>{n}</span>
+    </label>
+}
+
+view FilterSheetRange(id: str, label: str, on, on_low, on_high) {
+    let note = filter_sheet_range_note(on)
+    <fieldset.ui-filtsh-facet>
+        <legend>{label}</legend>
+        <div.ui-filtsh-range>
+            <label for={`${id}-low`}>Lowest
+                <input id={`${id}-low`} inputmode="decimal" autocomplete="off" enterkeyhint="done" value={str(get(on, "low") ?? "")}
+                       aria-invalid={note != null ? "true" : null} @input={(e) => { on_low(e.value) }}/>
+            </label>
+            <label for={`${id}-high`}>Highest
+                <input id={`${id}-high`} inputmode="decimal" autocomplete="off" enterkeyhint="done" value={str(get(on, "high") ?? "")}
+                       aria-invalid={note != null ? "true" : null} @input={(e) => { on_high(e.value) }}/>
+            </label>
+            {note != null && <p.ui-filtsh-bad role="alert">{note}</p>}
+        </div>
+    </fieldset>
+}
+
+component FilterSheet(items = [], facets = [], trigger: str? = "Filters", open: bool = false, title: str = "Filters",
+                      noun: str = "results", saved = null, save_key: str? = null, id: str = "ui-filtsh", on_apply = null, on_close = null) {
+    style global filter_sheet_css
+    let groups = filter_sheet_clean(facets)
+    let rows = type_of(items) == "list" ? items | filter((x) => type_of(x) == "map") : []
+    state own = false
+    state applied = filter_sheet_fit(saved, rows, groups)     // what the page behind is filtered by
+    state draft = filter_sheet_fit(saved, rows, groups)       // what is ticked in the sheet, until Show
+    state back = len(keys(filter_sheet_fit(saved, rows, groups))) > 0       // what is applied came from the last visit
+    let found = filter_sheet_found(rows, groups, draft)
+    let on_now = filter_sheet_on(groups, applied)
+    let on_draft = filter_sheet_on(groups, draft)
+    let close = () => {
+        own = false
+        draft = applied
+        on_close && on_close()
+    }
+    let apply = () => {
+        applied = draft
+        back = false
+        on_apply && on_apply(applied, found)
+        own = false
+        on_close && on_close()
+        // Private windows and full storage throw: the wrapper makes that an error value, and the filter still applies.
+        if save_key != null {
+            let text = json.stringify(applied)
+            let kept = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.setItem", `ui-filtsh-${save_key}`, text)) }))
+            is_err(kept)
+        }
+    }
+    let bound = (key, part, text) => {
+        let was = get(draft, key, { low: "", high: "" })
+        draft = set(draft, key, set(was, part, text))
+    }
+    <div.ui-filtsh-host @mount={(_el) => {
+        let given = len(keys(applied)) > 0
+        let text = save_key != null && !given ? js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.getItem", `ui-filtsh-${save_key}`)) })) : null
+        let kept = given ? applied : (is_err(text) ? {} : filter_sheet_restore(text, rows, groups))
+        if len(keys(kept)) > 0 {
+            applied = kept
+            draft = kept
+            back = true
+            on_apply && on_apply(kept, filter_sheet_found(rows, groups, kept))
+        }
+    }}>
+        {trigger != null && <button type="button" aria-haspopup="dialog" class={ui_cls(["ui-filtsh-open", on_now > 0 && "ui-filtsh-on"])}
+                                    @click={() => { own = true }}>
+            {trigger}
+            {on_now > 0 && <span.ui-filtsh-count aria-label={`${on_now} on`}>{on_now}</span>}
+        </button>}
+        <CartSheetFrame title={title} open={open || own} wide="center" on_close={close}
+                        footer={<div.ui-filtsh-acts>
+                            <Button variant="outline" size="lg" disabled={on_draft == 0} on_click={() => { draft = {} }}>Clear</Button>
+                            <Button size="lg" full={true} disabled={filter_sheet_any_bad(groups, draft)} on_click={apply}>
+                                <span aria-live="polite">Show {len(found)} {filter_sheet_noun(len(found), noun)}</span>
+                            </Button>
+                        </div>}>
+            {back && <p.ui-filtsh-saved>Your filters from last time.</p>}
+            <div.ui-filtsh-facets>
+                {for f in groups {
+                    let kind = get(f, "kind", "list")
+                    <div key={f.key}>
+                        {kind == "list" && <fieldset.ui-filtsh-facet>
+                            <legend>{f.label}</legend>
+                            {for o in filter_sheet_counts(rows, groups, draft, f) => <FilterSheetOption key={o.value} id={`${id}-${f.key}-${o.value}`}
+                                label={o.value} n={o.n} on={contains(get(draft, f.key, []), o.value)}
+                                on_toggle={() => { draft = filter_sheet_toggle(draft, f.key, o.value) }}/>}
+                        </fieldset>}
+                        {kind == "range" && <FilterSheetRange id={`${id}-${f.key}`} label={f.label} on={get(draft, f.key)}
+                            on_low={(t) => { bound(f.key, "low", t) }} on_high={(t) => { bound(f.key, "high", t) }}/>}
+                        {kind == "flag" && <label.ui-filtsh-opt for={`${id}-${f.key}`}>
+                            <input type="checkbox" id={`${id}-${f.key}`} checked={get(draft, f.key) == true}
+                                   @change={(e) => { draft = set(draft, f.key, e.checked) }}/>
+                            <span>{f.label}</span>
+                        </label>}
+                    </div>
+                }}
+            </div>
+        </CartSheetFrame>
+    </div>
+}
+
+// Whether a range cannot be read, so Show waits for it to be put right.
+fn filter_sheet_any_bad(facets: list, chosen: map) -> bool =
+    facets | any((f) => get(f, "kind", "list") == "range" && filter_sheet_range_note(get(chosen, f.key)) != null)

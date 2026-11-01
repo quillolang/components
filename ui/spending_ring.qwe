@@ -1,0 +1,225 @@
+// SpendingRing: where this month's money went, as a ring cut by category, and how the month so
+// far stands against the same day last month. A tap on a part of the ring or a line of the
+// list picks that category, and the middle and the comparison follow it; a tap in the middle
+// goes back to everything. Parts too thin for a finger are reached from the list, which is
+// also the way for keys and screen readers. On a tablet the list stands beside the ring.
+//
+//   import ui/spending_ring.qwe use SpendingRing
+//
+//   <SpendingRing today="2026-11-12" last_so_far={1120m} last_total={2480m} categories={[
+//       { name: "Rent", spent: 950m, last: 950m },
+//       { name: "Food", spent: 212.40m, last: 180.10m, color: "#c2410c" },
+//       { name: "Travel", spent: "96.15" }]}/>
+//
+// categories: each { name, spent, last, color }. spent: a decimal, an int or numeric text.
+// Nothing above zero leaves it out. last: that category by the same day last month. color: #rgb
+// or #rrggbb. last_so_far: everything by the same day last month. last_total: all of last
+// month. today: "YYYY-MM-DD", from your page. currency ("USD"), locale. label ("Spending this
+// month"). on_pick(name): the category picked, null for all of them.
+//
+// spending_ring_percents(amounts), spending_ring_compare(now, then), spending_ring_same_day(today)
+// and spending_ring_hit(x, y, parts) are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/price.qwe use price_text
+
+let spending_ring_css = css`
+.ui-spendring { display: grid; gap: 14px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 14px/1.4 var(--ui-font); }
+.ui-spendring-lay { display: grid; gap: 14px; min-width: 0; }
+.ui-spendring-ring { position: relative; width: min(100%, 300px); aspect-ratio: 1; margin: 0 auto; }
+.ui-spendring-ring svg { display: block; width: 100%; height: 100%; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.ui-spendring-part { fill: none; stroke: var(--ui-spendring-c); transition: stroke-width .15s, opacity .15s; }
+.ui-spendring-faded .ui-spendring-part { opacity: .35; }
+.ui-spendring-faded .ui-spendring-part-on { opacity: 1; }
+.ui-spendring-mid { position: absolute; inset: 24%; display: grid; margin: 0; place-content: center; gap: 2px; text-align: center; pointer-events: none; }
+.ui-spendring-mid span { color: var(--ui-muted); font-size: 12px; overflow-wrap: anywhere; }
+.ui-spendring-mid strong { font-size: min(22px, 6.4cqw); font-variant-numeric: tabular-nums; line-height: 1.15; overflow-wrap: anywhere; }
+.ui-spendring-list { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.ui-spendring-line {
+  box-sizing: border-box; display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; align-items: center; gap: 0 10px; width: 100%; min-height: 52px; padding: 6px 10px; border: 1px solid transparent; border-radius: var(--ui-radius); background: transparent; color: inherit;
+  font: inherit; text-align: left; cursor: pointer; touch-action: manipulation;
+}
+.ui-spendring-line[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-spendring-line:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-spendring-dot { grid-row: span 2; width: 14px; height: 14px; border-radius: 4px; background: var(--ui-spendring-c); }
+.ui-spendring-name { font-weight: 600; overflow-wrap: anywhere; }
+.ui-spendring-amt { justify-self: end; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-spendring-sub { color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-spendring-vs { grid-column: 3; justify-self: end; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-spendring-cmp { display: grid; gap: 8px; padding: 12px 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-spendring-cmp h3 { margin: 0; font-size: 14px; }
+.ui-spendring-cmp > div { display: grid; gap: 8px; }
+.ui-spendring-bar { display: grid; gap: 2px; }
+.ui-spendring-bar p { display: flex; justify-content: space-between; gap: 12px; margin: 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-spendring-track { height: 10px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-spendring-track span { display: block; height: 100%; border-radius: 999px; background: var(--ui-accent); transition: width .2s; }
+.ui-spendring-then .ui-spendring-track span { background: var(--ui-strong); }
+.ui-spendring-word { margin: 0; font-weight: 600; }
+.ui-spendring-up { color: var(--ui-danger); }
+.ui-spendring-down { color: var(--ui-success); }
+.ui-spendring-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-spendring-none { margin: 0; padding: 20px; border: 1px dashed var(--ui-border); border-radius: var(--ui-radius); color: var(--ui-muted); text-align: center; }
+@container (min-width: 600px) {
+  .ui-spendring-lay { grid-template-columns: minmax(240px, 300px) minmax(0, 1fr); align-items: center; gap: 28px; }
+}
+@media (hover: hover) { .ui-spendring-line:hover { background: var(--ui-subtle); } }
+@media (prefers-reduced-motion: reduce) { .ui-spendring-part, .ui-spendring-track span { transition: none; } }
+`
+
+// Colours for categories that name none, told apart again by their place in the list.
+let spending_ring_colors = ["var(--ui-accent)", "var(--ui-success)", "var(--ui-warning)", "var(--ui-info)", "var(--ui-danger)", "#0d9488", "#be185d", "#65a30d", "#7c3aed", "#b45309"]
+
+// An amount as a decimal, or null.
+fn spending_ring_dec(v) {
+    let kind = type_of(v)
+    if kind != "dec" && kind != "int" && kind != "float" && kind != "str" { return null }
+    let d = dec(v)
+    is_err(d) ? null : d
+}
+
+// Whole percentages of a list of amounts that add up to exactly 100, whatever the rounding:
+// each gets its share rounded down, and what is left goes to the largest remainders.
+fn spending_ring_percents(amounts: list) -> list {
+    let whole = sum(amounts)
+    if len(amounts) == 0 || whole <= 0m { return amounts | map((_a) => 0) }
+    let shares = amounts | map((a) => a * 100 / whole)
+    let floors = shares | map((s) => int(floor(s)))
+    let spare = 100 - sum(floors)
+    let order = enumerate(shares) | sort_by((p) => floors[p[0]] - p[1]) | map((p) => p[0])
+    let lucky = slice(order, 0, spare)
+    enumerate(floors) | map((p) => contains(lucky, p[0]) ? p[1] + 1 : p[1])
+}
+
+// The categories to draw, largest first: name, spent, last, colour, percent, and where each
+// starts and ends in turns of the ring, 0 to 1.
+fn spending_ring_parts(categories: list) -> list {
+    let good = categories | map((c) => { { name: str(c.name ?? "Other"), spent: spending_ring_dec(c.spent), last: spending_ring_dec(c.last), color: c.color } })
+        | filter((c) => c.spent != null && c.spent > 0m) | sort_by((c) => -float(c.spent))
+    let amounts = good | map((c) => c.spent)
+    let whole = sum(amounts)
+    let percents = spending_ring_percents(amounts)
+    let share = amounts | map((a) => float(a) / float(whole))
+    enumerate(good) | map((p) => {
+        let i = p[0]
+        let c = p[1]
+        let from = sum(slice(share, 0, i))
+        let given = type_of(c.color) == "str" && re.test(c.color, "^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$")
+        { name: c.name, spent: c.spent, last: c.last, color: given ? c.color : spending_ring_colors[i % len(spending_ring_colors)], percent: percents[i], from: from, to: from + share[i] }
+    })
+}
+
+// Which part a point falls on, as an index, the point counted in the ring's own units from its
+// middle: -1 in the hole, -2 outside it. The band is wider than it is drawn, for a finger.
+fn spending_ring_hit(x: num, y: num, parts: list) -> int {
+    let r = math.sqrt(x * x + y * y)
+    if r < 34 { return -1 }
+    if r > 62 { return -2 }
+    let angle = math.atan2(x, -y) / (2 * math.pi)
+    let turn = angle < 0 ? angle + 1 : angle
+    let found = enumerate(parts) | filter((p) => turn >= p[1].from && turn < p[1].to)
+    len(found) > 0 ? found[0][0] : len(parts) - 1
+}
+
+// One month against another: { diff, word, percent }. word: "more", "less" or "same"; percent:
+// to one decimal, null with nothing to measure against.
+fn spending_ring_compare(now_amt, then_amt) {
+    if now_amt == null || then_amt == null { return null }
+    let diff = now_amt - then_amt
+    let word = diff > 0m ? "more" : diff < 0m ? "less" : "same"
+    { diff: abs(diff), word: word, percent: then_amt > 0m ? round(abs(diff) * 100 / then_amt, 1, "half_up") : null }
+}
+
+// The same day last month: the 31st of March looks back to the last of February.
+fn spending_ring_same_day(today) -> str? {
+    if type_of(today) != "str" || !date.valid(today, "date") { return null }
+    date.add_months(today, -1)
+}
+
+// A bar's width against the longer of two.
+fn spending_ring_width(a, b) -> num {
+    if a == null { return 0 }
+    let top = max([a, b ?? 0m])
+    top <= 0m ? 0 : round(float(a) * 100 / float(top), 1)
+}
+
+// The ring's circles are 100 long whatever their size; this leaves a sliver between parts.
+fn spending_ring_dash(p, count_of: int) -> str {
+    let long = (p.to - p.from) * 100
+    let shown = count_of > 1 ? max([0.4, long - 0.7]) : 100
+    `${round(shown, 3)} ${round(100 - shown, 3)}`
+}
+
+component SpendingRing(categories: list = [], last_so_far = null, last_total = null, today: str? = null, currency: str = "USD", locale: str? = null,
+                       label: str = "Spending this month", on_pick = null) {
+    style global spending_ring_css
+    state picked = -1        // which part, by index; -1 for all of them
+    let parts = spending_ring_parts(categories)
+    let cash = (v) => price_text(v, currency, locale)
+    let total = sum(parts | map((p) => p.spent))
+    let part = picked >= 0 && picked < len(parts) ? parts[picked] : null
+    let last_all = spending_ring_dec(last_so_far)
+    let then_amt = part != null ? part.last : last_all
+    let now_amt = part != null ? part.spent : total
+    let cmp = spending_ring_compare(now_amt, then_amt)
+    let same_day = spending_ring_same_day(today)
+    let longest = spending_ring_dec(last_total)
+    let pick = (i: int) => {
+        picked = picked == i ? -1 : i
+        on_pick && on_pick(picked >= 0 ? parts[picked].name : null)
+    }
+    <section.ui-spendring aria-label={label}>
+        {len(parts) == 0 && <p.ui-spendring-none>Nothing spent yet this month.</p>}
+        {len(parts) > 0 && <div.ui-spendring-lay>
+            <div.ui-spendring-ring>
+                <svg viewBox="0 0 120 120" role="img" aria-label={`${label}: ${cash(total)} across ${len(parts)} categories`} class={picked >= 0 ? "ui-spendring-faded" : null}
+                     @click={(e) => {
+                         let box = e.target.closest("svg").getBoundingClientRect()
+                         let at = spending_ring_hit((e.clientX - box.left) * 120 / box.width - 60, (e.clientY - box.top) * 120 / box.height - 60, parts)
+                         if at == -1 {
+                             if picked != -1 { pick(picked) }
+                         } else if at >= 0 {
+                             pick(at)
+                         }
+                     }}>
+                    {for p in enumerate(parts) => <circle key={p[1].name} class={ui_cls(["ui-spendring-part", picked == p[0] && "ui-spendring-part-on"])} cx="60" cy="60" r="46" pathLength="100"
+                        stroke-width={picked == p[0] ? "20" : "16"} stroke-dasharray={spending_ring_dash(p[1], len(parts))} stroke-dashoffset={str(round(-p[1].from * 100, 3))}
+                        transform="rotate(-90 60 60)" style={`--ui-spendring-c: ${p[1].color}`}></circle>}
+                </svg>
+                <p.ui-spendring-mid aria-live="polite">
+                    <span>{part != null ? `${part.name}, ${part.percent > 0 ? `${part.percent}%` : "under 1%"}` : "Spent so far"}</span>
+                    <strong>{cash(now_amt)}</strong>
+                </p>
+            </div>
+            <ul.ui-spendring-list>
+                {for p in enumerate(parts) => <li key={p[1].name}>
+                    <button.ui-spendring-line type="button" aria-pressed={picked == p[0] ? "true" : "false"} @click={() => { pick(p[0]) }}>
+                        <span.ui-spendring-dot style={`--ui-spendring-c: ${p[1].color}`} aria-hidden="true"></span>
+                        <span.ui-spendring-name>{p[1].name}</span>
+                        <span.ui-spendring-amt>{cash(p[1].spent)}</span>
+                        <span.ui-spendring-sub>{p[1].percent > 0 ? `${p[1].percent}%` : "under 1%"}</span>
+                        {p[1].last != null && <span.ui-spendring-vs>{cash(p[1].last)} last month</span>}
+                    </button>
+                </li>}
+            </ul>
+        </div>}
+        {len(parts) > 0 && <div.ui-spendring-cmp>
+            <h3>{part != null ? `${part.name} so far` : "The month so far"}{today != null && same_day != null ? ` (to ${date.format(today, "MMM D")})` : ""}</h3>
+            {cmp == null
+                ? <p.ui-spendring-note>{part != null ? `Nothing to compare ${part.name} with from last month.` : "Nothing to compare with from last month."}</p>
+                : <div>
+                    <div.ui-spendring-bar>
+                        <p><span>This month</span><span>{cash(now_amt)}</span></p>
+                        <div.ui-spendring-track aria-hidden="true"><span style={`width: ${spending_ring_width(now_amt, then_amt)}%`}></span></div>
+                    </div>
+                    <div class="ui-spendring-bar ui-spendring-then">
+                        <p><span>{same_day != null ? `Last month, to ${date.format(same_day, "MMM D")}` : "Last month"}</span><span>{cash(then_amt)}</span></p>
+                        <div.ui-spendring-track aria-hidden="true"><span style={`width: ${spending_ring_width(then_amt, now_amt)}%`}></span></div>
+                    </div>
+                    <p class={ui_cls(["ui-spendring-word", cmp.word == "more" && "ui-spendring-up", cmp.word == "less" && "ui-spendring-down"])}>
+                        {cmp.word == "same" ? "The same as this time last month" : `${cash(cmp.diff)} ${cmp.word} than this time last month${cmp.percent != null ? ` (${cmp.percent}%)` : ""}`}
+                    </p>
+                </div>}
+            {part == null && longest != null && <p.ui-spendring-note>All of last month came to {cash(longest)}.</p>}
+        </div>}
+    </section>
+}

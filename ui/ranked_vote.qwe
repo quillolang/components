@@ -1,0 +1,334 @@
+// RankedVote: ranked ballots counted by instant runoff, round by round. Each round
+// every ballot counts for the first name on it still in the race. A name with more
+// than half of the ballots still in play wins; else the name with the fewest goes out
+// and its ballots move to their next choice, which the round shows, name by name. A
+// ballot with no choice left is exhausted: it is counted, and leaves the ballots in
+// play, so the winning line can fall. A tie for last is broken by a rule stated beside
+// the count, and the result says when that rule decided it.
+//
+//   <RankedVote candidates={["Ada", "Bo", "Cy"]} ballots="12: Ada > Bo\n9: Bo > Cy\n7: Cy > Bo"/>
+//   <RankedVote ballots={[{ ranking: ["Ada", "Bo"], count: 12 }, ["Cy", "Bo"]]} tie_rule="first"
+//               on_change={(r) => { winner = r.winner }}/>
+//
+// ballots: a ballot a line, as text ("Ada > Bo > Cy", with "12: " or "12 x " in front
+// for that many alike, commas work too), or a list of ballots, each a list of names
+// or { ranking, count }. candidates: the names, a list or text with commas; left out,
+// the names on the ballots, first seen first. A name not among the candidates, or
+// given twice on a ballot, is left off that ballot and reported by line. tie_rule:
+// "back" (the default: whoever had fewest in the latest earlier round where they
+// differed goes), "first" (fewest first preferences goes) or "listed" (the one
+// listed last goes); the first two fall back on "listed", so a count always ends.
+// title: the heading ("Ranked vote"). id: a prefix for its fields' ids ("ranked-vote"),
+// unique on the page. The fields are named candidates, ballots and tie_rule; name: a
+// prefix for those names. on_change(r): inside one of your components, given
+// { winner, rounds, ballots, exhausted, by_tie } after each change, winner null
+// when there is no count.
+//
+// ranked_vote_read(text, candidates) and ranked_vote_count(ballots, names, rule) are
+// the work, for a program's own use. It reads 2,000 lines and 50 candidates, and says so.
+
+import ui/theme.qwe use ui_cls
+
+let ranked_vote_css = css`
+.ui-rcv { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; max-width: 680px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-rcv .ui-rcv-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-rcv-field { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 500; }
+.ui-rcv input, .ui-rcv select, .ui-rcv textarea { box-sizing: border-box; width: 100%; min-width: 0; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.5 var(--ui-font); }
+.ui-rcv input, .ui-rcv select { height: 38px; }
+.ui-rcv textarea { min-height: 130px; padding: 8px 10px; resize: vertical; }
+.ui-rcv input:focus-visible, .ui-rcv select:focus-visible, .ui-rcv textarea:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-rcv-rule { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-rcv-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-rcv-result { margin: 0; padding: 10px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-weight: 600; }
+.ui-rcv-rounds { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.ui-rcv-round { display: grid; gap: 8px; min-width: 0; padding: 12px 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-rcv-round-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; margin: 0; }
+.ui-rcv .ui-rcv-round-name { margin: 0; font-size: 14px; font-weight: 650; }
+.ui-rcv-need { color: var(--ui-muted); font-size: 12px; }
+.ui-rcv-tally { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-rcv-line { display: grid; grid-template-columns: minmax(0, 120px) minmax(0, 1fr) auto; gap: 8px; align-items: center; font-variant-numeric: tabular-nums; }
+.ui-rcv-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-rcv-track { height: 10px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-rcv-fill { height: 100%; border-radius: 999px; background: var(--ui-accent); }
+.ui-rcv-gone .ui-rcv-fill { background: var(--ui-danger); }
+.ui-rcv-won .ui-rcv-fill { background: var(--ui-success); }
+.ui-rcv-count { font-weight: 600; }
+.ui-rcv-gain { margin-left: 4px; color: var(--ui-success); font-size: 12px; font-weight: 500; }
+.ui-rcv-move { margin: 0; color: var(--ui-muted); font-size: 13px; }
+`
+
+let ranked_vote_rules = [
+    { id: "back", label: "Look back through earlier rounds", text: "A tie for last: whoever had fewest in the latest earlier round where they differed goes out; if they were level all along, the one listed last." },
+    { id: "first", label: "Fewest first preferences", text: "A tie for last: whoever had fewest first preferences goes out; if they were level, the one listed last." },
+    { id: "listed", label: "Listed last", text: "A tie for last: the one listed last goes out." },
+]
+
+let ranked_vote_most_lines = 2000
+let ranked_vote_most_names = 50
+
+fn ranked_vote_names(given) {
+    let list_of = type_of(given) == "list" ? given : split(str(given ?? ""), ",")
+    list_of | map((x) => trim(str(x))) | filter((x) => x != "")
+}
+
+fn ranked_vote_tally(ballots: list, alive: list, size: int) {
+    let votes = for i in 0..size => 0
+    let gone = 0
+    for b in ballots {
+        let at = ranked_vote_next(b.ranking, alive)
+        if at == null { gone += b.count } else { votes = set(votes, at, votes[at] + b.count) }
+    }
+    { votes, exhausted: gone }
+}
+
+// The first choice on a ranking still in the race, or null.
+fn ranked_vote_next(ranking: list, alive: list) {
+    for c in ranking {
+        if alive[c] { return c }
+    }
+    null
+}
+
+fn ranked_vote_join(xs: list) {
+    let n = len(xs)
+    n < 2 ? join(xs, "") : `${join(slice(xs, 0, n - 1), ", ")} and ${xs[n - 1]}`
+}
+
+// Who of those tied goes out, and why, by the rule.
+fn ranked_vote_break(tied: list, rule: str, earlier: list, firsts: list) {
+    let left = tied
+    let why = "listed last"
+    if rule == "back" {
+        for r in reverse(range(len(earlier))) {
+            if len(left) > 1 {
+                let low = left | map((c) => earlier[r][c]) | min()
+                let fewer = left | filter((c) => earlier[r][c] == low)
+                if len(fewer) < len(left) {
+                    left = fewer
+                    why = `fewest in round ${r + 1}`
+                }
+            }
+        }
+    }
+    if rule == "first" {
+        let low = left | map((c) => firsts[c]) | min()
+        let fewer = left | filter((c) => firsts[c] == low)
+        if len(fewer) < len(left) {
+            left = fewer
+            why = "fewest first preferences"
+        }
+    }
+    if len(left) > 1 { why = "listed last" }
+    { out: last(left), why }
+}
+
+// The count: { rounds, winner, by_tie, ballots, exhausted }, with each round
+// { number, lines, active, exhausted, need, out, moves, to_exhausted, tie }.
+fn ranked_vote_count(ballots: list, names: list, rule: str = "back") {
+    let size = len(names)
+    let total = ballots | map((b) => b.count) | sum()
+    if total == 0 || size == 0 { return { rounds: [], winner: null, by_tie: false, ballots: total, exhausted: 0 } }
+    let alive = for i in 0..size => true
+    let firsts = ranked_vote_tally(ballots, alive, size).votes
+    let earlier = []
+    let rounds = []
+    let winner = null
+    let by_tie = false
+    while winner == null {
+        let t = ranked_vote_tally(ballots, alive, size)
+        let still = range(size) | filter((c) => alive[c])
+        let active = total - t.exhausted
+        let need = int(floor(active / 2)) + 1
+        let top = still | map((c) => t.votes[c]) | max()
+        let before = len(earlier) == 0 ? null : earlier[len(earlier) - 1]
+        let order = still | sort_by((c) => -t.votes[c])
+        let lines = order | map((c) => { name: names[c], votes: t.votes[c], gain: before == null ? 0 : t.votes[c] - before[c],
+            share: active == 0 ? 0m : round(dec(t.votes[c]) * 100 / active, 1, "half_up") })
+        let round_ = { number: len(rounds) + 1, lines, active, exhausted: t.exhausted, need, out: null, won: null, moves: [], to_exhausted: 0, tie: null }
+        if len(still) == 1 || top >= need {
+            winner = names[order[0]]
+            rounds = rounds | push(set(round_, "won", winner))
+        } else {
+            let low = still | map((c) => t.votes[c]) | min()
+            let tied = still | filter((c) => t.votes[c] == low)
+            let pick = ranked_vote_break(tied, rule, earlier, firsts)
+            let out = pick.out
+            // The two last in the race level: the rule has chosen the winner.
+            if len(tied) == len(still) { by_tie = true }
+            let after = set(alive, out, false)
+            let moved = for c in 0..size => 0
+            let lost = 0
+            for b in ballots {
+                if ranked_vote_next(b.ranking, alive) == out {
+                    let at = ranked_vote_next(b.ranking, after)
+                    if at == null { lost += b.count } else { moved = set(moved, at, moved[at] + b.count) }
+                }
+            }
+            let moves = range(size) | filter((c) => moved[c] > 0) | sort_by((c) => -moved[c]) | map((c) => { name: names[c], votes: moved[c] })
+            let tie = len(tied) < 2 ? null : { names: tied | map((c) => names[c]), votes: low, why: pick.why }
+            rounds = rounds | push({ ...round_, out: names[out], moves, to_exhausted: lost, tie })
+            alive = after
+        }
+        earlier = earlier | push(t.votes)
+    }
+    { rounds, winner, by_tie, ballots: total, exhausted: last(rounds).exhausted }
+}
+
+// One line of text as { count, ranking, problems }: the ranking as indexes into `names`,
+// found through `index`, which is keyed by small letters.
+fn ranked_vote_line(line: str, number: int, names: list, index, problems: list) {
+    let t = trim(line)
+    let many = re.find(t, "^(\\d{1,7})\\s*(:|x\\b|×|\\*)\\s*")
+    let count = many == null ? 1 : int(many.groups[0])
+    let body = many == null ? t : slice(t, many.end, len(t))
+    let seen = []
+    let said = problems
+    for raw in re.split(body, "[>,]") {
+        let word = trim(raw)
+        if word != "" {
+            let at = get(index, lower(word), null)
+            if at == null {
+                said = said | push(`Line ${number}: "${slice(word, 0, 40)}" is not a candidate, so it is left off the ballot.`)
+            } else if contains(seen, at) {
+                said = said | push(`Line ${number}: ${names[at]} is ranked twice; the first counts.`)
+            } else {
+                seen = seen | push(at)
+            }
+        }
+    }
+    { count, ranking: seen, problems: said }
+}
+
+// The ballots as text, whatever form they came in.
+fn ranked_vote_text(ballots) {
+    if type_of(ballots) != "list" { return str(ballots ?? "") }
+    let one = (b) => {
+        let ranking = type_of(b) == "map" ? (b.ranking ?? []) : type_of(b) == "list" ? b : [b]
+        let count = type_of(b) == "map" ? (b.count ?? 1) : 1
+        `${count == 1 ? "" : `${count}: `}${join(ranking | map((x) => str(x)), " > ")}`
+    }
+    join(ballots | map(one), "\n")
+}
+
+// Text to what the count takes: { names, ballots, problems, spoiled }. Equal rankings
+// are put together, so a long list costs what its distinct ballots cost.
+fn ranked_vote_read(text: str, candidates) {
+    let all_lines = split(replace(text, "\r", ""), "\n")
+    let lines = all_lines | take(ranked_vote_most_lines)
+    let problems = len(all_lines) > ranked_vote_most_lines ? [`Only the first ${ranked_vote_most_lines} lines are read.`] : []
+    let given = ranked_vote_names(candidates)
+    // Without a list of candidates, the ballots name them.
+    let found = len(given) > 0 ? given : lines | map((l) => re.replace(trim(l), "^\\d{1,7}\\s*(:|x\\b|×|\\*)\\s*", ""))
+        | map((l) => re.split(l, "[>,]") | map((w) => trim(w)) | filter((w) => w != "")) | flatten()
+    let names = []
+    let index = {}
+    for w in found {
+        if !has(index, lower(w)) {
+            index = set(index, lower(w), len(names))
+            names = names | push(w)
+        }
+    }
+    if len(names) > ranked_vote_most_names {
+        return { names: [], ballots: [], spoiled: 0, problems: [`There are ${len(names)} candidates: ${ranked_vote_most_names} is the most this counts.`] }
+    }
+    let merged = {}
+    let spoiled = 0
+    for i in 0..len(lines) {
+        if trim(lines[i]) != "" {
+            let b = ranked_vote_line(lines[i], i + 1, names, index, problems)
+            problems = b.problems
+            if len(b.ranking) == 0 {
+                spoiled += b.count
+            } else {
+                let key_ = join(b.ranking, ",")
+                let had = get(merged, key_, null)
+                merged = set(merged, key_, { ranking: b.ranking, count: b.count + (had == null ? 0 : had.count) })
+            }
+        }
+    }
+    { names, ballots: values(merged), problems, spoiled }
+}
+
+fn ranked_vote_noun(n: int) = n == 1 ? "1 ballot" : `${n} ballots`
+
+// What happened at the end of a round, in words.
+fn ranked_vote_moves(r) {
+    let parts = (r.moves | map((m) => `${m.votes} to ${m.name}`)) + (r.to_exhausted > 0 ? [`${r.to_exhausted} exhausted`] : [])
+    let gone = `${r.out} goes out${len(parts) > 0 ? `: ${ranked_vote_join(parts)}` : ", with no ballots to move"}.`
+    r.tie == null ? gone : `${ranked_vote_join(r.tie.names)} tied on ${r.tie.votes}. ${gone} Broken by ${r.tie.why}.`
+}
+
+fn ranked_vote_summary(c, spoiled: int) {
+    if c.winner == null { return "No ballots to count yet." }
+    let last_round = last(c.rounds)
+    let top = first(last_round.lines)
+    let spoilt = spoiled > 0 ? ` ${ranked_vote_noun(spoiled)} named no candidate and did not count.` : ""
+    let n = len(c.rounds)
+    `${c.winner} wins in round ${n}, with ${top.votes} of the ${last_round.active} ballots in play (${str(top.share)}%). ${ranked_vote_noun(c.exhausted)} exhausted.${spoilt}${c.by_tie ? " The tie rule decided this." : ""}`
+}
+
+component RankedVote(ballots = "", candidates = null, tie_rule: str = "back", title: str = "Ranked vote", id: str = "ranked-vote",
+                     name: str? = null, on_change = null, class: str? = null) {
+    style global ranked_vote_css
+    state names_text = type_of(candidates) == "list" ? join(candidates | map((x) => str(x)), ", ") : str(candidates ?? "")
+    state text = ranked_vote_text(ballots)
+    state rule = any(ranked_vote_rules, (r) => r.id == tie_rule) ? tie_rule : "back"
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let read = ranked_vote_read(text, names_text)
+    let c = ranked_vote_count(read.ballots, read.names, rule)
+    let rule_text = (ranked_vote_rules | find((r) => r.id == rule)).text
+    let tell = () => {
+        if on_change != null {
+            let r = ranked_vote_read(text, names_text)
+            let k = ranked_vote_count(r.ballots, r.names, rule)
+            on_change({ winner: k.winner, rounds: len(k.rounds), ballots: k.ballots, exhausted: k.exhausted, by_tie: k.by_tie })
+        }
+    }
+    <section class={ui_cls(["ui-rcv", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-rcv-title id={`${id}-title`}>{title}</h3>
+        <label.ui-rcv-field>
+            Candidates, with commas between (left empty, the names on the ballots)
+            <input type="text" id={`${id}-names`} name={named("candidates")} value={names_text} autocomplete="off" @input={(e) => { names_text = e.value; tell() }}/>
+        </label>
+        <label.ui-rcv-field>
+            Ballots, one a line, first choice first: Ada &gt; Bo &gt; Cy, or 12: Ada &gt; Bo for twelve alike
+            <textarea id={`${id}-ballots`} name={named("ballots")} value={text} rows="6" spellcheck="false" @input={(e) => { text = e.value; tell() }}></textarea>
+        </label>
+        <label.ui-rcv-field>
+            If there is a tie for last
+            <select id={`${id}-rule`} name={named("tie_rule")} @change={(e) => { rule = e.value; tell() }}>
+                {for r in ranked_vote_rules => <option key={r.id} value={r.id} selected={r.id == rule}>{r.label}</option>}
+            </select>
+        </label>
+        <p.ui-rcv-rule>{rule_text}</p>
+        {len(read.problems) > 0 && <ul.ui-rcv-problems role="alert">
+            {for p in read.problems | take(8) => <li>{p}</li>}
+            {len(read.problems) > 8 && <li>{`And ${len(read.problems) - 8} more.`}</li>}
+        </ul>}
+        <p.ui-rcv-result aria-live="polite">{ranked_vote_summary(c, read.spoiled)}</p>
+        {len(c.rounds) > 0 && <ol.ui-rcv-rounds>
+            {for r in c.rounds {
+                let n = r.number
+                <li.ui-rcv-round key={n}>
+                    <div.ui-rcv-round-head>
+                        <h4.ui-rcv-round-name>{`Round ${n}`}</h4>
+                        <span.ui-rcv-need>{`${ranked_vote_noun(r.active)} in play, ${r.need} to win${r.exhausted > 0 ? `, ${r.exhausted} exhausted` : ""}`}</span>
+                    </div>
+                    <ul.ui-rcv-tally>
+                        {for l in r.lines {
+                            let who = l.name
+                            <li key={who} class={ui_cls(["ui-rcv-line", who == r.out && "ui-rcv-gone", who == r.won && "ui-rcv-won"])}>
+                                <span.ui-rcv-name title={who}>{who}</span>
+                                <span.ui-rcv-track aria-hidden="true"><span.ui-rcv-fill style={`display:block;width:${str(l.share)}%`}/></span>
+                                <span><span.ui-rcv-count>{`${l.votes} (${str(l.share)}%)`}</span>{l.gain > 0 && <span.ui-rcv-gain>{`+${l.gain}`}</span>}</span>
+                            </li>
+                        }}
+                    </ul>
+                    {r.out != null && <p.ui-rcv-move>{ranked_vote_moves(r)}</p>}
+                </li>
+            }}
+        </ol>}
+    </section>
+}

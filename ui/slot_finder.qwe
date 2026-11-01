@@ -1,0 +1,364 @@
+// SlotFinder: when can these people meet? Give it each person's busy times and it finds
+// the slots free for everyone, inside working hours in a time zone you choose, at least
+// as long as you ask. When no slot suits everyone it ranks what comes closest, by the
+// fewest people affected, and names them. It works in instants, so people in different
+// zones and a day when the clocks change come out right.
+//
+//   <SlotFinder from="2026-11-02" to="2026-11-06" zone="Europe/Lisbon" minutes={45} people={[
+//       { name: "Ana", busy: [{ start: "2026-11-02T09:00:00Z", end: "2026-11-02T12:00:00Z" }] },
+//       { name: "Ben", zone: "America/New_York", busy: ["2026-11-02 09:00-11:30"] }]}/>
+//
+// people: a list of { name, zone?, busy }. busy: a list, each { start, end } as date-times
+// with an offset, or text "YYYY-MM-DD HH:MM-HH:MM" in the person's zone (the zone prop
+// when they give none, which picking another zone on the page does not change); an end at or before the start is the next day, and "2026-11-02 09:00-2026-11-04 17:00" runs for days. The boxes on the page
+// take that text, a line each. from, to: the days to look through ("YYYY-MM-DD"; at most
+// 31). zone: the zone working hours are in (UTC). day_start, day_end: working hours
+// ("09:00", "17:00"). minutes: the shortest slot (30). weekends: true looks at them too.
+// limit: how many slots to list (8). title: the heading. id: a prefix for its ids,
+// unique on the page. name: a prefix for the fields ("slot"). on_pick(slot): inside one
+// of your components, adds a Choose button to each slot; it is given { start, end, minutes,
+// busy }, start and end being date-times in the zone and busy the names affected.
+//
+// slot_finder_people(people, zone) makes busy times into instants, as { people, problems };
+// slot_finder_search(people, options) gives { free, partial, days }: both lists of { start,
+// end, minutes, busy }, in milliseconds. A zone must be on TimezonePicker's list or an
+// offset such as "+05:30": Quillo has no way to ask whether a zone exists, and an
+// unknown one stops the whole page, so anything else is refused with a message. It
+// reads at most 30 people with 500 busy times each.
+
+import ui/theme.qwe use ui_cls
+import ui/timezone_picker.qwe use timezone_picker_zones, TimezonePicker
+
+let slot_finder_css = css`
+.ui-slot-finder { display: grid; gap: 14px; min-width: 0; padding: 18px 20px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-slot-finder .ui-slot-finder-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-slot-finder-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px 12px; }
+.ui-slot-finder-field { display: grid; gap: 4px; min-width: 0; font-size: 13px; font-weight: 500; }
+.ui-slot-finder-field input, .ui-slot-finder-field textarea { box-sizing: border-box; width: 100%; min-width: 0; padding: 7px 9px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.4 var(--ui-font); }
+.ui-slot-finder-field textarea { font: 12px/1.5 var(--ui-mono); resize: vertical; }
+.ui-slot-finder-field input:focus-visible, .ui-slot-finder-field textarea:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-slot-finder-field [aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-slot-finder-check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px; }
+.ui-slot-finder-check input { margin: 0; accent-color: var(--ui-accent); }
+.ui-slot-finder-people { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 12px; }
+.ui-slot-finder-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-slot-finder-head { margin: 0; font-size: 14px; font-weight: 650; }
+.ui-slot-finder-slots { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-slot-finder-slot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-success-soft); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-slot-finder-partial { background: var(--ui-warning-soft); }
+.ui-slot-finder-busy { color: var(--ui-warning); font-size: 12px; overflow-wrap: anywhere; }
+.ui-slot-finder-pick { padding: 4px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 12px/1.2 var(--ui-font); cursor: pointer; }
+.ui-slot-finder-pick:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-slot-finder-said { margin: 0; color: var(--ui-muted); font-size: 13px; }
+`
+
+let slot_finder_most_days = 31
+let slot_finder_most_people = 30
+let slot_finder_most_busy = 500
+let slot_finder_most_tries = 600
+
+// Whether date functions can be given this zone: an unknown one is a failure that nothing
+// can catch, and stops the page. An offset must be one the clock has.
+fn slot_finder_zone_ok(z) -> bool {
+    if type_of(z) != "str" { return false }
+    if contains(timezone_picker_zones, z) { return true }
+    let m = re.find(z, "^[+-](\\d{2}):(\\d{2})$")
+    m != null && int(m.groups[0]) <= 14 && int(m.groups[1]) <= 59
+}
+
+// "HH:MM" as it may safely go to date.at, or null.
+fn slot_finder_time(t) {
+    if type_of(t) != "str" { return null }
+    let m = re.find(trim(t), "^(\\d{1,2}):(\\d{2})$")
+    if m == null { return null }
+    let h = int(m.groups[0])
+    if h > 23 || int(m.groups[1]) > 59 { return null }
+    `${h < 10 ? "0" : ""}${h}:${m.groups[1]}`
+}
+
+// One busy time as { start, end } in ms, or { error }.
+fn slot_finder_busy(b, zone: str) -> map {
+    if type_of(b) == "map" {
+        let ok = (t) => type_of(t) == "str" && date.valid(t, "date-time")
+        if !ok(b.start) || !ok(b.end) { return { error: "needs a start and an end with an offset, like 2026-11-02T09:00:00Z" } }
+        let start = date.ms(b.start)
+        let end = date.ms(b.end)
+        return end > start ? { start, end } : { error: "ends before it starts" }
+    }
+    let text = trim(str(b ?? ""))
+    let m = re.find(text, "^(\\d{4}-\\d{2}-\\d{2})[ T]+(\\d{1,2}:\\d{2})\\s*(?:-|–|to)\\s*(?:(\\d{4}-\\d{2}-\\d{2})[ T]+)?(\\d{1,2}:\\d{2})$")
+    if m == null { return { error: "is not written like 2026-11-02 09:00-10:30" } }
+    let day = m.groups[0]
+    let last_day = m.groups[2]
+    let from = slot_finder_time(m.groups[1])
+    let to = slot_finder_time(m.groups[3])
+    let fits = (d) => date.valid(d, "date") && d >= "1000-01-01" && d <= "9000-12-31"
+    if !fits(day) || (last_day != null && !fits(last_day)) { return { error: "has no such date" } }
+    if from == null || to == null { return { error: "has no such time" } }
+    let start = date.ms(date.at(day, from, zone))
+    let end = date.ms(date.at(last_day ?? (to > from ? day : date.add_days(day, 1)), to, zone))
+    end > start ? { start, end } : { error: "ends before it starts" }
+}
+
+// Overlapping and touching times become one: sorted, then each joins the last or starts anew.
+fn slot_finder_merge(spans: list) -> list {
+    let out = []
+    for s in sort_by(spans, (x) => x.start) {
+        let top = last(out)
+        if top != null && s.start <= top.end {
+            out = set(out, len(out) - 1, { start: top.start, end: max([top.end, s.end]) })
+        } else {
+            out = out | push({ start: s.start, end: s.end })
+        }
+    }
+    out
+}
+
+// See the top of the file.
+fn slot_finder_people(people, zone: str) -> map {
+    let crew = []
+    let problems = []
+    let everyone = type_of(people) == "list" ? people : []
+    if len(everyone) > slot_finder_most_people { problems = problems | push(`Only the first ${slot_finder_most_people} people are read.`) }
+    for [i, p] in enumerate(take(everyone, slot_finder_most_people)) {
+        let m = type_of(p) == "map" ? p : {}
+        let name = filled(trim(str(m.name ?? ""))) ?? `Person ${i + 1}`
+        let own = m.zone ?? zone
+        let good_zone = slot_finder_zone_ok(own)
+        if m.zone != null && !good_zone { problems = problems | push(`${name}: the time zone "${slice(str(m.zone), 0, 40)}" is not known.`) }
+        let spans = []
+        let list = type_of(m.busy) == "list" ? m.busy : []
+        if len(list) > slot_finder_most_busy { problems = problems | push(`${name}: only the first ${slot_finder_most_busy} busy times are read.`) }
+        for [j, b] in enumerate(take(list, slot_finder_most_busy)) {
+            if !(type_of(b) == "str" && trim(b) == "") {
+                let r = slot_finder_busy(b, good_zone ? own : "UTC")
+                if r.error != null {
+                    problems = problems | push(`${name}, busy time ${j + 1}: "${slice(type_of(b) == "map" ? str(b.start ?? "") : str(b), 0, 40)}" ${r.error}.`)
+                } else {
+                    spans = spans | push(r)
+                }
+            }
+        }
+        crew = crew | push({ name, busy: slot_finder_merge(spans) })
+    }
+    { people: crew, problems }
+}
+
+// The working day for each date, as ms: a date.at each end, so a clock change in the
+// day makes it 7 or 9 hours long, as it really is. A day that loses its hours is skipped.
+fn slot_finder_windows(from: str, to: str, zone: str, day_start: str, day_end: str, weekends: bool) -> list {
+    let out = []
+    for i in 0..date.days_between(from, to) + 1 {
+        let d = date.add_days(from, i)
+        if weekends || date.weekday(d) < 6 {
+            let start = date.ms(date.at(d, day_start, zone))
+            let end = date.ms(date.at(d, day_end, zone))
+            if end > start { out = out | push({ day: d, start, end }) }
+        }
+    }
+    out
+}
+
+// Who is busy at any time in [start, end).
+fn slot_finder_clash(people: list, start: int, end: int) -> list =
+    people | filter((p) => any(p.busy, (b) => b.start < end && b.end > start)) | map((p) => p.name)
+
+// Where the free time is in one window: the gaps left by everyone's busy times.
+fn slot_finder_gaps(window: map, people: list) -> list {
+    let taken = slot_finder_merge(people | map((p) => p.busy) | flatten())
+    let at = window.start
+    let out = []
+    for b in taken {
+        if b.end > at && b.start < window.end {
+            if b.start > at { out = out | push({ start: at, end: b.start }) }
+            at = max([at, b.end])
+        }
+    }
+    if at < window.end { out = out | push({ start: at, end: window.end }) }
+    out
+}
+
+// Times of `length` ms in a window, with who they clash with. Who is busy only changes
+// where a busy time starts or ends, so the only starts worth trying are the window's own,
+// just after a busy time, and just early enough to end before one.
+fn slot_finder_tries(window: map, people: list, length: int) -> list {
+    let starts = [window.start]
+    for p in people {
+        for b in p.busy {
+            if b.end >= window.start && b.end + length <= window.end { starts = starts | push(b.end) }
+            if b.start - length >= window.start && b.start <= window.end { starts = starts | push(b.start - length) }
+        }
+    }
+    starts | unique | sort | filter((s) => s + length <= window.end) | take(slot_finder_most_tries)
+        | map((s) => ({ start: s, end: s + length, minutes: floor(length / 60000), busy: slot_finder_clash(people, s, s + length) }))
+        | filter((t) => len(t.busy) > 0)
+}
+
+// See the top of the file. options: { from, to, zone, day_start, day_end, minutes, weekends }.
+fn slot_finder_search(people: list, o: map) -> map {
+    let windows = slot_finder_windows(o.from, o.to, o.zone, o.day_start, o.day_end, o.weekends)
+    let length = o.minutes * 60000
+    let free = []
+    let tries = []
+    for w in windows {
+        for g in slot_finder_gaps(w, people) {
+            if g.end - g.start >= length {
+                free = free | push({ start: g.start, end: g.end, minutes: floor((g.end - g.start) / 60000), busy: [] })
+            }
+        }
+    }
+    // Near misses are only for when nothing suits everyone, as they cost the most to find.
+    if len(free) == 0 {
+        for w in windows {
+            let near = people | map((p) => ({ name: p.name, busy: p.busy | filter((b) => b.start < w.end && b.end > w.start) }))
+            tries = tries + slot_finder_tries(w, near, length)
+        }
+    }
+    // Fewest people first, then soonest. Times that clash with the same people and
+    // overlap are one choice, so only the first of them is kept.
+    let partial = []
+    for t in sort_by(sort_by(tries, (x) => x.start), (x) => len(x.busy)) {
+        if !any(partial, (k) => k.start < t.end && k.end > t.start) { partial = partial | push(t) }
+    }
+    { free, partial, days: len(windows) }
+}
+
+// A time as it reads in the chosen zone: "Mon 2 Nov 09:30".
+fn slot_finder_show(ms: int, zone: str) -> str = date.format(date.from_ms(ms, zone), "ddd D MMM HH:mm")
+
+// "09:30" alone, for the end of a slot on the same day.
+fn slot_finder_clock(ms: int, zone: str) -> str = date.format(date.from_ms(ms, zone), "HH:mm")
+
+// A span as it reads: "1 h 30 min".
+fn slot_finder_long(m: int) -> str {
+    let h = floor(m / 60)
+    let rest = m % 60
+    h == 0 ? `${rest} min` : (rest == 0 ? `${h} h` : `${h} h ${rest} min`)
+}
+
+// The busy times as a person's text box starts: maps stay as they are, in the box's form.
+fn slot_finder_lines(p, zone: str) -> str {
+    let m = type_of(p) == "map" ? p : {}
+    let own = m.zone ?? zone
+    let safe = slot_finder_zone_ok(own) ? own : "UTC"
+    (type_of(m.busy) == "list" ? m.busy : []) | map((b) => {
+        if type_of(b) == "map" && type_of(b.start) == "str" && type_of(b.end) == "str" && date.valid(b.start, "date-time") && date.valid(b.end, "date-time") {
+            let a = date.to_zone(b.start, safe)
+            let z = date.to_zone(b.end, safe)
+            let day = slice(z, 0, 10)
+            `${slice(a, 0, 10)} ${slice(a, 11, 16)}-${day != slice(a, 0, 10) ? `${day} ` : ""}${slice(z, 11, 16)}`
+        } else {
+            // Kept in view as it came, so the line is reported rather than lost.
+            type_of(b) == "map" ? `${b.start ?? ""} to ${b.end ?? ""}` : str(b)
+        }
+    }) | join("\n")
+}
+
+component SlotFinder(people: list = [], from: str = "", to: str = "", zone: str = "UTC", day_start: str = "09:00", day_end: str = "17:00", minutes: int = 30,
+                     weekends: bool = false, limit: int = 8, title: str = "Find a time", id: str = "slot-finder", name: str = "slot", on_pick = null, class: str? = null) {
+    style global slot_finder_css
+    state first_day = from
+    state last_day = to
+    state tz = zone
+    state open_at = day_start
+    state close_at = day_end
+    state long_text = str(minutes)
+    state with_weekends = weekends
+    state texts = (type_of(people) == "list" ? people : []) | map((p) => slot_finder_lines(p, zone))
+    state said = ""
+    let crew = zip(type_of(people) == "list" ? people : [], texts) | map((p) => {
+        let m = type_of(p[0]) == "map" ? p[0] : { name: str(p[0]) }
+        { name: m.name, zone: m.zone, busy: split(p[1], "\n") }
+    })
+    // Busy text keeps the zone it was written in: picking another zone moves the working
+    // hours looked at, never when someone is actually busy.
+    let read = slot_finder_people(crew, zone)
+    let wanted = re.test(trim(long_text), "^\\d{1,5}$") ? int(trim(long_text)) : null
+    let open_ok = slot_finder_time(open_at)
+    let close_ok = slot_finder_time(close_at)
+    let date_ok = (d) => type_of(d) == "str" && date.valid(d, "date") && d >= "1000-01-01" && d <= "9000-12-31"
+    // The picker's offsets are those of the days asked about, not of the clock, so the
+    // page is the same however it is made; a zone given as an offset joins its list.
+    let offered = slot_finder_zone_ok(zone) && !contains(timezone_picker_zones, zone) ? [zone] + timezone_picker_zones : timezone_picker_zones
+    let offsets_at = date_ok(from) ? `${from}T12:00:00Z` : "2026-01-01T12:00:00Z"
+    let blocked = () => {
+        if !slot_finder_zone_ok(tz) { return `The time zone "${slice(str(tz), 0, 40)}" is not known.` }
+        if len(crew) == 0 { return "Add people to find a time for." }
+        if !date_ok(first_day) || !date_ok(last_day) { return "Choose the first and last days to look at." }
+        if last_day < first_day { return "The last day comes before the first." }
+        if date.days_between(first_day, last_day) >= slot_finder_most_days { return `That is more than ${slot_finder_most_days} days to look through.` }
+        if open_ok == null || close_ok == null { return "Working hours must be times, like 09:00." }
+        if close_ok <= open_ok { return "Working hours must end after they start." }
+        if wanted == null || wanted < 1 { return "The slot's length must be a whole number of minutes, 1 or more." }
+        null
+    }
+    let stop = blocked()
+    let found = stop == null ? slot_finder_search(read.people, { from: first_day, to: last_day, zone: tz, day_start: open_ok, day_end: close_ok, minutes: wanted, weekends: with_weekends }) : { free: [], partial: [], days: 0 }
+    let shown_free = take(found.free, limit)
+    let shown_partial = len(found.free) > 0 ? [] : take(found.partial, limit)
+    let pick = (s) => {
+        said = `Chose ${slot_finder_show(s.start, tz)}.`
+        on_pick && on_pick({ start: date.from_ms(s.start, tz), end: date.from_ms(s.start + wanted * 60000, tz), minutes: wanted, busy: s.busy })
+    }
+    let line = (s) => `${slot_finder_show(s.start, tz)} to ${date.date_in(date.from_ms(s.start, tz), tz) == date.date_in(date.from_ms(s.end, tz), tz) ? slot_finder_clock(s.end, tz) : slot_finder_show(s.end, tz)}`
+    <section class={ui_cls(["ui-slot-finder", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-slot-finder-title id={`${id}-title`}>{title}</h3>
+        <div.ui-slot-finder-grid>
+            <label.ui-slot-finder-field>First day
+                <input type="date" id={`${id}-from`} name={`${name}_from`} value={first_day} @input={(e) => { first_day = e.value }}/>
+            </label>
+            <label.ui-slot-finder-field>Last day
+                <input type="date" id={`${id}-to`} name={`${name}_to`} value={last_day} @input={(e) => { last_day = e.value }}/>
+            </label>
+            <TimezonePicker field={`${id}-zone`} name={`${name}_zone`} label="Time zone" value={tz} zones={offered} at={offsets_at} on_change={(z) => { tz = z }}/>
+            <label.ui-slot-finder-field>Working from
+                <input type="time" id={`${id}-open`} name={`${name}_open`} value={open_at} @input={(e) => { open_at = e.value }}/>
+            </label>
+            <label.ui-slot-finder-field>Working to
+                <input type="time" id={`${id}-close`} name={`${name}_close`} value={close_at} @input={(e) => { close_at = e.value }}/>
+            </label>
+            <label.ui-slot-finder-field>Minutes, at least
+                <input type="text" inputmode="numeric" id={`${id}-minutes`} name={`${name}_minutes`} value={long_text} autocomplete="off"
+                       aria-invalid={wanted == null || wanted < 1 ? "true" : null} @input={(e) => { long_text = e.value }}/>
+            </label>
+        </div>
+        <label.ui-slot-finder-check>
+            <input type="checkbox" id={`${id}-weekends`} name={`${name}_weekends`} checked={with_weekends} @change={(e) => { with_weekends = e.checked }}/>
+            Look at weekends too
+        </label>
+        {len(crew) > 0 && <div.ui-slot-finder-people>
+            {for [i, p] in enumerate(crew) => <label.ui-slot-finder-field key={i}>{p.name ?? `Person ${i + 1}`}, busy{p.zone != null ? ` (${p.zone})` : ""}
+                <textarea id={`${id}-busy-${i}`} name={`${name}_busy_${i}`} rows="3" spellcheck="false" placeholder="2026-11-02 09:00-10:30"
+                          @input={(e) => { texts = set(texts, i, e.value) }}>{texts[i]}</textarea>
+            </label>}
+        </div>}
+        {len(read.problems) > 0 && <ul.ui-slot-finder-problems role="alert">{for p in take(read.problems, 6) => <li key={p}>{p}</li>}</ul>}
+        <div aria-live="polite">
+            {stop != null
+                ? <p.ui-slot-finder-problems role="alert">{stop}</p>
+                : len(found.free) > 0
+                    ? <div>
+                        <p.ui-slot-finder-head>{len(found.free)} {len(found.free) == 1 ? "slot suits" : "slots suit"} everyone</p>
+                        <ul.ui-slot-finder-slots>
+                            {for s in shown_free => <li.ui-slot-finder-slot key={s.start}>
+                                <span>{line(s)} ({slot_finder_long(s.minutes)})</span>
+                                {on_pick != null && <button.ui-slot-finder-pick type="button" @click={() => { pick(s) }}>Choose</button>}
+                            </li>}
+                        </ul>
+                      </div>
+                    : <div>
+                        <p.ui-slot-finder-head>{len(shown_partial) > 0 ? "No slot suits everyone. Closest first:" : "Nothing fits in these hours."}</p>
+                        <ul.ui-slot-finder-slots>
+                            {for s in shown_partial => <li class="ui-slot-finder-slot ui-slot-finder-partial" key={s.start}>
+                                <span>{line(s)}</span>
+                                <span.ui-slot-finder-busy>{len(s.busy)} affected: {join(s.busy, ", ")}</span>
+                                {on_pick != null && <button.ui-slot-finder-pick type="button" @click={() => { pick(s) }}>Choose</button>}
+                            </li>}
+                        </ul>
+                      </div>}
+            {said != "" && <p.ui-slot-finder-said>{said}</p>}
+        </div>
+    </section>
+}

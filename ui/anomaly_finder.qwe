@@ -1,0 +1,337 @@
+// AnomalyFinder: reads a time series and says what is odd about it: outliers by
+// median absolute deviation, gaps in the data and lasting changes of level. It plots
+// them on a small line chart, numbered, and gives each its reason in a sentence.
+// Level shifts are found first and outliers measured inside each level, so that one
+// lasting step does not make half the series look wrong.
+//
+//   <AnomalyFinder points={[{ t: "2026-01-01", value: 120 }, { t: "2026-01-02", value: 118 }]}/>
+//   <AnomalyFinder points={[812, 790, 804, 2210, 798]} sensitivity={5} on_change={(f) => { found = f }}/>
+//
+// The method. Outliers: within a level, modified z = 0.6745 (x - median) / MAD, flagged
+// beyond the sensitivity (Iglewicz and Hoaglin's 3.5 by default); where over half the
+// values are the same and the MAD is 0, the mean absolute deviation stands in for it.
+// Level shifts: the medians of the windows either side of each point are compared,
+// after a running median of five has wiped out spikes, and with the steady trend
+// taken off so that a slope is not a shift, against the noise worked out from the steps
+// themselves; each level must then last and hold across its whole stretch. Gaps: an
+// empty value, or, with dates, a step of at least 1.5 times the usual one.
+//
+// points: the series in order, numbers or { t, value } (t a date, a date-time or any
+// label; a null value is a gap). The reader can paste over it, in the box named series:
+// a line for each point, "label, value" or the value alone; a first line of headings
+// is skipped, and the first 2,000 points are used. sensitivity: how many deviations
+// count as an outlier, 2 to 8 (3.5), which the reader can change with the slider named
+// sensitivity. title: the heading ("Anomalies"). id: a prefix for its ids
+// ("anomaly-finder"), unique on the page. name: a prefix for the fields' names.
+// on_change(findings): inside one of your components, given the list below after
+// each change.
+//
+// anomaly_finder_parse(text) and anomaly_finder_scan(points, sensitivity) are the work,
+// for a program's own use: scan gives { findings, levels, too_few, ... }, and each finding
+// is { kind, at, label, value, text }, kind being "outlier", "shift" or "gap".
+
+import ui/theme.qwe use ui_cls
+
+let anomaly_finder_css = css`
+.ui-anomaly-finder { display: grid; gap: 12px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-anomaly-finder .ui-anomaly-finder-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-anomaly-finder-chart { display: block; width: 100%; max-width: 640px; height: auto; }
+.ui-anomaly-finder-line { fill: none; stroke: var(--ui-accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.ui-anomaly-finder-gap { fill: var(--ui-subtle); }
+.ui-anomaly-finder-shift { stroke: var(--ui-warning); stroke-width: 2; stroke-dasharray: 5 4; vector-effect: non-scaling-stroke; }
+.ui-anomaly-finder-dot { fill: var(--ui-danger); stroke: var(--ui-surface); stroke-width: 2; }
+.ui-anomaly-finder-mark { fill: var(--ui-fg); font: 600 12px var(--ui-font); text-anchor: middle; paint-order: stroke; stroke: var(--ui-surface); stroke-width: 4px; }
+.ui-anomaly-finder-axis { display: flex; justify-content: space-between; gap: 12px; max-width: 640px; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-anomaly-finder-control { display: grid; gap: 4px; font-size: 13px; }
+.ui-anomaly-finder-control input { width: 100%; max-width: 320px; margin: 0; accent-color: var(--ui-accent); }
+.ui-anomaly-finder-live { display: grid; gap: 6px; min-width: 0; }
+.ui-anomaly-finder-say { margin: 0; font-weight: 600; }
+.ui-anomaly-finder-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-anomaly-finder-list li { display: flex; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--ui-border); }
+.ui-anomaly-finder-list li:last-child { border-bottom: 0; }
+.ui-anomaly-finder-num { flex: none; min-width: 20px; color: var(--ui-muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-anomaly-finder-kind { flex: none; min-width: 58px; font-weight: 600; }
+.ui-anomaly-finder-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-anomaly-finder-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-anomaly-finder-data summary { color: var(--ui-muted); font-size: 13px; cursor: pointer; }
+.ui-anomaly-finder-data summary:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-anomaly-finder-box { box-sizing: border-box; width: 100%; min-height: 120px; margin-top: 6px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.4 var(--ui-mono); resize: vertical; }
+.ui-anomaly-finder-box:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+`
+
+let anomaly_finder_cap = 2000
+let anomaly_finder_most = 40
+
+// A number with commas and up to two decimals, in whole numbers so that the server
+// and the browser write the same text.
+fn anomaly_finder_num(v: num) -> str {
+    let units = round(abs(v) * 100)
+    let whole = floor(units / 100)
+    let frac = units - whole * 100
+    let tail = frac == 0 ? "" : (frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${frac < 10 ? "0" : ""}${frac}`)
+    `${v < 0 && units > 0 ? "-" : ""}${anomaly_finder_group(whole)}${tail}`
+}
+
+fn anomaly_finder_group(n: num) -> str {
+    if n < 1000 { return str(n) }
+    let rest = str(n % 1000)
+    `${anomaly_finder_group(floor(n / 1000))},${repeat("0", 3 - len(rest))}${rest}`
+}
+
+fn anomaly_finder_one(v: num) -> str {
+    let tenths = round(abs(v) * 10)
+    `${v < 0 && tenths > 0 ? "-" : ""}${floor(tenths / 10)}.${tenths % 10}`
+}
+
+// A value as typed: a float, or null when it is not a number we can trust.
+fn anomaly_finder_read(text: str) {
+    let t = replace(trim(text), ",", "")
+    re.test(t, "^[-+]?\\d{1,15}(\\.\\d{1,12})?$") ? float(dec(t)) : null
+}
+
+// The text of a list of points, for the box.
+fn anomaly_finder_text(points: list) -> str =
+    slice(points, 0, anomaly_finder_cap) | map((p) => {
+        if type_of(p) != "map" { return p == null ? "" : str(p) }
+        let v = p.value == null ? "" : str(p.value)
+        p.t == null ? v : `${p.t}, ${v}`
+    }) | join("\n")
+
+// The box's lines to { points, problems, over }. A point is { label, value }, the value
+// null for a missing one. Nothing here throws: a bad line is named, and skipped.
+fn anomaly_finder_parse(text: str) -> map {
+    let lines = split(replace(text, "\r", ""), "\n")
+    let read = for n in range(len(lines)) {
+        let line = trim(lines[n])
+        let cut = re.find(line, "[,;\\t]")
+        let label = cut == null ? "" : trim(slice(line, 0, cut.start))
+        let raw = cut == null ? line : trim(slice(line, cut.end, len(line)))
+        let v = anomaly_finder_read(raw)
+        let empty = raw == "" || raw == "null" || raw == "NA" || raw == "-"
+        if line == "" { { skip: true } } else {
+            if v == null && !empty { { line: n + 1, bad: raw, skip: false } } else { { label, value: v, skip: false, bad: null } }
+        }
+    }
+    let lines_used = read | filter((r) => !r.skip)
+    // A first line that is no number and has none to its left is a heading.
+    let body = len(lines_used) > 0 && lines_used[0].bad != null ? slice(lines_used, 1, len(lines_used)) : lines_used
+    let bad = body | filter((r) => r.bad != null)
+    let good = body | filter((r) => r.bad == null)
+    let problems = slice(bad, 0, 6) | map((r) => `Line ${r.line}: "${slice(r.bad, 0, 40)}" is not a number, so it is skipped.`)
+    { points: slice(good, 0, anomaly_finder_cap) | map((r) => ({ label: r.label, value: r.value })),
+      problems: problems + (len(bad) > 6 ? [`And ${len(bad) - 6} more lines like these.`] : []), over: len(good) > anomaly_finder_cap ? len(good) - anomaly_finder_cap : 0 }
+}
+
+// A point's time in ms, or null when its label is no date.
+fn anomaly_finder_ms(label: str) {
+    date.valid(label) ? date.ms(label) : null
+}
+
+fn anomaly_finder_median(xs: list) = len(xs) == 0 ? 0 : stats.median(xs)
+
+// Where the level changes: places in `raw` where a shift holds up, in order.
+fn anomaly_finder_shifts(raw: list, limit: num) -> list {
+    let n = len(raw)
+    let w = min([max([4, floor(n / 6)]), 12])
+    if n < 2 * w { return [] }
+    // A running median of five wipes out spikes of one or two points and keeps a step as
+    // sharp as it was, so what is left to compare is the level.
+    let vs = for i in range(n) => stats.median(slice(raw, max([i - 2, 0]), min([i + 3, n])))
+    let steps = vec.diff(raw)
+    let usual = stats.median(steps)
+    let spread = stats.median(steps | map((d) => abs(d - usual)))
+    // The steady trend, over a span and not one step: noise that goes up and down makes
+    // the median single step anything, and a slope of 2 across 13 points hides a shift.
+    let slope = stats.median(for i in range(n - w) => vs[i + w] - vs[i]) / w
+    let noise = 1.4826 * spread / sqrt(2)
+    let unit = max([noise, abs(stats.median(raw)) * 0.01, 0.000000001])
+    let gap_at = (i: int) => abs(stats.median(slice(vs, i, i + w)) - stats.median(slice(vs, i - w, i)) - w * slope) / unit
+    let scores = for i in range(w, n - w + 1) => { i, score: gap_at(i) }
+    // Each run of places over the limit gives one candidate: its highest.
+    let peaks = []
+    let run = []
+    for s in scores {
+        if s.score >= limit { run = push(run, s) } else {
+            if len(run) > 0 { peaks = push(peaks, last(sort_by(run, (r) => r.score)).i); run = [] }
+        }
+    }
+    if len(run) > 0 { peaks = push(peaks, last(sort_by(run, (r) => r.score)).i) }
+    // A level has to last: no stretch shorter than a window, and each stretch's median
+    // against the next's, over all of it.
+    let sides = [0] + peaks + [n]
+    let lasting = range(len(peaks)) | filter((k) => sides[k + 1] - sides[k] >= w && sides[k + 2] - sides[k + 1] >= w) | map((k) => peaks[k])
+    let edges = [0] + lasting + [n]
+    let held = range(len(lasting)) | filter((k) => {
+        let a = slice(raw, edges[k], edges[k + 1])
+        let b = slice(raw, edges[k + 1], edges[k + 2])
+        let apart = (len(a) + len(b)) / 2
+        abs(stats.median(b) - stats.median(a) - apart * slope) / unit >= limit
+    })
+    held | map((k) => lasting[k])
+}
+
+// One sentence and a place for each thing found. `points` are { label, value } in order.
+fn anomaly_finder_scan(points: list, sensitivity: num) -> map {
+    let there = range(len(points)) | filter((i) => points[i].value != null)
+    let vs = there | map((i) => points[i].value)
+    let times = points | map((p) => anomaly_finder_ms(p.label))
+    let dated = len(points) > 0 && all(times, (t) => t != null)
+    let spans = dated && len(points) > 1 ? vec.diff(times) : []
+    let usual = len(spans) > 0 ? stats.median(spans) : 0
+    let out_of_order = any(spans, (d) => d <= 0)
+    let label_at = (i: int) => filled(points[i].label) ?? `point ${i + 1}`
+    // Gaps: runs of empty values, then steps too long for the series.
+    let empties = []
+    let open = null
+    for i in range(len(points)) {
+        if points[i].value == null { open = open ?? i } else {
+            if open != null { empties = push(empties, { from: open, to: i - 1 }); open = null }
+        }
+    }
+    if open != null { empties = push(empties, { from: open, to: len(points) - 1 }) }
+    let empty_gaps = empties | map((g) => {
+        let many = g.to - g.from + 1
+        { kind: "gap", at: g.from, end: g.to, label: label_at(g.from), value: null,
+          text: many == 1 ? `No value at ${label_at(g.from)}.` : `No value for ${many} points, ${label_at(g.from)} to ${label_at(g.to)}.` }
+    })
+    let long_gaps = out_of_order || usual <= 0 ? [] : range(len(spans)) | filter((i) => spans[i] >= 1.5 * usual) | map((i) => {
+        let missing = round(spans[i] / usual) - 1
+        { kind: "gap", at: i, end: i + 1, label: label_at(i), value: null,
+          text: `Nothing between ${label_at(i)} and ${label_at(i + 1)}: about ${missing} ${missing == 1 ? "point is" : "points are"} missing.` }
+    })
+    if len(vs) < 5 {
+        return { findings: empty_gaps + long_gaps, levels: [], too_few: true, dated, out_of_order, there, vs, times, shifts: [], outliers: [] }
+    }
+    let limit = sensitivity + 1.5
+    let cuts = anomaly_finder_shifts(vs, limit)
+    let edges = [0] + cuts + [len(vs)]
+    let levels = for k in range(len(edges) - 1) => stats.median(slice(vs, edges[k], edges[k + 1]))
+    let level_of = (j: int) => levels[len(cuts | filter((c) => c <= j))]
+    let leftovers = for j in range(len(vs)) => vs[j] - level_of(j)
+    let centre = stats.median(leftovers)
+    let mad = stats.median(leftovers | map((r) => abs(r - centre)))
+    let mean_dev = stats.mean(leftovers | map((r) => abs(r - centre)))
+    let scale = mad > 0 ? mad / 0.6745 : mean_dev * 1.253314
+    let outliers = scale <= 0 ? [] : range(len(vs)) | filter((j) => abs(leftovers[j] - centre) / scale > sensitivity) | map((j) => {
+        let i = there[j]
+        let z = (leftovers[j] - centre) / scale
+        { kind: "outlier", at: i, end: i, label: label_at(i), value: vs[j], z,
+          text: `${anomaly_finder_num(vs[j])} at ${label_at(i)} is ${anomaly_finder_one(abs(z))} deviations ${z > 0 ? "above" : "below"} the median of ${anomaly_finder_num(level_of(j))}; the limit is ${anomaly_finder_one(sensitivity)}.` }
+    })
+    let shifts = for k in range(len(cuts)) {
+        let i = there[cuts[k]]
+        let a = levels[k]
+        let b = levels[k + 1]
+        let by = a == 0 ? "" : ` (${b > a ? "up" : "down"} ${anomaly_finder_one(abs(b - a) * 100 / abs(a))}%)`
+        { kind: "shift", at: i, end: i, label: label_at(i), value: vs[cuts[k]],
+          text: `The level moved from ${anomaly_finder_num(a)} to ${anomaly_finder_num(b)} at ${label_at(i)}${by}, and stayed there.` }
+    }
+    let findings = sort_by(empty_gaps + long_gaps + shifts + outliers, (f) => f.at)
+    { findings, levels, too_few: false, dated, out_of_order, there, vs, times, shifts, outliers }
+}
+
+// A coordinate, to one decimal, written the same on both sides.
+fn anomaly_finder_xy(v: num) -> str {
+    let tenths = round(v * 10)
+    tenths % 10 == 0 ? str(floor(tenths / 10)) : `${floor(tenths / 10)}.${tenths % 10}`
+}
+
+// The chart's geometry from what the scan saw: { d, dots, shift_lines, gap_boxes, lo, hi }.
+fn anomaly_finder_plot(points: list, scan: map, width: num, height: num) -> map {
+    let vs = scan.vs
+    let lo = min(vs) ?? 0
+    let hi = max(vs) ?? 1
+    let span = hi - lo == 0 ? 1 : hi - lo
+    let first_t = scan.dated ? scan.times[0] : 0
+    let whole_t = scan.dated ? scan.times[len(points) - 1] - first_t : 0
+    let across = scan.dated && !scan.out_of_order && whole_t > 0
+    let x = (i: int) => 10 + (width - 20) * (across ? (scan.times[i] - first_t) / whole_t : (len(points) > 1 ? i / (len(points) - 1) : 0.5))
+    let y = (v: num) => 18 + (height - 28) * (1 - (v - lo) / span)
+    let segs = for i in range(len(points)) {
+        let p = points[i]
+        let broken = i == 0 || points[i - 1].value == null || any(scan.findings, (f) => f.kind == "gap" && f.end == i && f.at == i - 1)
+        p.value == null ? "" : `${broken ? "M" : "L"}${anomaly_finder_xy(x(i))} ${anomaly_finder_xy(y(p.value))}`
+    }
+    let numbered = for n in range(len(scan.findings)) => { n, f: scan.findings[n] }
+    { d: join(segs, " "), lo, hi,
+      dots: numbered | filter((o) => o.f.kind == "outlier") | map((o) => ({ n: o.n + 1, x: anomaly_finder_xy(x(o.f.at)), y: anomaly_finder_xy(y(o.f.value)), up: anomaly_finder_xy(y(o.f.value) - 8) })),
+      lines: numbered | filter((o) => o.f.kind == "shift") | map((o) => ({ n: o.n + 1, x: anomaly_finder_xy(x(o.f.at)) })),
+      boxes: numbered | filter((o) => o.f.kind == "gap") | map((o) => {
+          let a = x(max([o.f.at - (o.f.value == null && points[o.f.at].value == null ? 1 : 0), 0]))
+          let b = x(min([o.f.end + (points[o.f.end].value == null ? 1 : 0), len(points) - 1]))
+          { n: o.n + 1, x: anomaly_finder_xy(a), w: anomaly_finder_xy(max([b - a, 3])), mid: anomaly_finder_xy((a + b) / 2) }
+      }) }
+}
+
+fn anomaly_finder_summary(s: map) -> str {
+    let of_kind = (kind: str) => len(s.findings | filter((f) => f.kind == kind))
+    let bit = (n: int, one: str, many: str) => n == 0 ? [] : [n == 1 ? `1 ${one}` : `${n} ${many}`]
+    let parts = bit(of_kind("outlier"), "outlier", "outliers") + bit(of_kind("shift"), "level shift", "level shifts") + bit(of_kind("gap"), "gap", "gaps")
+    len(parts) == 0 ? "Nothing odd in this series." : `Found ${join(parts, ", ")}.`
+}
+
+component AnomalyFinder(points: list = [], sensitivity = 3.5, title: str = "Anomalies", id: str = "anomaly-finder", name: str? = null, on_change = null, class: str? = null) {
+    style global anomaly_finder_css
+    state text = anomaly_finder_text(points)
+    state level = sensitivity < 2 ? 2 : (sensitivity > 8 ? 8 : sensitivity)
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let parsed = anomaly_finder_parse(text)
+    let series = parsed.points
+    let scan = anomaly_finder_scan(series, level)
+    let plain = len(scan.vs) > 0
+    let box = plain ? anomaly_finder_plot(series, scan, 640, 200) : null
+    let first_label = len(series) > 0 ? (filled(series[0].label) ?? "Start") : ""
+    let last_label = len(series) > 0 ? (filled(series[len(series) - 1].label) ?? "End") : ""
+    let tell = () => {
+        if on_change != null {
+            on_change(anomaly_finder_scan(anomaly_finder_parse(text).points, level).findings | map((f) => ({ kind: f.kind, at: f.at, label: f.label, value: f.value, text: f.text })))
+        }
+    }
+    <section class={ui_cls(["ui-anomaly-finder", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-anomaly-finder-title id={`${id}-title`}>{title}</h3>
+        {plain && <div>
+            <svg.ui-anomaly-finder-chart viewBox="0 0 640 200" role="img" aria-label={`Line chart of ${len(scan.vs)} values. ${anomaly_finder_summary(scan)}`}>
+                {for g in box.boxes => <rect.ui-anomaly-finder-gap key={g.n} x={g.x} y="0" width={g.w} height="200"/>}
+                {for g in box.boxes => <text.ui-anomaly-finder-mark key={g.n} x={g.mid} y="13">{g.n}</text>}
+                {for l in box.lines => <line.ui-anomaly-finder-shift key={l.n} x1={l.x} x2={l.x} y1="0" y2="200"/>}
+                {for l in box.lines => <text.ui-anomaly-finder-mark key={l.n} x={l.x} y="13">{l.n}</text>}
+                <path.ui-anomaly-finder-line d={box.d}/>
+                {for o in box.dots => <circle.ui-anomaly-finder-dot key={o.n} cx={o.x} cy={o.y} r="5"/>}
+                {for o in box.dots => <text.ui-anomaly-finder-mark key={o.n} x={o.x} y={o.up}>{o.n}</text>}
+            </svg>
+            <div.ui-anomaly-finder-axis aria-hidden="true">
+                <span>{first_label}</span><span>{anomaly_finder_num(box.lo)} to {anomaly_finder_num(box.hi)}</span><span>{last_label}</span>
+            </div>
+        </div>}
+        <label.ui-anomaly-finder-control for={`${id}-level`}>
+            <span>Flag values beyond <strong>{anomaly_finder_one(level)}</strong> deviations</span>
+            <input type="range" id={`${id}-level`} name={named("sensitivity")} min="2" max="8" step="0.5" value={level} @input={(e) => { level = float(e.value); tell() }}/>
+        </label>
+        <div.ui-anomaly-finder-live aria-live="polite">
+            {len(series) == 0 ? <p.ui-anomaly-finder-note>Paste a series to look at.</p>
+                : (scan.too_few ? <p.ui-anomaly-finder-note>Too few values to judge: at least 5 are needed, and there {len(scan.vs) == 1 ? "is 1" : `are ${len(scan.vs)}`}.</p>
+                    : <p.ui-anomaly-finder-say>{anomaly_finder_summary(scan)}</p>)}
+            {len(parsed.problems) > 0 && <ul.ui-anomaly-finder-problems role="alert">{for p in parsed.problems => <li>{p}</li>}</ul>}
+            {len(scan.findings) > 0 && <ol.ui-anomaly-finder-list>
+                {for n in range(min([len(scan.findings), anomaly_finder_most])) {
+                    let f = scan.findings[n]
+                    <li key={`${f.kind}-${f.at}`} data-kind={f.kind}>
+                        <span.ui-anomaly-finder-num>{n + 1}</span>
+                        <span.ui-anomaly-finder-kind>{f.kind == "outlier" ? "Outlier" : (f.kind == "shift" ? "Level" : "Gap")}</span>
+                        <span>{f.text}</span>
+                    </li>
+                }}
+            </ol>}
+            {len(scan.findings) > anomaly_finder_most && <p.ui-anomaly-finder-note>And {len(scan.findings) - anomaly_finder_most} more.</p>}
+            {parsed.over > 0 && <p.ui-anomaly-finder-note>Only the first {anomaly_finder_cap} points are used; {parsed.over} more were left out.</p>}
+            {scan.out_of_order && <p.ui-anomaly-finder-note>The dates are out of order or repeat, so gaps in time are not looked for.</p>}
+        </div>
+        <details.ui-anomaly-finder-data>
+            <summary>The data</summary>
+            <label.ui-sr for={`${id}-series`}>Series, a line for each point</label>
+            <textarea.ui-anomaly-finder-box id={`${id}-series`} name={named("series")} spellcheck="false" rows="8" @input={(e) => { text = e.value; tell() }}>{text}</textarea>
+        </details>
+    </section>
+}

@@ -1,0 +1,408 @@
+// CommentSheet: the comments on a post, in a sheet that rises from the bottom of a phone
+// and stands beside the post on a tablet. Comments come in threads, with replies folded
+// under their comment; sort by top or by newest; the reply bar stays above the keyboard;
+// and the count stays right through every add and delete, a thread taken away counting
+// all its replies. The grip and the header drag it taller, shorter or away, and the
+// Close and Expand buttons and Escape do the same without a gesture.
+//
+//   <CommentSheet trigger="Comments" comments={post.comments} total={post.comment_count}
+//                 on_add={(c) => { save(c.parent, c.text) }} on_remove={(ids) => { drop(ids) }}/>
+//   <CommentSheet open={showing} comments={list} me="Rui" sort="new" on_close={() => { showing = false }}/>
+//
+// comments: a list of { id, parent?, name, text, at?, time?, likes?, liked?, mine?, avatar? }.
+// id: text or a number; a repeat is shown once. parent: the id of what it answers; a parent
+// that is gone, or a loop of them, makes it a comment of its own. at: ISO text, which
+// is what newest sorts by. time: as it should read ("2 h"). mine: yours, so it can be deleted.
+// total: how many there are in all, for when only some were sent; the sheet adds and takes
+// away from it. me: your name on what you write ("You"). sort: "top" (most liked, then most
+// answered) or "new". title ("Comments"). trigger: the text of a button that opens it, with
+// the count after it. Inside one of your components, open it from your own state: open={...}
+// and on_close(). modal: true is the browser's <dialog> over the page, which holds the focus;
+// false keeps it inside the nearest element with a transform, for a frame or a pane.
+// id, class: for the <dialog>; id-count is the element showing the count.
+// on_add({ id, parent, text }): id is a stand-in, for your server to replace.
+// on_remove(ids): the ids gone, a thread's replies too. on_like(id, liked).
+// on_count(n): the count, when it changes. All work inside one of your components.
+
+import ui/theme.qwe use ui_cls
+import ui/composer_bar.qwe use ComposerBar, composer_bar_follow
+
+let comment_sheet_css = css`
+.ui-comment-sheet-host { display: contents; }
+.ui-comment-sheet-open { min-height: 46px; padding: 0 18px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 15px var(--ui-font); cursor: pointer; }
+.ui-comment-sheet-open:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-comment-sheet {
+  position: fixed; inset: 0; z-index: 35; box-sizing: border-box; width: 100%; height: 100%; max-width: none; max-height: none; margin: 0; padding: 0; overflow: hidden; border: 0; background: transparent;
+  color: var(--ui-fg); container-type: size; font: 15px/1.4 var(--ui-font);
+}
+.ui-comment-sheet::backdrop { background: transparent; }
+.ui-comment-sheet-shade { position: absolute; inset: 0; background: var(--ui-overlay); }
+.ui-comment-sheet-panel {
+  position: absolute; left: 0; right: 0; bottom: var(--ui-comment-sheet-lift, 0px); display: flex; flex-direction: column; box-sizing: border-box; height: 64%;
+  max-height: calc(100% - var(--ui-comment-sheet-lift, 0px) - 8px); border-radius: 16px 16px 0 0; background: var(--ui-surface); box-shadow: var(--ui-shadow-lg);
+  transition: height .24s cubic-bezier(.2, .9, .3, 1), transform .24s cubic-bezier(.2, .9, .3, 1); animation: ui-comment-sheet-up .24s cubic-bezier(.2, .9, .3, 1);
+}
+@keyframes ui-comment-sheet-up { from { transform: translateY(100%); } }
+.ui-comment-sheet-full .ui-comment-sheet-panel { height: calc(100% - 8px); }
+.ui-comment-sheet-panel.ui-comment-sheet-dragging { transition: none; }
+.ui-comment-sheet-handle { flex: none; touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-comment-sheet-grip { display: grid; place-items: center; width: 100%; height: 44px; margin-bottom: -14px; padding: 0; border: 0; background: transparent; cursor: grab; touch-action: none; }
+.ui-comment-sheet-grip span { width: 40px; height: 5px; border-radius: 999px; background: var(--ui-strong); }
+.ui-comment-sheet-grip:focus-visible { outline: none; }
+.ui-comment-sheet-grip:focus-visible span { background: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-comment-sheet-head { display: flex; align-items: center; gap: 4px; padding: 0 6px 6px 16px; }
+.ui-comment-sheet-head h2 { flex: 1; min-width: 0; margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; }
+.ui-comment-sheet-head h2 span { color: var(--ui-muted); font-weight: 500; }
+.ui-comment-sheet-btn { flex: none; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--ui-muted); cursor: pointer; }
+.ui-comment-sheet-btn svg { width: 20px; height: 20px; }
+.ui-comment-sheet-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-comment-sheet-sorts { flex: none; display: flex; gap: 4px; padding: 0 12px 6px; border-bottom: 1px solid var(--ui-border); }
+.ui-comment-sheet-sort { min-height: 44px; padding: 0 14px; border: 0; border-radius: 999px; background: transparent; color: var(--ui-muted); font: 500 14px var(--ui-font); cursor: pointer; }
+.ui-comment-sheet-sort[aria-pressed="true"] { background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-comment-sheet-sort:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-comment-sheet-list { flex: 1; min-height: 0; margin: 0; padding: 4px 12px 12px; overflow-y: auto; overscroll-behavior: contain; list-style: none; }
+.ui-comment-sheet-none { padding: 32px 16px; color: var(--ui-muted); text-align: center; }
+.ui-comment-sheet-replies { margin: 0; padding: 0 0 0 40px; list-style: none; }
+.ui-comment-sheet-one { display: grid; grid-template-columns: 32px 1fr; gap: 0 8px; padding-top: 10px; }
+.ui-comment-sheet-face { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; overflow: hidden; background: var(--ui-accent-soft); color: var(--ui-accent); font-size: 12px; font-weight: 650; }
+.ui-comment-sheet-face img { width: 100%; height: 100%; object-fit: cover; }
+.ui-comment-sheet-meta { display: flex; align-items: baseline; gap: 6px; font-size: 13px; }
+.ui-comment-sheet-meta b { font-weight: 600; }
+.ui-comment-sheet-meta small { color: var(--ui-muted); font-size: 12px; }
+.ui-comment-sheet-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-comment-sheet-to { color: var(--ui-accent); font-weight: 500; }
+.ui-comment-sheet-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin-left: -8px; color: var(--ui-muted); }
+.ui-comment-sheet-act { min-width: 44px; min-height: 44px; padding: 0 8px; border: 0; background: transparent; color: inherit; font: 500 13px var(--ui-font); cursor: pointer; font-variant-numeric: tabular-nums; }
+.ui-comment-sheet-act[aria-pressed="true"] { color: var(--ui-danger); }
+.ui-comment-sheet-act:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: var(--ui-radius-sm); }
+.ui-comment-sheet-gone { color: var(--ui-danger); }
+.ui-comment-sheet-ask { grid-column: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 2px 8px; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); font-size: 13px; }
+.ui-comment-sheet-more { display: block; min-height: 44px; margin-left: 32px; padding: 0 8px; border: 0; background: transparent; color: var(--ui-accent); font: 600 13px var(--ui-font); cursor: pointer; }
+.ui-comment-sheet-more:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: var(--ui-radius-sm); }
+.ui-comment-sheet-replying { display: flex; align-items: center; gap: 4px; padding: 0 0 0 8px; color: var(--ui-muted); font-size: 13px; }
+.ui-comment-sheet-replying span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* On a tablet the post stays in sight: a column at the side, not a sheet over it. */
+@container (min-width: 640px) {
+  .ui-comment-sheet-panel, .ui-comment-sheet-full .ui-comment-sheet-panel { top: 0; left: auto; bottom: var(--ui-comment-sheet-lift, 0px); width: 380px; height: auto; max-height: none; border-radius: 16px 0 0 16px; animation-name: ui-comment-sheet-in; }
+  .ui-comment-sheet-grip, .ui-comment-sheet-size { display: none; }
+  .ui-comment-sheet-handle { touch-action: auto; cursor: default; }
+  .ui-comment-sheet-head { padding-top: 10px; }
+}
+@keyframes ui-comment-sheet-in { from { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) { .ui-comment-sheet-panel { transition: none; animation: none; } }
+`
+
+// Each comment once, with its id and its parent's as text.
+fn comment_sheet_clean(comments) {
+    let kept = (type_of(comments) == "list" ? comments : []) | filter((c) => type_of(c) == "map" && c.id != null)
+    let seq = for i in range(len(kept)) => { ...kept[i], seq: i, cid: str(kept[i].id), pid: kept[i].parent != null ? str(kept[i].parent) : null }
+    let by_id = group_by(seq, (c) => c.cid)
+    seq | filter((c) => get(by_id, c.cid, [c])[0].seq == c.seq)
+}
+
+// The top of a comment's thread: its own id when it has no parent that can be found, or
+// when its parents go round in a loop.
+fn comment_sheet_root(c, by_id) -> str {
+    let at = c
+    let steps = 0
+    while steps < 64 {
+        let up = at.pid != null ? get(by_id, at.pid, [])  : []
+        if len(up) == 0 { return at.cid }
+        at = up[0]
+        steps += 1
+    }
+    c.cid
+}
+
+// Whether c is `cid`, or under it.
+fn comment_sheet_under(c, cid: str, by_id) -> bool {
+    let at = c
+    let steps = 0
+    while steps < 64 {
+        if at.cid == cid { return true }
+        let up = at.pid != null ? get(by_id, at.pid, []) : []
+        if len(up) == 0 { return false }
+        at = up[0]
+        steps += 1
+    }
+    false
+}
+
+// The threads to show: [{ comment, replies }], replies oldest first, whoever they answer,
+// each with `to`, the name answered when that is not the thread's top. Your new ones come
+// first, as you want to see them; then by likes and replies, or by time.
+fn comment_sheet_threads(rows: list, order: str) {
+    let by_id = group_by(rows, (c) => c.cid)
+    let tagged = rows | map((c) => { ...c, root: comment_sheet_root(c, by_id) })
+    let by_root = group_by(tagged | filter((c) => c.root != c.cid), (c) => c.root)
+    let named = (c) => {
+        let up = c.pid != null ? get(by_id, c.pid, []) : []
+        c.pid != c.root && len(up) > 0 ? { ...c, to: up[0].name } : c
+    }
+    let all_threads = tagged | filter((c) => c.root == c.cid) | map((t) => { comment: t, replies: get(by_root, t.cid, []) | map(named) })
+    let fresh = reverse(all_threads | filter((t) => t.comment.fresh == true))
+    let others = all_threads | filter((t) => t.comment.fresh != true)
+    let ranked = order == "new"
+        ? reverse(sort_by(others, (t) => str(t.comment.at ?? "")))
+        : sort_by(others, (t) => 0 - comment_sheet_likes(t.comment) * 1000 - len(t.replies))
+    fresh + ranked
+}
+
+// A count of likes that can be trusted.
+fn comment_sheet_likes(c) -> int = type_of(c.likes) == "int" && c.likes > 0 ? c.likes : 0
+
+// The list with `cid` and all under it gone: { rows, gone }, gone the ids.
+fn comment_sheet_remove(rows: list, cid: str) {
+    let by_id = group_by(rows, (c) => c.cid)
+    let gone = rows | filter((c) => comment_sheet_under(c, cid, by_id))
+    { rows: rows | filter((c) => !comment_sheet_under(c, cid, by_id)), gone: gone | map((c) => c.id) }
+}
+
+// Likes after one person's press: never under nothing.
+fn comment_sheet_like(rows: list, cid: str) =
+    rows | map((c) => c.cid == cid ? { ...c, liked: c.liked != true, likes: max([comment_sheet_likes(c) + (c.liked == true ? -1 : 1), 0]) } : c)
+
+// The count to show. `total` is the whole, of which `start` came to the page and `now` are
+// here: adds and deletes move the whole. A total under what is on screen is out of date.
+fn comment_sheet_total(total, start: int, now: int) -> int {
+    let usable = type_of(total) == "int" && total >= 0
+    let whole = usable ? total + now - start : now
+    max([whole, now])
+}
+
+// "1 comment", "1,204 comments".
+fn comment_sheet_count_label(n: int) -> str = n == 1 ? "1 comment" : `${format_number(n)} comments`
+
+// How a drag of the sheet ends, from "half" or "full": "half", "full" or "closed". Up is
+// negative; speed is in pixels a millisecond, down being positive.
+fn comment_sheet_snap(from: str, dy: num, speed: num) -> str {
+    let flick = abs(speed) >= 0.4 && abs(dy) >= 24
+    let down = dy >= 80 || (flick && speed > 0)
+    let up = dy <= -80 || (flick && speed < 0)
+    if from == "full" { return down ? (dy >= 280 ? "closed" : "half") : "full" }
+    if up { return "full" }
+    down ? "closed" : "half"
+}
+
+// Speed from the last tenth of a second or so, not from the last two events, which can be
+// a moment apart or several together. `m` holds two marks, { p0, t0, p1, t1 }, the older
+// being what speed is measured from, and where it began: { from, since }.
+fn comment_sheet_marks(pos: num, at: num) = { from: pos, since: at, p0: pos, t0: at, p1: pos, t1: at }
+fn comment_sheet_track(m, pos: num, at: num) =
+    at - m.t1 >= 40 ? { ...m, p0: m.p1, t0: m.t1, p1: pos, t1: at } : m
+
+// Pixels a millisecond: since the older mark, or over the whole gesture if that is quicker,
+// as a phone that is busy hands a flick over in few events.
+fn comment_sheet_speed(m, pos: num, at: num) -> num {
+    let recent = (pos - m.p0) / max([at - m.t0, 1])
+    let whole = (pos - m.from) / max([at - m.since, 1])
+    abs(whole) > abs(recent) ? whole : recent
+}
+
+// Up to two letters for someone with no picture.
+fn comment_sheet_initials(name) -> str =
+    upper(join(split(trim(str(name ?? "")), " ") | filter((w) => w != "") | map((w) => slice(w, 0, 1)) | slice(0, 2), ""))
+
+view CommentSheetOne(c, liked_label: str, asking: bool, reply_count: int, on_reply, on_like, on_delete, on_ask, on_keep) =
+    <div.ui-comment-sheet-one data-cid={c.cid}>
+        <span.ui-comment-sheet-face aria-hidden="true">{c.avatar != null ? <img src={c.avatar} alt=""/> : comment_sheet_initials(c.name)}</span>
+        <div>
+            <div.ui-comment-sheet-meta>
+                <b>{c.name}</b>
+                {c.time != null && <small>{c.time}</small>}
+            </div>
+            <p.ui-comment-sheet-text>{c.to != null && <span.ui-comment-sheet-to>{`@${c.to} `}</span>}{str(c.text ?? "")}</p>
+            <div.ui-comment-sheet-acts>
+                <button.ui-comment-sheet-act type="button" @click={on_reply} aria-label={`Reply to ${c.name}`}>Reply</button>
+                <button.ui-comment-sheet-act type="button" aria-pressed={c.liked == true ? "true" : "false"} aria-label={liked_label} @click={on_like}>
+                    {c.liked == true ? "Liked" : "Like"} {comment_sheet_likes(c) > 0 ? comment_sheet_likes(c) : ""}
+                </button>
+                {c.mine == true && <button.ui-comment-sheet-act.ui-comment-sheet-gone type="button" @click={on_ask}>Delete</button>}
+            </div>
+        </div>
+        {asking && <div.ui-comment-sheet-ask role="alert">
+            <span>{reply_count > 0 ? `Delete this and its ${reply_count} ${reply_count == 1 ? "reply" : "replies"}?` : "Delete this comment?"}</span>
+            <button.ui-comment-sheet-act.ui-comment-sheet-gone type="button" @click={on_delete}>Delete</button>
+            <button.ui-comment-sheet-act type="button" @click={on_keep}>Keep</button>
+        </div>}
+    </div>
+
+component CommentSheet(comments: list = [], total: int? = null, me: str = "You", sort: str = "top", title: str = "Comments", trigger: str? = null,
+                       open: bool = false, modal: bool = true, on_add = null, on_remove = null, on_like = null, on_count = null, on_close = null,
+                       id: str? = null, class: str? = null) {
+    style global comment_sheet_css
+    state rows = comment_sheet_clean(comments)
+    state start = len(rows)
+    state order = sort
+    state opened = []
+    state target = null      // the comment being answered
+    state asking = null      // the id waiting for a yes
+    state full = false
+    state was_open = false
+    state made = 0
+    state dlg = null
+    state panel = null
+    state list = null
+    state opener = null
+    state grip = null        // { id, y, from, when, last, speed, moved }
+    let threads = comment_sheet_threads(rows, order)
+    let count = comment_sheet_total(total, start, len(rows))
+    let wide = () => dlg.clientWidth >= 640
+    let show = () => {
+        if dlg != null && !dlg.open {
+            full = false
+            if modal { dlg.showModal() } else { dlg.show() }
+            dlg.querySelector(".ui-comment-sheet-close").focus({ preventScroll: true })
+        }
+    }
+    let leave = () => { if dlg.open { dlg.close() } }
+    // On a change of `open` only: left open by a parent that has no on_close, it must not come straight back.
+    if dlg != null && panel != null && open != was_open {
+        was_open = open
+        if open { show() } else if dlg.open { dlg.close() }
+    }
+    let counted = () => { on_count && on_count(comment_sheet_total(total, start, len(rows))) }
+    let answer = (c) => {
+        target = c
+        let box = panel.querySelector("textarea")
+        if box != null { box.focus() }
+    }
+    let unfold = (cid) => { if !contains(opened, cid) { opened = opened + [cid] } }
+    let sent = (m) => {
+        let to = target
+        let parent = to != null ? to.cid : null
+        made += 1
+        let c = { id: `new-${made}`, cid: `new-${made}`, pid: parent, parent, name: me, text: m.text, time: "now", mine: true, fresh: true, likes: 0, seq: len(rows) + made, at: "" }
+        rows = rows + [c]
+        target = null
+        if to != null { unfold(to.root ?? to.cid) } else { list.scrollTop = 0 }
+        counted()
+        on_add && on_add({ id: c.id, parent, text: m.text })
+    }
+    let drop = (cid) => {
+        let out = comment_sheet_remove(rows, cid)
+        rows = out.rows
+        asking = null
+        if target != null && !any(rows, (r) => r.cid == target.cid) { target = null }
+        counted()
+        on_remove && on_remove(out.gone)
+    }
+    let like = (cid) => {
+        rows = comment_sheet_like(rows, cid)
+        let c = find(rows, (r) => r.cid == cid)
+        if c != null { on_like && on_like(c.id, c.liked == true) }
+    }
+    let settle = () => {
+        // On the panel, whose class is fixed: the dialog's is written again whenever a prop it reads changes.
+        panel.classList.remove("ui-comment-sheet-dragging")
+        panel.style.transform = ""
+        panel.style.height = ""
+    }
+    <div.ui-comment-sheet-host>
+        {trigger != null && <button.ui-comment-sheet-open type="button" aria-haspopup="dialog" @mount={(el) => { opener = el }} @click={show}>{trigger} ({format_number(count)})</button>}
+        <dialog class={ui_cls(["ui-comment-sheet", full && "ui-comment-sheet-full", class])} id={id} aria-label={title}
+                @mount={(el) => {
+                    dlg = el
+                    composer_bar_follow(el, (lift, _top, _height, _open) => { el.style.setProperty("--ui-comment-sheet-lift", `${lift}px`) })
+                }}
+                @close={() => {
+                    grip = null
+                    asking = null
+                    settle()
+                    if opener != null { opener.focus({ preventScroll: true }) }
+                    on_close && on_close()
+                }}
+                @keydown={(e) => { if e.key == "Escape" { e.preventDefault(); leave() } }}>
+            <div.ui-comment-sheet-shade @click={leave}></div>
+            <section.ui-comment-sheet-panel @mount={(el) => { panel = el }}>
+                <div.ui-comment-sheet-handle
+                     @pointerdown={(e) => {
+                         if e.button == 0 && e.isPrimary && !wide() && e.target.closest(".ui-comment-sheet-btn") == null {
+                             grip = { id: e.pointerId, y: e.clientY, from: panel.offsetHeight, moved: false, marks: comment_sheet_marks(e.clientY, e.timeStamp) }
+                         }
+                     }}
+                     @pointermove={(e) => {
+                         if grip != null && e.pointerId == grip.id {
+                             let dy = e.clientY - grip.y
+                             if grip.moved || abs(dy) >= 6 {
+                                 if !grip.moved {
+                                     e.target.setPointerCapture(e.pointerId)
+                                     panel.classList.add("ui-comment-sheet-dragging")
+                                 }
+                                 grip = { ...grip, moved: true, marks: comment_sheet_track(grip.marks, e.clientY, e.timeStamp) }
+                                 if dy < 0 {
+                                     panel.style.transform = ""
+                                     panel.style.height = `${grip.from - dy}px`
+                                 } else {
+                                     panel.style.height = ""
+                                     panel.style.transform = `translateY(${dy}px)`
+                                 }
+                             }
+                         }
+                     }}
+                     @pointerup={(e) => {
+                         if grip != null && e.pointerId == grip.id {
+                             let g = grip
+                             grip = null
+                             settle()
+                             if g.moved {
+                                 let to = comment_sheet_snap(full ? "full" : "half", e.clientY - g.y, comment_sheet_speed(g.marks, e.clientY, e.timeStamp))
+                                 if to == "closed" { leave() } else { full = to == "full" }
+                             }
+                         }
+                     }}
+                     @pointercancel={() => {
+                         grip = null
+                         settle()
+                     }}>
+                    <button.ui-comment-sheet-grip type="button" aria-label={full ? "Make it smaller" : "Make it taller"}
+                            @click={(e) => { if e.detail == 0 { full = !full } }}
+                            @keydown={(e) => {
+                                if e.key == "ArrowUp" { e.preventDefault(); full = true }
+                                if e.key == "ArrowDown" { e.preventDefault(); if full { full = false } else { leave() } }
+                            }}><span aria-hidden="true"></span></button>
+                    <div.ui-comment-sheet-head>
+                        <h2>{title} <span id={id != null ? `${id}-count` : null}>{format_number(count)}</span></h2>
+                        <button.ui-comment-sheet-btn.ui-comment-sheet-close type="button" aria-label="Close" @click={leave}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                        </button>
+                    </div>
+                </div>
+                <p.ui-sr role="status">{comment_sheet_count_label(count)}</p>
+                <div.ui-comment-sheet-sorts role="group" aria-label="Sort by">
+                    <button.ui-comment-sheet-sort type="button" aria-pressed={order == "top" ? "true" : "false"} @click={() => { order = "top" }}>Top</button>
+                    <button.ui-comment-sheet-sort type="button" aria-pressed={order == "new" ? "true" : "false"} @click={() => { order = "new" }}>Newest</button>
+                </div>
+                <ul.ui-comment-sheet-list @mount={(el) => { list = el }}>
+                    {len(threads) == 0 && <li.ui-comment-sheet-none>No comments yet. Be the first.</li>}
+                    {for t in threads => <li key={t.comment.cid}>
+                        <CommentSheetOne c={t.comment} liked_label={`Like, ${comment_sheet_likes(t.comment)} so far`} asking={asking == t.comment.cid} reply_count={len(t.replies)}
+                                         on_reply={() => { answer(t.comment) }} on_like={() => { like(t.comment.cid) }}
+                                         on_ask={() => { asking = t.comment.cid }} on_delete={() => { drop(t.comment.cid) }} on_keep={() => { asking = null }}/>
+                        {len(t.replies) > 0 && <button.ui-comment-sheet-more type="button" aria-expanded={contains(opened, t.comment.cid) ? "true" : "false"}
+                                @click={() => { opened = contains(opened, t.comment.cid) ? opened | filter((o) => o != t.comment.cid) : opened + [t.comment.cid] }}>
+                            {contains(opened, t.comment.cid) ? "Hide replies" : (len(t.replies) == 1 ? "View 1 reply" : `View ${len(t.replies)} replies`)}
+                        </button>}
+                        {contains(opened, t.comment.cid) && <ul.ui-comment-sheet-replies>
+                            {for r in t.replies => <li key={r.cid}>
+                                <CommentSheetOne c={r} liked_label={`Like, ${comment_sheet_likes(r)} so far`} asking={asking == r.cid} reply_count={0}
+                                                 on_reply={() => { answer(r) }} on_like={() => { like(r.cid) }}
+                                                 on_ask={() => { asking = r.cid }} on_delete={() => { drop(r.cid) }} on_keep={() => { asking = null }}/>
+                            </li>}
+                        </ul>}
+                    </li>}
+                </ul>
+                <ComposerBar name="comment" label={target != null ? `Reply to ${target.name}` : "Add a comment"}
+                             placeholder={target != null ? `Reply to ${target.name}` : "Add a comment"} keyboard={false} attach={false} voice={false}
+                             max_rows={4} send_label="Post" on_send={sent}>
+                    {target != null && <div.ui-comment-sheet-replying>
+                        <span>Replying to {target.name}</span>
+                        <button.ui-comment-sheet-btn type="button" aria-label="Stop replying" @click={() => { target = null }}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                        </button>
+                    </div>}
+                </ComposerBar>
+            </section>
+        </dialog>
+    </div>
+}

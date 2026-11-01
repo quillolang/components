@@ -1,0 +1,442 @@
+// WidgetGrid: a home screen of tiles of different sizes. A long press lifts a tile, and the same
+// finger carries it; the others make way and close up, as they do on a phone. Lifting it leaves
+// the screen in Edit, where each tile can be chosen and made a different size, put
+// earlier or later, or taken away and brought back. The Edit button and the keys reach all of
+// that without a long press. The whole arrangement is plain data: a list to keep and give back.
+//
+//   component Home() {
+//       state kept = load_home()                 // a server fn: a phone app's localStorage lasts one launch
+//       <WidgetGrid saved={kept} on_change={(layout) => { save_home(layout) }} on_open={(id) => { navigate(`/${id}`) }} widgets={[
+//           { id: "steps", title: "Steps", size: "2x2", value: "8,412", note: "of 10,000", tone: "accent" },
+//           { id: "water", title: "Water", value: "1.2 L" },
+//           { id: "week", title: "This week", size: "4x2", sizes: ["4x2", "2x2"], note: "Five workouts" },
+//       ]} render={(w) => w.id == "week" ? <MyWeek/> : null}/>
+//   }
+//
+// widgets: each { id, title, size?, sizes?, value?, note?, tone? }. size: columns by rows,
+// from "1x1" to "4x4" ("1x1"); a phone has 4 columns and a wide container 8, so a tablet holds
+// twice as much and a tile keeps its shape. sizes: what Size goes through on this tile (all of
+// "1x1", "2x1", "2x2", "4x2"). tone: "accent", "success", "warning", "danger" or "info". One with
+// no title or a second with the same id is left out. render(widget): inside one of your
+// components, what goes in a tile, or null for the title, value and note. saved: what on_change
+// gave. store: a localStorage key to keep it under as well, which in a phone app lasts one
+// launch. on_change(layout): after each change, a list of { id, size, hidden } in order, those
+// hidden at the end. on_open(id): a tile tapped outside Edit. delay: the long press, in
+// milliseconds (420). label: for screen readers ("Home screen"). class.
+//
+// Keys, in Edit, on a focused tile: arrows put it earlier or later, Enter chooses it, Delete
+// takes it away, Escape ends Edit. Under a screen reader the buttons under the grid do the same.
+
+import ui/theme.qwe use ui_cls
+
+let widget_grid_css = css`
+.ui-wgrid { position: relative; --ui-wgrid-gap: 10px; --ui-wgrid-cols: 4; container-type: inline-size; color: var(--ui-fg); font: 15px/1.3 var(--ui-font); }
+.ui-wgrid-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.ui-wgrid-title { margin: 0; font-size: 13px; font-weight: 600; color: var(--ui-muted); }
+.ui-wgrid-edit, .ui-wgrid-tool, .ui-wgrid-back { min-width: 64px; min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-wgrid-edit:focus-visible, .ui-wgrid-tool:focus-visible, .ui-wgrid-back:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-wgrid-tool:disabled { opacity: .5; cursor: default; }
+.ui-wgrid-grid { --ui-wgrid-cell: calc((100cqw - (var(--ui-wgrid-cols) - 1) * var(--ui-wgrid-gap)) / var(--ui-wgrid-cols)); display: grid; position: relative;
+  grid-template-columns: repeat(var(--ui-wgrid-cols), minmax(0, 1fr)); grid-auto-rows: var(--ui-wgrid-cell); grid-auto-flow: dense; gap: var(--ui-wgrid-gap); margin: 0; padding: 0; list-style: none; }
+.ui-wgrid-slot { min-width: 0; min-height: 0; }
+.ui-wgrid-tile { position: relative; width: 100%; height: 100%; border-radius: var(--ui-radius); background: var(--ui-subtle); --t: var(--ui-fg); color: var(--ui-fg);
+  transition: transform .2s cubic-bezier(.2, .8, .2, 1), box-shadow .15s; touch-action: pan-y; -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+.ui-wgrid-tone-accent { --t: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-wgrid-tone-success { --t: var(--ui-success); background: var(--ui-success-soft); }
+.ui-wgrid-tone-warning { --t: var(--ui-warning); background: var(--ui-warning-soft); }
+.ui-wgrid-tone-danger { --t: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-wgrid-tone-info { --t: var(--ui-info); background: var(--ui-info-soft); }
+.ui-wgrid-open { display: flex; flex-direction: column; width: 100%; height: 100%; padding: 10px; overflow: hidden; border: 0; border-radius: inherit; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; touch-action: inherit; }
+.ui-wgrid-open:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-wgrid-face { display: flex; flex: 1; flex-direction: column; justify-content: space-between; min-height: 0; gap: 2px; }
+.ui-wgrid-name { font-size: 13px; font-weight: 600; color: var(--ui-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-wgrid-value { font-size: 20px; font-weight: 700; color: var(--t); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-wgrid-tall .ui-wgrid-value { font-size: 30px; }
+.ui-wgrid-note { font-size: 12px; color: var(--ui-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-wgrid-pressing { transform: scale(.97); }
+.ui-wgrid-editing .ui-wgrid-tile { touch-action: none; cursor: grab; }
+.ui-wgrid-editing .ui-wgrid-open { pointer-events: none; }
+.ui-wgrid-picked { outline: 2px solid var(--ui-accent); outline-offset: 1px; }
+.ui-wgrid-lifted { z-index: 3; transition: box-shadow .15s; box-shadow: var(--ui-shadow-lg); cursor: grabbing; }
+.ui-wgrid-still .ui-wgrid-tile { transition: none; }
+.ui-wgrid-tile:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 1px; }
+.ui-wgrid-tools { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; padding: 8px 0 max(8px, env(safe-area-inset-bottom)); background: var(--ui-bg); }
+.ui-wgrid-tool { flex: 1 1 auto; }
+.ui-wgrid-tray { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 4px; color: var(--ui-muted); font-size: 13px; }
+.ui-wgrid-none { margin: 0; color: var(--ui-muted); }
+@container (min-width: 620px) {
+  .ui-wgrid-grid { --ui-wgrid-cols: 8; }
+}
+@media (hover: hover) {
+  .ui-wgrid-edit:hover, .ui-wgrid-back:hover, .ui-wgrid-tool:not(:disabled):hover { background: var(--ui-subtle); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-wgrid-tile { transition: none; } }
+`
+
+let widget_grid_sizes = ["1x1", "2x1", "2x2", "4x2"]
+let widget_grid_tones = ["accent", "success", "warning", "danger", "info"]
+
+// "2x1" as { w, h }, each from 1 to 4; anything else is 1x1.
+fn widget_grid_size(x) {
+    if type_of(x) != "str" { return { w: 1, h: 1 } }
+    let p = split(x, "x")
+    if len(p) != 2 || len(p[0]) != 1 || len(p[1]) != 1 { return { w: 1, h: 1 } }
+    let w = int(p[0])
+    let h = int(p[1])
+    if is_err(w) || is_err(h) || w < 1 || w > 4 || h < 1 || h > 4 { return { w: 1, h: 1 } }
+    { w, h }
+}
+
+fn widget_grid_text(s) -> str {
+    let z = widget_grid_size(s)
+    `${z.w}x${z.h}`
+}
+
+// The widgets that can be shown: with a title, each id once, ids as text.
+fn widget_grid_clean(widgets) {
+    if type_of(widgets) != "list" { return [] }
+    let named = take(widgets, 60) | filter((w) => type_of(w) == "map" && filled(get(w, "title")) != null)
+    let all = for [i, w] in enumerate(named) => {
+        let own = get(w, "sizes")
+        {
+            ...w, id: get(w, "id") != null ? str(w.id) : `_${i}`, title: str(w.title), size: widget_grid_text(get(w, "size")),
+            sizes: type_of(own) == "list" && len(own) > 0 ? own | map((s) => widget_grid_text(s)) : widget_grid_sizes,
+        }
+    }
+    let ids = all | map((w) => w.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// The layout: what was kept for those there are, in its order, then any new.
+fn widget_grid_merge(widgets, saved) {
+    let given = type_of(saved) == "list" ? saved | filter((r) => type_of(r) == "map" && get(r, "id") != null) : []
+    let ids = widgets | map((w) => w.id)
+    let kept_all = given | filter((r) => contains(ids, str(r.id)))
+                         | map((r) => { id: str(r.id), size: widget_grid_text(get(r, "size")), hidden: get(r, "hidden") == true })
+    let seen = kept_all | map((r) => r.id)
+    let kept = enumerate(kept_all) | filter((p) => index_of(seen, p[1].id) == p[0]) | map((p) => p[1])
+    let fresh = widgets | filter((w) => !contains(seen, w.id)) | map((w) => { id: w.id, size: w.size, hidden: false })
+    let open = (kept + fresh) | filter((r) => !r.hidden)
+    open + (kept | filter((r) => r.hidden))
+}
+
+// First fit, row by row, as the browser's dense grid places them: each item takes the first
+// spot it fits, so a small one can fill a hole that a large one left. Gives { id, x, y, w, h }.
+fn widget_grid_pack(items, cols: int) {
+    let used = {}
+    let out = []
+    for it in items {
+        let z = widget_grid_size(it.size)
+        let w = z.w > cols ? cols : z.w
+        let h = z.h
+        let y = 0
+        let spot = null
+        while spot == null {
+            for x in range(0, cols - w + 1) {
+                if spot == null {
+                    let free = true
+                    for dy in range(0, h) {
+                        for dx in range(0, w) {
+                            if get(used, `c${x + dx}:${y + dy}`, false) { free = false }
+                        }
+                    }
+                    if free { spot = x }
+                }
+            }
+            if spot == null { y += 1 }
+        }
+        for dy in range(0, h) {
+            for dx in range(0, w) { used = set(used, `c${spot + dx}:${y + dy}`, true) }
+        }
+        out = out + [{ id: it.id, x: spot, y, w, h }]
+    }
+    out
+}
+
+fn widget_grid_index(items, id: str) {
+    let ids = items | map((i) => i.id)
+    index_of(ids, id)
+}
+
+// A list with the item at one place moved to another.
+fn widget_grid_move(xs, from: int, to: int) {
+    let item = xs[from]
+    let rest = slice(xs, 0, from) + slice(xs, from + 1, len(xs))
+    slice(rest, 0, to) + [item] + slice(rest, to, len(rest))
+}
+
+// The order a finger over cell cx, cy asks for: the dragged tile takes the place of whatever
+// stands there. Over its own place, it stays; past the end of everything, it goes last.
+fn widget_grid_over(items, id: str, cx: int, cy: int, cols: int) {
+    let placed = widget_grid_pack(items, cols)
+    let hit = find(placed, (p) => cx >= p.x && cx < p.x + p.w && cy >= p.y && cy < p.y + p.h)
+    let from = widget_grid_index(items, id)
+    if hit == null {
+        let bottom = max(placed | map((p) => p.y + p.h))
+        return cy >= bottom ? widget_grid_move(items, from, len(items) - 1) : items
+    }
+    if hit.id == id { return items }
+    widget_grid_move(items, from, widget_grid_index(items, hit.id))
+}
+
+// How far each tile stands from its place in one order to its place in another, in cells.
+fn widget_grid_shift(items, virtual, cols: int) {
+    let a = widget_grid_pack(items, cols)
+    let b = widget_grid_pack(virtual, cols)
+    for p in a => {
+        let q = find(b, (o) => o.id == p.id)
+        { id: p.id, dx: q.x - p.x, dy: q.y - p.y }
+    }
+}
+
+fn widget_grid_tone(x) -> str? = contains(widget_grid_tones, x) ? `ui-wgrid-tone-${x}` : null
+
+// What a tile shows when no render says otherwise.
+view WidgetGridFace(w) =
+    <span.ui-wgrid-face>
+        <span.ui-wgrid-name>{w.title}</span>
+        {get(w, "value") != null && <span.ui-wgrid-value>{str(w.value)}</span>}
+        {get(w, "note") != null && <span.ui-wgrid-note>{str(w.note)}</span>}
+    </span>
+
+component WidgetGrid(widgets = [], render = null, saved = null, store: str? = null, label: str = "Home screen", delay: int = 420, on_change = null, on_open = null, class: str? = null) {
+    style global widget_grid_css
+    let clean = widget_grid_clean(widgets)
+    state rows = widget_grid_merge(clean, saved)
+    state editing = false
+    state picked = ""
+    state press = null       // a finger that may become a long press
+    state held = false       // a long press happened, so the click after it opens nothing
+    state g = null           // a tile in the air
+    state lifted = ""
+    state still = false      // no transitions, for the moment an order is committed
+    state grid = null
+    state win = null
+    state said = ""
+    let open_rows = rows | filter((r) => !r.hidden && find(clean, (w) => w.id == r.id) != null)
+    let hidden_rows = rows | filter((r) => r.hidden && find(clean, (w) => w.id == r.id) != null)
+    let shown = open_rows | map((r) => { ...find(clean, (w) => w.id == r.id), size: r.size })
+    let back = hidden_rows | map((r) => find(clean, (w) => w.id == r.id))
+    let at_pick = widget_grid_index(open_rows, picked)
+    let pick_item = at_pick != null ? shown[at_pick] : null
+    let buzz = (kind: str, ms: int) => {
+        if win != null {
+            if win.quilloNative != null {
+                js("quilloNative.haptic", kind)
+            } else {
+                if win.navigator.vibrate != null && js("navigator.userActivation.hasBeenActive") == true { js("navigator.vibrate", ms) }
+            }
+        }
+    }
+    let told = () => {
+        on_change && on_change(rows)
+        if store != null {
+            let text = json.stringify(rows)
+            // Storage can throw when it is blocked or full, which would stop the handler where it stands.
+            js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.setItem", store, text) ?? true) }))
+        }
+    }
+    let set_open = (list) => {
+        rows = list + hidden_rows
+        told()
+    }
+    let shift = (from: int, to: int) => {
+        if from != to && to >= 0 && to < len(open_rows) {
+            let title = shown[from].title
+            set_open(widget_grid_move(open_rows, from, to))
+            said = `${title} moved to place ${to + 1} of ${len(open_rows)}.`
+            buzz("selection", 8)
+        }
+    }
+    let grow = () => {
+        if pick_item != null {
+            let i = index_of(pick_item.sizes, pick_item.size)
+            let next = pick_item.sizes[((i ?? -1) + 1) % len(pick_item.sizes)]
+            set_open(open_rows | map((r) => r.id == picked ? { ...r, size: next } : r))
+            said = `${pick_item.title} is now ${next}.`
+        }
+    }
+    let take_away = () => {
+        if pick_item != null {
+            let id = picked
+            let was = at_pick
+            let title = pick_item.title
+            picked = ""
+            rows = (open_rows | filter((r) => r.id != id)) + hidden_rows + [{ id, size: pick_item.size, hidden: true }]
+            told()
+            said = `${title} taken away.`
+            // Focus stays on the screen: on what took its place, or the next best.
+            let others = grid.querySelectorAll(".ui-wgrid-tile")
+            let next = others[was + 1] ?? others[was - 1]
+            if next != null { next.focus() }
+        }
+    }
+    let bring_back = (id: str) => {
+        let was = hidden_rows | filter((r) => r.id == id)
+        rows = open_rows + (was | map((r) => { ...r, hidden: false })) + (hidden_rows | filter((r) => r.id != id))
+        told()
+        said = "Brought back."
+    }
+    let end_edit = () => {
+        editing = false
+        picked = ""
+    }
+    let lift = (pid: int, id: str, x: num, y: num) => {
+        let el = grid.querySelector(`[data-id="${id}"]`)
+        let box = grid.getBoundingClientRect()
+        let cols = len(split(trim(win.getComputedStyle(grid).gridTemplateColumns), " "))
+        let gap = win.parseFloat(win.getComputedStyle(grid).columnGap)
+        let cell = (box.width - (cols - 1) * gap) / cols
+        let tiles = grid.querySelectorAll(".ui-wgrid-tile")
+        let els = for i in range(0, tiles.length) => { id: tiles[i].dataset.id, el: tiles[i] }
+        grid.setPointerCapture(pid)
+        g = { pid, id, x, y, on: true, el, box, cols, gap, cell, els, items: open_rows, virtual: open_rows, cx: -1, cy: -1 }
+        lifted = id
+        picked = id
+        editing = true
+        buzz("medium", 15)
+    }
+    // The drag, by hand: only transforms until the finger lifts.
+    let follow = (e) => {
+        g.el.style.transform = `translate(${e.clientX - g.x}px, ${e.clientY - g.y}px)`
+        let step = g.cell + g.gap
+        let cx = floor((e.clientX - g.box.left) / step)
+        let cy = floor((e.clientY - g.box.top) / step)
+        // Decided once for each cell the finger enters, so tiles of different sizes do not swap back and forth under it.
+        if cx != g.cx || cy != g.cy {
+            let ok = cx >= 0 && cx < g.cols && cy >= 0
+            let next = ok ? widget_grid_over(g.virtual, g.id, cx, cy, g.cols) : g.virtual
+            let changed = widget_grid_index(next, g.id) != widget_grid_index(g.virtual, g.id)
+            g = { ...g, cx, cy, virtual: next }
+            if changed {
+                let moves = widget_grid_shift(g.items, next, g.cols)
+                for m in moves {
+                    if m.id != g.id {
+                        let tile = find(g.els, (t) => t.id == m.id)
+                        tile.el.style.transform = m.dx == 0 && m.dy == 0 ? "" : `translate(${m.dx * step}px, ${m.dy * step}px)`
+                    }
+                }
+                buzz("selection", 6)
+            }
+        }
+    }
+    let drop = (commit: bool) => {
+        let was = g
+        g = null
+        lifted = ""
+        still = true
+        for t in was.els { t.el.style.transform = "" }
+        let from = widget_grid_index(was.items, was.id)
+        let to = widget_grid_index(was.virtual, was.id)
+        if commit && from != to {
+            set_open(was.virtual)
+            said = `Moved to place ${to + 1} of ${len(was.virtual)}.`
+        }
+        js("requestAnimationFrame", (_t = null) => { still = false })
+    }
+    if press != null {
+        every(delay, () => {
+            if press != null {
+                let p = press
+                press = null
+                held = true
+                lift(p.pid, p.id, p.x, p.y)
+            }
+        })
+    }
+    <section class={ui_cls(["ui-wgrid", editing && "ui-wgrid-editing", still && "ui-wgrid-still", class])} aria-label={label}>
+        <div.ui-wgrid-bar>
+            <p.ui-wgrid-title>{label}</p>
+            <button.ui-wgrid-edit type="button" aria-pressed={editing ? "true" : "false"} @click={() => { if editing { end_edit() } else { editing = true } }}>{editing ? "Done" : "Edit"}</button>
+        </div>
+        {len(shown) == 0 && <p.ui-wgrid-none>Nothing on this screen.</p>}
+        <ul.ui-wgrid-grid
+            @mount={(me) => {
+                grid = me
+                win = js("window")
+                if store != null && saved == null {
+                    let text = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.getItem", store)) }))
+                    if type_of(text) == "str" {
+                        let got = json.parse(text)
+                        if !is_err(got) { rows = widget_grid_merge(clean, got) }
+                    }
+                }
+                // Once a tile is in the air the finger is the drag's: pan-y would hand it to the page on the first move.
+                let guard = (e) => { if g != null && e.cancelable { e.preventDefault() } }
+                me.addEventListener("touchmove", guard, { passive: false })
+                () => { me.removeEventListener("touchmove", guard) }
+            }}
+            @contextmenu={(e) => { if press != null || held || g != null { e.preventDefault() } }}
+            @pointerdown={(e) => {
+                held = false
+                let tile = e.target.closest(".ui-wgrid-tile")
+                if tile != null && e.isPrimary && e.button == 0 && g == null {
+                    press = { pid: e.pointerId, id: tile.dataset.id, x: e.clientX, y: e.clientY, editing }
+                }
+            }}
+            @pointermove={(e) => {
+                if press != null && e.pointerId == press.pid {
+                    let far = abs(e.clientX - press.x) + abs(e.clientY - press.y)
+                    if press.editing && far > 6 {
+                        // In Edit a tile goes with the finger at once.
+                        let p = press
+                        press = null
+                        lift(p.pid, p.id, p.x, p.y)
+                    } else if far > 10 {
+                        press = null
+                    }
+                }
+                if g != null && e.pointerId == g.pid { follow(e) }
+            }}
+            @pointerup={(e) => {
+                if press != null && e.pointerId == press.pid { press = null }
+                if g != null && e.pointerId == g.pid { drop(true) }
+            }}
+            @pointercancel={(e) => {
+                if press != null && e.pointerId == press.pid { press = null }
+                if g != null && e.pointerId == g.pid { drop(false) }
+            }}>
+            {for [i, w] in enumerate(shown) {
+                let own = render != null ? render(w) : null
+                // The span is on the slot and the finger moves the tile in it: a style written from state on the
+                // tile itself would wipe the transform of one in the air.
+                <li.ui-wgrid-slot key={w.id} style={`grid-column: span ${widget_grid_size(w.size).w}; grid-row: span ${widget_grid_size(w.size).h}`}>
+                <div data-id={w.id} tabindex={editing ? "0" : null} role={editing ? "group" : null}
+                    aria-label={editing ? `${w.title}, ${w.size}, place ${i + 1} of ${len(shown)}` : null}
+                    class={ui_cls(["ui-wgrid-tile", widget_grid_tone(get(w, "tone")), widget_grid_size(w.size).h > 1 && "ui-wgrid-tall", picked == w.id && "ui-wgrid-picked",
+                                   lifted == w.id && "ui-wgrid-lifted", press != null && press.id == w.id && "ui-wgrid-pressing"])}
+                    @click={() => {
+                        if held { held = false } else { if editing { picked = picked == w.id ? "" : w.id } }
+                    }}
+                    @keydown={(e) => {
+                        if editing && e.target.closest("button") == null {
+                            let k = e.key
+                            if k == "ArrowLeft" || k == "ArrowUp" { e.preventDefault(); shift(i, i - 1) }
+                            if k == "ArrowRight" || k == "ArrowDown" { e.preventDefault(); shift(i, i + 1) }
+                            if k == "Enter" || k == " " { e.preventDefault(); picked = w.id }
+                            if k == "Delete" || k == "Backspace" { e.preventDefault(); picked = w.id; take_away() }
+                            if k == "Escape" { end_edit() }
+                        }
+                    }}>
+                <button.ui-wgrid-open type="button" tabindex={editing ? "-1" : null}
+                        @click={() => { if !held && !editing { on_open && on_open(w.id) } }}>
+                    {own != null ? <span>{own}</span> : <WidgetGridFace w={w}/>}
+                </button>
+                </div>
+                </li>
+            }}
+        </ul>
+        {editing && <div.ui-wgrid-tools role="toolbar" aria-label="Change the chosen tile">
+            <button.ui-wgrid-tool.ui-wgrid-earlier type="button" disabled={at_pick == null || at_pick == 0} @click={() => { shift(at_pick, at_pick - 1) }}>Earlier</button>
+            <button.ui-wgrid-tool.ui-wgrid-later type="button" disabled={at_pick == null || at_pick == len(shown) - 1} @click={() => { shift(at_pick, at_pick + 1) }}>Later</button>
+            <button.ui-wgrid-tool.ui-wgrid-sized type="button" disabled={pick_item == null} @click={() => { grow() }}>{pick_item != null ? `Size ${pick_item.size}` : "Size"}</button>
+            <button.ui-wgrid-tool.ui-wgrid-away type="button" disabled={pick_item == null} @click={() => { take_away() }}>Take away</button>
+        </div>}
+        {editing && len(back) > 0 && <div.ui-wgrid-tray>
+            <span>Taken away:</span>
+            {for w in back => <button.ui-wgrid-back key={w.id} type="button" @click={() => { bring_back(w.id) }}>Bring back {w.title}</button>}
+        </div>}
+        <span.ui-sr role="status">{said}</span>
+    </section>
+}

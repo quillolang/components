@@ -1,0 +1,95 @@
+const quiz = $("#adaptive-quiz-demo-title").closest(".ui-adquiz");
+const q = (box = quiz) => box.querySelector(".ui-adquiz-question")?.textContent.replace(/^Difficulty \S+ ?\. ?/, "").replace(/^Difficulty [\d.]+\. /, "");
+const meter = (box = quiz) => box.querySelector(".ui-adquiz-meter").textContent;
+const why = (box = quiz) => box.querySelector(".ui-adquiz-card")?.previousElementSibling?.classList.contains("ui-adquiz-why") ? box.querySelector(".ui-adquiz-why").textContent : "";
+const go = (box = quiz) => box.querySelector(".ui-adquiz-go");
+const verdict = (box = quiz) => box.querySelector(".ui-adquiz-verdict")?.textContent;
+const pick = async (text, box = quiz) => { const l = [...box.querySelectorAll(".ui-adquiz-choice")].find((c) => c.textContent.trim() === text); l.querySelector("input").click(); await wait(40); };
+const answer = async (text, box = quiz) => { await pick(text, box); go(box).click(); await wait(60); };
+const next = async (box = quiz) => { go(box).click(); await wait(80); };
+// The first question is at the middle level. No estimate yet. The server's markup has the answer's choices, as radios.
+if (q() !== "What is the square root of 169?") return `first: ${q()}`;
+if (meter() !== "Question 1 of up to 6No estimate yet") return meter();
+if (quiz.querySelector("input[type=radio]").name !== "answer") return "radio name";
+// No choice made: it asks for one and moves on no further.
+go().click(); await wait(60);
+if (quiz.querySelector(".ui-adquiz-warn")?.textContent !== "Pick an answer first." || verdict()) return "no choice";
+await pick("13");
+if (quiz.querySelector(".ui-adquiz-warn")) return "the warning stays after a pick";
+// By the keyboard: Enter on a radio checks it.
+key(quiz.querySelector(".ui-adquiz-choice input:checked"), "Enter"); await wait(80);
+if (verdict() !== "Right." || quiz.querySelector(".ui-adquiz-explain").textContent !== "13 × 13 is 169.") return `the verdict: ${verdict()}`;
+// Worked out on their own: levels by the quarter from 1 to 5, each equally likely at first: 3.5, 27%.
+if (!meter().endsWith("Estimated level 3.5, confidence 27% (Low)")) return `after 1: ${meter()}`;
+if (document.activeElement !== go()) return "focus does not go to Next";
+if ([...quiz.querySelectorAll(".ui-adquiz-choice input")].some((i) => !i.disabled)) return "an answer can be changed after it is told";
+if (go().textContent !== "Next question") return go().textContent;
+await next();
+if (q() !== "What is the sum of the angles of a hexagon?" || why() !== "Right, so a harder one.") return `harder: ${q()} / ${why()}`;
+if (document.activeElement !== quiz.querySelector(".ui-adquiz-question")) return "focus does not go to the question";
+if (quiz.querySelector("input:checked")) return "the last pick carries over";
+await answer("720°"); 
+if (!meter().endsWith("Estimated level 3.9, confidence 34% (Low)")) return `after 2: ${meter()}`;
+await next();
+if (q() !== "How many ways can 5 people stand in a line?") return `5th level: ${q()}`;
+await answer("60");
+if (verdict() !== "Not quite: the answer is 120." || !quiz.querySelector(".ui-adquiz-is-wrong") || !quiz.querySelector(".ui-adquiz-is-right")) return `wrong: ${verdict()}`;
+if (!meter().endsWith("Estimated level 3.7, confidence 33% (Low)")) return `after 3: ${meter()}`;
+await next();
+if (q() !== "What is 17 × 23?" || why() !== "Not that one, so an easier one.") return `easier: ${q()} / ${why()}`;
+await answer("391");
+if (!meter().endsWith("Estimated level 4, confidence 46% (Low)")) return `after 4: ${meter()}`;
+await next();
+if (q() !== "What is the 10th prime number?") return q();
+await answer("29");
+if (!meter().endsWith("Estimated level 4.2, confidence 45% (Low)")) return `after 5: ${meter()}`;
+await next();
+// Nothing above the top level, and level 5 used up: it says so and takes the nearest left.
+if (q() !== "What is 2 to the power 10?" || why() !== "Right, so a harder one was due, but none is left at level 5, so this is level 3.") return `the next nearest: ${q()} / ${why()}`;
+await answer("1024");
+if (go().textContent !== "See the result") return go().textContent;
+await next();
+if (!quiz.querySelector(".ui-adquiz-level")) return "the result";
+const review = [...quiz.querySelectorAll(".ui-adquiz-review li")];
+if (review.length !== 6 || new Set(review.map((l) => l.firstChild.textContent)).size !== 6) return `no repeats: ${review.length}`;
+if (!review[2].textContent.includes("You said 60; the answer is 120.")) return review[2].textContent;
+if (!quiz.querySelector(".ui-adquiz-result").textContent.includes("5 of 6 right") || !quiz.textContent.includes("That is the limit of 6 questions")) return quiz.querySelector(".ui-adquiz-result").textContent;
+const saved = JSON.parse(quiz.querySelector("input[type=hidden]").value);
+if (saved.right !== 5 || saved.asked !== 6 || saved.reason !== "limit") return JSON.stringify(saved);
+// All wrong, from the start again: down to the bottom, and then level 1's other question.
+go().click(); await wait(100);
+if (q() !== "What is the square root of 169?" || meter() !== "Question 1 of up to 6No estimate yet") return `start again: ${q()}`;
+await answer("11"); await next();
+if (q() !== "What is 12 × 12?") return `down: ${q()}`;
+await answer("124"); await next();
+if (q() !== "What is 7 + 5?") return `down again: ${q()}`;
+await answer("11"); await next();
+if (q() !== "What is half of 18?" || why() !== "Right or wrong, this is the easiest level there is.") return `the floor: ${q()} / ${why()}`;
+await answer("6");
+if (!meter().endsWith("Estimated level 1.3, confidence 95% (High)")) return `all wrong: ${meter()}`;
+// A bad bank: each bad question is named and left out, and the two good ones run out.
+const s = $("#adaptive-quiz-demo-short-title").closest(".ui-adquiz");
+const said = [...s.querySelectorAll(".ui-adquiz-problems li")].map((l) => l.textContent).join(" / ");
+if (said !== "Question 3 has no text, so it is left out. / Question 4 needs at least two choices, so it is left out. / Question 5 has an answer that is not among its choices, so it is left out. / Question 6 has no difficulty, so it is left out. / Question 7 is a repeat, so it is left out.") return said;
+if (meter(s) !== "Question 1 of up to 2No estimate yet") return meter(s);
+const note = () => s.closest(".demo-stack").querySelector(".demo-note").textContent;
+await answer("Green", s);
+if (!meter(s).endsWith("Estimated level 2.1, confidence 46% (Low)")) return `one level: ${meter(s)}`;
+if (note() !== "on_answer: s1 right, level 2.1.") return note();
+await next(s);
+if (q(s) !== "How many sides has a heptagon?" || why(s) !== "Right or wrong, this is the hardest level there is.") return `the second: ${q(s)} / ${why(s)}`;
+await answer("6", s);
+if (s.querySelector(".ui-adquiz-explain")) return "no explanation given, none shown";
+if (!meter(s).endsWith("Estimated level 1.8, confidence 49% (Low)")) return meter(s);
+await next(s);
+if (!s.textContent.includes("That was every question there is")) return "running out";
+if (note() !== "on_finish: 1 of 2, out.") return note();
+if (s.querySelector("input[type=hidden]").name !== "short_result") return "name prefix";
+// Stopping when sure enough: 27% after one, 34% after two, against a stop at 30.
+const early = $("#adaptive-quiz-demo-early-title").closest(".ui-adquiz");
+await answer("13", early);
+if (go(early).textContent !== "Next question") return `27% is not 30%: ${go(early).textContent}`;
+await next(early); await answer("720°", early);
+if (go(early).textContent !== "See the result") return `34% is past 30%: ${go(early).textContent}`;
+await next(early);
+if (!early.textContent.includes("It stopped early, sure enough of the level.") || !early.querySelector(".ui-adquiz-result").textContent.includes("2 of 2 right")) return "stopping early";

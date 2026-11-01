@@ -1,0 +1,270 @@
+// SwipeDismissList: a list whose rows are swiped away, either way, as a phone's
+// notifications are. The rows below close up, and an Undo stands by for a few seconds in
+// which nothing is final. Rows gone within a moment of each other form one batch, undone
+// together; batches stack up, the newest is undone first, each comes back to the place
+// it had, and each runs out in the order it was made, which is when on_dismiss says it is
+// final. Each row's Dismiss button, and the Delete key on it, does what a swipe does, and
+// Ctrl+Z undoes. In a wide container every batch waiting stands in a column of its own.
+//
+//   component Alerts() {
+//       <SwipeDismissList items={alerts} clear_label="Clear all" on_dismiss={(ids) => { delete_alerts(ids) }}/>
+//   }
+//
+// items: each { id, title, subtitle? }. One without a title is left out, a second with an
+// id already seen too. on_dismiss(ids): inside one of your components, these rows are gone for good,
+// as their undo ran out or the list left the page; ids as text. on_undo(ids): these came back.
+// undo_seconds: how long a batch can be undone (6). batch_ms: how soon after the last a
+// row joins its batch (1500). clear_label: shows a button of that name, sending
+// every row away as one batch. label: the list's name for screen readers. empty_text: what
+// shows with no rows. class.
+
+import ui/theme.qwe use ui_cls
+
+let swipe_dismiss_list_css = css`
+.ui-swipe-dismiss { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-swipe-dismiss-inner { display: grid; gap: 10px; }
+.ui-swipe-dismiss-list { margin: 0; padding: 0; list-style: none; overflow: hidden; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-subtle); }
+.ui-swipe-dismiss-row { display: grid; grid-template-rows: 1fr; transition: grid-template-rows .22s cubic-bezier(.2, .8, .2, 1); }
+.ui-swipe-dismiss-gone { grid-template-rows: 0fr; visibility: hidden; transition: grid-template-rows .22s cubic-bezier(.2, .8, .2, 1) .12s, visibility 0s .34s; }
+.ui-swipe-dismiss-clip { position: relative; min-height: 0; overflow: hidden; }
+.ui-swipe-dismiss-under { position: absolute; inset: 0; display: flex; align-items: center; justify-content: flex-start; padding: 0 20px; background: var(--ui-danger); color: #fff; font-weight: 600; }
+.ui-swipe-dismiss-under[data-way="left"] { justify-content: flex-end; }
+.ui-swipe-dismiss-front { position: relative; display: flex; align-items: center; gap: 8px; min-height: 60px; padding: 6px 6px 6px 16px; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface);
+  touch-action: pan-y; transition: transform .22s cubic-bezier(.2, .8, .2, 1); }
+.ui-swipe-dismiss-moving { transition: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-swipe-dismiss-text { flex: 1; min-width: 0; }
+.ui-swipe-dismiss-title { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-swipe-dismiss-sub { display: block; color: var(--ui-muted); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-swipe-dismiss-x { display: grid; flex: none; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: pointer; }
+.ui-swipe-dismiss-x svg { width: 18px; height: 18px; }
+.ui-swipe-dismiss-x:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-swipe-dismiss-none { padding: 24px 16px; color: var(--ui-muted); text-align: center; }
+.ui-swipe-dismiss-clear { justify-self: end; min-height: 44px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-swipe-dismiss-clear:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+/* On a phone the newest batch alone shows, above the safe area when the list is a screen; sticky keeps it in sight. */
+.ui-swipe-dismiss-bar { position: sticky; bottom: max(8px, env(safe-area-inset-bottom)); z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; min-width: 0; }
+.ui-swipe-dismiss-batch { display: flex; align-items: center; gap: 8px; min-height: 52px; padding: 4px 6px 4px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-fg); color: var(--ui-bg); box-shadow: var(--ui-shadow); }
+.ui-swipe-dismiss-batch:not(:first-child) { display: none; }
+.ui-swipe-dismiss-batch span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-swipe-dismiss-undo { min-width: 64px; min-height: 44px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: inherit; font: 700 14px/1 var(--ui-font); text-decoration: underline; cursor: pointer; }
+.ui-swipe-dismiss-undo:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+@media (hover: hover) {
+  .ui-swipe-dismiss-x:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+  .ui-swipe-dismiss-clear:hover { background: var(--ui-subtle); }
+}
+@container (min-width: 560px) {
+  .ui-swipe-dismiss-inner { grid-template-columns: minmax(0, 1fr) 220px; align-items: start; }
+  .ui-swipe-dismiss-clear { grid-column: 1 / -1; }
+  .ui-swipe-dismiss-bar { position: static; }
+  .ui-swipe-dismiss-batch:not(:first-child) { display: flex; opacity: .85; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-swipe-dismiss-row, .ui-swipe-dismiss-gone, .ui-swipe-dismiss-front { transition: none; }
+}
+`
+
+// The rows that can be shown: those with a title, each id once, ids as text.
+fn swipe_dismiss_list_clean(items) {
+    if type_of(items) != "list" { return [] }
+    let named = items | filter((i) => type_of(i) == "map" && get(i, "title") != null)
+    // One without an id gets its place, marked so it cannot be taken for a real id of that number.
+    let all = enumerate(named) | map((p) => { ...p[1], id: get(p[1], "id") != null ? str(p[1].id) : `_${p[0]}` })
+    let ids = all | map((i) => i.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+fn swipe_dismiss_list_axis(dx: num, dy: num, slop: num) -> str {
+    if abs(dx) < slop && abs(dy) < slop { return "" }
+    abs(dx) > abs(dy) ? "x" : "y"
+}
+
+// Whether a release at x with speed v (signed) sends the row away: from 40% of the width, or a
+// throw from any distance past 24, unless it is thrown back the way it came.
+fn swipe_dismiss_list_goes(x: num, v: num, width: num) -> bool {
+    if abs(v) >= 0.5 && abs(x) >= 24 { return v * x > 0 }
+    abs(x) >= width * 0.4
+}
+
+// Batches with ids added: to the last one if that is near enough in time (gap ms), else as a new one,
+// numbered id. A batch is { id, ids, at }, at being its last addition.
+fn swipe_dismiss_list_add(batches: list, ids: list, now: num, gap: num, id: int) -> list {
+    let n = len(batches)
+    if n > 0 && gap > 0 && now - batches[n - 1].at <= gap {
+        let last = batches[n - 1]
+        return slice(batches, 0, n - 1) + [{ ...last, ids: last.ids + ids, at: now }]
+    }
+    batches + [{ id, ids, at: now }]
+}
+
+// Batches split into those still waiting and those whose keep ms have run out, oldest first.
+fn swipe_dismiss_list_due(batches: list, now: num, keep: num) -> map {
+    { waiting: batches | filter((b) => now - b.at < keep), over: batches | filter((b) => now - b.at >= keep) }
+}
+
+// What a batch says.
+fn swipe_dismiss_list_words(b, rows: list) -> str {
+    if len(b.ids) != 1 { return `${len(b.ids)} removed` }
+    let r = find(rows, (x) => x.id == b.ids[0])
+    r != null ? `${r.title} removed` : "1 removed"
+}
+
+fn swipe_dismiss_list_sample(s, pos: num, now: num) {
+    let dt = now - s.at
+    dt < 32 ? s : { pos, at: now, v: (pos - s.pos) / dt }
+}
+
+fn swipe_dismiss_list_speed(s, pos: num, now: num, moved: num) -> num {
+    if now - moved > 80 { return 0 }
+    let dt = now - s.at
+    let since = dt >= 8 ? (pos - s.pos) / dt : 0
+    abs(since) > abs(s.v) ? since : s.v
+}
+
+component SwipeDismissList(items = [], on_dismiss = null, on_undo = null, undo_seconds: int = 6, batch_ms: int = 1500, clear_label: str? = null,
+                           label: str = "List", empty_text: str = "Nothing here.", class: str? = null) {
+    style global swipe_dismiss_list_css
+    let rows = swipe_dismiss_list_clean(items)
+    state finished = []      // ids gone for good
+    state batches = []       // those that can still come back, oldest first
+    state made = 0
+    state root = null
+    state g = null
+    let waiting = batches | map((b) => b.ids) | flatten
+    let kept = rows | filter((r) => !contains(finished, r.id))
+    let showing = kept | filter((r) => !contains(waiting, r.id))
+    let newest_first = reverse(batches)
+    let send = (ids: list, gap: num) => {
+        made += 1
+        batches = swipe_dismiss_list_add(batches, ids, js("Date.now"), gap, made)
+    }
+    let front_of = (id: str) => root.querySelector(`.ui-swipe-dismiss-front[data-id="${id}"]`)
+    let bring_back = (b) => {
+        batches = batches | filter((x) => x.id != b.id)
+        for id in b.ids {
+            let el = front_of(id)
+            if el != null {
+                el.classList.remove("ui-swipe-dismiss-moving")
+                el.style.transform = ""
+            }
+        }
+        on_undo && on_undo(b.ids)
+    }
+    let by_key = (id: str) => {
+        // Focus goes on to the next row, or the row before; with none, to the Undo that just came.
+        let at = index_of(showing | map((r) => r.id), id)
+        let next = len(showing) > at + 1 ? showing[at + 1] : at > 0 ? showing[at - 1] : null
+        send([id], batch_ms)
+        js("requestAnimationFrame", (_t = null) => {
+            let to = next != null ? root.querySelector(`.ui-swipe-dismiss-front[data-id="${next.id}"] button`) : root.querySelector(".ui-swipe-dismiss-undo")
+            to && to.focus()
+        })
+    }
+    let tick = () => {
+        let split = swipe_dismiss_list_due(batches, js("Date.now"), undo_seconds * 1000)
+        if len(split.over) > 0 {
+            batches = split.waiting
+            finished = finished + (split.over | map((b) => b.ids) | flatten)
+            for b in split.over { on_dismiss && on_dismiss(b.ids) }
+        }
+    }
+    if len(batches) > 0 { every(200, tick) }
+    <div class={ui_cls(["ui-swipe-dismiss", class])}
+         @mount={(me) => {
+             root = me
+             // Leaving the page ends every wait.
+             () => { for b in batches { on_dismiss && on_dismiss(b.ids) } }
+         }}
+         @keydown={(e) => {
+             if e.key == "z" && (e.ctrlKey || e.metaKey) && len(batches) > 0 {
+                 e.preventDefault()
+                 bring_back(batches[len(batches) - 1])
+             }
+         }}>
+        <div.ui-swipe-dismiss-inner>
+            {clear_label != null && <button.ui-swipe-dismiss-clear type="button" @click={() => {
+                if len(showing) > 0 { send(showing | map((r) => r.id), 0) }
+            }}>{clear_label}</button>}
+            <ul.ui-swipe-dismiss-list role="list" aria-label={label}
+                @pointerdown={(e) => {
+                    let el = e.target.closest(".ui-swipe-dismiss-front")
+                    let free = el != null && e.isPrimary && e.button == 0 && e.target.closest("button, a, input") == null
+                    g = free ? { pid: e.pointerId, el, x: e.clientX, y: e.clientY, on: false, at: 0, shift: 0, moved: e.timeStamp, s: { pos: e.clientX, at: e.timeStamp, v: 0 } } : null
+                }}
+                @pointermove={(e) => {
+                    if g != null && e.pointerId == g.pid {
+                        let dx = e.clientX - g.x
+                        if !g.on {
+                            let way = swipe_dismiss_list_axis(dx, e.clientY - g.y, 8)
+                            if way == "y" { g = null }
+                            if way == "x" {
+                                g.el.setPointerCapture(e.pointerId)
+                                g.el.classList.add("ui-swipe-dismiss-moving")
+                                g = { ...g, on: true, shift: dx > 0 ? 8 : -8 }
+                            }
+                        }
+                        if g != null && g.on {
+                            let x = dx - g.shift
+                            g.el.style.transform = `translateX(${x}px)`
+                            g.el.previousElementSibling.dataset.way = x < 0 ? "left" : "right"
+                            g = { ...g, at: x, moved: e.timeStamp, s: swipe_dismiss_list_sample(g.s, e.clientX, e.timeStamp) }
+                        }
+                    }
+                }}
+                @pointerup={(e) => {
+                    if g != null && e.pointerId == g.pid {
+                        let was = g
+                        g = null
+                        if was.on {
+                            was.el.classList.remove("ui-swipe-dismiss-moving")
+                            let w = was.el.offsetWidth
+                            let v = swipe_dismiss_list_speed(was.s, e.clientX, e.timeStamp, was.moved)
+                            if swipe_dismiss_list_goes(was.at, v, w) {
+                                was.el.style.transform = `translateX(${was.at > 0 ? w : -w}px)`
+                                send([was.el.dataset.id], batch_ms)
+                            } else {
+                                was.el.style.transform = ""
+                            }
+                        }
+                    }
+                }}
+                @pointercancel={(e) => {
+                    if g != null && e.pointerId == g.pid {
+                        let was = g
+                        g = null
+                        was.el.classList.remove("ui-swipe-dismiss-moving")
+                        was.el.style.transform = ""
+                    }
+                }}>
+                {for r in kept => <li key={r.id} aria-hidden={contains(waiting, r.id) ? "true" : null}
+                        class={ui_cls(["ui-swipe-dismiss-row", contains(waiting, r.id) && "ui-swipe-dismiss-gone"])}>
+                    <div.ui-swipe-dismiss-clip>
+                        <div.ui-swipe-dismiss-under aria-hidden="true">Dismiss</div>
+                        <div.ui-swipe-dismiss-front data-id={r.id}>
+                            <span.ui-swipe-dismiss-text>
+                                <span.ui-swipe-dismiss-title>{r.title}</span>
+                                {get(r, "subtitle") != null && <span.ui-swipe-dismiss-sub>{r.subtitle}</span>}
+                            </span>
+                            <button.ui-swipe-dismiss-x type="button" aria-label={`Dismiss ${r.title}`}
+                                    @click={() => { by_key(r.id) }}
+                                    @keydown={(e) => {
+                                        if e.key == "Delete" || e.key == "Backspace" {
+                                            e.preventDefault()
+                                            by_key(r.id)
+                                        }
+                                    }}>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                            </button>
+                        </div>
+                    </div>
+                </li>}
+                {len(showing) == 0 && <li.ui-swipe-dismiss-none>{empty_text}</li>}
+            </ul>
+            <div.ui-swipe-dismiss-bar role="status">
+                {for [i, b] in enumerate(newest_first) => <div.ui-swipe-dismiss-batch key={b.id}>
+                    <span>{swipe_dismiss_list_words(b, rows)}{i == 0 && len(batches) > 1 ? ` (${len(batches) - 1} more)` : ""}</span>
+                    <button.ui-swipe-dismiss-undo type="button" aria-label={`Undo: ${swipe_dismiss_list_words(b, rows)}`} @click={() => { bring_back(b) }}>Undo</button>
+                </div>}
+            </div>
+        </div>
+    </div>
+}

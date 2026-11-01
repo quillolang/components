@@ -1,0 +1,220 @@
+// SwipeTabs: pages swiped sideways, in step with a strip of tabs above them. The line
+// under the tabs moves with the finger, between one tab's place and width and the
+// next's. A page is built only when it comes into reach. Tapping a tab and the arrow
+// keys do all that swiping does. The pages are a scroller that snaps, so the swipe is
+// the system's own, at its speed and with its feel, on both engines.
+//
+//   import ui/swipe_tabs.qwe use SwipeTabs
+//
+//   component News() {
+//       <SwipeTabs tabs={[{ id: "top", label: "Top" }, { id: "local", label: "Local" }, { id: "sport", label: "Sport" }]}
+//                  page={(id) => <Stories section={id}/>} on_change={(id) => { seen(id) }}/>
+//   }
+//
+// tabs: { id, label }. page(id): gives a page, called when it first comes into reach
+// and once only, so a page keeps what it holds. It is a function, so SwipeTabs goes
+// inside one of your components. current: the tab showing (the first if it is no tab's
+// id); a later change to it moves there. on_change(id): called when another page has
+// come to the front, by whatever way. label: what screen readers call the strip
+// ("Sections"). wait_text: what a page says until it is built ("Loading"). id: a prefix
+// for the elements' ids, unique on the page. The box takes the size of its parent, which
+// needs a height. Each page scrolls up and down by itself and keeps its place.
+//
+// A strip of more tabs than fit scrolls sideways, keeping the current one in view; in a
+// pane 600 px wide or more the tabs stand in the middle, up to 160 px each, sharing what
+// there is. A page still fills the pane, one at a time.
+
+import ui/theme.qwe use ui_cls
+
+let swipe_tabs_css = css`
+.ui-swipetabs { display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; overflow: hidden; container-type: inline-size; background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.5 var(--ui-font); }
+.ui-swipetabs-strip {
+  position: relative; display: flex; flex: none; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface);
+  padding-inline: max(0px, env(safe-area-inset-left)) max(0px, env(safe-area-inset-right));
+}
+.ui-swipetabs-strip::-webkit-scrollbar { display: none; }
+.ui-swipetabs-tab {
+  flex: none; min-width: 72px; min-height: 48px; padding: 0 16px; border: 0; background: transparent; color: var(--ui-muted); font: 500 14px/1.2 var(--ui-font); white-space: nowrap; cursor: pointer;
+  -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+}
+.ui-swipetabs-tab[aria-selected="true"] { color: var(--ui-accent); }
+.ui-swipetabs-tab:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+@media (hover: hover) { .ui-swipetabs-tab:hover { color: var(--ui-fg); } .ui-swipetabs-tab[aria-selected="true"]:hover { color: var(--ui-accent); } }
+/* Before the first measure the selected tab marks itself, so the page shows it from the server. */
+.ui-swipetabs-strip:not(.ui-swipetabs-measured) .ui-swipetabs-tab[aria-selected="true"] { box-shadow: inset 0 -2px 0 var(--ui-accent); }
+.ui-swipetabs-line {
+  position: absolute; bottom: 0; left: 0; width: 1px; height: 2px; background: var(--ui-accent); transform-origin: 0 0; visibility: hidden; pointer-events: none; will-change: transform;
+}
+.ui-swipetabs-measured .ui-swipetabs-line { visibility: visible; }
+.ui-swipetabs-track { display: flex; flex: 1; min-height: 0; overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; scroll-snap-type: x mandatory; scrollbar-width: none; }
+.ui-swipetabs-track::-webkit-scrollbar { display: none; }
+.ui-swipetabs-page { box-sizing: border-box; flex: 0 0 100%; min-width: 0; height: 100%; overflow-y: auto; overscroll-behavior-y: contain; scroll-snap-align: start; scroll-snap-stop: always; outline: none; }
+.ui-swipetabs-page:focus-visible { box-shadow: inset var(--ui-focus); }
+.ui-swipetabs-built { display: contents; }
+.ui-swipetabs-wait { padding: 32px 16px; color: var(--ui-muted); text-align: center; }
+@container (min-width: 600px) {
+  .ui-swipetabs-strip { justify-content: center; }
+  .ui-swipetabs-tab { flex: 0 1 160px; min-width: 0; }
+}
+`
+
+// The tabs that can be used: bad rows and a second use of an id are dropped.
+fn swipe_tabs_rows(tabs: list) -> list {
+    let rows = take(tabs, 40) | filter((t) => type_of(t) == "map" && get(t, "id") != null)
+    let ids = rows | map((t) => t.id)
+    enumerate(rows) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// Where a tab is to start: the one asked for, by its place, or the first.
+fn swipe_tabs_start(rows: list, wanted) -> int = wanted == null ? 0 : (index_of(rows | map((t) => t.id), wanted) ?? 0)
+
+// The line for a place between two pages: from the left tab's spot towards the
+// right one's, in both place and width. spots: [{ x, w }], one per tab.
+fn swipe_tabs_line(spots: list, place: num) {
+    let n = len(spots)
+    if n == 0 { return { x: 0, w: 0 } }
+    if place <= 0 { return spots[0] }
+    if place >= n - 1 { return spots[n - 1] }
+    let i = floor(place)
+    let t = place - i
+    { x: spots[i].x + (spots[i + 1].x - spots[i].x) * t, w: spots[i].w + (spots[i + 1].w - spots[i].w) * t }
+}
+
+// The pages a place has in reach: the one or two showing. Within a hair of a page, as
+// at the end of a scroll, that is one.
+fn swipe_tabs_reach(place: num, n: int) -> list {
+    let both = abs(place - round(place)) < 0.02 ? [round(place)] : [floor(place), ceil(place)]
+    both | filter((i) => i >= 0 && i < n)
+}
+
+fn swipe_tabs_paint(line, spots: list, place: num) {
+    let s = swipe_tabs_line(spots, place)
+    line.style.transform = `translate3d(${s.x}px, 0, 0) scaleX(${s.w})`
+}
+
+component SwipeTabs(tabs: list = [], page = null, current: str? = null, on_change = null, label: str = "Sections", wait_text: str = "Loading",
+                    id: str = "ui-swipetabs", class: str? = null) {
+    style global swipe_tabs_css
+    let rows = swipe_tabs_rows(tabs)
+    let ids = rows | map((t) => t.id)
+    state at = swipe_tabs_start(swipe_tabs_rows(tabs), current)
+    state built = [swipe_tabs_start(swipe_tabs_rows(tabs), current)]
+    state asked = current
+    state aim = null              // a page being scrolled to: until there, what passes does not count
+    state spots = []
+    state win = null
+    state track = null
+    state strip = null
+    state line = null
+    let build = (list_of: list) => {
+        let more = list_of | filter((i) => !contains(built, i))
+        if len(more) > 0 { built = built + more }
+    }
+    // Keeps the strip's tab in view, gently, and in the middle where it can.
+    let reveal = (i: int) => {
+        if i < len(spots) && strip.scrollWidth > strip.clientWidth {
+            let left = spots[i].x - (strip.clientWidth - spots[i].w) / 2
+            strip.scrollTo({ left: left, behavior: win.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" })
+        }
+    }
+    let landed = (i: int) => {
+        if i != at {
+            at = i
+            reveal(i)
+            if i < len(ids) { on_change && on_change(ids[i]) }
+        }
+    }
+    let go = (i: int, tell: bool) => {
+        if i >= 0 && i < len(ids) && i != at {
+            let width = track.clientWidth
+            build([i])
+            aim = i
+            at = i
+            reveal(i)
+            if tell { on_change && on_change(ids[i]) }
+            let still = win.matchMedia("(prefers-reduced-motion: reduce)").matches
+            track.scrollTo({ left: i * width, behavior: still ? "auto" : "smooth" })
+        }
+    }
+    if current != asked {
+        asked = current
+        go(swipe_tabs_start(rows, current), false)
+    }
+    let measure = () => {
+        if strip != null {
+            let els = strip.querySelectorAll("[role=tab]")
+            spots = range(0, els.length) | map((i) => {
+                let el = els.item(i)
+                { x: el.offsetLeft, w: el.offsetWidth }
+            })
+            if len(spots) > 0 {
+                strip.classList.add("ui-swipetabs-measured")
+                swipe_tabs_paint(line, spots, track.clientWidth > 0 ? abs(track.scrollLeft) / track.clientWidth : at)
+            }
+        }
+    }
+    <div class={ui_cls(["ui-swipetabs", class])}
+         @mount={(el) => {
+             win = js("window")
+             track = el.querySelector(".ui-swipetabs-track")
+             strip = el.querySelector(".ui-swipetabs-strip")
+             line = el.querySelector(".ui-swipetabs-line")
+             if at > 0 { track.scrollLeft = at * track.clientWidth }
+             measure()
+             // Rotation or a new pane: the pages change width, the page stays the page.
+             let ro = js_new("ResizeObserver", () => {
+                 track.scrollLeft = at * track.clientWidth
+                 measure()
+             })
+             ro.observe(track)
+             ro.observe(strip)
+             () => ro.disconnect()
+         }}>
+        <div.ui-swipetabs-strip role="tablist" aria-label={label}
+             @keydown={(e) => {
+                 let n = len(ids)
+                 let to = match e.key {
+                     "ArrowRight" => (at + 1) % n
+                     "ArrowLeft" => (at + n - 1) % n
+                     "Home" => 0
+                     "End" => n - 1
+                     _ => null
+                 }
+                 if to != null {
+                     e.preventDefault()
+                     go(to, true)
+                     strip.querySelectorAll("[role=tab]").item(to).focus()
+                 }
+             }}>
+            {for t in rows => <SwipeTabsTab key={t.id} prefix={id} tab={t} on={ids[at] == t.id} on_press={() => { go(index_of(ids, t.id) ?? 0, true) }}/>}
+            <span.ui-swipetabs-line aria-hidden="true"></span>
+        </div>
+        <div.ui-swipetabs-track
+             @scroll={(e) => {
+                 let width = e.clientWidth
+                 if width > 0 {
+                     let place = abs(e.scrollLeft) / width
+                     swipe_tabs_paint(line, spots, place)
+                     if aim == null {
+                         build(swipe_tabs_reach(place, len(ids)))
+                         // A finger: what it comes to rest on, or nearly so, is the page.
+                         if abs(place - round(place)) < 0.02 { landed(round(place)) }
+                     } else if abs(place - aim) < 0.02 {
+                         aim = null
+                     }
+                 }
+             }}
+             @pointerdown={() => { aim = null }}>
+            {for t in ids => <div.ui-swipetabs-page key={t} id={`${id}-page-${t}`} role="tabpanel" aria-labelledby={`${id}-tab-${t}`} tabindex="0"
+                    inert={ids[at] == t ? null : ""}>
+                {contains(built, index_of(ids, t) ?? 0)
+                    ? <div.ui-swipetabs-built>{page != null ? page(t) : null}</div>
+                    : <div.ui-swipetabs-wait role="status">{wait_text}</div>}
+            </div>}
+        </div>
+    </div>
+}
+
+view SwipeTabsTab(tab, prefix: str, on: bool, on_press) =
+    <button.ui-swipetabs-tab type="button" role="tab" id={`${prefix}-tab-${tab.id}`} aria-selected={on ? "true" : "false"} aria-controls={`${prefix}-page-${tab.id}`}
+            tabindex={on ? "0" : "-1"} @click={() => { on_press() }}>{get(tab, "label", "")}</button>

@@ -1,0 +1,278 @@
+// WaveformView: draws an audio file's waveform, plays it, and lets a finger scrub along
+// it, with a line at the current time. The file is decoded on the phone; give `peaks` when
+// the server knows them, and nothing is decoded. A drag up or down is left to the page, so
+// a list of these still scrolls. Keys work on the waveform as on a slider, and the buttons
+// beside it do the same without any gesture. With reduced motion the line and the played
+// part stop gliding and step from bar to bar.
+//
+//   <WaveformView src="/notes/42.m4a" label="Voice note from Ana"/>
+//   <WaveformView src={url} peaks={[0.1, 0.8, 0.4, 0.2]} on_seek={(s) => { at = s }}/>
+//
+// src: the audio. It is read with fetch, so another site must allow that; if it will not
+// or the file is too long to decode, a flat line stands in and the sound still plays.
+// peaks: heights from 0 to 1, one a bar, in place of decoding. bars: how many to draw when
+// decoding (96; 8 to 512). label: what screen readers call it ("Audio"). step: seconds an
+// arrow key or a button skips (5). max_decode: the most bytes to decode (40000000), since a
+// decoded hour fills a phone's memory. on_seek(seconds): inside one of your components,
+// called when a scrub, a key or a button lands.
+//
+// Needs Button: `import ui/button.qwe use Button`.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let waveform_view_css = css`
+.ui-waveform-view { --ui-waveform-view-p: 0; container-type: inline-size; display: grid; gap: 10px; width: 100%; padding: 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.4 var(--ui-font); }
+.ui-waveform-view-title { margin: 0; font-weight: 600; }
+.ui-waveform-view-track {
+  container-type: inline-size; position: relative; height: 88px; overflow: hidden; border-radius: var(--ui-radius-sm); background: var(--ui-subtle);
+  touch-action: pan-y; cursor: ew-resize; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; outline: none;
+}
+.ui-waveform-view-track:focus-visible { box-shadow: var(--ui-focus); }
+.ui-waveform-view-track svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.ui-waveform-view-all { fill: var(--ui-muted); opacity: .55; }
+.ui-waveform-view-played svg { fill: var(--ui-accent); }
+.ui-waveform-view-played { position: absolute; inset: 0; clip-path: inset(0 calc(100% - var(--ui-waveform-view-p) * 1%) 0 0); pointer-events: none; }
+.ui-waveform-view-line { position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--ui-danger); transform: translateX(calc(var(--ui-waveform-view-p) * 1cqw - 1px)); pointer-events: none; }
+.ui-waveform-view-tip {
+  position: absolute; left: 50%; top: 6px; padding: 2px 8px; border-radius: 999px; background: rgba(0, 0, 0, .7); color: #fff; font: 600 13px/1.4 var(--ui-font);
+  font-variant-numeric: tabular-nums; transform: translateX(-50%); opacity: 0; pointer-events: none;
+}
+/* An attribute, not a class: the root's class is rewritten when the reduced-motion setting changes, which would drop this in mid-scrub. */
+.ui-waveform-view[data-scrubbing] .ui-waveform-view-tip { opacity: 1; }
+.ui-waveform-view-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-waveform-view-clock { margin-left: auto; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-waveform-view-say { margin: 0; color: var(--ui-muted); font-size: 13px; }
+/* A tablet, or a wide pane: more height for a finger and for the shape of the sound. */
+@container (min-width: 400px) { .ui-waveform-view-track { height: 132px; } }
+`
+
+// A value kept between two others.
+fn waveform_view_clamp(v: num, lo: num, hi: num) -> num = v < lo ? lo : v > hi ? hi : v
+
+// Seconds as m:ss, rounded down.
+fn waveform_view_clock(s: num) -> str {
+    let t = s < 0 ? 0 : floor(s)
+    let sec = t % 60
+    `${floor(t / 60)}:${sec < 10 ? "0" : ""}${sec}`
+}
+
+// Heights given as a prop, kept to numbers from 0 to 1, so a bad one is a flat bar.
+fn waveform_view_clean(xs) -> list {
+    if xs == null || type_of(xs) != "list" { return [] }
+    xs | map((x) => type_of(x) == "int" || type_of(x) == "float" ? waveform_view_clamp(x, 0, 1) : 0)
+}
+
+// The loudest of each of `bars` stretches of `total` samples read from `ch`, which can be
+// indexed (a Float32Array in the browser, a list in a test). Each stretch is looked at in
+// 256 places, not all of them: an hour has 158 million samples.
+fn waveform_view_peaks(ch, total: int, bars: int) -> list {
+    if total <= 0 || bars <= 0 { return [] }
+    for i in range(bars) => {
+        let from = floor(i * total / bars)
+        let to = floor((i + 1) * total / bars)
+        let span = to - from
+        let stride = span > 256 ? span / 256 : 1
+        let count = span > 256 ? 256 : span
+        let seen = range(count) | map((k) => abs(ch[from + floor(k * stride)] ?? 0))
+        count > 0 ? max(seen) : 0
+    }
+}
+
+// Heights scaled so that the loudest is 1. All silence stays silence.
+fn waveform_view_scale(xs: list) -> list {
+    if len(xs) == 0 { return [] }
+    let top = max(xs)
+    top <= 0 ? xs | map((_x) => 0) : xs | map((x) => round(x / top, 4))
+}
+
+// One path for all the bars, in a box n wide and 100 high, each centred and 0.8 wide. A
+// path is one element whatever the count, and stretches with its box, so turning the phone
+// redraws nothing. The least bar is 2 high, so silence is seen as a line.
+fn waveform_view_path(xs: list) -> str {
+    let bars = for [i, x] in enumerate(xs) => {
+        let h = round(x * 100 > 2 ? x * 100 : 2, 2)
+        `M${round(i + 0.1, 1)} ${round((100 - h) / 2, 2)}h.8v${h}h-.8z`
+    }
+    join(bars, "")
+}
+
+// A place along the waveform, moved back to the start of its bar: the reduced-motion form
+// goes bar by bar. Percentages in, percentages out.
+fn waveform_view_snap(p: num, n: int) -> num {
+    if n <= 0 { return p }
+    round(floor(p * n / 100) * 100 / n, 3)
+}
+
+// Whether a length from the player can be used: a live recording says Infinity.
+fn waveform_view_known(d) -> bool = d != null && !is_err(d) && d > 0 && d < 86400
+
+// The flat line that stands in while nothing better is known.
+fn waveform_view_flat(n: int) -> list = range(n) | map((_i) => 0)
+
+component WaveformView(src: str, peaks: list? = null, bars: int = 96, label: str = "Audio", step: num = 5, max_decode: int = 40000000,
+                       on_seek = null, class: str? = null) {
+    style global waveform_view_css
+    state heights = waveform_view_clean(peaks)
+    state status = len(waveform_view_clean(peaks)) > 0 ? "ready" : "loading"   // loading, ready, flat
+    state root = null
+    state sound = null
+    state tip = null
+    state dur = 0
+    state time = 0
+    state playing = false
+    state still = false
+    state down = null           // { x, y, left, w, on, pointer }, from a finger down to its lifting
+    let count = waveform_view_clamp(bars, 8, 512)
+    let shown = len(heights) > 0 ? heights : waveform_view_flat(count)
+    let path = waveform_view_path(shown)
+    let at = dur > 0 ? waveform_view_clamp(time, 0, dur) : 0
+    let paint = (p: num) => {
+        if root != null {
+            root.style.setProperty("--ui-waveform-view-p", str(round(still ? waveform_view_snap(p, len(shown)) : p, 3)))
+        }
+    }
+    let follow = () => {
+        if sound != null && dur > 0 && (down == null || !down.on) { paint(sound.currentTime * 100 / dur) }
+    }
+    if playing && !still { every(50, follow) }
+    let seek = (t: num) => {
+        if dur > 0 {
+            let to = waveform_view_clamp(t, 0, dur)
+            sound.currentTime = to
+            time = to
+            paint(to * 100 / dur)
+            on_seek && on_seek(to)
+        }
+    }
+    let where = (e) => waveform_view_clamp((e.clientX - down.left) / down.w, 0, 1)
+    // A decoded file's length is used where the player's is not known, as with a recording.
+    let decode = () => {
+        let res = js("fetch", src)
+        if is_err(res) { return null }
+        let bytes = js("Promise.resolve", res.arrayBuffer())
+        if is_err(bytes) || bytes.byteLength == 0 || bytes.byteLength > max_decode { return null }
+        // In a Promise, as a constructor that throws would stop the handler, not give an error value.
+        let ctx = js("Promise.resolve", js_new("Promise", (done) => { done(js_new("OfflineAudioContext", 1, 1, 44100)) }))
+        if is_err(ctx) { return null }
+        let audio = js("Promise.resolve", ctx.decodeAudioData(bytes))
+        if is_err(audio) { return null }
+        { heights: waveform_view_scale(waveform_view_peaks(audio.getChannelData(0), audio.length, count)), seconds: audio.duration }
+    }
+    let load = () => {
+        let got = decode()
+        if got == null {
+            status = "flat"
+        } else {
+            heights = got.heights
+            if dur == 0 { dur = got.seconds }
+            status = "ready"
+        }
+    }
+    let flip = () => {
+        if sound != null {
+            if playing { sound.pause() } else { sound.play().catch((_ = null) => { playing = false }) }
+        }
+    }
+    <div class={ui_cls(["ui-waveform-view", still && "ui-waveform-view-still", class])} data-state={status}
+         @mount={(el) => {
+             root = el
+             let wish = js("matchMedia", "(prefers-reduced-motion: reduce)")
+             still = wish.matches
+             let told = (_e = null) => {
+                 still = wish.matches
+                 follow()
+             }
+             wish.addEventListener("change", told)
+             if status == "loading" { load() }
+             () => {
+                 wish.removeEventListener("change", told)
+                 if sound != null { sound.pause() }
+             }
+         }}>
+        <p.ui-waveform-view-title>{label}</p>
+        <div.ui-waveform-view-track role="slider" tabindex="0" aria-label={`${label}: position`} aria-valuemin="0" aria-valuemax={str(round(dur))} aria-valuenow={str(round(at))}
+             aria-valuetext={`${waveform_view_clock(at)} of ${waveform_view_clock(dur)}`}
+             @contextmenu={(e) => { e.preventDefault() }}
+             @pointerdown={(e) => {
+                 if e.button == 0 && dur > 0 {
+                     let r = e.target.closest("[role=slider]").getBoundingClientRect()
+                     down = { x: e.clientX, y: e.clientY, left: r.left, w: r.width, on: false, pointer: e.pointerId }
+                 }
+             }}
+             @pointermove={(e) => {
+                 if down != null {
+                     let dx = e.clientX - down.x
+                     let dy = e.clientY - down.y
+                     if !down.on {
+                         if abs(dx) >= 6 || abs(dy) >= 6 {
+                             if abs(dy) > abs(dx) {
+                                 down = null     // up or down is the page's
+                             } else {
+                                 e.target.closest("[role=slider]").setPointerCapture(e.pointerId)
+                                 down = { ...down, on: true }
+                                 root.dataset.scrubbing = "1"
+                             }
+                         }
+                     }
+                     if down != null && down.on {
+                         let part = where(e)
+                         paint(part * 100)
+                         tip.textContent = waveform_view_clock(part * dur)
+                     }
+                 }
+             }}
+             @pointerup={(e) => {
+                 if down != null {
+                     let part = where(e)
+                     root.removeAttribute("data-scrubbing")
+                     down = null
+                     seek(part * dur)
+                 }
+             }}
+             @pointercancel={() => {
+                 root.removeAttribute("data-scrubbing")
+                 down = null
+                 follow()
+             }}
+             @keydown={(e) => {
+                 let to = match e.key {
+                     "ArrowLeft" => time - step
+                     "ArrowDown" => time - step
+                     "ArrowRight" => time + step
+                     "ArrowUp" => time + step
+                     "PageDown" => time - step * 6
+                     "PageUp" => time + step * 6
+                     "Home" => 0
+                     "End" => dur
+                     _ => -1
+                 }
+                 if to != -1 && dur > 0 {
+                     e.preventDefault()
+                     seek(to)
+                 }
+             }}>
+            <svg.ui-waveform-view-all viewBox={`0 0 ${len(shown)} 100`} preserveAspectRatio="none" aria-hidden="true"><path d={path}/></svg>
+            <div.ui-waveform-view-played aria-hidden="true">
+                <svg viewBox={`0 0 ${len(shown)} 100`} preserveAspectRatio="none"><path d={path}/></svg>
+            </div>
+            <div.ui-waveform-view-line aria-hidden="true"></div>
+            <span.ui-waveform-view-tip aria-hidden="true" @mount={(el) => { tip = el }}></span>
+        </div>
+        <div.ui-waveform-view-bar>
+            <Button size="lg" label={playing ? "Pause" : "Play"} on_click={flip}>{playing ? "Pause" : "Play"}</Button>
+            <Button size="lg" variant="outline" tone="neutral" label={`Back ${step} seconds`} disabled={dur == 0} on_click={() => { seek(time - step) }}>−{step}</Button>
+            <Button size="lg" variant="outline" tone="neutral" label={`Forward ${step} seconds`} disabled={dur == 0} on_click={() => { seek(time + step) }}>+{step}</Button>
+            <span.ui-waveform-view-clock role="timer" aria-label="Time">{waveform_view_clock(at)} / {waveform_view_clock(dur)}</span>
+        </div>
+        {status == "flat" && <p.ui-waveform-view-say>The waveform could not be drawn from this file. It may still play.</p>}
+        <audio src={src} preload="metadata" @mount={(el) => { sound = el }}
+               @loadedmetadata={(e) => { if waveform_view_known(e.target.duration) { dur = e.target.duration } }}
+               @durationchange={(e) => { if waveform_view_known(e.target.duration) { dur = e.target.duration } }}
+               @timeupdate={(e) => {
+                   time = e.target.currentTime
+                   follow()
+               }}
+               @play={() => { playing = true }} @pause={() => { playing = false }} @ended={() => { playing = false }}></audio>
+    </div>
+}

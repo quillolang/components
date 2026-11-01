@@ -1,0 +1,155 @@
+// ExtractiveSummary: a shorter version of a text made only of its own sentences, with no
+// AI service and nothing sent anywhere. Each sentence is scored by how often its words
+// come in the whole text and by how early it stands; the best are kept, in the order they
+// were written. A slider sets how many, it says what share of the text is left, and the
+// chosen sentences are marked in the source. A sentence said twice is kept once.
+//
+//   <ExtractiveSummary value={article.body} keep={3} name="body"/>
+//   <ExtractiveSummary on_change={(r) => { summary = r.summary }}/>
+//
+// value: the text to start with. name: the field's name ("text"), and keep_name the
+// slider's ("keep"), so a plain <form> sends them. label: the field's label ("Text to
+// summarise"). rows: the box's height in lines (7). id: a prefix for its ids
+// ("extractive-summary"), unique on the page. keep: how many sentences to start with (3).
+// language: which language's common words to leave out of the scoring, "en", "es",
+// "fr", "de", "pt" or "it" ("auto" works it out). limit: the most characters read
+// (50000); past it, it reads the start and says so. on_change(result): inside one of
+// your components, given the map below as it changes. class: more classes for its
+// outer element.
+//
+// extractive_summary_of(text, keep, language, limit) is the summary, for a program's own
+// use: { summary, kept, total, words_kept, words_total, share, capped, sentences }, where
+// share is the percentage of the words kept, a whole number, and sentences lists
+// { text, start, end, words, score, kept } in the text's order.
+//
+// A sentence's score is the mean, over its words that are not common words, of how
+// many times each comes in the text, as a share of the best such mean, plus half of its
+// place (1 for the first sentence, falling evenly to 1/n for the last). A sentence
+// under five words counts for that fraction of its mean, as "Bees sting." would
+// otherwise beat every longer sentence about bees.
+
+import ui/theme.qwe use ui_cls
+import ui/copy_button.qwe use CopyButton
+import ui/readability_meter.qwe use readability_meter_language, readability_meter_sentences, readability_meter_stop_sets, readability_meter_words
+
+let extractive_summary_css = css`
+.ui-extractive-summary { display: grid; gap: 14px; min-width: 0; max-width: 760px; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-extractive-summary-field { display: grid; gap: 5px; min-width: 0; }
+.ui-extractive-summary-field label { font-size: 13px; font-weight: 500; }
+.ui-extractive-summary-field textarea { box-sizing: border-box; display: block; width: 100%; min-width: 0; padding: 9px 12px; resize: vertical; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.5 var(--ui-font); }
+.ui-extractive-summary-field textarea:hover { border-color: var(--ui-strong); }
+.ui-extractive-summary-field textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-extractive-summary-field input[type=range] { width: 100%; margin: 0; accent-color: var(--ui-accent); }
+.ui-extractive-summary-field input[type=range]:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: var(--ui-radius-sm); }
+.ui-extractive-summary-said { margin: 0; font-weight: 600; }
+.ui-extractive-summary-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-extractive-summary-out { display: grid; gap: 8px; padding: 12px 14px; border-left: 3px solid var(--ui-accent); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-extractive-summary-out h4, .ui-extractive-summary-source h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.ui-extractive-summary-text { margin: 0; overflow-wrap: anywhere; }
+.ui-extractive-summary-copy { justify-self: start; height: 30px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-extractive-summary-copy:hover { border-color: var(--ui-strong); }
+.ui-extractive-summary-copy:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-extractive-summary-source { display: grid; gap: 6px; min-width: 0; }
+.ui-extractive-summary-marked { max-height: 260px; overflow: auto; margin: 0; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ui-muted); }
+.ui-extractive-summary-marked:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-extractive-summary-marked mark { border-radius: 2px; background: var(--ui-accent-soft); color: var(--ui-fg); }
+`
+
+// Each sentence's score (see the top of the file), in order.
+fn extractive_summary_score(sentences: list, stop) -> list {
+    let n = len(sentences)
+    let lists = sentences | map((s) => readability_meter_words(s.text) | map((w) => replace(lower(w.text), "’", "'")))
+    let content = lists | map((ws) => ws | filter((w) => !has(stop, w) && !re.test(w, "^[0-9.,:'-]+$")))
+    let groups = group_by(flatten(content), (w) => w)
+    let times = reduce(keys(groups), {}, (m, w) => set(m, w, len(get(groups, w, []))))
+    let means = for i in range(0, n) {
+        let ws = content[i]
+        let m = len(ws) == 0 ? 0 : (ws | map((w) => get(times, w, 0)) | sum()) / len(ws)
+        m * min([len(lists[i]), 5]) / 5
+    }
+    let top = max(means)
+    for i in range(0, n) {
+        let tf = top > 0 ? means[i] / top : 0
+        { ...sentences[i], words: len(lists[i]), score: tf + (1 - i / n) / 2 }
+    }
+}
+
+// The summary (see the top of the file).
+fn extractive_summary_of(text: str, keep: int = 3, language: str = "auto", limit: int = 50000) {
+    let capped = len(text) > limit
+    let t = capped ? slice(text, 0, limit) : text
+    let found = readability_meter_sentences(t)
+    let all_words = readability_meter_words(t) | map((w) => replace(lower(w.text), "’", "'"))
+    let guess = language == "auto" ? readability_meter_language(all_words) : null
+    let code = language == "auto" ? (guess == null ? null : guess.code) : language
+    let stop = code == null ? {} : get(readability_meter_stop_sets, code, {})
+    let scored = extractive_summary_score(found, stop)
+    // Best first, the earlier of equals first; a sentence said twice takes one place.
+    let ranked = sort_by(scored, (s) => -s.score)
+    let distinct = reduce(ranked, { seen: {}, picks: [] }, (acc, s) =>
+        has(acc.seen, s.text) ? acc : { seen: set(acc.seen, s.text, true), picks: push(acc.picks, s.start) })
+    let picks = take(distinct.picks, keep)
+    let marked = scored | map((s) => { ...s, kept: contains(picks, s.start) })
+    let chosen = marked | filter((s) => s.kept)
+    let words_kept = chosen | map((s) => s.words) | sum()
+    let words_total = marked | map((s) => s.words) | sum()
+    { summary: chosen | map((s) => s.text) | join(" "), kept: len(chosen), total: len(distinct.picks), words_kept, words_total,
+      share: words_total == 0 ? 0 : round(words_kept * 100 / words_total), capped, sentences: marked }
+}
+
+// The text in pieces, kept sentences marked: [{ text, kept, start }].
+fn extractive_summary_pieces(text: str, sentences: list) -> list {
+    let chars = split(text, "")
+    let n = len(chars)
+    let at = 0
+    let parts = for s in sentences {
+        let gap = { text: join(slice(chars, at, s.start), ""), kept: false, start: at }
+        at = s.end
+        [gap, { text: s.text, kept: s.kept, start: s.start }]
+    }
+    flatten(parts) + [{ text: join(slice(chars, at, n), ""), kept: false, start: at }] | filter((p) => p.text != "")
+}
+
+component ExtractiveSummary(value: str = "", name: str = "text", keep_name: str = "keep", label: str = "Text to summarise", rows: int = 7, id: str = "extractive-summary",
+                            keep: int = 3, language: str = "auto", limit: int = 50000, on_change = null, class: str? = null) {
+    style global extractive_summary_css
+    state text = value
+    state wanted = keep
+    let r = extractive_summary_of(text, max([wanted, 1]), language, limit)
+    let shown = len(text) > limit ? slice(text, 0, limit) : text
+    let blank = trim(text) == ""
+    let said = blank ? "Type or paste some text to summarise it."
+        : r.total == 0 ? "There are no sentences in this text."
+        : r.total == 1 ? "There is only one sentence, so there is nothing to shorten."
+        : `Kept ${r.kept} of ${r.total} sentences, ${r.words_kept} of ${r.words_total} words: ${r.share}% of the text.`
+    let tell = (next_text: str, next_keep: int) => {
+        on_change && on_change(extractive_summary_of(next_text, max([next_keep, 1]), language, limit))
+    }
+    <section class={ui_cls(["ui-extractive-summary", class])} aria-labelledby={`${id}-said`}>
+        <div.ui-extractive-summary-field>
+            <label for={`${id}-text`}>{label}</label>
+            <textarea id={`${id}-text`} name={name} rows={rows} value={text} @input={(e) => { text = e.value; tell(e.value, wanted) }}></textarea>
+        </div>
+        {r.total > 1 && <div.ui-extractive-summary-field>
+            <label for={`${id}-keep`}>Sentences to keep: {min([wanted, r.total])}</label>
+            <input type="range" id={`${id}-keep`} name={keep_name} min="1" max={r.total} step="1" value={min([wanted, r.total])}
+                   @input={(e) => { wanted = int(e.value) ?? 1; tell(text, wanted) }}/>
+        </div>}
+        <p.ui-extractive-summary-said id={`${id}-said`} aria-live="polite">{said}</p>
+        {r.capped && <p.ui-extractive-summary-note>Only the first {format_number(limit, "en-US", 0)} characters were read.</p>}
+        {r.total > 1 && <div.ui-extractive-summary-out>
+            <h4>Summary</h4>
+            <p.ui-extractive-summary-text>{r.summary}</p>
+            <CopyButton text={r.summary} label="Copy summary" class="ui-extractive-summary-copy"/>
+        </div>}
+        {r.total > 1 && <div.ui-extractive-summary-source>
+            <h4>Where it came from</h4>
+            <p.ui-extractive-summary-marked tabindex="0">
+                {for p in extractive_summary_pieces(shown, r.sentences) => p.kept ? <mark key={p.start}>{p.text}</mark> : p.text}
+            </p>
+        </div>}
+    </section>
+}

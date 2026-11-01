@@ -1,0 +1,232 @@
+// LocationButton: asks for where the person is, once, on a tap, and says what came
+// of it: the place and how close it is, or why there is none. It asks the phone's own
+// location services in the Quillo app (quilloNative), the web's geolocation in a browser,
+// and says so where neither is there. A refusal is a normal answer: the button stays,
+// and in the app a button goes to the app's page in Settings. Coming back from there, it
+// asks again by itself.
+//
+//   <LocationButton name="place"/>
+//   <LocationButton label="Find stores near me" timeout={10} on_locate={(p) => { here = p }}/>
+//
+// label: the button ("Use my location"). name: a hidden input sent with a plain <form>,
+// as "lat,lon,accuracy", empty until there is a place. timeout: seconds to wait for a
+// place (15); an answer that comes later is still taken, as the first time a person may
+// be reading the system's question. high_accuracy: asks for GPS, which takes longer and
+// uses more battery (true). max_age: seconds an earlier place may be reused (0).
+// on_locate(place): inside one of your components, called with { lat, lon, accuracy,
+// altitude, speed, course, at, from }, where from is "app" or "web", and any of accuracy
+// to at may be null. on_state(status): called as it changes, with "asking", "found",
+// "refused", "off" (no place came: location services off, or no signal), "timeout",
+// "none" (nothing here can give a place), "insecure" (the page is not on https) or "idle".
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let location_button_css = css`
+.ui-locbtn { container-type: inline-size; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-locbtn-in { display: grid; gap: 10px; }
+.ui-locbtn-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-locbtn-pin { width: 18px; height: 18px; flex: none; }
+.ui-locbtn-place { display: grid; gap: 2px; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-locbtn-place[data-old] { opacity: .6; }
+.ui-locbtn-coords { font: 500 15px/1.4 var(--ui-mono); overflow-wrap: anywhere; }
+.ui-locbtn-near { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--ui-muted); }
+.ui-locbtn-grade { padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+.ui-locbtn-grade-good { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-locbtn-grade-fair { background: var(--ui-warning-soft); color: var(--ui-warning); }
+.ui-locbtn-grade-poor, .ui-locbtn-grade-unknown { background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-locbtn-say { margin: 0; color: var(--ui-muted); }
+.ui-locbtn-say:empty { display: none; }
+.ui-locbtn-say[data-bad] { color: var(--ui-fg); }
+/* With room, the answer stands beside the button rather than under it. */
+@container (min-width: 420px) {
+  .ui-locbtn-in { grid-template-columns: auto minmax(0, 1fr); align-items: start; column-gap: 16px; }
+  .ui-locbtn-bar { grid-row: 1 / span 2; flex-direction: column; align-items: stretch; }
+}
+`
+
+// A number the page can use: `null`, text and NaN are not.
+fn location_button_num(x) = (type_of(x) == "int" || type_of(x) == "float") && math.isfinite(x)
+
+// The state an error from the app's call means. Both apps say "... turned off for this
+// app" for a person's refusal, and only Android tells of location services being off.
+fn location_button_app_state(text) {
+    let t = lower(str(text))
+    if contains(t, "for this app") || contains(t, "denied") || contains(t, "not allowed") {
+        "refused"
+    } else if contains(t, "timed out") || contains(t, "timeout") {
+        "timeout"
+    } else {
+        "off"
+    }
+}
+
+// The state a GeolocationPositionError's code means.
+fn location_button_web_state(code) = match code {
+    1 => "refused"
+    3 => "timeout"
+    _ => "off"
+}
+
+// A place from either source, or null when it is not one. The fields past lon are
+// dropped when they make no sense: iOS gives -1 for a speed or course it does not know.
+fn location_button_place(lat, lon, accuracy, altitude, speed, course, at, from) {
+    let num = location_button_num
+    if !num(lat) || !num(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+        null
+    } else {
+        { lat: lat, lon: lon, accuracy: num(accuracy) && accuracy >= 0 ? accuracy : null,
+          altitude: num(altitude) ? altitude : null, speed: num(speed) && speed >= 0 ? speed : null,
+          course: num(course) && course >= 0 ? course : null, at: num(at) ? at : null, from: from }
+    }
+}
+
+// How far to trust a place, by its accuracy in metres: "good" is good enough to find a
+// door, "fair" a street, and "poor" a town.
+fn location_button_grade(accuracy) {
+    if !location_button_num(accuracy) {
+        "unknown"
+    } else if accuracy <= 20 {
+        "good"
+    } else if accuracy <= 100 {
+        "fair"
+    } else {
+        "poor"
+    }
+}
+
+fn location_button_near(accuracy) {
+    if !location_button_num(accuracy) {
+        "Accuracy not known"
+    } else if accuracy >= 1000 {
+        `Within ${format_number(accuracy / 1000, "en-US", 1)} km`
+    } else {
+        `Within ${format_number(round(accuracy), "en-US", 0)} m`
+    }
+}
+
+// 14.59950° N, 120.98420° E. Five places is about a metre, which is more than a phone knows.
+fn location_button_coords(lat, lon) {
+    let part = (v, plus, minus) => `${format_number(abs(v), "en-US", 5)}° ${v < 0 ? minus : plus}`
+    `${part(lat, "N", "S")}, ${part(lon, "E", "W")}`
+}
+
+// What goes in the hidden input.
+fn location_button_field(place) = place == null ? "" : `${place.lat},${place.lon},${place.accuracy ?? ""}`
+
+// What a state says. The Settings button is the app's; a browser has none to open.
+fn location_button_message(status, in_app) = match status {
+    "asking" => "Asking for your location."
+    "refused" => in_app ? "Location is turned off for this app. You can allow it in Settings." :
+        "Location is blocked for this page. Allow it in your browser's site settings, then try again."
+    "off" => "No location came. Check that location services are on, or try where the sky can be seen."
+    "timeout" => "This is taking too long. Try again, near a window or outside."
+    "none" => "This browser cannot give a location."
+    "insecure" => "Browsers give a location only to pages on https."
+    _ => ""
+}
+
+component LocationButton(label: str = "Use my location", name: str? = null, timeout: num = 15, high_accuracy: bool = true,
+                         max_age: num = 0, on_locate = null, on_state = null, class: str? = null) {
+    style global location_button_css
+    state status = "idle"
+    state place = null
+    state ticket = 0            // counts the asks: an answer to any but the last, or to one cancelled, is dropped
+    state in_app = false
+    state timing = false        // the app's call has no timeout of its own, so this clock is it
+    state to_settings = false   // gone to Settings: ask again on coming back
+
+    let become = (s) => {
+        status = s
+        timing = false
+        on_state && on_state(s)
+    }
+    let got = (p, mine) => {
+        if mine == ticket {
+            if p == null {
+                become("off")
+            } else {
+                place = p
+                become("found")
+                on_locate && on_locate(p)
+            }
+        }
+    }
+    let from_web = (mine) => {
+        if js("isSecureContext") != true {
+            become("insecure")
+        } else {
+            let r = js("navigator.geolocation.getCurrentPosition",
+                (pos) => {
+                    let c = pos.coords
+                    got(location_button_place(c.latitude, c.longitude, c.accuracy, c.altitude, c.speed, c.heading, pos.timestamp, "web"), mine)
+                },
+                (e) => { if mine == ticket { become(location_button_web_state(e.code)) } },
+                { enableHighAccuracy: high_accuracy, timeout: round(max([timeout, 1]) * 1000), maximumAge: round(max([max_age, 0]) * 1000) })
+            if is_err(r) { become("none") }
+        }
+    }
+    let locate = () => {
+        ticket += 1
+        let mine = ticket
+        status = "asking"
+        on_state && on_state("asking")
+        timing = true
+        let r = js("quilloNative.location")
+        if is_err(r) && contains(r.error, "not defined") {
+            in_app = false
+            timing = false
+            from_web(mine)
+        } else {
+            in_app = true
+            if is_err(r) {
+                if mine == ticket { become(location_button_app_state(r.error)) }
+            } else {
+                got(location_button_place(r.lat, r.lon, r.accuracy, r.altitude, r.speed, r.course, r.at, "app"), mine)
+            }
+        }
+    }
+    // The clock runs while the app's call has not answered. It leaves the ticket alone,
+    // so a place that comes after all is taken.
+    if timing { every(round(max([timeout, 1]) * 1000), () => { become("timeout") }) }
+
+    let say = location_button_message(status, in_app)
+    let bad = status == "refused" || status == "off" || status == "timeout" || status == "none" || status == "insecure"
+    let grade = location_button_grade(place.accuracy)
+    <div class={ui_cls(["ui-locbtn", class])} @mount={(_el) => {
+        let d = js("document")
+        let back = (_e = null) => {
+            if to_settings && js("document.visibilityState") == "visible" {
+                to_settings = false
+                locate()
+            }
+        }
+        d.addEventListener("visibilitychange", back)
+        () => { d.removeEventListener("visibilitychange", back) }
+    }}>
+        <div.ui-locbtn-in>
+            <div.ui-locbtn-bar>
+                <Button size="lg" class="ui-locbtn-go" loading={status == "asking"} on_click={locate}>
+                    {status != "asking" && <svg.ui-locbtn-pin viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s7-6.2 7-11a7 7 0 1 0-14 0c0 4.8 7 11 7 11Z"/><circle cx="12" cy="10" r="2.5"/></svg>}
+                    {status == "asking" ? "Finding you" : (bad ? "Try again" : (place != null ? "Update location" : label))}
+                </Button>
+                {status == "asking" && <Button size="lg" variant="ghost" class="ui-locbtn-cancel" on_click={() => {
+                    ticket += 1
+                    become("idle")
+                }}>Cancel</Button>}
+                {status == "refused" && in_app && <Button size="lg" variant="outline" class="ui-locbtn-settings" on_click={() => {
+                    to_settings = true
+                    js("quilloNative.openSettings")
+                }}>Open Settings</Button>}
+            </div>
+            {place != null && <div.ui-locbtn-place data-old={status != "found" ? "" : null}>
+                <span.ui-locbtn-coords>{location_button_coords(place.lat, place.lon)}</span>
+                <span.ui-locbtn-near>{location_button_near(place.accuracy)}
+                    <span class={`ui-locbtn-grade ui-locbtn-grade-${grade}`}>{grade}</span></span>
+            </div>}
+            <p.ui-locbtn-say role="status" data-bad={bad ? "" : null}>{say}</p>
+        </div>
+        {name != null && <input type="hidden" name={name} value={location_button_field(place)}/>}
+    </div>
+}

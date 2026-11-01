@@ -1,0 +1,351 @@
+// ExpressionInput: a number field that does sums. It takes "12*3+4", "15% of 80",
+// "(1+2)/3", "100 + 10%" or "1,234.50 × 2", shows the answer as it is typed, and sends
+// the answer, not the words. Its parser is its own, nothing is evaluated as code, and
+// the arithmetic is exact: fractions are kept as fractions to the end, so 0.1+0.2 is
+// 0.3 and 1/3*3 is 1. Where it cannot read something, it says what and marks the place.
+//
+//   <ExpressionInput id="qty" name="qty" label="Quantity" value="12*3+4"/>
+//   <ExpressionInput id="fee" name="fee" label="Fee" decimals={2} lowest={0}
+//                    on_change={(v) => { fee = v }}/>
+//
+// id: a prefix for its ids, unique on the page. name: the hidden field that holds the
+// answer as plain digits ("1234.5"), empty while there is none. label, hint,
+// placeholder, required, disabled as for every field. value: the expression to start
+// with. decimals: places to round the answer to, half up ("10/3" is 3.33); left out,
+// an answer is as long as it needs, and one that never ends (1/3) is cut at 28 places
+// and says so. lowest, highest: decimals the answer must fall between. locale: how the
+// answer is written on the page ("en-US"; the field always has plain digits). class:
+// more classes. on_change(value): inside one of your components, the answer as a
+// decimal after each change, null when there is none.
+//
+// Reads + - * / and × ÷ x, brackets, a minus before a number, % after one (a hundredth,
+// so "50% * 20" is 10), "of" after a percentage, and commas that group thousands.
+// After + or - a percentage is of what stands before it, as on a calculator: "100 +
+// 10%" is 110. At most 500 characters and 64 brackets deep, and numbers of 28 digits;
+// an answer past 28 digits is an error, not a wrong number.
+//
+// expression_input_eval(text, decimals) is the same for a program's own use (a route
+// checking what was sent): { status, value, rounded, message, at }. status is "empty",
+// "ok" or "bad"; value the answer as text; rounded whether digits were cut; at the
+// character the message is about, from 0.
+
+import ui/theme.qwe use ui_cls
+
+let expression_input_css = css`
+.ui-exprinput { display: grid; gap: 6px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-exprinput-label { font-size: 13px; font-weight: 500; }
+.ui-exprinput-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-exprinput-control { box-sizing: border-box; width: 100%; height: 38px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1 var(--ui-mono);
+  font-variant-numeric: tabular-nums; transition: border-color .15s, box-shadow .15s; }
+.ui-exprinput-control::placeholder { color: var(--ui-muted); opacity: 1; font-family: var(--ui-font); }
+.ui-exprinput-control:hover { border-color: var(--ui-strong); }
+.ui-exprinput-control:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-exprinput-control[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-exprinput-control:disabled { opacity: .55; cursor: not-allowed; }
+.ui-exprinput-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-exprinput-out { margin: 0; min-height: 20px; font-size: 13px; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-exprinput-out strong { color: var(--ui-fg); font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-exprinput-note { display: block; font-size: 12px; }
+.ui-exprinput-bad { color: var(--ui-danger); }
+.ui-exprinput-where { display: block; margin: 2px 0 0; padding: 4px 8px; border-radius: 4px; background: var(--ui-subtle); color: var(--ui-fg);
+  font: 13px/1.5 var(--ui-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-exprinput-where mark { border-radius: 2px; background: var(--ui-danger-soft); color: var(--ui-danger); font-weight: 700;
+  text-decoration: underline; }
+@media (prefers-reduced-motion: reduce) { .ui-exprinput-control { transition: none; } }
+`
+
+let expression_input_limit = 500
+let expression_input_depth_limit = 64
+let expression_input_digits_limit = 28
+
+// A dec has 28 or 29 digits, and going past them stops the program: nothing here can
+// catch that, so every product is measured first.
+fn expression_input_size(x) = len(str(floor(abs(x))))
+
+fn expression_input_fits(a, b) = expression_input_size(a) + expression_input_size(b) <= 28
+
+fn expression_input_gcd(a, b) {
+    let x = abs(a)
+    let y = abs(b)
+    while y != 0 {
+        let r = x % y
+        x = y
+        y = r
+    }
+    x
+}
+
+// A fraction in its lowest terms, the sign on top. { n, d } are whole decimals. Past
+// what they hold a value is `rough`: a decimal in n, no longer exact.
+fn expression_input_fraction(n, d) {
+    let g = expression_input_gcd(n, d)
+    g > 1 ? { n: n / g, d: d / g } : { n, d }
+}
+
+fn expression_input_rough(x) = { n: x, d: 1m, rough: true }
+
+fn expression_input_decimal(v) = v.d == 1 ? v.n : v.n / v.d
+
+fn expression_input_too_large() = { err: "The answer is too large: past 28 digits." }
+
+fn expression_input_rough_mul(a, b) {
+    let x = expression_input_decimal(a)
+    let y = expression_input_decimal(b)
+    if expression_input_size(x) + expression_input_size(y) > 27 { return expression_input_too_large() }
+    expression_input_rough(x * y)
+}
+
+fn expression_input_mul(a, b) {
+    if a.rough || b.rough { return expression_input_rough_mul(a, b) }
+    let g1 = expression_input_gcd(a.n, b.d)
+    let g2 = expression_input_gcd(b.n, a.d)
+    let n1 = g1 > 1 ? a.n / g1 : a.n
+    let d2 = g1 > 1 ? b.d / g1 : b.d
+    let n2 = g2 > 1 ? b.n / g2 : b.n
+    let d1 = g2 > 1 ? a.d / g2 : a.d
+    if !expression_input_fits(n1, n2) || !expression_input_fits(d1, d2) { return expression_input_rough_mul(a, b) }
+    expression_input_fraction(n1 * n2, d1 * d2)
+}
+
+fn expression_input_div(a, b) {
+    if a.rough || b.rough {
+        let x = expression_input_decimal(a)
+        let y = expression_input_decimal(b)
+        // Dividing by something small makes something large.
+        if abs(y) < 1 && abs(x) >= abs(y) * 10000000000000000000000000000m { return expression_input_too_large() }
+        return expression_input_rough(x / y)
+    }
+    let negative = b.n < 0
+    expression_input_mul(a, { n: negative ? 0 - b.d : b.d, d: abs(b.n) })
+}
+
+fn expression_input_add(a, b) {
+    let rough = () => {
+        let x = expression_input_decimal(a)
+        let y = expression_input_decimal(b)
+        if expression_input_size(x) > 27 || expression_input_size(y) > 27 { return expression_input_too_large() }
+        expression_input_rough(x + y)
+    }
+    if a.rough || b.rough { return rough() }
+    let g = expression_input_gcd(a.d, b.d)
+    let ad = a.d / g
+    let bd = b.d / g
+    if !expression_input_fits(a.n, bd) || !expression_input_fits(b.n, ad) || !expression_input_fits(ad, b.d) { return rough() }
+    expression_input_fraction(a.n * bd + b.n * ad, ad * b.d)
+}
+
+fn expression_input_neg(v) = { ...v, n: 0 - v.n }
+
+// What is written, cut into tokens { k, at, ... }, or { err, at }. A number's token holds
+// its fraction; the last token is { k: "end" }.
+fn expression_input_tokens(text: str) {
+    let ops = { "+": "+", "-": "-", "−": "-", "–": "-", "*": "*", "×": "*", "x": "*", "X": "*", "/": "/", "÷": "/", "(": "(", ")": ")", "%": "%" }
+    let tokens = []
+    let pieces = re.find_all(text, "\\s+|\\d[\\d,]*(?:\\.\\d*)?|\\.\\d+|of\\b|.", "is") | filter((m) => !re.test(m.text, "^\\s+$"))
+    for m in pieces {
+        let piece = m.text
+        if re.test(piece, "^[\\d.]") && piece != "." {
+            if contains(piece, ",") && !re.test(piece, "^\\d{1,3}(?:,\\d{3})+(?:\\.\\d*)?$") {
+                let comma = index_of(piece, ",")
+                return { err: "A comma groups thousands, as in 1,234. A decimal is written with a point.", at: m.start + comma }
+            }
+            let plain = replace(piece, ",", "")
+            let parts = split(plain, ".")
+            let whole = re.replace(parts[0], "^0+", "")
+            let frac = re.replace(parts[1] ?? "", "0+$", "")
+            if len(whole) + len(frac) > expression_input_digits_limit {
+                return { err: `This number is too long: ${expression_input_digits_limit} digits at most.`, at: m.start }
+            }
+            let digits = filled(whole + frac) ?? "0"
+            tokens = push(tokens, { k: "n", at: m.start, v: expression_input_fraction(dec(digits), dec("1" + repeat("0", len(frac)))) })
+        } else if lower(piece) == "of" {
+            tokens = push(tokens, { k: "of", at: m.start })
+        } else if ops[piece] != null {
+            tokens = push(tokens, { k: ops[piece], at: m.start })
+        } else {
+            return { err: `"${piece}" cannot be read here: use numbers, + - * / %, brackets and "of".`, at: m.start }
+        }
+    }
+    { tokens: push(tokens, { k: "end", at: len(text) }) }
+}
+
+// Each level gives { v, i }, the value and the token after it, or { err, at }.
+fn expression_input_atom(ts: list, i: int, depth: int) {
+    let tok = ts[i]
+    if tok.k == "n" { return { v: { ...tok.v, pct: false }, i: i + 1 } }
+    if tok.k == "(" {
+        if depth >= expression_input_depth_limit { return { err: `Too deep: ${expression_input_depth_limit} brackets at most.`, at: tok.at } }
+        let inner = expression_input_sum(ts, i + 1, depth + 1)
+        if inner.err != null { return inner }
+        if ts[inner.i].k != ")" { return { err: "This bracket is never closed.", at: tok.at } }
+        return { v: { ...inner.v, pct: false }, i: inner.i + 1 }
+    }
+    if tok.k == "end" { return { err: "Something is missing at the end: a number.", at: tok.at } }
+    if tok.k == ")" { return { err: "A number should come before this bracket.", at: tok.at } }
+    { err: "A number should come here.", at: tok.at }
+}
+
+fn expression_input_percent(ts: list, i: int, depth: int) {
+    let got = expression_input_atom(ts, i, depth)
+    if got.err != null { return got }
+    let v = got.v
+    let at = got.i
+    while ts[at].k == "%" {
+        let cut = expression_input_mul(v, { n: 1m, d: 100m })
+        if cut.err != null { return { err: cut.err, at: ts[at].at } }
+        v = { ...cut, pct: true }
+        at += 1
+    }
+    { v, i: at }
+}
+
+fn expression_input_unary(ts: list, i: int, depth: int) {
+    let k = ts[i].k
+    if k != "-" && k != "+" { return expression_input_percent(ts, i, depth) }
+    if depth > expression_input_depth_limit { return { err: "Too many signs in a row.", at: ts[i].at } }
+    let got = expression_input_unary(ts, i + 1, depth + 1)
+    if got.err != null || k == "+" { return got }
+    { v: expression_input_neg(got.v), i: got.i }
+}
+
+fn expression_input_product(ts: list, i: int, depth: int) {
+    let left = expression_input_unary(ts, i, depth)
+    if left.err != null { return left }
+    let v = left.v
+    let at = left.i
+    while contains(["*", "/", "of"], ts[at].k) {
+        let op = ts[at]
+        if op.k == "of" && !v.pct { return { err: `"of" follows a percentage, as in 15% of 80.`, at: op.at } }
+        let right = expression_input_unary(ts, at + 1, depth)
+        if right.err != null { return right }
+        if op.k == "/" && right.v.n == 0 { return { err: "Cannot divide by zero.", at: ts[at + 1].at } }
+        let next = op.k == "/" ? expression_input_div(v, right.v) : expression_input_mul(v, right.v)
+        if next.err != null { return { err: next.err, at: op.at } }
+        v = { ...next, pct: false }
+        at = right.i
+    }
+    { v, i: at }
+}
+
+fn expression_input_sum(ts: list, i: int, depth: int) {
+    let left = expression_input_product(ts, i, depth)
+    if left.err != null { return left }
+    let v = left.v
+    let at = left.i
+    while ts[at].k == "+" || ts[at].k == "-" {
+        let op = ts[at]
+        let right = expression_input_product(ts, at + 1, depth)
+        if right.err != null { return right }
+        // A percentage after + or - is of what stands before it.
+        let part = right.v.pct && !v.pct ? expression_input_mul(v, right.v) : right.v
+        if part.err != null { return { err: part.err, at: op.at } }
+        let next = expression_input_add(v, op.k == "-" ? expression_input_neg(part) : part)
+        if next.err != null { return { err: next.err, at: op.at } }
+        v = { ...next, pct: false }
+        at = right.i
+    }
+    { v, i: at }
+}
+
+// How many places a fraction's decimals run to, or null if they never end.
+fn expression_input_places(d) {
+    let rest = d
+    let twos = 0
+    let fives = 0
+    while rest % 2 == 0 {
+        rest = rest / 2
+        twos += 1
+    }
+    while rest % 5 == 0 {
+        rest = rest / 5
+        fives += 1
+    }
+    rest != 1 ? null : max([twos, fives])
+}
+
+// Without the zeros a division leaves at the end.
+fn expression_input_plain(x) {
+    let s = str(x)
+    contains(s, ".") ? re.replace(s, "\\.?0+$", "") : s
+}
+
+// The answer as text: { value, rounded }.
+fn expression_input_answer(v, decimals) {
+    let exact = !v.rough && (expression_input_places(v.d) ?? 99) <= 28
+    let x = expression_input_decimal(v)
+    if decimals == null { return { value: expression_input_plain(x), rounded: !exact } }
+    let cut = round(x, decimals, "half_up")
+    { value: str(cut), rounded: !exact || cut != x }
+}
+
+// The whole reading: see the opening comment.
+fn expression_input_eval(text, decimals = null) {
+    let bad = (message: str, at: int) => { status: "bad", value: "", rounded: false, message, at }
+    let raw = str(text ?? "")
+    if trim(raw) == "" { return { status: "empty", value: "", rounded: false, message: null, at: null } }
+    if len(raw) > expression_input_limit { return bad(`Too long to work out: ${expression_input_limit} characters at most.`, expression_input_limit) }
+    let cut = expression_input_tokens(raw)
+    if cut.err != null { return bad(cut.err, cut.at) }
+    let got = expression_input_sum(cut.tokens, 0, 0)
+    if got.err != null { return bad(got.err, got.at) }
+    let stop = cut.tokens[got.i]
+    if stop.k == ")" { return bad("No bracket was opened for this one.", stop.at) }
+    if stop.k != "end" { return bad("An operator should come here, such as + or *.", stop.at) }
+    let out = expression_input_answer(got.v, decimals)
+    { status: "ok", value: out.value, rounded: out.rounded, message: null, at: null }
+}
+
+// The place an error is about: the text around it, so a long expression stays short.
+fn expression_input_window(text: str, at: int) {
+    let from = max([0, at - 24])
+    let upto = min([len(text), at + 25])
+    { before: `${from > 0 ? "…" : ""}${slice(text, from, at)}`, here: at < len(text) ? slice(text, at, at + 1) : " ", after: `${slice(text, at + 1, upto)}${upto < len(text) ? "…" : ""}` }
+}
+
+fn expression_input_shown(value: str, locale: str) {
+    let places = len(split(value, ".")[1] ?? "")
+    format_number(dec(value), locale, places)
+}
+
+component ExpressionInput(id: str, name: str? = null, label: str? = null, value: str = "", placeholder: str = "12*3+4, 15% of 80, (1+2)/3",
+                          hint: str? = null, required: bool = false, disabled: bool = false, decimals: int? = null, lowest = null, highest = null,
+                          locale: str = "en-US", on_change = null, class: str? = null) {
+    style global expression_input_css
+    state text = value
+    let read = expression_input_eval(text, decimals)
+    let answer = read.status == "ok" ? dec(read.value) : null
+    let low = lowest != null ? dec(lowest) : null
+    let high = highest != null ? dec(highest) : null
+    let under = answer != null && low != null && answer < low
+    let over = answer != null && high != null && answer > high
+    let refused = under ? `The answer must be at least ${str(low)}.` : over ? `The answer must be at most ${str(high)}.` : null
+    let result = read.status == "ok" && refused == null ? read.value : ""
+    let place = read.at != null ? expression_input_window(text, read.at) : null
+    let described = ui_cls([hint != null && `${id}-hint`, `${id}-out`])
+    <div class={ui_cls(["ui-exprinput", class])}>
+        {label != null && <label.ui-exprinput-label for={id}>
+            {label}{required && <span.ui-exprinput-req aria-hidden="true">*</span>}
+        </label>}
+        <input.ui-exprinput-control type="text" id={id} value={text} placeholder={placeholder} required={required} disabled={disabled}
+               autocomplete="off" spellcheck="false" inputmode="text" aria-invalid={read.status == "bad" || refused != null ? "true" : null}
+               aria-describedby={described}
+               @input={(e) => {
+                   text = e.value
+                   let r = expression_input_eval(e.value, decimals)
+                   let v = r.status == "ok" ? dec(r.value) : null
+                   let fits = v != null && (low == null || v >= low) && (high == null || v <= high)
+                   on_change && on_change(fits ? v : null)
+               }}/>
+        {name != null && <input type="hidden" name={name} value={result}/>}
+        {hint != null && <p.ui-exprinput-hint id={`${id}-hint`}>{hint}</p>}
+        <div.ui-exprinput-out id={`${id}-out`} aria-live="polite">
+            {read.status == "bad" ? <span.ui-exprinput-bad>{read.message} (character {read.at + 1})</span>
+                : refused != null ? <span.ui-exprinput-bad>{refused}</span>
+                : read.status == "ok" ? <span>= <strong>{expression_input_shown(read.value, locale)}</strong>
+                    {read.rounded && <span.ui-exprinput-note>{decimals != null ? `Rounded to ${decimals} places.` : "Rounded: the decimals never end."}</span>}</span>
+                : null}
+            {place != null && <code.ui-exprinput-where aria-hidden="true">{place.before}<mark>{place.here}</mark>{place.after}</code>}
+        </div>
+    </div>
+}

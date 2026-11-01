@@ -1,0 +1,550 @@
+// ChartAdvisor: looks at rows and picks a chart from the shape of the data: a date and
+// a number make a line, a category and a number make bars, two numbers a scatter, one
+// number a histogram. It says why, lets the reader switch the chart and the columns,
+// says what is wrong with a choice it would not make, and draws the result as SVG.
+//
+//   <ChartAdvisor rows={[{ month: "2026-01-01", revenue: 120 }, { month: "2026-02-01", revenue: 140 }]}/>
+//   <ChartAdvisor rows={orders} on_change={(c) => { chosen = c.kind }}/>
+//
+// What it sees. A column is numbers when nine in ten of its values are (commas,
+// currency signs and % allowed), dates when all are dates, months when all are month
+// names, a year when it is called year and holds years; a column called id or counting
+// 1, 2, 3 is left out of the advice; anything else is a category. With several to
+// choose from, a date comes first if it has three or more values, then a category.
+// Rows sharing a place on the axis are added, or averaged where a sum means nothing (a
+// rate, a score, a price), and the chart's title says which. Bars go from largest
+// to smallest, or in time order for dates, and past 12 the rest are gathered as Other.
+// A scatter shows up to 1,000 points, evenly picked. Empty values are left out, and
+// counted under the chart.
+//
+// rows: a list of maps. The reader can paste over them, in the box named data: JSON (a
+// list of maps) or CSV with a line of headings, separated by commas, semicolons or
+// tabs. The first 5,000 rows and 200,000 characters are read. chart: "line", "bar",
+// "scatter" or "histogram", to start on that instead of the advice. title: the heading
+// ("Chart advice"). id: a prefix for its ids ("chart-advisor"), unique on the page. The
+// fields are named chart, x and y; name: a prefix for those names. on_change(choice):
+// inside one of your components, given { kind, x, y, advised } after each change,
+// advised being the chart it would pick; x and y are column names, y null for a count.
+//
+// chart_advisor_read(text) gives { rows, problems }; chart_advisor_columns(rows) the
+// columns; chart_advisor_pick(columns) gives { kind, x, y, why } or null; and
+// chart_advisor_fit(kind, x, y) says whether a chart suits two columns, as { ok, note };
+// all for a program's own use.
+
+import ui/theme.qwe use ui_cls
+
+let chart_advisor_css = css`
+.ui-chart-advisor { display: grid; gap: 12px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-chart-advisor .ui-chart-advisor-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-chart-advisor-kinds { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0; padding: 0; border: 0; font-size: 13px; }
+.ui-chart-advisor-kinds legend { float: left; margin-right: 8px; padding: 0; color: var(--ui-muted); }
+.ui-chart-advisor-kinds label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.ui-chart-advisor-kinds label[data-off] { color: var(--ui-muted); cursor: not-allowed; }
+.ui-chart-advisor-kinds input { margin: 0; accent-color: var(--ui-accent); }
+.ui-chart-advisor-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; max-width: 440px; }
+.ui-chart-advisor-field { display: grid; gap: 4px; min-width: 0; font-size: 13px; }
+.ui-chart-advisor-field select { box-sizing: border-box; width: 100%; height: 34px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); }
+.ui-chart-advisor-field select:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-chart-advisor-live { display: grid; gap: 6px; min-width: 0; }
+.ui-chart-advisor-why { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-chart-advisor-note { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+.ui-chart-advisor-small { margin: 0; color: var(--ui-muted); font-size: 12px; }
+.ui-chart-advisor-none { margin: 0; color: var(--ui-muted); }
+.ui-chart-advisor-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-chart-advisor-button { justify-self: start; min-height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); cursor: pointer; }
+.ui-chart-advisor-button:hover { border-color: var(--ui-strong); }
+.ui-chart-advisor-button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-chart-advisor-figure { min-width: 0; margin: 0; }
+.ui-chart-advisor-name { margin: 0; font-size: 14px; font-weight: 600; }
+.ui-chart-advisor-svg { display: block; width: 100%; max-width: 720px; height: auto; }
+.ui-chart-advisor-grid { stroke: var(--ui-border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.ui-chart-advisor-base { stroke: var(--ui-strong); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.ui-chart-advisor-text { fill: var(--ui-muted); font: 12px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-chart-advisor-line { fill: none; stroke: var(--ui-accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.ui-chart-advisor-mark { fill: var(--ui-accent); }
+.ui-chart-advisor-rest { fill: var(--ui-strong); }
+.ui-chart-advisor-dot { fill: var(--ui-accent); fill-opacity: .65; }
+.ui-chart-advisor-data summary { color: var(--ui-muted); font-size: 13px; cursor: pointer; }
+.ui-chart-advisor-data summary:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-chart-advisor-box { box-sizing: border-box; width: 100%; min-height: 120px; margin-top: 6px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.4 var(--ui-mono); resize: vertical; }
+.ui-chart-advisor-box:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+@media (max-width: 480px) { .ui-chart-advisor-pair { grid-template-columns: minmax(0, 1fr); } }
+`
+
+let chart_advisor_row_cap = 5000
+let chart_advisor_text_cap = 200000
+let chart_advisor_bar_cap = 12
+let chart_advisor_dot_cap = 1000
+let chart_advisor_months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+let chart_advisor_kinds = [{ id: "line", label: "Line" }, { id: "bar", label: "Bars" }, { id: "scatter", label: "Scatter" }, { id: "histogram", label: "Histogram" }]
+
+// A number with commas and up to two decimals, in whole numbers so that the server
+// and the browser write the same text.
+fn chart_advisor_num(v: num) -> str {
+    let units = round(abs(v) * 100)
+    let whole = floor(units / 100)
+    let frac = units - whole * 100
+    let tail = frac == 0 ? "" : (frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${frac < 10 ? "0" : ""}${frac}`)
+    `${v < 0 && units > 0 ? "-" : ""}${chart_advisor_group(whole)}${tail}`
+}
+
+fn chart_advisor_group(n: num) -> str {
+    if n < 1000 { return str(n) }
+    let rest = str(n % 1000)
+    `${chart_advisor_group(floor(n / 1000))},${repeat("0", 3 - len(rest))}${rest}`
+}
+
+fn chart_advisor_one(v: num) -> str {
+    let tenths = round(abs(v) * 10)
+    `${v < 0 && tenths > 0 ? "-" : ""}${chart_advisor_group(floor(tenths / 10))}.${tenths % 10}`
+}
+
+// A value as a float, from a number or text such as "$1,200.50" or "12%"; null when it is not one.
+fn chart_advisor_number(v) {
+    let kind = type_of(v)
+    if kind == "int" || kind == "float" {
+        let f = float(v)
+        return math.isfinite(f) && abs(f) < 1000000000000000 ? f : null
+    }
+    if kind == "dec" { return float(v) }
+    if kind != "str" { return null }
+    let t = re.replace(trim(v), "[$€£¥₱,\\s%]", "")
+    re.test(t, "^[-+]?\\d{1,15}(\\.\\d{1,12})?$") ? float(dec(t)) : null
+}
+
+// A date as "YYYY-MM-DD" from a date or a date-time, else null.
+fn chart_advisor_day(v) {
+    if type_of(v) != "str" { return null }
+    let t = slice(trim(v), 0, 10)
+    re.test(t, "^\\d{4}-\\d{2}-\\d{2}$") && date.valid(t, "date") ? t : null
+}
+
+fn chart_advisor_blank(v) -> bool = v == null || (type_of(v) == "str" && trim(v) == "")
+
+// "ad_spend" as a sentence would say it.
+fn chart_advisor_words(key: str) -> str = trim(re.replace(replace(replace(key, "_", " "), "-", " "), "\\s+", " "))
+
+fn chart_advisor_capital(s: str) -> str = len(s) == 0 ? s : upper(slice(s, 0, 1)) + slice(s, 1, len(s))
+
+// Which of tab, semicolon and comma a line of headings is split by.
+fn chart_advisor_sep(line: str) -> str {
+    let tally = (s: str) => len(split(line, s)) - 1
+    let tabs = tally("\t")
+    let semis = tally(";")
+    let commas = tally(",")
+    tabs > 0 && tabs >= commas && tabs >= semis ? "\t" : (semis > commas ? ";" : ",")
+}
+
+// CSV's rows, each a list of fields, as RFC 4180 reads them. The characters are split
+// out first: a string indexed by character costs its length each time.
+fn chart_advisor_csv(text: str, sep: str) -> list {
+    let chars = split(text, "")
+    let rows = []
+    let row = []
+    let field = []
+    let quoted = false
+    let i = 0
+    let n = len(chars)
+    while i < n {
+        let c = chars[i]
+        if quoted {
+            if c == "\"" {
+                if i + 1 < n && chars[i + 1] == "\"" { field = push(field, c); i += 1 } else { quoted = false }
+            } else { field = push(field, c) }
+        } else if c == "\"" {
+            quoted = true
+        } else if c == sep {
+            row = push(row, join(field))
+            field = []
+        } else if c == "\n" {
+            rows = push(rows, push(row, join(field)))
+            row = []
+            field = []
+        } else if c != "\r" {
+            field = push(field, c)
+        }
+        i += 1
+    }
+    if len(field) > 0 || len(row) > 0 { rows = push(rows, push(row, join(field))) }
+    rows | filter((r) => !(len(r) == 1 && trim(r[0]) == ""))
+}
+
+// What was pasted to { rows, problems }. Nothing here throws.
+fn chart_advisor_read(text: str) -> map {
+    let long = len(text) > chart_advisor_text_cap
+    let t = trim(long ? slice(text, 0, chart_advisor_text_cap) : text)
+    let cut = long ? [`Only the first ${chart_advisor_group(chart_advisor_text_cap)} characters are read.`] : []
+    if t == "" { return { rows: [], problems: cut } }
+    let head = t[0]
+    if head == "[" || head == "{" {
+        let v = json.parse(t)
+        if is_err(v) { return { rows: [], problems: ["That is not valid JSON: look for a missing comma, bracket or quote."] } }
+        if type_of(v) != "list" { return { rows: [], problems: ["The JSON must be a list of rows, such as [{\"a\": 1}]."] } }
+        let good = v | filter((r) => type_of(r) == "map")
+        let some = len(v) - len(good)
+        return { rows: good, problems: cut + (some > 0 ? [`${some} ${some == 1 ? "item is" : "items are"} not a row, so left out.`] : []) }
+    }
+    let table = chart_advisor_csv(t, chart_advisor_sep(split(t, "\n")[0]))
+    let names = table[0] | map((h) => trim(h))
+    if len(table) < 2 { return { rows: [], problems: cut } }
+    let body = slice(table, 1, len(table))
+    let fits = body | filter((r) => len(r) == len(names))
+    let misfits = len(body) - len(fits)
+    let where_bad = find(range(len(body)), (i) => len(body[i]) != len(names))
+    let rows = fits | map((r) => reduce(range(len(names)), {}, (m, i) => set(m, filled(names[i]) ?? `column ${i + 1}`, r[i])))
+    { rows, problems: cut + (misfits > 0 ? [`${misfits} ${misfits == 1 ? "row does" : "rows do"} not have ${len(names)} fields, so left out (first at row ${where_bad == null ? 0 : where_bad + 2}).`] : []) }
+}
+
+// A month's place from its name, 1 to 12, or null: "Jan", "january", "Sept".
+fn chart_advisor_month(v) {
+    if type_of(v) != "str" { return null }
+    let t = lower(trim(v))
+    if !re.test(t, "^(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|june?|july?|aug(ust)?|sept?(ember)?|oct(ober)?|nov(ember)?|dec(ember)?)$") { return null }
+    let at = index_of(chart_advisor_months, slice(t, 0, 3))
+    at == null ? null : at + 1
+}
+
+// What a column is: { key, title, kind, values, numbers, ranks, distinct, average }. kind is
+// "number", "time", "id" or "category"; ranks order a time column's values.
+fn chart_advisor_column(key: str, values: list) -> map {
+    let present = values | filter((v) => !chart_advisor_blank(v))
+    let numbers = values | map(chart_advisor_number)
+    let counted = numbers | filter((n) => n != null)
+    let name = lower(key)
+    let is_number = len(present) >= 1 && len(counted) >= 0.9 * len(present)
+    let is_date = len(present) >= 1 && all(present, (v) => chart_advisor_day(v) != null)
+    let is_month = len(present) >= 2 && all(present, (v) => chart_advisor_month(v) != null)
+    let is_year = is_number && re.test(name, "year") && all(counted, (n) => n == floor(n) && n >= 1000 && n <= 3000)
+    let count_up = len(counted) >= 5 && all(range(1, len(counted)), (i) => counted[i] - counted[i - 1] == 1)
+    let id_like = re.test(name, "(^|[_ -])(id|no|number|code)$") || count_up
+    let timed = is_date || is_month || is_year
+    let kind = timed ? "time" : (is_number ? (id_like ? "id" : "number") : "category")
+    let ranks = !timed ? null : values | map((v) => {
+        if chart_advisor_blank(v) { return null }
+        is_date ? date.days_between("2000-01-01", chart_advisor_day(v)) : (is_month ? chart_advisor_month(v) : chart_advisor_number(v))
+    })
+    { key, title: chart_advisor_words(key), kind, values, numbers, ranks, distinct: len(unique(present | map((v) => str(v)))),
+      average: re.test(name, "rate|percent|pct|ratio|avg|average|mean|median|score|rating|margin|share|price|age|index") || any(present, (v) => type_of(v) == "str" && contains(v, "%")) }
+}
+
+fn chart_advisor_columns(rows: list) -> list {
+    let names = unique(flatten(rows | map((r) => keys(r))))
+    slice(names, 0, 40) | map((k) => chart_advisor_column(k, rows | map((r) => r[k]))) | filter((c) => c.distinct > 0)
+}
+
+fn chart_advisor_many(n: int, one: str) -> str = n == 1 ? `1 ${one}` : `${n} ${one}s`
+
+// The chart this shape of data asks for: { kind, x, y, why }, x and y being columns; null
+// when there is nothing to draw.
+fn chart_advisor_pick(cols: list) {
+    let nums = cols | filter((c) => c.kind == "number")
+    let times = cols | filter((c) => c.kind == "time")
+    let cats = cols | filter((c) => c.kind == "category")
+    let time = find(times, (c) => c.distinct >= 3)
+    let cat = find(cats, (c) => c.distinct >= 2) ?? first(cats) ?? first(times)
+    if len(nums) >= 1 && time != null {
+        return { kind: "line", x: time, y: nums[0], why: `A date and a number: a line shows how ${nums[0].title} moves over ${time.title}.` }
+    }
+    if len(nums) >= 1 && cat != null {
+        return { kind: "bar", x: cat, y: nums[0], why: `A category and a number: bars compare ${nums[0].title} across ${chart_advisor_many(cat.distinct, cat.title)}.` }
+    }
+    if len(nums) >= 2 {
+        return { kind: "scatter", x: nums[0], y: nums[1], why: `Two numbers: a scatter shows whether ${nums[0].title} and ${nums[1].title} go together.` }
+    }
+    if len(nums) == 1 {
+        return { kind: "histogram", x: nums[0], y: nums[0], why: `One number: a histogram shows how the values of ${nums[0].title} are spread.` }
+    }
+    if time != null { return { kind: "line", x: time, y: null, why: `Dates alone: a line of how many rows fall on each ${time.title}.` } }
+    if cat != null { return { kind: "bar", x: cat, y: null, why: `A category alone: bars count the rows in each ${cat.title}.` } }
+    null
+}
+
+// Whether a chart suits these columns: { ok, note }. ok false means it cannot be drawn;
+// a note says what is wrong with one that can.
+fn chart_advisor_fit(kind: str, x, y) -> map {
+    let is_num = (c) => c != null && (c.kind == "number" || c.kind == "id")
+    if kind == "scatter" {
+        return is_num(x) && is_num(y) ? { ok: true, note: null } : { ok: false, note: "A scatter needs two columns of numbers." }
+    }
+    if kind == "histogram" {
+        return is_num(y) || is_num(x) ? { ok: true, note: null } : { ok: false, note: "A histogram needs a column of numbers." }
+    }
+    if x == null { return { ok: false, note: "Pick a column to go across." } }
+    if kind == "line" && x.kind != "time" {
+        return { ok: true, note: `A line says that one point leads to the next, and ${x.title} has no order of that kind.` }
+    }
+    if kind == "bar" && x.kind == "time" && x.distinct > 30 {
+        return { ok: true, note: `${x.distinct} dates make thin bars: a line reads better.` }
+    }
+    { ok: true, note: null }
+}
+
+// One value for each place on the axis: { label, value, rank, seen } in first-seen order.
+fn chart_advisor_gather(x: map, y) -> map {
+    let n = len(x.values)
+    let used = range(n) | filter((i) => !chart_advisor_blank(x.values[i]) && (y == null || y.numbers[i] != null))
+    let groups = group_by(used, (i) => str(x.values[i]))
+    let points = for [label, members] in groups {
+        let numbers = y == null ? [] : members | map((i) => y.numbers[i])
+        let value = y == null ? len(members) : (y.average ? sum(numbers) / len(numbers) : float(sum(numbers | map((v) => dec(v)))))
+        { label, value, rank: x.ranks == null ? 0 : x.ranks[members[0]] }
+    }
+    { points, skipped: n - len(used) }
+}
+
+// The axis from lo to hi, widened to round ticks: about four steps of 1, 2, 2.5 or 5 x 10^n.
+fn chart_advisor_scale(lo: num, hi: num) -> map {
+    let span = hi - lo == 0 ? (lo == 0 ? 1 : abs(lo)) : hi - lo
+    let raw = span / 4
+    let mag = 1
+    while mag * 10 <= raw { mag = mag * 10 }
+    while mag > raw { mag = mag / 10 }
+    let r = raw / mag
+    let step = (r <= 1 ? 1 : (r <= 2 ? 2 : (r <= 2.5 ? 2.5 : (r <= 5 ? 5 : 10)))) * mag
+    let a = floor(lo / step + 0.000001)
+    let b0 = ceil(hi / step - 0.000001)
+    let b = b0 == a ? a + 1 : b0
+    { lo: a * step, hi: b * step, ticks: for i in range(b - a + 1) => (a + i) * step }
+}
+
+fn chart_advisor_xy(v: num) -> str {
+    let tenths = round(v * 10)
+    let a = abs(tenths)
+    `${tenths < 0 ? "-" : ""}${floor(a / 10)}${a % 10 == 0 ? "" : `.${a % 10}`}`
+}
+
+fn chart_advisor_short(label: str) -> str = len(label) > 18 ? `${slice(label, 0, 17)}…` : label
+
+let chart_advisor_left = 64
+let chart_advisor_right = 624
+let chart_advisor_top = 14
+let chart_advisor_bottom = 262
+
+fn chart_advisor_y_ticks(s: map) -> list {
+    let y = (v: num) => chart_advisor_bottom - (chart_advisor_bottom - chart_advisor_top) * (v - s.lo) / (s.hi - s.lo)
+    s.ticks | map((t) => ({ y: chart_advisor_xy(y(t)), text_y: chart_advisor_xy(y(t) + 4), label: chart_advisor_num(t) }))
+}
+
+// A line through the points in time order, or as given.
+fn chart_advisor_draw_line(points: list) -> map {
+    let n = len(points)
+    let values = points | map((p) => p.value)
+    let s = chart_advisor_scale(min(values), max(values))
+    let x = (i: int) => n == 1 ? (chart_advisor_left + chart_advisor_right) / 2 : chart_advisor_left + (chart_advisor_right - chart_advisor_left) * i / (n - 1)
+    let y = (v: num) => chart_advisor_bottom - (chart_advisor_bottom - chart_advisor_top) * (v - s.lo) / (s.hi - s.lo)
+    let places = n <= 2 ? range(n) : [0, floor((n - 1) / 2), n - 1]
+    { height: 290, ticks: chart_advisor_y_ticks(s),
+      path: join(for i in range(n) => `${i == 0 ? "M" : "L"}${chart_advisor_xy(x(i))} ${chart_advisor_xy(y(values[i]))}`, " "),
+      dots: n > 40 ? [] : for i in range(n) => { x: chart_advisor_xy(x(i)), y: chart_advisor_xy(y(values[i])), tip: `${points[i].label}: ${chart_advisor_num(values[i])}` },
+      labels: places | map((i) => ({ x: chart_advisor_xy(x(i)), label: chart_advisor_short(points[i].label), anchor: i == 0 ? "start" : (i == n - 1 ? "end" : "middle") })) }
+}
+
+// Bars across: long labels read better beside a bar than under it.
+fn chart_advisor_draw_bars(points: list) -> map {
+    let start = 150
+    let end = 570
+    let values = points | map((p) => p.value)
+    let lo = min(values + [0])
+    let hi = max(values + [0])
+    let span = hi - lo == 0 ? 1 : hi - lo
+    let x = (v: num) => start + (end - start) * (v - lo) / span
+    let zero = x(0)
+    { height: 12 + 26 * len(points), zero: chart_advisor_xy(zero),
+      bars: for i in range(len(points)) {
+          let p = points[i]
+          let a = x(min([p.value, 0]))
+          let b = x(max([p.value, 0]))
+          { y: chart_advisor_xy(6 + 26 * i), label_y: chart_advisor_xy(22 + 26 * i), x: chart_advisor_xy(a), w: chart_advisor_xy(max([b - a, 1])), value_x: chart_advisor_xy(b + 6),
+            label: chart_advisor_short(p.label), value: chart_advisor_num(p.value), rest: p.rest == true, tip: `${p.label}: ${chart_advisor_num(p.value)}` }
+      } }
+}
+
+fn chart_advisor_draw_scatter(points: list) -> map {
+    let xs = points | map((p) => p.x)
+    let ys = points | map((p) => p.y)
+    let sx = chart_advisor_scale(min(xs), max(xs))
+    let sy = chart_advisor_scale(min(ys), max(ys))
+    let px = (v: num) => chart_advisor_left + (chart_advisor_right - chart_advisor_left) * (v - sx.lo) / (sx.hi - sx.lo)
+    let py = (v: num) => chart_advisor_bottom - (chart_advisor_bottom - chart_advisor_top) * (v - sy.lo) / (sy.hi - sy.lo)
+    { height: 290, ticks: chart_advisor_y_ticks(sy),
+      labels: sx.ticks | map((t) => ({ x: chart_advisor_xy(px(t)), label: chart_advisor_num(t), anchor: "middle" })),
+      dots: points | map((p) => ({ x: chart_advisor_xy(px(p.x)), y: chart_advisor_xy(py(p.y)), tip: `${chart_advisor_num(p.x)}, ${chart_advisor_num(p.y)}` })) }
+}
+
+// Bins of even width: Sturges's number of them, or one when every value is the same.
+fn chart_advisor_bins(xs: list) -> list {
+    let lo = min(xs)
+    let hi = max(xs)
+    if lo == hi { return [{ lo, hi, count: len(xs) }] }
+    let many = ceil(math.log2(len(xs))) + 1
+    let width = (hi - lo) / many
+    let at = (x: num) => min([floor((x - lo) / width), many - 1])
+    let groups = group_by(xs, at)
+    for b in range(many) => { lo: lo + b * width, hi: lo + (b + 1) * width, count: len(groups[str(b)] ?? []) }
+}
+
+fn chart_advisor_draw_histogram(bins: list) -> map {
+    let n = len(bins)
+    let s = chart_advisor_scale(0, max(bins | map((b) => b.count)))
+    let w = (chart_advisor_right - chart_advisor_left) / n
+    let y = (v: num) => chart_advisor_bottom - (chart_advisor_bottom - chart_advisor_top) * (v - s.lo) / (s.hi - s.lo)
+    { height: 290, ticks: chart_advisor_y_ticks(s),
+      labels: [{ x: chart_advisor_xy(chart_advisor_left), label: chart_advisor_num(bins[0].lo), anchor: "start" }, { x: chart_advisor_xy(chart_advisor_right), label: chart_advisor_num(bins[n - 1].hi), anchor: "end" }],
+      bars: for i in range(n) {
+          let b = bins[i]
+          { x: chart_advisor_xy(chart_advisor_left + w * i + 1), y: chart_advisor_xy(y(b.count)), w: chart_advisor_xy(max([w - 2, 1])), h: chart_advisor_xy(max([chart_advisor_bottom - y(b.count), 0])),
+            tip: `${chart_advisor_num(b.lo)} to ${chart_advisor_num(b.hi)}: ${b.count}` }
+      } }
+}
+
+// Everything the chart needs for a choice: { kind, name, table, line, bars, dots, ... }.
+fn chart_advisor_build(kind: str, x, y) -> map {
+    let measure = y == null ? "Rows" : `${y.average ? "Average " : ""}${y.title}`
+    if kind == "scatter" {
+        let both = range(len(x.numbers)) | filter((i) => x.numbers[i] != null && y.numbers[i] != null)
+        let step = ceil(len(both) / chart_advisor_dot_cap)
+        let picked = step <= 1 ? both : range(len(both)) | filter((i) => i % step == 0) | map((i) => both[i])
+        let points = picked | map((i) => ({ x: x.numbers[i], y: y.numbers[i] }))
+        return { kind, name: `${chart_advisor_capital(y.title)} against ${x.title}`, count: len(points), scatter: len(points) == 0 ? null : chart_advisor_draw_scatter(points),
+                 skipped: len(x.numbers) - len(both), sampled: len(both) > len(points) ? len(both) : 0,
+                 table: slice(points, 0, 30) | map((p) => ({ label: chart_advisor_num(p.x), value: chart_advisor_num(p.y) })), head: [x.title, y.title] }
+    }
+    if kind == "histogram" {
+        let col = y ?? x
+        let xs = col.numbers | filter((v) => v != null)
+        let bins = len(xs) == 0 ? [] : chart_advisor_bins(xs)
+        return { kind, name: `How ${col.title} is spread`, count: len(xs), histogram: len(xs) == 0 ? null : chart_advisor_draw_histogram(bins),
+                 skipped: len(col.numbers) - len(xs), sampled: 0,
+                 table: bins | map((b) => ({ label: `${chart_advisor_num(b.lo)} to ${chart_advisor_num(b.hi)}`, value: str(b.count) })), head: [col.title, "Rows"] }
+    }
+    let gathered = chart_advisor_gather(x, y)
+    let in_time = x.kind == "time"
+    let ordered = in_time ? sort_by(gathered.points, (p) => p.rank) : gathered.points
+    let name = chart_advisor_capital(`${measure} by ${x.title}`)
+    if kind == "line" {
+        return { kind, name, count: len(ordered), line: len(ordered) == 0 ? null : chart_advisor_draw_line(ordered), skipped: gathered.skipped, sampled: 0,
+                 table: slice(ordered, 0, 30) | map((p) => ({ label: p.label, value: chart_advisor_num(p.value) })), head: [x.title, measure] }
+    }
+    let sized = in_time ? ordered : reverse(sort_by(reverse(ordered), (p) => p.value))
+    let head_bars = slice(sized, 0, chart_advisor_bar_cap)
+    let rest = slice(sized, chart_advisor_bar_cap, len(sized))
+    let rest_value = y != null && y.average ? sum(rest | map((p) => p.value)) / max([len(rest), 1]) : float(sum(rest | map((p) => dec(p.value))))
+    let bars = len(rest) == 0 ? head_bars : push(head_bars, { label: `Other (${len(rest)})`, value: rest_value, rest: true })
+    { kind, name, count: len(bars), bars: len(bars) == 0 ? null : chart_advisor_draw_bars(bars), skipped: gathered.skipped, sampled: 0,
+      table: bars | map((p) => ({ label: p.label, value: chart_advisor_num(p.value) })), head: [x.title, measure] }
+}
+
+fn chart_advisor_shown(kind: str) -> str = (find(chart_advisor_kinds, (k) => k.id == kind) ?? { label: "Chart" }).label
+
+component ChartAdvisor(rows: list = [], chart: str? = null, title: str = "Chart advice", id: str = "chart-advisor", name: str? = null, on_change = null, class: str? = null) {
+    style global chart_advisor_css
+    state text = len(rows) == 0 ? "" : json.stringify(rows)
+    state picked = chart
+    state x_key = null
+    state y_key = null
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let read = chart_advisor_read(text)
+    let got = slice(read.rows, 0, chart_advisor_row_cap)
+    let cols = chart_advisor_columns(got)
+    let advice = chart_advisor_pick(cols)
+    let col_of = (k) => k == null ? null : find(cols, (c) => c.key == k)
+    let usable = advice != null
+    let x = usable ? (col_of(x_key) ?? advice.x) : null
+    let y = usable ? (y_key == "" ? null : (col_of(y_key) ?? advice.y)) : null
+    let number_cols = cols | filter((c) => c.kind == "number" || c.kind == "id")
+    let choice = usable ? (picked ?? advice.kind) : null
+    let fits = usable ? chart_advisor_kinds | map((k) => ({ ...k, fit: chart_advisor_fit(k.id, x, y) })) : []
+    let current = usable ? (find(fits, (k) => k.id == choice) ?? fits[0]) : null
+    let kind = usable ? (current.fit.ok ? choice : advice.kind) : null
+    let refused = usable && !current.fit.ok
+    // A refused choice falls back to the advice whole: its chart on its own columns.
+    let drawn = usable ? chart_advisor_build(kind, refused ? advice.x : x, refused ? advice.y : y) : null
+    let note = usable && !refused ? current.fit.note : null
+    let own = usable && (picked != null || x_key != null || y_key != null)
+    let label_of = (k: map) => k.fit.ok ? k.label : `${k.label} (not for this data)`
+    let tell = () => {
+        if on_change != null {
+            let c = chart_advisor_columns(slice(chart_advisor_read(text).rows, 0, chart_advisor_row_cap))
+            let a = chart_advisor_pick(c)
+            if a == null { on_change(null) } else {
+                let xc = (x_key == null ? null : find(c, (o) => o.key == x_key)) ?? a.x
+                let yc = y_key == "" ? null : ((y_key == null ? null : find(c, (o) => o.key == y_key)) ?? a.y)
+                let wanted = picked ?? a.kind
+                let done = chart_advisor_fit(wanted, xc, yc).ok ? wanted : a.kind
+                on_change({ kind: done, x: xc.key, y: yc == null ? null : yc.key, advised: a.kind })
+            }
+        }
+    }
+    let reset = () => { picked = null; x_key = null; y_key = null; tell() }
+    <section class={ui_cls(["ui-chart-advisor", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-chart-advisor-title id={`${id}-title`}>{title}</h3>
+        <div.ui-chart-advisor-live aria-live="polite">
+            {len(read.problems) > 0 && <ul.ui-chart-advisor-problems role="alert">{for p in read.problems => <li>{p}</li>}</ul>}
+            {!usable && <p.ui-chart-advisor-none>{len(got) == 0 ? "Nothing to chart yet." : "No column here can be charted."}</p>}
+            {usable && <p.ui-chart-advisor-why data-k="why"><strong>{chart_advisor_shown(advice.kind)}.</strong> {advice.why}</p>}
+            {refused && <p.ui-chart-advisor-note data-k="refused">{current.fit.note} Showing the advice instead.</p>}
+            {note != null && <p.ui-chart-advisor-note data-k="note">{note}</p>}
+        </div>
+        {usable && <fieldset.ui-chart-advisor-kinds>
+            <legend>Chart</legend>
+            {for k in fits => <label key={k.id} data-off={k.fit.ok ? null : "true"} title={k.fit.note}>
+                <input type="radio" name={named("chart")} value={k.id} checked={k.id == kind} disabled={!k.fit.ok} @change={() => { picked = k.id; tell() }}/> {label_of(k)}</label>}
+        </fieldset>}
+        {usable && <div.ui-chart-advisor-pair>
+            <label.ui-chart-advisor-field for={`${id}-x`}>{kind == "scatter" ? "Across" : "Across, or the column"}
+                <select id={`${id}-x`} name={named("x")} @change={(e) => { x_key = e.value; tell() }}>
+                    {for c in cols => <option key={c.key} value={c.key} selected={c.key == x.key}>{c.title}</option>}
+                </select></label>
+            <label.ui-chart-advisor-field for={`${id}-y`}>Value
+                <select id={`${id}-y`} name={named("y")} @change={(e) => { y_key = e.value; tell() }}>
+                    <option value="" selected={y == null}>Count of rows</option>
+                    {for c in number_cols => <option key={c.key} value={c.key} selected={y != null && c.key == y.key}>{c.title}</option>}
+                </select></label>
+        </div>}
+        {own && <button.ui-chart-advisor-button type="button" @click={reset}>Back to the advice</button>}
+        {usable && <figure.ui-chart-advisor-figure>
+            <figcaption.ui-chart-advisor-name>{drawn.name}</figcaption>
+            {drawn.line != null && <svg.ui-chart-advisor-svg data-chart="line" viewBox="0 0 640 290" role="img" aria-label={`${drawn.name}: a line of ${drawn.count} points.`}>
+                {for t in drawn.line.ticks => <line.ui-chart-advisor-grid key={t.label} x1="64" x2="624" y1={t.y} y2={t.y}/>}
+                {for t in drawn.line.ticks => <text.ui-chart-advisor-text key={t.label} x="56" y={t.text_y} text-anchor="end">{t.label}</text>}
+                <path.ui-chart-advisor-line d={drawn.line.path}/>
+                {for d in drawn.line.dots => <circle.ui-chart-advisor-mark cx={d.x} cy={d.y} r="3"><title>{d.tip}</title></circle>}
+                {for l in drawn.line.labels => <text.ui-chart-advisor-text x={l.x} y="282" text-anchor={l.anchor}>{l.label}</text>}
+            </svg>}
+            {drawn.bars != null && <svg.ui-chart-advisor-svg data-chart="bar" viewBox={`0 0 640 ${drawn.bars.height}`} role="img" aria-label={`${drawn.name}: ${chart_advisor_many(drawn.count, "bar")}, largest first.`}>
+                <line.ui-chart-advisor-base x1={drawn.bars.zero} x2={drawn.bars.zero} y1="0" y2={drawn.bars.height}/>
+                {for b in drawn.bars.bars => <rect key={b.label} x={b.x} y={b.y} width={b.w} height="20" class={b.rest ? "ui-chart-advisor-rest" : "ui-chart-advisor-mark"}><title>{b.tip}</title></rect>}
+                {for b in drawn.bars.bars => <text.ui-chart-advisor-text key={b.label} x="142" y={b.label_y} text-anchor="end">{b.label}</text>}
+                {for b in drawn.bars.bars => <text.ui-chart-advisor-text key={b.label} x={b.value_x} y={b.label_y}>{b.value}</text>}
+            </svg>}
+            {drawn.scatter != null && <svg.ui-chart-advisor-svg data-chart="scatter" viewBox="0 0 640 290" role="img" aria-label={`${drawn.name}: ${chart_advisor_many(drawn.count, "point")}.`}>
+                {for t in drawn.scatter.ticks => <line.ui-chart-advisor-grid key={t.label} x1="64" x2="624" y1={t.y} y2={t.y}/>}
+                {for t in drawn.scatter.ticks => <text.ui-chart-advisor-text key={t.label} x="56" y={t.text_y} text-anchor="end">{t.label}</text>}
+                {for d in drawn.scatter.dots => <circle.ui-chart-advisor-dot cx={d.x} cy={d.y} r="4"><title>{d.tip}</title></circle>}
+                {for l in drawn.scatter.labels => <text.ui-chart-advisor-text key={l.label} x={l.x} y="282" text-anchor={l.anchor}>{l.label}</text>}
+            </svg>}
+            {drawn.histogram != null && <svg.ui-chart-advisor-svg data-chart="histogram" viewBox="0 0 640 290" role="img" aria-label={`${drawn.name}: ${drawn.count} values.`}>
+                {for t in drawn.histogram.ticks => <line.ui-chart-advisor-grid key={t.label} x1="64" x2="624" y1={t.y} y2={t.y}/>}
+                {for t in drawn.histogram.ticks => <text.ui-chart-advisor-text key={t.label} x="56" y={t.text_y} text-anchor="end">{t.label}</text>}
+                {for b in drawn.histogram.bars => <rect.ui-chart-advisor-mark x={b.x} y={b.y} width={b.w} height={b.h}><title>{b.tip}</title></rect>}
+                {for l in drawn.histogram.labels => <text.ui-chart-advisor-text key={l.label} x={l.x} y="282" text-anchor={l.anchor}>{l.label}</text>}
+            </svg>}
+            {drawn.count == 0 && <p.ui-chart-advisor-none>No rows have both columns filled in.</p>}
+            <table.ui-sr>
+                <caption>{drawn.name}</caption>
+                <thead><tr><th scope="col">{drawn.head[0]}</th><th scope="col">{drawn.head[1]}</th></tr></thead>
+                <tbody>{for r in drawn.table => <tr><td>{r.label}</td><td>{r.value}</td></tr>}</tbody>
+            </table>
+        </figure>}
+        {usable && drawn.skipped > 0 && <p.ui-chart-advisor-small>{chart_advisor_many(drawn.skipped, "row")} with an empty value left out.</p>}
+        {usable && drawn.sampled > 0 && <p.ui-chart-advisor-small>Showing {drawn.count} of {drawn.sampled} points, evenly picked.</p>}
+        {len(read.rows) > chart_advisor_row_cap && <p.ui-chart-advisor-small>Only the first {chart_advisor_row_cap} rows are read; {len(read.rows) - chart_advisor_row_cap} more were left out.</p>}
+        <details.ui-chart-advisor-data>
+            <summary>The data</summary>
+            <label.ui-sr for={`${id}-data`}>Rows, as JSON or CSV</label>
+            <textarea.ui-chart-advisor-box id={`${id}-data`} name={named("data")} spellcheck="false" rows="8" @input={(e) => { text = e.value; tell() }}>{text}</textarea>
+        </details>
+    </section>
+}

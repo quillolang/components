@@ -1,0 +1,375 @@
+// AccessChecker: works out who may do what from a policy given as data. Roles
+// inherit from other roles, users hold roles, and rules allow or deny an action on a
+// resource. Pick who, an action and a resource and it says allow or deny and the
+// exact rule that decided, through which roles it got there. A deny beats any allow,
+// whatever the order of the rules, and what no rule allows is denied. Below it, the
+// matrix of every user and role against every action on every resource; a cell picks
+// that case. A role that inherits itself is reported, with the loop spelt out, and
+// inheritance stops going round it, so one bad line still leaves answers.
+//
+//   <AccessChecker roles={{ viewer: [], editor: ["viewer"] }} users={{ ada: ["editor"] }}
+//                  rules={[{ effect: "allow", role: "viewer", action: "read", resource: "docs/*" },
+//                          { effect: "deny", user: "ada", action: "delete", resource: "docs/final" }]}/>
+//   <AccessChecker roles={roles} users={users} rules={rules} resources={["docs/plan", "billing"]}
+//                  actions={["read", "write"]} on_decide={(d) => { last = d }}/>
+//
+// roles: a map from each role to the roles it inherits. users: a map from each user
+// to the roles they hold. rules: a list of maps, each { effect: "allow" or "deny",
+// role or user: who it is for (role "*" is everyone), action, resource, note }; in
+// action and resource a `*` stands for any text, so "docs/*" takes "docs/plan" and
+// "docs/a/b" but not "docs". note is an optional reason shown with the rule. actions,
+// resources: what the matrix and the pickers offer (left out, those the rules name).
+// who, action, resource: where the pickers start. editable: shows the policy as JSON
+// to change (true); bad JSON, unknown roles and bad rules are each said by name, and
+// the field is named `policy`, the pickers `who`, `action` and `resource`, so a form
+// around it sends them. title: its heading. id: a prefix for its ids, unique on the
+// page. limit: the most matrix cells to work out (3000): past it fewer resources show
+// and it says so. on_decide(decision): inside one of your components, given
+// { who, action, resource, allowed, rule, via, reason } after each change; rule is
+// the deciding rule's number from 1, or null. class: more classes for its outer element.
+//
+// access_checker_model(roles, users, rules, actions, resources) checks the policy
+// and gives what the others take; access_checker_decide(model, who, action, resource)
+// and access_checker_matrix(model, limit) work in a program, on the server too.
+
+import ui/theme.qwe use ui_cls
+
+let access_checker_css = css`
+.ui-access-checker { display: grid; gap: 16px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-access-checker .ui-access-checker-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-access-checker-ask { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.ui-access-checker-field { display: grid; gap: 5px; min-width: 0; }
+.ui-access-checker-field label { font-size: 13px; font-weight: 500; }
+.ui-access-checker-field select, .ui-access-checker-field input { box-sizing: border-box; width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); }
+.ui-access-checker-field select:focus-visible, .ui-access-checker-field input:focus-visible, .ui-access-checker-policy textarea:focus-visible {
+  outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-access-checker-answer { display: grid; gap: 6px; padding: 12px 14px; border-radius: var(--ui-radius-sm); border-left: 4px solid var(--ui-border); background: var(--ui-subtle); }
+.ui-access-checker-allow { border-left-color: var(--ui-success); }
+.ui-access-checker-deny { border-left-color: var(--ui-danger); }
+.ui-access-checker-verdict { font-size: 16px; font-weight: 700; }
+.ui-access-checker-allow .ui-access-checker-verdict { color: var(--ui-success); }
+.ui-access-checker-deny .ui-access-checker-verdict { color: var(--ui-danger); }
+.ui-access-checker-reason, .ui-access-checker-via, .ui-access-checker-others { margin: 0; overflow-wrap: anywhere; }
+.ui-access-checker-via, .ui-access-checker-others { color: var(--ui-muted); font-size: 13px; }
+.ui-access-checker-rule { font-family: var(--ui-mono); font-size: 13px; }
+.ui-access-checker-problems { display: grid; gap: 4px; margin: 0; padding: 10px 12px 10px 28px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+.ui-access-checker-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-access-checker-error { margin: 0; color: var(--ui-danger); font-size: 13px; overflow-wrap: anywhere; }
+.ui-access-checker-scroll { overflow-x: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-access-checker-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-access-checker table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-access-checker caption { padding: 8px 10px; text-align: left; font-weight: 600; }
+.ui-access-checker th, .ui-access-checker td { padding: 4px 6px; border: 1px solid var(--ui-border); text-align: center; white-space: nowrap; }
+.ui-access-checker thead th { background: var(--ui-subtle); font-weight: 600; }
+.ui-access-checker tbody th { position: sticky; left: 0; background: var(--ui-surface); text-align: left; font-weight: 500; }
+.ui-access-checker-role { color: var(--ui-muted); font-weight: 400; }
+.ui-access-checker-cell { width: 26px; height: 26px; padding: 0; border: 1px solid transparent; border-radius: 4px; background: none; font: 600 13px/1 var(--ui-font); cursor: pointer; }
+.ui-access-checker-cell:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-access-checker-yes { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-access-checker-no { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-access-checker-picked { border-color: var(--ui-fg); }
+.ui-access-checker-policy summary { font-weight: 600; cursor: pointer; }
+.ui-access-checker-policy summary:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 4px; }
+.ui-access-checker-policy textarea { box-sizing: border-box; width: 100%; margin-top: 8px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.5 var(--ui-mono); resize: vertical; }
+`
+
+let access_checker_most_rules = 2000
+let access_checker_most_roles = 2000
+
+// A list of the names in x, as text; anything else is an empty list.
+fn access_checker_names(x) -> list = type_of(x) == "list" ? x | filter((n) => type_of(n) == "str") : (type_of(x) == "str" ? [x] : [])
+
+// The loops in the roles, each as its names with the first repeated at the end:
+// ["a", "b", "a"]. Each role is walked once, so this stays linear however tangled
+// they are; a role two loops share reports both only if each adds an edge back.
+fn access_checker_cycles(roles: map) -> list {
+    let done = {}
+    let found = []
+    // A local `fn` cannot call itself in browser code, so a lambda in a variable does.
+    let visit = null
+    visit = (name: str, trail: list) => {
+        for next in access_checker_names(get(roles, name)) {
+            let at = index_of(trail, next)
+            if at != null {
+                found = push(found, slice(trail, at, len(trail)) + [next])
+            } else if !has(done, next) && has(roles, next) {
+                visit(next, trail + [next])
+            }
+        }
+        done = set(done, name, true)
+    }
+    for name in keys(roles) {
+        if !has(done, name) { visit(name, [name]) }
+    }
+    found
+}
+
+// Every role reached from `starts`, nearest first, each once, with the way to it:
+// [{ name, path: ["editor", "viewer"] }]. Seen roles are skipped, so a loop ends here.
+fn access_checker_reach(roles: map, starts: list) -> list {
+    let seen = {}
+    let out = []
+    let queue = starts | map((s) => { name: s, path: [s] })
+    let i = 0
+    while i < len(queue) {
+        let item = queue[i]
+        i += 1
+        if !has(seen, item.name) {
+            seen = set(seen, item.name, true)
+            out = push(out, item)
+            for next in access_checker_names(get(roles, item.name)) {
+                queue = push(queue, { name: next, path: item.path + [next] })
+            }
+        }
+    }
+    out
+}
+
+// Whether a pattern takes a value; `*` stands for any text, slashes too.
+fn access_checker_glob(pattern: str, value: str) -> bool {
+    if pattern == "*" { return true }
+    let parts = split(pattern, "*")
+    if len(parts) == 1 { return pattern == value }
+    let head = parts[0]
+    let tail = parts[-1]
+    if !starts_with(value, head) || len(value) < len(head) + len(tail) || !ends_with(value, tail) { return false }
+    let rest = slice(value, len(head), len(value) - len(tail))
+    let ok = true
+    for part in slice(parts, 1, len(parts) - 1) {
+        let at = index_of(rest, part)
+        if at == null { ok = false } else { rest = slice(rest, at + len(part), len(rest)) }
+    }
+    ok
+}
+
+// A rule as a line: "deny role editor delete docs/*".
+fn access_checker_rule_text(r: map) -> str {
+    let who = r.user != null ? `user ${r.user}` : (r.role == "*" ? "everyone" : `role ${r.role}`)
+    `${r.effect} ${who} ${r.action} ${r.resource}`
+}
+
+// What is wrong with a rule, or null. i is its number from 1.
+fn access_checker_rule_problem(r, i: int, role_names: list, user_names: list) -> str? {
+    if type_of(r) != "map" { return `Rule ${i} is not a map of fields, so it is ignored.` }
+    if r.effect != "allow" && r.effect != "deny" { return `Rule ${i} needs effect "allow" or "deny", so it is ignored.` }
+    if r.role == null && r.user == null { return `Rule ${i} names neither a role nor a user, so it is ignored.` }
+    if type_of(r.action) != "str" || type_of(r.resource) != "str" { return `Rule ${i} needs an action and a resource, so it is ignored.` }
+    if r.role != null && r.role != "*" && !contains(role_names, r.role) { return `Rule ${i} names the role "${r.role}", which is not in the roles.` }
+    if r.user != null && !contains(user_names, r.user) { return `Rule ${i} names the user "${r.user}", who is not in the users.` }
+    null
+}
+
+// The policy checked and put in order: { roles, users, rules (each with its number
+// n), actions, resources, cycles, problems (text), who (the picks: { id, kind, name }) }.
+// Anything that is not the right shape counts as empty, and is said in problems.
+fn access_checker_model(roles, users, rules, actions = null, resources = null) -> map {
+    let problems = []
+    let role_map = type_of(roles) == "map" ? roles : {}
+    let user_map = type_of(users) == "map" ? users : {}
+    let rule_list = type_of(rules) == "list" ? rules : []
+    if roles != null && type_of(roles) != "map" { problems = push(problems, "roles must be a map from each role to the roles it inherits.") }
+    if users != null && type_of(users) != "map" { problems = push(problems, "users must be a map from each user to their roles.") }
+    if rules != null && type_of(rules) != "list" { problems = push(problems, "rules must be a list.") }
+    if len(keys(role_map)) > access_checker_most_roles { problems = push(problems, `Only the first ${access_checker_most_roles} roles are read.`); role_map = reduce(take(keys(role_map), access_checker_most_roles), {}, (m, k) => set(m, k, get(role_map, k))) }
+    if len(rule_list) > access_checker_most_rules { problems = push(problems, `Only the first ${access_checker_most_rules} rules are read.`); rule_list = take(rule_list, access_checker_most_rules) }
+    let role_names = keys(role_map)
+    let user_names = keys(user_map)
+    for [name, parents] in role_map {
+        for p in access_checker_names(parents) {
+            if !has(role_map, p) { problems = push(problems, `Role "${name}" inherits "${p}", which is not in the roles.`) }
+        }
+    }
+    for [name, held] in user_map {
+        for r in access_checker_names(held) {
+            if !has(role_map, r) { problems = push(problems, `User "${name}" holds "${r}", which is not in the roles.`) }
+        }
+    }
+    let cycles = access_checker_cycles(role_map)
+    for c in cycles { problems = push(problems, `Roles inherit in a loop: ${join(c, " → ")}. Inheritance stops where the loop closes.`) }
+    let checked = enumerate(rule_list) | map((p) => { r: p[1], n: p[0] + 1, problem: access_checker_rule_problem(p[1], p[0] + 1, role_names, user_names) })
+    problems = problems + (checked | filter((c) => c.problem != null) | map((c) => c.problem))
+    // A rule naming an unknown role or user is reported, yet cannot match, so only
+    // those with a real shape go on.
+    let usable = checked | filter((c) => type_of(c.r) == "map" && (c.r.effect == "allow" || c.r.effect == "deny")
+        && (c.r.role != null || c.r.user != null) && type_of(c.r.action) == "str" && type_of(c.r.resource) == "str")
+        | map((c) => { ...c.r, n: c.n })
+    let named = (field: str) => unique(usable | map((r) => get(r, field)) | filter((x) => x != "*"))
+    let who = (user_names | map((n) => { id: `user:${n}`, kind: "user", name: n }))
+        + (role_names | map((n) => { id: `role:${n}`, kind: "role", name: n }))
+    { roles: role_map, users: user_map, rules: usable, cycles, problems, who,
+      actions: type_of(actions) == "list" ? actions | map((a) => str(a)) : named("action"),
+      resources: type_of(resources) == "list" ? resources | map((a) => str(a)) : named("resource") }
+}
+
+// The roles a pick holds: [{ name, path }].
+fn access_checker_held(model: map, who: map) -> list =
+    who.kind == "role" ? access_checker_reach(model.roles, [who.name])
+        : access_checker_reach(model.roles, access_checker_names(get(model.users, who.name)))
+
+// The rules that are about a pick, each with `via`, the way to it (["editor", "viewer"]).
+fn access_checker_rules_for(model: map, who: map) -> list {
+    let held = access_checker_held(model, who)
+    let by_role = reduce(held, {}, (m, h) => set(m, h.name, h.path))
+    let out = []
+    for r in model.rules {
+        if r.user != null {
+            if who.kind == "user" && r.user == who.name { out = push(out, { ...r, via: [] }) }
+        } else if r.role == "*" {
+            out = push(out, { ...r, via: [] })
+        } else if has(by_role, r.role) {
+            out = push(out, { ...r, via: get(by_role, r.role) })
+        }
+    }
+    out
+}
+
+// The answer among rules already about one pick: a deny wins, the first of them
+// naming the decision; then the first allow; then the default, deny.
+fn access_checker_decide_among(rules: list, action: str, resource: str) -> map {
+    let matched = rules | filter((r) => access_checker_glob(r.action, action) && access_checker_glob(r.resource, resource))
+    let denies = matched | filter((r) => r.effect == "deny")
+    let allows = matched | filter((r) => r.effect == "allow")
+    let rule = len(denies) > 0 ? denies[0] : (len(allows) > 0 ? allows[0] : null)
+    { allowed: len(denies) == 0 && len(allows) > 0, rule, matched, denies, allows }
+}
+
+// One decision: { allowed, rule (the deciding rule), via, reason, matched }.
+fn access_checker_decide(model: map, who_id: str, action: str, resource: str) -> map {
+    let who = find(model.who, (w) => w.id == who_id)
+    if who == null { return { allowed: false, rule: null, via: [], matched: [], reason: `"${who_id}" is not in the policy, so nothing is allowed.` } }
+    let d = access_checker_decide_among(access_checker_rules_for(model, who), action, resource)
+    let overridden = len(d.denies) > 0 ? d.allows : []
+    let reason = d.rule == null ? "No rule matches, and what no rule allows is denied."
+        : (len(d.denies) > 0
+            ? (len(overridden) > 0 ? `Rule ${d.rule.n} denies it, and a deny beats the allow of ${access_checker_list(overridden | map((r) => `rule ${r.n}`))}.` : `Rule ${d.rule.n} denies it.`)
+            : `Rule ${d.rule.n} allows it, and no rule denies it.`)
+    { allowed: d.allowed, rule: d.rule, via: d.rule == null ? [] : d.rule.via, matched: d.matched, reason }
+}
+
+// "a", "a and b", "a, b and c".
+fn access_checker_list(xs: list) -> str =
+    len(xs) < 2 ? join(xs, "") : `${join(slice(xs, 0, len(xs) - 1), ", ")} and ${xs[-1]}`
+
+// Every cell: { resources (those shown), left (resources not shown), rows: [{ who,
+// cells: [{ action, resource, allowed, rule }] }] }. The work is capped at `limit`
+// cells by showing fewer resources, never fewer people.
+fn access_checker_matrix(model: map, limit: int = 3000) -> map {
+    let per = max([1, len(model.who) * len(model.actions)])
+    let room = max([1, floor(limit / per)])
+    let shown = take(model.resources, room)
+    let rows = model.who | map((w) => {
+        let rules = access_checker_rules_for(model, w)
+        let cells = flatten(shown | map((res) => model.actions | map((a) => {
+            let d = access_checker_decide_among(rules, a, res)
+            { action: a, resource: res, allowed: d.allowed, rule: d.rule == null ? null : d.rule.n }
+        })))
+        { who: w, cells }
+    })
+    { resources: shown, left: len(model.resources) - len(shown), rows }
+}
+
+// The policy as JSON to edit, a rule to a line.
+fn access_checker_text(roles, users, rules) -> str {
+    let lines = (rules ?? []) | map((r) => `    ${json.stringify(r)}`)
+    let body = len(lines) == 0 ? "[]" : `[\n${join(lines, ",\n")}\n  ]`
+    `{\n  "roles": ${json.stringify(roles ?? {})},\n  "users": ${json.stringify(users ?? {})},\n  "rules": ${body}\n}`
+}
+
+component AccessChecker(roles = null, users = null, rules = null, actions = null, resources = null, who: str? = null, action: str? = null,
+                        resource: str? = null, editable: bool = true, title: str = "Who can do what", id: str = "access-checker",
+                        limit: int = 3000, on_decide = null, class: str? = null) {
+    style global access_checker_css
+    state text = access_checker_text(roles, users, rules)
+    state pick_who = who ?? ""
+    state pick_action = action ?? ""
+    state pick_resource = resource ?? ""
+    let parsed = editable ? json.parse(text) : { roles, users, rules }
+    let bad_json = type_of(parsed) != "map"
+    let model = bad_json ? access_checker_model(roles, users, rules, actions, resources)
+        : access_checker_model(parsed.roles, parsed.users, parsed.rules, actions, resources)
+    let who_id = find(model.who, (w) => w.id == pick_who) != null ? pick_who : (len(model.who) > 0 ? model.who[0].id : "")
+    let act = pick_action != "" ? pick_action : (len(model.actions) > 0 ? model.actions[0] : "")
+    let res = pick_resource != "" ? pick_resource : (len(model.resources) > 0 ? model.resources[0] : "")
+    let d = access_checker_decide(model, who_id, act, res)
+    let m = access_checker_matrix(model, limit)
+    let tell = () => {
+        if on_decide != null {
+            let x = access_checker_decide(model, who_id, act, res)
+            on_decide({ who: who_id, action: act, resource: res, allowed: x.allowed, rule: x.rule == null ? null : x.rule.n, via: x.via, reason: x.reason })
+        }
+    }
+    let label_of = (w) => w.kind == "role" ? `${w.name} (role)` : w.name
+    <section class={ui_cls(["ui-access-checker", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-access-checker-title id={`${id}-title`}>{title}</h3>
+        <div.ui-access-checker-ask>
+            <div.ui-access-checker-field>
+                <label for={`${id}-who`}>Who</label>
+                <select id={`${id}-who`} name="who" @change={(e) => { pick_who = e.value; tell() }}>
+                    {for w in model.who => <option key={w.id} value={w.id} selected={w.id == who_id}>{label_of(w)}</option>}
+                </select>
+            </div>
+            <div.ui-access-checker-field>
+                <label for={`${id}-action`}>Action</label>
+                <input type="text" id={`${id}-action`} name="action" list={`${id}-actions`} value={act} autocomplete="off" spellcheck="false"
+                       @input={(e) => { pick_action = e.value; tell() }}/>
+                <datalist id={`${id}-actions`}>{for a in model.actions => <option key={a} value={a}></option>}</datalist>
+            </div>
+            <div.ui-access-checker-field>
+                <label for={`${id}-resource`}>Resource</label>
+                <input type="text" id={`${id}-resource`} name="resource" list={`${id}-resources`} value={res} autocomplete="off" spellcheck="false"
+                       @input={(e) => { pick_resource = e.value; tell() }}/>
+                <datalist id={`${id}-resources`}>{for r in model.resources => <option key={r} value={r}></option>}</datalist>
+            </div>
+        </div>
+        <div class={ui_cls(["ui-access-checker-answer", d.allowed ? "ui-access-checker-allow" : "ui-access-checker-deny"])} aria-live="polite">
+            <span.ui-access-checker-verdict>{d.allowed ? "Allow" : "Deny"}</span>
+            <p.ui-access-checker-reason>{d.reason}</p>
+            {d.rule != null && <p.ui-access-checker-rule>{`${d.rule.n}. ${access_checker_rule_text(d.rule)}`}{d.rule.note != null ? ` (${d.rule.note})` : ""}</p>}
+            {len(d.via) > 1 && <p.ui-access-checker-via>Through {join(d.via, " → ")}</p>}
+            {len(d.via) == 1 && <p.ui-access-checker-via>Through the role {d.via[0]}</p>}
+            {len(d.matched) > 1 && <p.ui-access-checker-others>Rules that matched: {join(d.matched | map((r) => str(r.n)), ", ")}</p>}
+        </div>
+        {bad_json && <p.ui-access-checker-error role="alert">The policy is not valid JSON, so the one given is shown: {is_err(parsed) ? parsed.error : "it must be a map"}.</p>}
+        {len(model.problems) > 0 && <ul.ui-access-checker-problems aria-label="Problems in the policy">
+            {for p in model.problems => <li key={p}>{p}</li>}
+        </ul>}
+        {len(m.rows) == 0 || len(model.actions) == 0 || len(m.resources) == 0
+            ? <p.ui-access-checker-note>The matrix needs at least one user or role, action and resource.</p>
+            : <div.ui-access-checker-scroll tabindex="0" role="region" aria-label="Matrix of everything">
+                <table>
+                    <caption>Every case: pick a cell to see why</caption>
+                    <thead>
+                        <tr>
+                            <th scope="col" rowspan="2">Who</th>
+                            {for r in m.resources => <th key={r} scope="colgroup" colspan={len(model.actions)}>{r}</th>}
+                        </tr>
+                        <tr>
+                            {for c in m.rows[0].cells => <th key={`${c.resource}|${c.action}`} scope="col">{c.action}</th>}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {for row in m.rows => <tr key={row.who.id}>
+                            <th scope="row">{row.who.name}{row.who.kind == "role" && <span.ui-access-checker-role> (role)</span>}</th>
+                            {for c in row.cells => <td key={`${c.resource}|${c.action}`}>
+                                <button type="button" class={ui_cls(["ui-access-checker-cell", c.allowed ? "ui-access-checker-yes" : "ui-access-checker-no",
+                                        row.who.id == who_id && c.action == act && c.resource == res && "ui-access-checker-picked"])}
+                                        aria-label={`${label_of(row.who)}, ${c.action}, ${c.resource}: ${c.allowed ? "allow" : "deny"}`}
+                                        @click={() => { pick_who = row.who.id; pick_action = c.action; pick_resource = c.resource; tell() }}>
+                                    <span aria-hidden="true">{c.allowed ? "✓" : "✕"}</span>
+                                </button>
+                            </td>}
+                        </tr>}
+                    </tbody>
+                </table>
+            </div>}
+        {m.left > 0 && <p.ui-access-checker-note>{`${m.left} more ${m.left == 1 ? "resource is" : "resources are"} left out of the matrix, past ${limit} cells. The pickers above still answer for them.`}</p>}
+        {editable && <details.ui-access-checker-policy>
+            <summary>Policy as JSON</summary>
+            <label.ui-sr for={`${id}-policy`}>Policy as JSON</label>
+            <textarea id={`${id}-policy`} name="policy" rows="12" spellcheck="false" @input={(e) => { text = e.value }}>{text}</textarea>
+        </details>}
+    </section>
+}

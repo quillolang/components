@@ -1,0 +1,273 @@
+// ChatScreen: a whole conversation as a screen of a phone app. Messages are grouped by
+// who wrote them and by day, with the day's name kept in sight as you scroll. It opens
+// at the newest and stays there as new ones come, without any script, so nothing jumps
+// as the page starts. Scrolled up to read, you stay where you are: older ones can load
+// above you and new ones arrive below you and the message you are reading does not
+// move, and a button says how many are new. Near the top it asks for older ones, and a
+// button does the same for keys and screen readers. The on-screen keyboard shrinks the
+// messages rather than covering them. The composer is yours, as children: a ComposerBar
+// with keyboard={false}, as ChatScreen itself clears the keyboard.
+//
+//   <ChatScreen title="Ana Silva" today={date.today()} messages={msgs} has_more={true}
+//               on_load_older={() => { load_more() }}>
+//       <ComposerBar keyboard={false} on_send={(m) => { send(m.text) }}/>
+//   </ChatScreen>
+//
+// messages: oldest first, a list of { id, from, name?, text, at, mine?, status?, time?,
+// avatar? }. id: text or a number, which keeps its row; a repeated id is shown once.
+// from: who wrote it (an id or a name), which is what messages are grouped by.
+// name: as shown (from when left out). at: when, as ISO text, "2026-11-01T09:41:00";
+// its date gives the day and its HH:MM the time shown, so pass it in the reader's zone,
+// or give time as it should read. mine: yours. status: as MessageBubble takes it.
+// today: "2026-11-01", for Today and Yesterday: a prop, so the server's page and the
+// browser's agree. gap: minutes between two messages of one person that part them (5).
+// title, subtitle: a bar along the top, left out with no title. typing: a name, while
+// that person is typing. has_more: there are older ones to ask for. loading: they are on
+// their way. label: what screen readers call the messages ("Messages").
+// fill: it is the screen: fixed to the window and following the visual viewport, for an
+// app; else it fills its parent, which needs a height.
+// threads: a list of { id, name, preview?, unread? }, shown beside the messages only
+// where there is room, on a tablet; current: the id of the open one. id, class: for the outer element.
+// on_load_older(): asked once for each batch. on_thread(id): a thread was picked.
+// Both work inside one of your components.
+
+import ui/theme.qwe use ui_cls
+import ui/message_bubble.qwe use MessageBubble
+import ui/composer_bar.qwe use composer_bar_follow
+
+let chat_screen_css = css`
+.ui-chat-screen { display: flex; container-type: inline-size; box-sizing: border-box; width: 100%; height: 100%; min-height: 0; overflow: hidden; background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.45 var(--ui-font); }
+.ui-chat-screen-fill { position: fixed; inset: 0; z-index: 30; height: auto; max-height: 100dvh; overscroll-behavior: none; }
+.ui-chat-screen-side { display: none; flex: none; width: 260px; overflow-y: auto; border-right: 1px solid var(--ui-border); background: var(--ui-subtle); overscroll-behavior: contain; }
+.ui-chat-screen-thread {
+  display: grid; grid-template-columns: 1fr auto; gap: 0 8px; width: 100%; min-height: 60px; padding: 10px 14px; border: 0; border-bottom: 1px solid var(--ui-border);
+  background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.ui-chat-screen-thread[aria-current="true"] { background: var(--ui-accent-soft); }
+.ui-chat-screen-thread:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-chat-screen-thread b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-chat-screen-thread small { grid-column: 1; overflow: hidden; color: var(--ui-muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.ui-chat-screen-thread i { grid-row: 1 / 3; grid-column: 2; align-self: center; min-width: 22px; padding: 0 6px; border-radius: 999px; background: var(--ui-accent); color: var(--ui-accent-fg); font: 600 12px/22px var(--ui-font); text-align: center; }
+.ui-chat-screen-main { position: relative; flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; padding-bottom: var(--ui-chat-screen-lift, 0px); }
+.ui-chat-screen-bar { flex: none; padding: max(10px, env(safe-area-inset-top)) 16px 10px; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-chat-screen-bar h2 { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-chat-screen-bar p { margin: 0; color: var(--ui-muted); font-size: 13px; }
+/* Reversed so that the bottom is where a scroll starts from: on both engines, what is added above does not move
+   what is on screen, and a screen at the bottom stays there. overflow-anchor is off so that only this rule applies. */
+.ui-chat-screen-scroll { flex: 1; display: flex; flex-direction: column-reverse; min-height: 0; overflow-y: auto; overflow-anchor: none; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+.ui-chat-screen-scroll:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-chat-screen-list { position: relative; display: flow-root; padding: 8px 12px; }
+.ui-chat-screen-row { padding-top: 2px; }
+.ui-chat-screen-row-first { padding-top: 10px; }
+.ui-chat-screen-day { position: sticky; top: 6px; z-index: 2; display: flex; justify-content: center; padding: 8px 0 4px; pointer-events: none; }
+.ui-chat-screen-day span { min-width: 104px; padding: 2px 12px; border-radius: 999px; background: var(--ui-subtle); color: var(--ui-muted); font-size: 12px; font-weight: 600; line-height: 20px; text-align: center; box-shadow: 0 0 0 1px var(--ui-border); }
+.ui-chat-screen-older {
+  display: block; margin: 4px auto 8px; min-height: 44px; padding: 0 16px; border: 1px solid var(--ui-border); border-radius: 999px;
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 14px var(--ui-font); cursor: pointer;
+}
+.ui-chat-screen-older:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-chat-screen-typing { margin: 6px 0 2px 4px; color: var(--ui-muted); font-size: 13px; }
+.ui-chat-screen-foot { flex: none; position: relative; }
+.ui-chat-screen-jump {
+  position: absolute; right: 12px; bottom: calc(100% + 12px); z-index: 3; display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 44px; min-height: 44px; padding: 0 12px;
+  border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow); font: 600 13px var(--ui-font); cursor: pointer;
+}
+.ui-chat-screen-jump svg { width: 18px; height: 18px; }
+.ui-chat-screen-jump:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@container (min-width: 640px) {
+  .ui-chat-screen-side { display: block; }
+  .ui-chat-screen-list { padding: 8px 24px; }
+  .ui-chat-screen-bar { padding-left: 24px; padding-right: 24px; }
+}
+`
+
+let chat_screen_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+let chat_screen_weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+// The date of a message's `at`, or "" when it has none that can be read.
+fn chat_screen_day(at) -> str {
+    let d = slice(str(at ?? ""), 0, 10)
+    date.valid(d, "date") ? d : ""
+}
+
+// What a day is called: Today, Yesterday, "Thu 29 Oct", and the year when it is another.
+fn chat_screen_day_label(day: str, today: str) -> str {
+    if !date.valid(day, "date") { return "Earlier" }
+    let known = date.valid(today, "date")
+    if known && day == today { return "Today" }
+    if known && date.add_days(today, -1) == day { return "Yesterday" }
+    let p = date.parts(day)
+    let line = `${chat_screen_weekdays[p.weekday - 1]} ${p.day} ${chat_screen_months[p.month - 1]}`
+    known && date.parts(today).year == p.year ? line : `${line} ${p.year}`
+}
+
+// Milliseconds of `at`, or null: seconds may be left out, and a zone too.
+fn chat_screen_ms(at) {
+    let text = str(at ?? "")
+    if len(text) < 16 || !date.valid(slice(text, 0, 10), "date") { return null }
+    let whole = len(text) == 16 ? `${text}:00Z` : (len(text) == 19 ? `${text}Z` : text)
+    date.valid(whole, "date-time") ? date.ms(whole) : null
+}
+
+// Whether b follows on from a in one group: one person, one day, close together.
+fn chat_screen_joined(a, b, gap: num) -> bool {
+    if a == null || b == null || a.from != b.from || a.day != b.day { return false }
+    if a.ms == null || b.ms == null { return true }
+    abs(b.ms - a.ms) <= gap * 60000
+}
+
+// Each message once, the first time its id is seen, with what the rows need worked out.
+fn chat_screen_clean(messages) {
+    let kept = (type_of(messages) == "list" ? messages : []) | filter((m) => type_of(m) == "map" && m.id != null)
+    let seq = for i in range(len(kept)) => { ...kept[i], seq: i, day: chat_screen_day(kept[i].at), ms: chat_screen_ms(kept[i].at), rid: str(kept[i].id) }
+    let by_id = group_by(seq, (m) => m.rid)
+    seq | filter((m) => get(by_id, m.rid, [m])[0].seq == m.seq)
+}
+
+// The rows of the list, in order: { kind: "day", key, label } before each new day and
+// { kind: "message", key, id, ..., first, last } for each message, first and last saying
+// where it stands in its group.
+fn chat_screen_rows(messages, today: str, gap: num) {
+    let ms = chat_screen_clean(messages)
+    let n = len(ms)
+    flatten(for i in range(n) => {
+        let m = ms[i]
+        let before = i > 0 ? ms[i - 1] : null
+        let after = i + 1 < n ? ms[i + 1] : null
+        let first = !chat_screen_joined(before, m, gap)
+        let row = { kind: "message", key: `m:${m.rid}`, id: m.rid, name: m.name ?? str(m.from ?? ""), text: str(m.text ?? ""),
+                    mine: m.mine == true, status: m.status, avatar: m.avatar, time: m.time ?? (len(str(m.at ?? "")) >= 16 ? slice(str(m.at), 11, 16) : null),
+                    datetime: m.at, first, last: !chat_screen_joined(m, after, gap) }
+        (before == null || before.day != m.day) && (m.day != "" || before == null)
+            ? [{ kind: "day", key: `d:${m.day}:${i == 0 ? "" : m.rid}`, label: chat_screen_day_label(m.day, today) }, row]
+            : [row]
+    })
+}
+
+// How many messages came after the one with id `seen`, leaving out your own.
+fn chat_screen_after(messages, seen) -> int {
+    let ms = chat_screen_clean(messages)
+    let at = index_of(ms | map((m) => m.rid), seen)
+    at == null ? 0 : len(slice(ms, at + 1, len(ms)) | filter((m) => m.mine != true))
+}
+
+// The last message's id, as text: "" for none.
+fn chat_screen_last(messages) -> str {
+    let ms = chat_screen_clean(messages)
+    len(ms) > 0 ? ms[len(ms) - 1].rid : ""
+}
+
+component ChatScreen(messages: list = [], today: str = "", gap: num = 5, title: str? = null, subtitle: str? = null, typing: str? = null,
+                     has_more: bool = false, loading: bool = false, label: str = "Messages", fill: bool = false, threads: list = [],
+                     current = null, on_load_older = null, on_thread = null, id: str? = null, class: str? = null, children) {
+    style global chat_screen_css
+    state box = null
+    state list = null
+    state pinned = true
+    state seen = ""
+    state asked_at = -1
+    state tail_id = ""       // the newest message when last measured, and how much of the list is under it
+    state tail_under = 0
+    let rows = chat_screen_rows(messages, today, gap)
+    let count = len(rows)
+    let unseen = pinned ? 0 : chat_screen_after(messages, seen)
+    let newest = chat_screen_last(messages)
+    let want_older = () => {
+        if on_load_older != null && has_more && !loading && asked_at != count {
+            asked_at = count
+            on_load_older()
+        }
+    }
+    let to_bottom = () => {
+        let still = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+        box.scrollTo({ top: 0, behavior: still ? "auto" : "smooth" })
+    }
+    let newest_mine = (len(rows) > 0 ? rows[len(rows) - 1].mine : false) == true
+    let measure_tail = () => {
+        let marks = js("Array.from", list.querySelectorAll("[data-mid]"))
+        let found = find(marks, (m) => m.dataset.mid == tail_id)
+        let last_one = len(marks) > 0 ? marks[len(marks) - 1] : null
+        if found != null && !pinned {
+            // New ones came under a person reading: what they read must not rise.
+            // From that message's top, as it may itself change, losing its time to one that joins it.
+            // A pixel either way is rounding from a list that grew at the top.
+            let under = list.offsetHeight - found.offsetTop
+            if abs(under - tail_under) > 1 { box.scrollTop = box.scrollTop - (under - tail_under) }
+        }
+        if last_one != null {
+            // What you send yourself you want to see, wherever you had scrolled to.
+            if !pinned && last_one.dataset.mid != tail_id && tail_id != "" && newest_mine {
+                box.scrollTop = 0
+                pinned = true
+            }
+            tail_id = last_one.dataset.mid
+            tail_under = list.offsetHeight - last_one.offsetTop
+        }
+        if pinned { seen = newest }
+    }
+    <div class={ui_cls(["ui-chat-screen", fill && "ui-chat-screen-fill", class])} id={id}
+         @mount={(el) => {
+             composer_bar_follow(el, (lift, top, height, open) => {
+                 if fill {
+                     // The whole window is ours, so follow the part that can be seen, which iOS may slide.
+                     el.style.top = open ? `${top}px` : ""
+                     el.style.height = open ? `${height}px` : ""
+                 } else {
+                     el.style.setProperty("--ui-chat-screen-lift", `${lift}px`)
+                 }
+             })
+         }}>
+        {len(threads) > 0 && <nav.ui-chat-screen-side aria-label="Conversations">
+            {for t in threads => <button.ui-chat-screen-thread key={str(t.id)} type="button" aria-current={t.id == current ? "true" : null}
+                    @click={() => { on_thread && on_thread(t.id) }}>
+                <b>{t.name}</b>
+                {t.preview != null && <small>{t.preview}</small>}
+                {(t.unread ?? 0) > 0 && <i>{t.unread}</i>}
+            </button>}
+        </nav>}
+        <div.ui-chat-screen-main>
+            {title != null && <header.ui-chat-screen-bar>
+                <h2>{title}</h2>
+                {subtitle != null && <p>{subtitle}</p>}
+            </header>}
+            <div.ui-chat-screen-scroll role="log" aria-label={label} aria-live="polite" tabindex="0"
+                 @mount={(el) => { box = el }}
+                 @scroll={() => {
+                     let was = pinned
+                     pinned = abs(box.scrollTop) < 40
+                     if pinned && !was { seen = newest }
+                     if box.scrollHeight - box.clientHeight - abs(box.scrollTop) < 160 { want_older() }
+                 }}>
+                <div.ui-chat-screen-list
+                     @mount={(el) => {
+                         list = el
+                         seen = newest
+                         measure_tail()
+                         let sized = js_new("ResizeObserver", (_r = null) => { measure_tail() })
+                         sized.observe(el)
+                         () => { sized.disconnect() }
+                     }}>
+                    {has_more && <button.ui-chat-screen-older type="button" disabled={loading} @click={want_older}>{loading ? "Loading…" : "Load earlier messages"}</button>}
+                    {for r in rows => <div key={r.key} class={ui_cls([r.kind == "day" ? "ui-chat-screen-day" : "ui-chat-screen-row", r.first && "ui-chat-screen-row-first"])} data-mid={r.id}>
+                        {r.kind == "day"
+                            ? <span>{r.label}</span>
+                            : <MessageBubble mine={r.mine} name={r.name} avatar={r.avatar} time={r.last ? r.time : null} datetime={r.datetime}
+                                             status={r.mine && r.last ? r.status : null} first={r.first} last={r.last}>{r.text}</MessageBubble>}
+                    </div>}
+                    {typing != null && <p.ui-chat-screen-typing>{typing} is typing…</p>}
+                </div>
+            </div>
+            <div.ui-chat-screen-foot>
+                {!pinned && <button.ui-chat-screen-jump type="button" aria-label={unseen > 0 ? `${unseen} new, go to the latest` : "Go to the latest"}
+                        @click={() => {
+                            to_bottom()
+                            box.focus({ preventScroll: true })
+                        }}>
+                    {unseen > 0 && <span>{unseen} new</span>}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+                </button>}
+                {children}
+            </div>
+        </div>
+    </div>
+}

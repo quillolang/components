@@ -43,7 +43,7 @@ mkdirSync(join(dir, "copies"));
 
 function program(files) {
     const name = `main${files.length}.qwe`;
-    writeFileSync(join(dir, name), ['use "ui/theme.qwe"', ...files.map((f) => `use "${f}"`),
+    writeFileSync(join(dir, name), ['use ui/theme.qwe', ...files.map((f) => `use ${f}`),
         'route GET / = <html><head><style>{theme_css}</style></head><body>ok</body></html>', ""].join("\n"));
     return name;
 }

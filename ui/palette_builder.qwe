@@ -1,0 +1,276 @@
+// PaletteBuilder: one base colour becomes a palette: a scale from 50 to 950 with the
+// base's hue and saturation, a semantic set (primary, success, warning, danger, info
+// and neutral, each with the colour to write on it), and a grid that shows which
+// pairs of the scale pass WCAG contrast. The base stands at the step whose lightness
+// is nearest its own, exactly as given, and the other steps run from it to near
+// white and near black. It exports the lot as CSS variables or as JSON.
+//
+//   import ui/palette_builder.qwe use PaletteBuilder
+//
+//   <PaletteBuilder base="#5b4bdb" prefix="brand"/>
+//   <PaletteBuilder id="tints" base="hsl(160, 60%, 35%)" format="json" on_change={(p) => { palette = p }}/>
+//
+// base: where the field starts, as ColorContrast reads it: hex, rgb() or hsl(). id: a
+// prefix for its ids ("palette-builder"), unique on the page. prefix: the start of
+// the variables' names ("brand" gives --brand-500); it can be changed in its field,
+// and what a CSS name cannot hold becomes a dash. format: the export to start on,
+// "css" or "json". title: the heading ("Palette"). The fields are named base and
+// prefix. class: more classes for its outer element.
+// on_change(palette): inside one of your components, called after each change with
+// { scale: [{ step, hex }], semantic: [{ role, hex, on, ratio }] }, or null while the
+// base is not a colour.
+//
+// Each semantic colour but primary is moved as little as it takes to reach 4.5:1 on
+// white, keeping its hue and saturation; primary is the base as given, and `on` is
+// whichever of white and black reads better on the colour.
+//
+// For a program's own use: palette_builder_scale(color) and
+// palette_builder_semantic(color) take a colour from color_contrast_parse;
+// palette_builder_pairs(scale) gives each pair's ratio and level, and
+// palette_builder_export_css(scale, semantic, prefix) and
+// palette_builder_export_json(scale, semantic) the export's text.
+
+import ui/theme.qwe use ui_cls
+import ui/color_contrast.qwe use color_contrast_parse, color_contrast_ratio, color_contrast_ratio_text, color_contrast_hsl, color_contrast_from_hsl, color_contrast_nearest
+
+let palette_builder_css = css`
+.ui-palette { display: grid; gap: 16px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-palette .ui-palette-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-palette .ui-palette-sub { margin: 0; font-size: 13px; font-weight: 600; }
+.ui-palette-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 220px)); gap: 12px; }
+.ui-palette-field { display: grid; gap: 5px; min-width: 0; }
+.ui-palette-field label { font-size: 13px; font-weight: 500; }
+.ui-palette-input { box-sizing: border-box; width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-mono); transition: border-color .15s, box-shadow .15s; }
+.ui-palette-input:hover { border-color: var(--ui-strong); }
+.ui-palette-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-palette-input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-palette-why { margin: 0; color: var(--ui-danger); font-size: 13px; overflow-wrap: anywhere; }
+.ui-palette-scale { display: grid; grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-palette-step { display: grid; gap: 2px; padding: 10px 8px; border-radius: var(--ui-radius-sm); font: 11px/1.3 var(--ui-mono); }
+.ui-palette-step b { font: 700 12px/1.3 var(--ui-font); }
+.ui-palette-base { outline: 2px solid var(--ui-fg); outline-offset: 1px; }
+.ui-palette-roles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-palette-role { display: grid; gap: 2px; padding: 10px 12px; border-radius: var(--ui-radius-sm); font: 12px/1.35 var(--ui-mono); }
+.ui-palette-role b { font: 600 13px/1.3 var(--ui-font); text-transform: capitalize; }
+.ui-palette-grid { overflow-x: auto; }
+.ui-palette-grid:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: var(--ui-radius-sm); }
+.ui-palette-grid table { border-collapse: collapse; font: 11px/1.2 var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-palette-grid th { padding: 4px 6px; color: var(--ui-muted); font-weight: 600; }
+.ui-palette-grid td { min-width: 38px; padding: 6px 4px; border: 2px solid var(--ui-surface); text-align: center; font-weight: 600; }
+.ui-palette-count { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-palette-export { display: grid; gap: 8px; min-width: 0; }
+.ui-palette-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-palette-bar label { color: var(--ui-muted); font-size: 13px; }
+.ui-palette-select, .ui-palette-copy { height: 32px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-palette-select:focus-visible, .ui-palette-copy:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-palette-copy:hover { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-palette-said { color: var(--ui-muted); font-size: 13px; }
+.ui-palette-export pre { max-height: 260px; margin: 0; overflow: auto; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-subtle); color: var(--ui-fg); font: 12px/1.5 var(--ui-mono); }
+.ui-palette-export pre:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (max-width: 480px) { .ui-palette-fields { grid-template-columns: minmax(0, 1fr); } }
+@media (prefers-reduced-motion: reduce) { .ui-palette-input { transition: none; } }
+`
+
+// The steps, and about how light each is: a base takes the step nearest its lightness.
+let palette_builder_steps = [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 950]
+let palette_builder_marks = [0.975, 0.95, 0.9, 0.82, 0.72, 0.6, 0.5, 0.4, 0.3, 0.2, 0.12]
+
+let palette_builder_white = { r: 255, g: 255, b: 255, hex: "#ffffff" }
+let palette_builder_black = { r: 0, g: 0, b: 0, hex: "#000000" }
+
+// The lightness of each step: the marks, bent to pass through the base's own.
+fn palette_builder_lights(l) -> list {
+    let dist = palette_builder_marks | map((m) => abs(m - l))
+    let at = index_of(dist, min(dist))
+    let mark = palette_builder_marks[at]
+    let top = palette_builder_marks[0]
+    let low = palette_builder_marks[10]
+    for [i, m] in enumerate(palette_builder_marks) => {
+        if i == at {
+            l
+        } else if i < at {
+            l + (top - l) * (m - mark) / (top - mark)
+        } else {
+            l - (l - low) * (mark - m) / (mark - low)
+        }
+    }
+}
+
+// The scale of a colour: [{ step, hex, r, g, b, base }], the base's own colour at its step.
+fn palette_builder_scale(color: map) -> list {
+    let hsl = color_contrast_hsl(color)
+    let lights = palette_builder_lights(hsl.l)
+    let at = index_of(lights, hsl.l)
+    for [i, step] in enumerate(palette_builder_steps) => {
+        let c = i == at ? color : color_contrast_from_hsl(hsl.h, hsl.s, lights[i])
+        { step, hex: c.hex, r: c.r, g: c.g, b: c.b, base: i == at }
+    }
+}
+
+// White or black, whichever reads better on `c`.
+fn palette_builder_on(c: map) -> map =
+    color_contrast_ratio(palette_builder_white, c) >= color_contrast_ratio(palette_builder_black, c) ? palette_builder_white : palette_builder_black
+
+fn palette_builder_clamp(x, lo, hi) = max([lo, min([x, hi])])
+
+// The semantic set of a colour: [{ role, hex, on, ratio }].
+fn palette_builder_semantic(color: map) -> list {
+    let hsl = color_contrast_hsl(color)
+    let s = palette_builder_clamp(hsl.s, 0.5, 0.9)
+    let l = palette_builder_clamp(hsl.l, 0.35, 0.55)
+    let readable = (c: map) => {
+        let n = color_contrast_nearest(c, palette_builder_white, 4.5)
+        color_contrast_ratio(c, palette_builder_white) >= 4.5 || n == null ? c : n.color
+    }
+    let entry = (role: str, c: map) => {
+        let on = palette_builder_on(c)
+        { role, hex: c.hex, on: on.hex, ratio: color_contrast_ratio(c, on) }
+    }
+    [entry("primary", color)] + ([{ role: "success", h: 145 }, { role: "warning", h: 38 }, { role: "danger", h: 4 }, { role: "info", h: 205 }]
+        | map((x) => entry(x.role, readable(color_contrast_from_hsl(x.h, s, l)))))
+        + [entry("neutral", readable(color_contrast_from_hsl(hsl.h, min([hsl.s, 0.1]), l)))]
+}
+
+// A pair's level: "AAA", "AA", "AA large" (3:1 only) or "" when none.
+fn palette_builder_level(ratio) -> str = ratio >= 7 ? "AAA" : (ratio >= 4.5 ? "AA" : (ratio >= 3 ? "AA large" : ""))
+
+// Each pair of the scale, text by background: rows of { step, ratio, level, text }.
+fn palette_builder_pairs(scale: list) -> list =
+    scale | map((fg) => {
+        step: fg.step,
+        hex: fg.hex,
+        cells: scale | map((bg) => {
+            let ratio = color_contrast_ratio(fg, bg)
+            { step: bg.step, hex: bg.hex, ratio, level: palette_builder_level(ratio), text: color_contrast_ratio_text(ratio) }
+        })
+    })
+
+// How many of the different pairs reach a ratio: each pair once, a step with itself not at all.
+fn palette_builder_count(pairs: list, target) -> int {
+    let n = 0
+    for [i, row] in enumerate(pairs) {
+        for [j, cell] in enumerate(row.cells) {
+            if j > i && cell.ratio >= target { n += 1 }
+        }
+    }
+    n
+}
+
+// What may start a CSS variable's name.
+fn palette_builder_prefix(text) -> str {
+    let s = re.replace(re.replace(lower(trim(str(text ?? ""))), "[^a-z0-9-]+", "-"), "^-+|-+$", "")
+    let cut = slice(s, 0, 40)
+    cut == "" ? "brand" : (re.test(cut, "^[0-9]") ? "c-" + cut : cut)
+}
+
+fn palette_builder_export_css(scale: list, semantic: list, prefix: str) -> str {
+    let lines = (scale | map((s) => `  --${prefix}-${s.step}: ${s.hex};`))
+        + flatten(semantic | map((r) => [`  --${prefix}-${r.role}: ${r.hex};`, `  --${prefix}-on-${r.role}: ${r.on};`]))
+    ":root {\n" + join(lines, "\n") + "\n}\n"
+}
+
+// By hand, so the keys stay in this order on the server and in the browser alike.
+fn palette_builder_export_json(scale: list, semantic: list) -> str {
+    let steps = join(scale | map((s) => `    "${s.step}": "${s.hex}"`), ",\n")
+    let roles = join(semantic | map((r) => `    "${r.role}": { "color": "${r.hex}", "on": "${r.on}" }`), ",\n")
+    "{\n  \"scale\": {\n" + steps + "\n  },\n  \"semantic\": {\n" + roles + "\n  }\n}\n"
+}
+
+component PaletteBuilder(base: str = "#5b4bdb", id: str = "palette-builder", prefix: str = "brand", format: str = "css",
+                         title: str = "Palette", on_change = null, class: str? = null) {
+    style global palette_builder_css
+    state text = base
+    state name = prefix
+    state fmt = format == "json" ? "json" : "css"
+    state said = ""
+    let color = color_contrast_parse(text)
+    let ok = color.error == null
+    let scale = ok ? palette_builder_scale(color) : []
+    let roles = ok ? palette_builder_semantic(color) : []
+    let pairs = palette_builder_pairs(scale)
+    let safe = palette_builder_prefix(name)
+    let output = fmt == "json" ? palette_builder_export_json(scale, roles) : palette_builder_export_css(scale, roles, safe)
+    let tell = () => {
+        if on_change != null {
+            let c = color_contrast_parse(text)
+            if c.error != null {
+                on_change(null)
+            } else {
+                on_change({ scale: palette_builder_scale(c) | map((s) => { step: s.step, hex: s.hex }), semantic: palette_builder_semantic(c) })
+            }
+        }
+    }
+    let copy = () => {
+        if js("isSecureContext") != true {
+            said = "Could not copy: select the text instead"
+        } else {
+            js("navigator.clipboard.writeText", output).then((_ = null) => { said = "Copied" }, (_ = null) => { said = "Could not copy: select the text instead" })
+        }
+    }
+    let swatch = (c: map) => `background: ${c.hex}; color: ${palette_builder_on(c).hex}`
+    <section class={ui_cls(["ui-palette", class])} id={id} aria-labelledby={`${id}-title`}>
+        <h3.ui-palette-title id={`${id}-title`}>{title}</h3>
+        <div.ui-palette-fields>
+            <div.ui-palette-field>
+                <label for={`${id}-base`}>Base colour</label>
+                <input.ui-palette-input type="text" id={`${id}-base`} name="base" value={text} autocomplete="off" spellcheck="false"
+                       aria-invalid={ok ? null : "true"} aria-describedby={ok ? null : `${id}-why`}
+                       @input={(e) => { text = e.value; said = ""; tell() }}/>
+                {!ok && <p.ui-palette-why id={`${id}-why`} role="alert">{color.error}</p>}
+            </div>
+            <div.ui-palette-field>
+                <label for={`${id}-prefix`}>Variable prefix</label>
+                <input.ui-palette-input type="text" id={`${id}-prefix`} name="prefix" value={name} autocomplete="off" spellcheck="false"
+                       @input={(e) => { name = e.value; said = "" }}/>
+            </div>
+        </div>
+        {ok && <h4.ui-palette-sub>Scale</h4>}
+        {ok && <ol.ui-palette-scale>
+            {for s in scale => <li key={s.step} class={ui_cls(["ui-palette-step", s.base && "ui-palette-base"])} data-step={s.step} style={swatch(s)}>
+                <b>{s.step}</b><span>{s.hex}</span>{s.base && <span.ui-sr> (the base)</span>}
+            </li>}
+        </ol>}
+        {ok && <h4.ui-palette-sub>Semantic colours</h4>}
+        {ok && <ul.ui-palette-roles>
+            {for r in roles => <li.ui-palette-role key={r.role} data-role={r.role} style={`background: ${r.hex}; color: ${r.on}`}>
+                <b>{r.role}</b><span>{r.hex}</span><span>{`${color_contrast_ratio_text(r.ratio)}:1 with ${r.on}`}</span>
+            </li>}
+        </ul>}
+        {ok && <h4.ui-palette-sub id={`${id}-pairs`}>Which pairs pass</h4>}
+        {ok && <p.ui-palette-count aria-live="polite">
+            {`Of the 55 pairs of steps, ${palette_builder_count(pairs, 4.5)} reach AA (4.5:1) and ${palette_builder_count(pairs, 7)} reach AAA (7:1).`}
+        </p>}
+        {ok && <div.ui-palette-grid tabindex="0" role="region" aria-labelledby={`${id}-pairs`}>
+            <table>
+                <caption class="ui-sr">Contrast of each step as text, by row, on each step as background, by column</caption>
+                <thead>
+                    <tr><th scope="col"><span.ui-sr>Text</span></th>{for s in scale => <th key={s.step} scope="col">{s.step}</th>}</tr>
+                </thead>
+                <tbody>
+                    {for r in pairs => <tr key={r.step}>
+                        <th scope="row">{r.step}</th>
+                        {for c in r.cells => <td key={c.step} data-pair={`${r.step}-${c.step}`} title={`${r.step} on ${c.step}: ${c.text}:1`}
+                                                 style={`background: ${c.hex}; color: ${r.hex}`}>{c.level == "AA large" ? "AA+" : c.level}</td>}
+                    </tr>}
+                </tbody>
+            </table>
+        </div>}
+        {ok && <p.ui-palette-count>AA+ passes for large text only. A cell with nothing fails.</p>}
+        {ok && <div.ui-palette-export>
+            <div.ui-palette-bar>
+                <label for={`${id}-format`}>Export as</label>
+                <select.ui-palette-select id={`${id}-format`} @change={(e) => { fmt = e.value; said = "" }}>
+                    <option value="css" selected={fmt == "css"}>CSS variables</option>
+                    <option value="json" selected={fmt == "json"}>JSON</option>
+                </select>
+                <button.ui-palette-copy type="button" @click={copy}>Copy</button>
+                <span.ui-palette-said role="status">{said}</span>
+            </div>
+            <pre tabindex="0" aria-label="The export"><code>{output}</code></pre>
+        </div>}
+    </section>
+}

@@ -1,0 +1,268 @@
+// AmountInput: an amount field that reads what people write. It takes "1.5k", "2m",
+// "1,234.50", "1.234,50", "1 234,50 €", "$12", "EUR 40", "(12.50)" and works out which
+// mark groups and which is the decimal, then shows the amount as the locale writes it
+// and puts a plain decimal in the form. Where the marks alone cannot say ("1,234" is
+// 1234 to an American and 1.234 to a German) it goes with the likelier, says it is not
+// sure, and offers both.
+//
+//   <AmountInput id="price" name="price" label="Price" value="1.5k" currency="USD"/>
+//   <AmountInput id="budget" label="Budget" currency="EUR" locale="de-DE" negative={true}
+//                on_change={(a) => { budget = a }}/>
+//
+// id: a prefix for its ids, unique on the page. name: the hidden field that holds the
+// amount as a plain decimal with the currency's places ("1234.50"), empty while there is
+// none; `<name>_currency` beside it holds the currency. label, hint, placeholder,
+// required, disabled as for every field. value: the text to start with. currency: the
+// ISO code an amount with none is in ("USD"). A "$" or a "¥" stays in it when it is that
+// kind of currency: "$12" in a CAD field is CAD. fixed: true refuses another currency.
+// locale: how the amount is written, and which mark is the decimal when nothing else
+// decides ("en-US"). negative: true allows amounts below zero ("-12", "(12.50)"; refused
+// otherwise). class: more classes. on_change(amount): inside one of your components,
+// { amount, currency } after each change, amount a decimal, or null when there is none.
+//
+// Two marks: the last is the decimal. One mark, seen twice: it groups. One mark once:
+// a decimal, unless exactly three digits follow one to three digits (not starting with
+// 0), which is the ambiguous case. There it is a grouping when three decimals do not fit
+// the currency (as in USD), and otherwise the locale's mark decides. Spaces and
+// apostrophes only ever group. Groups are checked (threes, or India's 2-2-3). k, m (mn,
+// mio, mln), b (bn, bln), t (tn), thousand, million, billion, trillion, lakh and crore
+// multiply. More decimals than the currency has are rounded half up, and it says so.
+//
+// amount_input_parse(text, mark, currency, pick) is the reading, for a program's own use:
+// { status, amount, currency, rounded, message, readings }. status is "empty", "ok",
+// "ambiguous" or "bad"; readings are { way, amount, rounded }, way "grouped" or
+// "decimal"; pick chooses one. amount_input_mark(locale) gives a locale's decimal mark.
+
+import ui/theme.qwe use ui_cls
+
+let amount_input_css = css`
+.ui-amountin { display: grid; gap: 6px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-amountin-label { font-size: 13px; font-weight: 500; }
+.ui-amountin-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-amountin-control { box-sizing: border-box; width: 100%; height: 38px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1 var(--ui-font);
+  font-variant-numeric: tabular-nums; transition: border-color .15s, box-shadow .15s; }
+.ui-amountin-control::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-amountin-control:hover { border-color: var(--ui-strong); }
+.ui-amountin-control:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-amountin-control[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-amountin-control:disabled { opacity: .55; cursor: not-allowed; }
+.ui-amountin-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-amountin-out { margin: 0; min-height: 20px; font-size: 13px; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-amountin-out strong { color: var(--ui-fg); font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-amountin-note { display: block; font-size: 12px; }
+.ui-amountin-bad { color: var(--ui-danger); }
+.ui-amountin-unsure { display: block; color: var(--ui-warning); font-size: 12px; }
+.ui-amountin-ways { display: flex; flex-wrap: wrap; gap: 6px; }
+.ui-amountin-way { min-height: 30px; padding: 4px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 13px/1.3 var(--ui-font); text-align: left; cursor: pointer; }
+.ui-amountin-way:hover { border-color: var(--ui-accent); }
+.ui-amountin-way:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-amountin-way[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-amountin-way small { display: block; color: var(--ui-muted); font-size: 11px; }
+@media (prefers-reduced-motion: reduce) { .ui-amountin-control { transition: none; } }
+`
+
+let amount_input_limit = 64
+// Symbols that name one currency, the longest first so "US$" is not read as "$".
+let amount_input_symbols = [["US$", "USD"], ["CA$", "CAD"], ["AU$", "AUD"], ["NZ$", "NZD"], ["HK$", "HKD"], ["C$", "CAD"], ["A$", "AUD"], ["S$", "SGD"],
+    ["R$", "BRL"], ["€", "EUR"], ["£", "GBP"], ["₹", "INR"], ["₱", "PHP"], ["₩", "KRW"], ["₪", "ILS"], ["฿", "THB"], ["₺", "TRY"], ["₽", "RUB"], ["zł", "PLN"]]
+let amount_input_dollars = ["USD", "CAD", "AUD", "NZD", "SGD", "HKD", "MXN", "TWD"]
+let amount_input_words = { dollar: "$", dollars: "$", bucks: "$", euro: "EUR", euros: "EUR", pound: "GBP", pounds: "GBP", yen: "JPY" }
+let amount_input_multipliers = { k: 3, thousand: 3, lakh: 5, crore: 7, m: 6, mn: 6, mio: 6, mln: 6, million: 6, b: 9, bn: 9, bln: 9, billion: 9, t: 12, tn: 12, trillion: 12 }
+let amount_input_not_codes = ["mln", "mio", "bln"]
+
+// The decimal mark of a locale, as it writes one and a half.
+fn amount_input_mark(locale) = contains(format_number(1.5, str(locale ?? "en-US"), 1), ",") ? "," : "."
+
+fn amount_input_dollar(fallback: str) = contains(amount_input_dollars, fallback) ? fallback : "USD"
+
+fn amount_input_yen(fallback: str) = fallback == "JPY" || fallback == "CNY" ? fallback : "JPY"
+
+// Takes the currency off the text: { code, rest }, code null when none was written.
+fn amount_input_currency(s: str, fallback: str) {
+    for pair in amount_input_symbols {
+        if starts_with(s, pair[0]) { return { code: pair[1], rest: trim(slice(s, len(pair[0]), len(s))) } }
+        if ends_with(s, pair[0]) { return { code: pair[1], rest: trim(slice(s, 0, len(s) - len(pair[0]))) } }
+    }
+    if starts_with(s, "$") { return { code: amount_input_dollar(fallback), rest: trim(slice(s, 1, len(s))) } }
+    if ends_with(s, "$") { return { code: amount_input_dollar(fallback), rest: trim(slice(s, 0, len(s) - 1)) } }
+    if starts_with(s, "¥") { return { code: amount_input_yen(fallback), rest: trim(slice(s, 1, len(s))) } }
+    if ends_with(s, "¥") { return { code: amount_input_yen(fallback), rest: trim(slice(s, 0, len(s) - 1)) } }
+    let word = re.find(s, "^(.*?)\\s*\\b(dollars?|bucks|euros?|pounds?|yen)$", "i")
+    if word != null {
+        let said = amount_input_words[lower(word.groups[1])]
+        return { code: said == "$" ? amount_input_dollar(fallback) : said, rest: word.groups[0] }
+    }
+    let front = re.find(s, "^([A-Za-z]{3})(?:\\s+|$|[^A-Za-z])")
+    if front != null && !contains(amount_input_not_codes, lower(front.groups[0])) { return { code: upper(front.groups[0]), rest: trim(slice(s, 3, len(s))) } }
+    let back = re.find(s, "(?:^|[^A-Za-z])([A-Za-z]{3})$")
+    if back != null && !contains(amount_input_not_codes, lower(back.groups[0])) { return { code: upper(back.groups[0]), rest: trim(slice(s, 0, len(s) - 3)) } }
+    { code: null, rest: s }
+}
+
+fn amount_input_sign(s: str) {
+    let m = re.find(s, "^[-−–]\\s*")
+    if m != null { return { minus: true, rest: slice(s, m.end, len(s)) } }
+    let after = re.find(s, "\\s*[-−–]$")
+    if after != null { return { minus: true, rest: slice(s, 0, after.start) } }
+    { minus: false, rest: s }
+}
+
+// Whether digits written with `sep` between them are grouped as people group them.
+fn amount_input_grouped(whole: str, sep: str) {
+    let mark = sep == "." ? "\\." : sep
+    re.test(whole, `^\\d{1,3}(?:${mark}\\d{3})+$`) || re.test(whole, `^\\d{1,2}(?:${mark}\\d{2})*${mark}\\d{3}$`)
+}
+
+// The number's digits: { whole, frac } or, for one mark that could go either way,
+// { group, whole, frac } with `whole` and `frac` as the decimal reading; or { error }.
+fn amount_input_digits(body: str) {
+    let spaced = re.find(body, "^(\\d{1,3}(?:[ ']\\d{3})+)(?:[.,](\\d*))?$")
+    if spaced != null { return { whole: re.replace(spaced.groups[0], "[ ']", ""), frac: spaced.groups[1] ?? "" } }
+    if re.test(body, "[ ']") { return { error: `Spaces and apostrophes group digits in threes: "${body}" does not.` } }
+    let dots = len(split(body, ".")) - 1
+    let commas = len(split(body, ",")) - 1
+    if dots == 0 && commas == 0 { return { whole: body, frac: "" } }
+    if dots > 0 && commas > 0 {
+        let last_dot = len(body) - 1 - index_of(reverse(body), ".")
+        let last_comma = len(body) - 1 - index_of(reverse(body), ",")
+        let decimal = last_dot > last_comma ? "." : ","
+        let group = decimal == "." ? "," : "."
+        let cut = max([last_dot, last_comma])
+        let head = slice(body, 0, cut)
+        if contains(head, decimal) { return { error: `"${decimal}" comes twice, and only the decimal mark should come last: "${body}".` } }
+        if !amount_input_grouped(head, group) { return { error: `Digits are grouped in threes: "${head}" is not.` } }
+        return { whole: replace(head, group, ""), frac: slice(body, cut + 1, len(body)) }
+    }
+    let sep = dots > 0 ? "." : ","
+    let parts = split(body, sep)
+    if len(parts) > 2 {
+        if !amount_input_grouped(body, sep) { return { error: `Digits are grouped in threes: "${body}" is not.` } }
+        return { whole: replace(body, sep, ""), frac: "" }
+    }
+    let before = parts[0]
+    let after = parts[1]
+    if len(after) == 3 && len(before) >= 1 && len(before) <= 3 && !starts_with(before, "0") {
+        return { group: sep, whole: before, frac: after }
+    }
+    { whole: before, frac: after }
+}
+
+// One reading of the digits: { amount, rounded }, or { error }.
+fn amount_input_amount(whole: str, frac: str, zeros: int, minus: bool, code: str) {
+    let size = len(re.replace(whole, "^0+", "")) + zeros
+    if size > 16 || len(frac) > 20 { return { error: "That amount is too long: 16 digits before the decimal mark at most." } }
+    let scaled = dec(`${filled(whole) ?? "0"}.${filled(frac) ?? "0"}`) * dec("1" + repeat("0", zeros))
+    let signed = minus ? 0 - scaled : scaled
+    let m = money.of(signed, code, "half_up")
+    if type_of(m) == "error" { return { error: "That amount is too large." } }
+    { amount: str(m.amount), rounded: type_of(money.of(signed, code)) == "error" }
+}
+
+// The whole reading: see the opening comment.
+fn amount_input_parse(text, mark: str = ".", currency: str = "USD", pick: str? = null) {
+    let bad = (message: str) => { status: "bad", amount: "", currency, rounded: false, message, readings: [] }
+    let raw = trim(re.replace(str(text ?? ""), "[   ]", " "))
+    if raw == "" { return { status: "empty", amount: "", currency, rounded: false, message: null, readings: [] } }
+    if len(raw) > amount_input_limit { return bad(`That is too long to be an amount: ${amount_input_limit} characters at most.`) }
+    let brackets = re.find(raw, "^\\((.*)\\)$")
+    let first = amount_input_sign(trim(brackets != null ? brackets.groups[0] : raw))
+    let cur = amount_input_currency(trim(first.rest), currency)
+    let second = amount_input_sign(trim(cur.rest))
+    let minus = brackets != null || first.minus || second.minus
+    let code = cur.code ?? currency
+    if type_of(money.minor_units(code)) == "error" { return bad(`"${code}" is not a currency code.`) }
+    let places = money.minor_units(code)
+    let unit = re.find(second.rest, "^(.*?)\\s*(k|mn|mio|mln|m|bn|bln|b|tn|t|thousand|lakh|crore|million|billion|trillion)$", "i")
+    let zeros = unit != null ? amount_input_multipliers[lower(unit.groups[1])] : 0
+    let body = trim(unit != null ? unit.groups[0] : second.rest)
+    if body == "" { return bad(cur.code != null || unit != null ? "There is no number here yet." : "Type a number.") }
+    let stray = re.find(body, "[^\\d.,' ]")
+    if stray != null { return bad(`"${stray.text}" cannot be part of an amount (character ${(index_of(raw, stray.text) ?? 0) + 1}).`) }
+    if !re.test(body, "\\d") { return bad("There is no number here yet.") }
+    let read = amount_input_digits(body)
+    if read.error != null { return bad(read.error) }
+    let done = (r, others: list) => {
+        { status: len(others) > 0 ? "ambiguous" : "ok", amount: r.amount, currency: code, rounded: r.rounded, message: null, readings: others }
+    }
+    if read.group == null {
+        let one = amount_input_amount(read.whole, read.frac, zeros, minus, code)
+        return one.error != null ? bad(one.error) : done(one, [])
+    }
+    let as_decimal = amount_input_amount(read.whole, read.frac, zeros, minus, code)
+    let as_group = amount_input_amount(read.whole + read.frac, "", zeros, minus, code)
+    if as_decimal.error != null { return bad(as_decimal.error) }
+    if as_group.error != null { return bad(as_group.error) }
+    let likely = zeros == 0 && places < 3 ? "grouped" : read.group == mark ? "decimal" : "grouped"
+    let way = pick ?? likely
+    let readings = [{ way: "grouped", ...as_group }, { way: "decimal", ...as_decimal }]
+    done(way == "grouped" ? as_group : as_decimal, readings)
+}
+
+fn amount_input_shown(amount: str, code: str, locale: str) = money.format(money.of(amount, code, "half_up"), locale)
+
+fn amount_input_negative(amount: str) = starts_with(amount, "-") && dec(amount) != 0
+
+component AmountInput(id: str, name: str? = null, label: str? = null, value: str = "", placeholder: str = "1.5k, $12, EUR 40, 1,234.50", hint: str? = null,
+                      required: bool = false, disabled: bool = false, currency: str = "USD", fixed: bool = false, locale: str = "en-US",
+                      negative: bool = false, on_change = null, class: str? = null) {
+    style global amount_input_css
+    state text = value
+    state pick = null
+    let mark = amount_input_mark(locale)
+    let home = upper(currency)
+    let judge = (typed: str, way) => {
+        let r = amount_input_parse(typed, mark, home, way)
+        if r.status == "bad" || r.status == "empty" { return { ...r, refused: null } }
+        if fixed && r.currency != home { return { ...r, refused: `This field takes ${home}, not ${r.currency}.` } }
+        if !negative && amount_input_negative(r.amount) { return { ...r, refused: "A negative amount is not allowed here." } }
+        { ...r, refused: null }
+    }
+    let read = judge(text, pick)
+    let fault = read.status == "bad" ? read.message : read.refused
+    let good = fault == null && read.status != "empty"
+    let sent = good ? read.amount : ""
+    let money_code = good ? read.currency : home
+    let described = ui_cls([hint != null && `${id}-hint`, `${id}-out`])
+    let tell = (r) => {
+        if on_change != null {
+            let fine = r.status != "bad" && r.status != "empty" && r.refused == null
+            on_change({ amount: fine ? dec(r.amount) : null, currency: fine ? r.currency : home })
+        }
+    }
+    <div class={ui_cls(["ui-amountin", class])}>
+        {label != null && <label.ui-amountin-label for={id}>
+            {label}{required && <span.ui-amountin-req aria-hidden="true">*</span>}
+        </label>}
+        <input.ui-amountin-control type="text" id={id} value={text} placeholder={placeholder} required={required} disabled={disabled}
+               autocomplete="off" spellcheck="false" aria-invalid={fault != null ? "true" : null} aria-describedby={described}
+               @input={(e) => {
+                   text = e.value
+                   pick = null
+                   tell(judge(e.value, null))
+               }}/>
+        {name != null && <input type="hidden" name={name} value={sent}/>}
+        {name != null && <input type="hidden" name={`${name}_currency`} value={money_code}/>}
+        {hint != null && <p.ui-amountin-hint id={`${id}-hint`}>{hint}</p>}
+        <div.ui-amountin-out id={`${id}-out`} aria-live="polite">
+            {fault != null ? <span.ui-amountin-bad>{fault}</span>
+                : good ? <span>
+                    <strong>{amount_input_shown(read.amount, read.currency, locale)}</strong>
+                    {read.rounded && <span.ui-amountin-note>Rounded: {read.currency} has {money.minor_units(read.currency)} decimals.</span>}
+                    {read.status == "ambiguous" && <span.ui-amountin-unsure>"{trim(text)}" can be read two ways. Please check.</span>}
+                </span>
+                : null}
+        </div>
+        {good && read.status == "ambiguous" && <div.ui-amountin-ways role="group" aria-label="How to read it">
+            {for r in read.readings => <button.ui-amountin-way key={r.way} type="button" data-way={r.way} aria-pressed={r.amount == read.amount ? "true" : "false"}
+                    @click={() => {
+                        pick = r.way
+                        tell(judge(text, r.way))
+                    }}>
+                {amount_input_shown(r.amount, read.currency, locale)}
+                <small>{r.way == "grouped" ? "The mark groups thousands" : "The mark is a decimal"}{r.rounded ? ", rounded" : ""}</small>
+            </button>}
+        </div>}
+    </div>
+}

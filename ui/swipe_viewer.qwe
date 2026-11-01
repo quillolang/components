@@ -1,0 +1,380 @@
+// SwipeViewer: photos on a black screen, swiped sideways with the next one coming in under the
+// finger, pulled down to close, pinched or double tapped to zoom. The two either side are already
+// loaded, and two more each way are on their way, so a swipe never shows an empty frame. It stays on
+// its photo through a close, a reopening and a turn of the phone, and says where it ended, for the
+// grid behind it to come back to. A tablet has a strip of all the photos along the bottom.
+//
+//   import ui/swipe_viewer.qwe use SwipeViewer
+//
+//   <SwipeViewer open={viewing} start={from} photos={[{ src: "/p/1.jpg", full: "/p/1-big.jpg", alt: "The harbour", caption: "Oban, at low tide" }]}
+//                on_close={(i) => { viewing = false; from = i }}/>
+//
+// photos: each { id, src, full, alt, caption }, or just the address. full: what is shown large, src
+// when left out, and src is what the strip shows. open: shows it, from your own state. start: the photo to
+// open on; left the same, it reopens where it was. label: what screen readers call it. on_change(index):
+// inside one of your components, when the photo changes. on_close(index): it closed, on this one.
+//
+// A swipe needs a quarter of the width, or a flick. A pull down needs 120 px, or a flick. Each has its
+// equal: the buttons, the arrow keys, + and - to zoom, 0 to fit, Escape to close.
+
+import ui/theme.qwe use ui_cls
+
+let swipe_viewer_css = css`
+.ui-swipev {
+  box-sizing: border-box; position: fixed; inset: 0; width: 100vw; max-width: none; height: 100dvh; max-height: none; margin: 0; padding: 0; overflow: hidden; border: 0; background: transparent; color: #fff;
+  font: 14px/1.4 var(--ui-font); overscroll-behavior: none;
+}
+.ui-swipev[open] { display: flex; flex-direction: column; }
+.ui-swipev::backdrop { background: transparent; }
+/* What dims with a pull: the black behind the photo. */
+.ui-swipev-black { position: absolute; inset: 0; background: #000; opacity: var(--ui-swipev-dim, 1); }
+.ui-swipev-top, .ui-swipev-tools { position: relative; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.ui-swipev-top { padding: calc(4px + env(safe-area-inset-top, 0px)) max(8px, env(safe-area-inset-right, 0px)) 4px max(12px, env(safe-area-inset-left, 0px)); }
+.ui-swipev-tools { padding: 4px max(8px, env(safe-area-inset-right, 0px)) calc(4px + env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px)); }
+.ui-swipev-where, .ui-swipev-level { font-variant-numeric: tabular-nums; }
+.ui-swipev-level { min-width: 52px; text-align: center; }
+.ui-swipev-tool { display: grid; place-items: center; min-width: 46px; height: 46px; padding: 0 8px; border: 0; border-radius: 10px; background: transparent; color: #fff; font: 600 20px var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-swipev-tool:disabled { color: rgba(255, 255, 255, .35); cursor: default; }
+.ui-swipev-tool svg { width: 22px; height: 22px; }
+.ui-swipev-tool:focus-visible, .ui-swipev-thumb:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }
+/* Everything a finger does here is ours: the page must neither scroll nor zoom behind it. */
+.ui-swipev-stage { position: relative; z-index: 1; flex: 1; min-height: 0; overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: grab; }
+.ui-swipev-track { position: absolute; inset: 0; will-change: transform; }
+.ui-swipev-slide { position: absolute; top: 0; bottom: 0; width: 100%; overflow: hidden; }
+.ui-swipev-slide img { display: block; width: 100%; height: 100%; object-fit: contain; transform-origin: 50% 50%; will-change: transform; pointer-events: none; -webkit-user-drag: none; }
+.ui-swipev-caption { position: relative; z-index: 1; margin: 0; padding: 6px 14px 0; text-align: center; }
+.ui-swipev-caption:empty { display: none; }
+.ui-swipev-strip { display: none; }
+.ui-swipev-thumb { flex: none; width: 56px; height: 56px; padding: 0; overflow: hidden; border: 2px solid transparent; border-radius: 8px; background: #222; cursor: pointer; opacity: .65; touch-action: manipulation; }
+.ui-swipev-thumb[aria-current="true"] { border-color: #fff; opacity: 1; }
+.ui-swipev-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
+@media (hover: hover) { .ui-swipev-tool:hover:not(:disabled) { background: rgba(255, 255, 255, .14); } }
+/* It covers the whole window, so the window's width is the one that counts, in Split View too. */
+@media (min-width: 700px) {
+  .ui-swipev-strip { position: relative; z-index: 1; display: flex; gap: 6px; padding: 8px 12px; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
+  .ui-swipev-caption { font-size: 16px; }
+}
+`
+
+// The photos that can be shown: an address, or a map with src.
+fn swipe_viewer_clean(photos) -> list {
+    if type_of(photos) != "list" { return [] }
+    photos | filter((p) => (type_of(p) == "str" && p != "") || (type_of(p) == "map" && type_of(get(p, "src")) == "str" && p.src != ""))
+           | map((p) => type_of(p) == "str" ? { src: p, full: p, alt: "", caption: "" }
+                                            : { src: p.src, full: str(get(p, "full") ?? p.src), alt: str(get(p, "alt") ?? ""), caption: str(get(p, "caption") ?? "") })
+}
+
+// A place to go to, kept within the photos; what cannot be read is the first.
+fn swipe_viewer_place(v, count: int) -> int {
+    let t = type_of(v)
+    if count <= 0 || (t != "int" && t != "float") { return 0 }
+    max([0, min([floor(v), count - 1])])
+}
+
+// Whether a photo is near enough to hold an image: two each way.
+fn swipe_viewer_near(i: int, at: int) -> bool = abs(i - at) <= 2
+
+fn swipe_viewer_zoom(z) = max([1, min([z, 4])])
+
+// How far a photo may pan each way, at a zoom, so its edge never leaves the side.
+fn swipe_viewer_bound(v, zoom, size) {
+    let most = (zoom - 1) * size / 2
+    max([0 - most, min([v, most])])
+}
+
+// A swipe at release: -1 back, 1 on, 0 stays. A quarter of the width does it, or a flick of 0.5 px/ms
+// over at least 30 px, as long as the finger is not by then going back.
+fn swipe_viewer_turn(dx, speed, width) -> int {
+    if dx <= 0 - width / 4 || (dx <= -30 && speed <= -0.5) { return speed > 0.3 ? 0 : 1 }
+    if dx >= width / 4 || (dx >= 30 && speed >= 0.5) { return speed < -0.3 ? 0 : -1 }
+    0
+}
+
+// Whether a pull down closes: 120 px, or a flick of 0.6 px/ms over at least 30, not going back.
+fn swipe_viewer_closes(dy, speed) -> bool = (dy > 120 && speed > -0.3) || (dy > 30 && speed > 0.6)
+
+fn swipe_viewer_gap(a, b) = sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y))
+
+// Two points, moving on every 50 ms, so the speed at release is never read from one last move.
+fn swipe_viewer_mark(x, y, t) -> map = { a: { x: x, y: y, t: t }, b: { x: x, y: y, t: t } }
+fn swipe_viewer_marked(m: map, x, y, t) -> map = t - m.b.t > 50 ? { a: m.b, b: { x: x, y: y, t: t } } : m
+fn swipe_viewer_speed(from_at, to_at, from_t, to_t) = (to_at - from_at) / max([1, to_t - from_t])
+
+component SwipeViewer(photos = [], open: bool = false, start = 0, label: str = "Photos", on_change = null, on_close = null, class: str? = null) {
+    style global swipe_viewer_css
+    let pics = swipe_viewer_clean(photos)
+    let count = len(pics)
+    state at = swipe_viewer_place(start, count)
+    state said_start = start
+    state dlg = null
+    state stage = null
+    state track = null
+    state strip = null
+    state still = false
+    state zoom = 1            // committed at each release
+    state px = 0
+    state py = 0
+    state now_at = { z: 1, x: 0, y: 0 }   // where the fingers have it: no markup reads this, so moves render nothing
+    state pts = []            // the fingers down
+    state mode = ""           // "", "pan", "swipe", "pull" or "pinch"
+    state from = null
+    state mark = null
+    state tapped = null       // the last tap, for a double tap
+    state turning = 0         // a turn on its way, -1 or 1
+    let pic = count > 0 ? pics[min([at, count - 1])] : null
+    let img_of = (i) => track.querySelector(`[data-i="${i}"] img`)
+    let place = (z, x, y) => {
+        now_at = { z: z, x: x, y: y }
+        let img = img_of(at)
+        if img != null { img.style.transform = `translate(${x}px, ${y}px) scale(${z})` }
+    }
+    let commit = () => {
+        zoom = now_at.z
+        px = now_at.x
+        py = now_at.y
+    }
+    let settle_to = (z, x, y) => {
+        let img = img_of(at)
+        if img != null { img.style.transition = still ? "none" : "transform .2s cubic-bezier(.2, .8, .2, 1)" }
+        place(z, x, y)
+        commit()
+    }
+    let zoom_to = (z) => {
+        let to = swipe_viewer_zoom(z)
+        settle_to(to, swipe_viewer_bound(px, to, stage.clientWidth), swipe_viewer_bound(py, to, stage.clientHeight))
+    }
+    let home = () => {
+        track.style.transition = still ? "none" : "transform .2s cubic-bezier(.2, .8, .2, 1)"
+        track.style.transform = ""
+        dlg.style.removeProperty("--ui-swipev-dim")
+    }
+    let land = (i) => {
+        // The photo left goes back to fit, unseen, so it is whole when it comes round again.
+        let old = img_of(at)
+        if old != null {
+            old.style.transition = "none"
+            old.style.transform = ""
+        }
+        now_at = { z: 1, x: 0, y: 0 }
+        zoom = 1
+        px = 0
+        py = 0
+        track.style.transition = "none"
+        track.style.transform = ""
+        at = i
+        on_change && on_change(i)
+        if strip != null {
+            let t = strip.querySelector(`[data-t="${i}"]`)
+            if t != null { t.scrollIntoView({ block: "nearest", inline: "center", behavior: "instant" }) }
+        }
+    }
+    let finish_turn = () => {
+        if turning != 0 {
+            let by = turning
+            turning = 0
+            land(at + by)
+        }
+    }
+    let turn = (by) => {
+        finish_turn()
+        let to = at + by
+        if to >= 0 && to < count {
+            if still {
+                land(to)
+            } else {
+                turning = by
+                track.style.transition = "transform .2s cubic-bezier(.2, .8, .2, 1)"
+                track.style.transform = `translateX(${0 - by * stage.clientWidth}px)`
+            }
+        } else {
+            home()
+        }
+    }
+    let go = (i) => {
+        finish_turn()
+        let to = swipe_viewer_place(i, count)
+        if to != at { land(to) }
+    }
+    let show_it = () => {
+        if dlg != null && !dlg.open && count > 0 {
+            dlg.showModal()
+            if strip != null {
+                let t = strip.querySelector(`[data-t="${at}"]`)
+                if t != null { t.scrollIntoView({ block: "nearest", inline: "center", behavior: "instant" }) }
+            }
+        }
+    }
+    if start != said_start {
+        said_start = start
+        at = swipe_viewer_place(start, count)
+    }
+    // Fewer photos than the place it was on: the last of them.
+    if count > 0 && at >= count { at = count - 1 }
+    if open && dlg != null { show_it() }
+    if !open && dlg != null && dlg.open { dlg.close() }
+    if turning != 0 { every(210, finish_turn) }
+    let up = (e) => {
+        let kept = pts | filter((p) => p.id != e.pointerId)
+        let was_down = len(kept) != len(pts)
+        if was_down {
+            pts = kept
+            let dx = e.clientX - from.x
+            let dy = e.clientY - from.y
+            let was = mode
+            if was == "pinch" {
+                commit()
+                mode = ""
+                if len(kept) > 0 {
+                    from = { x: kept[0].x, y: kept[0].y, px: px, py: py }
+                    mark = swipe_viewer_mark(kept[0].x, kept[0].y, e.timeStamp)
+                    mode = zoom > 1 ? "pan" : "held"
+                } else if zoom <= 1 {
+                    settle_to(1, 0, 0)
+                }
+            } else if len(kept) == 0 {
+                mode = ""
+                if e.type == "pointercancel" {
+                    if was == "swipe" || was == "pull" { home() } else { settle_to(zoom, px, py) }
+                } else if was == "swipe" {
+                    let by = swipe_viewer_turn(dx, swipe_viewer_speed(mark.a.x, e.clientX, mark.a.t, e.timeStamp), stage.clientWidth)
+                    if by == 0 { home() } else { turn(by) }
+                } else if was == "pull" {
+                    if swipe_viewer_closes(dy, swipe_viewer_speed(mark.a.y, e.clientY, mark.a.t, e.timeStamp)) {
+                        home()
+                        dlg.close()
+                    } else {
+                        home()
+                    }
+                } else if was == "pan" {
+                    commit()
+                } else if was == "" {
+                    // A tap, then another near it soon after, zooms there and back.
+                    let p = { x: e.clientX, y: e.clientY }
+                    if tapped != null && e.timeStamp - tapped.t < 320 && swipe_viewer_gap(tapped, p) < 30 {
+                        tapped = null
+                        if zoom > 1 {
+                            settle_to(1, 0, 0)
+                        } else {
+                            let r = stage.getBoundingClientRect()
+                            let to = 2.5
+                            let x = (r.width / 2 - (e.clientX - r.left)) * (to - 1)
+                            let y = (r.height / 2 - (e.clientY - r.top)) * (to - 1)
+                            settle_to(to, swipe_viewer_bound(x, to, r.width), swipe_viewer_bound(y, to, r.height))
+                        }
+                    } else {
+                        tapped = { x: e.clientX, y: e.clientY, t: e.timeStamp }
+                    }
+                }
+            }
+        }
+    }
+    <dialog class={ui_cls(["ui-swipev", class])} aria-label={label}
+            @mount={(el) => {
+                dlg = el
+                still = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+                if open { show_it() }
+                // A turn of the phone: the photo stays, and a pan is kept inside the new edges.
+                let grown = js_new("ResizeObserver", (_x) => {
+                    if stage != null && zoom > 1 { zoom_to(zoom) }
+                })
+                grown.observe(el)
+                () => grown.disconnect()
+            }}
+            @close={() => {
+                finish_turn()
+                if zoom > 1 { settle_to(1, 0, 0) }
+                on_close && on_close(at)
+            }}
+            @keydown={(e) => {
+                let k = e.key
+                if k == "ArrowLeft" { e.preventDefault(); turn(-1) }
+                if k == "ArrowRight" { e.preventDefault(); turn(1) }
+                if k == "+" || k == "=" { e.preventDefault(); zoom_to(zoom + 0.5) }
+                if k == "-" { e.preventDefault(); zoom_to(zoom - 0.5) }
+                if k == "0" { e.preventDefault(); settle_to(1, 0, 0) }
+            }}>
+        <div.ui-swipev-black></div>
+        <div.ui-swipev-top>
+            <span.ui-swipev-where role="status">{count > 0 ? `${min([at + 1, count])} / ${count}` : ""}</span>
+            <button.ui-swipev-tool type="button" aria-label="Close" @click={() => { dlg.close() }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+            </button>
+        </div>
+        <div.ui-swipev-stage
+             @mount={(el) => { stage = el }}
+             @pointerdown={(e) => {
+                 finish_turn()
+                 stage.setPointerCapture(e.pointerId)
+                 pts = pts | filter((p) => p.id != e.pointerId) | push({ id: e.pointerId, x: e.clientX, y: e.clientY })
+                 track.style.transition = "none"
+                 let img = img_of(at)
+                 if img != null { img.style.transition = "none" }
+                 if len(pts) == 2 {
+                     mode = "pinch"
+                     track.style.transform = ""
+                     from = { x: e.clientX, y: e.clientY, d: max([1, swipe_viewer_gap(pts[0], pts[1])]), z: zoom, px: px, py: py, cx: (pts[0].x + pts[1].x) / 2, cy: (pts[0].y + pts[1].y) / 2 }
+                 } else if len(pts) == 1 {
+                     mode = ""
+                     from = { x: e.clientX, y: e.clientY, px: px, py: py }
+                     mark = swipe_viewer_mark(e.clientX, e.clientY, e.timeStamp)
+                 }
+             }}
+             @pointermove={(e) => {
+                 let known = find(pts, (p) => p.id == e.pointerId) != null
+                 if known {
+                     pts = pts | map((p) => p.id == e.pointerId ? { id: p.id, x: e.clientX, y: e.clientY } : p)
+                     if mode == "pinch" && len(pts) == 2 {
+                         let z = swipe_viewer_zoom(from.z * swipe_viewer_gap(pts[0], pts[1]) / from.d)
+                         let x = from.px + (pts[0].x + pts[1].x) / 2 - from.cx
+                         let y = from.py + (pts[0].y + pts[1].y) / 2 - from.cy
+                         place(z, swipe_viewer_bound(x, z, stage.clientWidth), swipe_viewer_bound(y, z, stage.clientHeight))
+                     } else if len(pts) == 1 {
+                         let dx = e.clientX - from.x
+                         let dy = e.clientY - from.y
+                         if mode == "" && (abs(dx) >= 10 || abs(dy) >= 10) {
+                             mode = zoom > 1 ? "pan" : abs(dx) > abs(dy) ? "swipe" : dy > 0 ? "pull" : "held"
+                         }
+                         mark = swipe_viewer_marked(mark, e.clientX, e.clientY, e.timeStamp)
+                         if mode == "pan" {
+                             place(zoom, swipe_viewer_bound(from.px + dx, zoom, stage.clientWidth), swipe_viewer_bound(from.py + dy, zoom, stage.clientHeight))
+                         }
+                         if mode == "swipe" {
+                             // No photo that way: it gives, and comes back.
+                             let edge = (dx > 0 && at == 0) || (dx < 0 && at + 1 >= count)
+                             track.style.transform = `translateX(${edge ? dx * 0.3 : dx}px)`
+                         }
+                         if mode == "pull" {
+                             let d = max([0, dy])
+                             track.style.transform = `translateY(${d}px) scale(${max([0.7, 1 - d / 1200])})`
+                             dlg.style.setProperty("--ui-swipev-dim", `${max([0.2, 1 - d / 400])}`)
+                         }
+                     }
+                 }
+             }}
+             @pointerup={(e) => { up(e) }}
+             @pointercancel={(e) => { up(e) }}>
+            <div.ui-swipev-track @mount={(el) => { track = el }}>
+                {for [i, p] in enumerate(pics) => swipe_viewer_near(i, at) && <div.ui-swipev-slide key={i} data-i={i} style={`left: ${(i - at) * 100}%`} aria-hidden={i == at ? null : "true"}>
+                    <img src={p.full} alt={p.alt} draggable="false"/>
+                </div>}
+            </div>
+        </div>
+        <p.ui-swipev-caption>{pic == null ? "" : pic.caption}</p>
+        <div.ui-swipev-strip @mount={(el) => { strip = el }}>
+            {for [i, p] in enumerate(pics) => <button.ui-swipev-thumb key={i} data-t={i} type="button" aria-label={`Photo ${i + 1}${p.alt != "" ? `: ${p.alt}` : ""}`} aria-current={i == at ? "true" : "false"} @click={() => { go(i) }}>
+                <img src={p.src} alt="" loading="lazy" draggable="false"/>
+            </button>}
+        </div>
+        <div.ui-swipev-tools>
+            <button.ui-swipev-tool type="button" aria-label="Previous photo" disabled={at == 0} @click={() => { turn(-1) }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 6-6 6 6 6"/></svg>
+            </button>
+            <button.ui-swipev-tool type="button" aria-label="Zoom out" disabled={zoom <= 1} @click={() => { zoom_to(zoom - 0.5) }}>-</button>
+            <span.ui-swipev-level aria-live="polite">{round(zoom * 100)}%</span>
+            <button.ui-swipev-tool type="button" aria-label="Zoom in" disabled={zoom >= 4} @click={() => { zoom_to(zoom + 0.5) }}>+</button>
+            <button.ui-swipev-tool type="button" aria-label="Next photo" disabled={at + 1 >= count} @click={() => { turn(1) }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+            </button>
+        </div>
+    </dialog>
+}

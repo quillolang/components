@@ -1,0 +1,401 @@
+// ShiftPlanner: people by days across a week, each cell the shift they work. It checks
+// the rest between shifts (across midnight too), weekly hours, skills, days off and
+// coverage, and marks each breach where it is, with its reason. Auto-fill fills what
+// is short and keeps what is there: the hardest places first, each to whoever is
+// allowed and has the fewest hours and the fewest of that shift, so nights go round
+// fairly. What it could not fill it says, and why nobody could take it.
+//
+//   <ShiftPlanner week="2026-11-02" min_rest={11}
+//       people={[{ id: "ana", name: "Ana", skills: ["forklift"], max_hours: 32 }, { id: "ben", name: "Ben", off: [3] }]}
+//       shifts={[{ id: "e", name: "Early", start: "06:00", end: "14:00", need: 1 },
+//                { id: "n", name: "Night", start: "22:00", end: "06:00", need: 1, skill: "forklift" }]}/>
+//
+// week: any date in the week; it starts on Monday. people: a list of { id, name?, skills?,
+// max_hours?, off? }, off being days they cannot work, each a weekday from 1 for Monday
+// to 7 for Sunday or a date. shifts: a list of { id, name?, start, end, need?, skill? }.
+// start and end are "HH:MM"; an end at or before the start is the next day. need: people
+// wanted each day (1), or a list of seven, Monday first. skill: what it needs. assigned: the
+// plan to start with, a list of { person, day, shift }, day from 0 for Monday or a date.
+// min_rest: hours between shifts (11). max_hours: a week's limit for those who do not
+// give one (40). title: the heading. id: a prefix for its ids, unique on the page. name: a
+// prefix for the fields, one for each cell: <name>_<person>_<day> ("shift"). on_change(plan):
+// inside one of your components, after each change, with the list of { person, day, shift },
+// day being the date.
+//
+// One person works at most one shift a day; it plans at most 200 people and 40 shifts.
+// The week stands alone: rest against the
+// week before or after it is not checked.
+//
+// shift_planner_read(people, shifts) makes the data safe: { people, shifts, problems }.
+// shift_planner_check(people, shifts, week, plan, rules) gives the breaches, each
+// { kind, person, day, shift, reason }, kinds being rest, hours, skill, off and cover.
+// shift_planner_fill(people, shifts, week, plan, rules) gives { plan, unfilled }. A
+// plan is a map from "person day" (day 0 to 6) to a shift's id; rules is { min_rest, max_hours }.
+
+import ui/theme.qwe use ui_cls
+
+let shift_planner_css = css`
+.ui-shift-planner { display: grid; gap: 12px; min-width: 0; padding: 18px 20px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-shift-planner .ui-shift-planner-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-shift-planner-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-shift-planner-btn { padding: 7px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1.2 var(--ui-font); cursor: pointer; }
+.ui-shift-planner-btn:hover { border-color: var(--ui-accent); }
+.ui-shift-planner-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-shift-planner-fill { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-shift-planner-wrap { overflow-x: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-shift-planner-wrap:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-shift-planner-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-shift-planner-table th, .ui-shift-planner-table td { padding: 5px 6px; border-bottom: 1px solid var(--ui-border); text-align: center; white-space: nowrap; }
+.ui-shift-planner-table thead th { background: var(--ui-subtle); font-weight: 600; }
+.ui-shift-planner-table tbody th, .ui-shift-planner-table tfoot th { position: sticky; left: 0; z-index: 1; background: var(--ui-surface); font-weight: 600; text-align: left; }
+.ui-shift-planner-cell select { box-sizing: border-box; width: 84px; padding: 4px; border: 1px solid var(--ui-border); border-radius: 4px; background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); }
+.ui-shift-planner-cell select:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-shift-planner-bad { background: var(--ui-danger-soft); }
+.ui-shift-planner-bad select { border-color: var(--ui-danger); }
+.ui-shift-planner-hours { font-weight: 600; }
+.ui-shift-planner-over { color: var(--ui-danger); }
+.ui-shift-planner-short { background: var(--ui-danger-soft); color: var(--ui-danger); font-weight: 650; }
+.ui-shift-planner-list { display: grid; gap: 3px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-shift-planner-breach { color: var(--ui-danger); }
+.ui-shift-planner-unfilled { color: var(--ui-warning); }
+.ui-shift-planner-ok { color: var(--ui-success); }
+.ui-shift-planner-said { min-height: 1.4em; margin: 0; color: var(--ui-muted); font-size: 13px; }
+`
+
+let shift_planner_most_people = 200
+let shift_planner_most_shifts = 40
+let shift_planner_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+// "HH:MM" as minutes, or null.
+fn shift_planner_time(t) {
+    if type_of(t) != "str" { return null }
+    let m = re.find(trim(t), "^(\\d{1,2}):(\\d{2})$")
+    if m == null { return null }
+    let h = int(m.groups[0])
+    let mins = int(m.groups[1])
+    h > 23 || mins > 59 ? null : h * 60 + mins
+}
+
+// See the top of the file: bad people and shifts are left out and said.
+fn shift_planner_read(people, shifts) -> map {
+    let problems = []
+    let crew = []
+    let seen = {}
+    let everyone = type_of(people) == "list" ? people : []
+    let every_shift = type_of(shifts) == "list" ? shifts : []
+    if len(everyone) > shift_planner_most_people { problems = problems | push(`Only the first ${shift_planner_most_people} people are planned.`) }
+    if len(every_shift) > shift_planner_most_shifts { problems = problems | push(`Only the first ${shift_planner_most_shifts} shifts are planned.`) }
+    for [i, p] in enumerate(take(everyone, shift_planner_most_people)) {
+        let id = type_of(p) == "map" ? trim(str(p.id ?? "")) : ""
+        if id == "" {
+            problems = problems | push(`Person ${i + 1} has no id.`)
+        } else if has(seen, id) {
+            problems = problems | push(`Person ${i + 1}: the id ${id} is used twice.`)
+        } else {
+            seen = set(seen, id, true)
+            crew = crew | push({ id, name: filled(trim(str(p.name ?? ""))) ?? id, skills: type_of(p.skills) == "list" ? p.skills | map(str) : [],
+                                 max_hours: p.max_hours, off: type_of(p.off) == "list" ? p.off : [] })
+        }
+    }
+    let rota = []
+    let known = {}
+    for [i, s] in enumerate(take(every_shift, shift_planner_most_shifts)) {
+        let id = type_of(s) == "map" ? trim(str(s.id ?? "")) : ""
+        let from = type_of(s) == "map" ? shift_planner_time(s.start) : null
+        let to = type_of(s) == "map" ? shift_planner_time(s.end) : null
+        let need = type_of(s) == "map" ? s.need ?? 1 : 1
+        let needs = type_of(need) == "list" ? range(7) | map((d) => type_of(need[d]) == "int" && need[d] >= 0 ? need[d] : 0) : (type_of(need) == "int" && need >= 0 ? range(7) | map((_) => need) : null)
+        if id == "" {
+            problems = problems | push(`Shift ${i + 1} has no id.`)
+        } else if has(known, id) {
+            problems = problems | push(`Shift ${i + 1}: the id ${id} is used twice.`)
+        } else if from == null || to == null {
+            problems = problems | push(`Shift ${id}: its times must be written HH:MM.`)
+        } else if needs == null {
+            problems = problems | push(`Shift ${id}: what it needs is not a whole number of people.`)
+        } else {
+            known = set(known, id, true)
+            let minutes = to > from ? to - from : to + 1440 - from
+            rota = rota | push({ id, name: filled(trim(str(s.name ?? ""))) ?? id, from, minutes, needs, skill: s.skill != null ? str(s.skill) : null })
+        }
+    }
+    { people: crew, shifts: rota, problems }
+}
+
+fn shift_planner_key(person: str, day: int) -> str = `${person} ${day}`
+
+// That week's Monday, or null for what is not a date.
+fn shift_planner_monday(d) {
+    if type_of(d) != "str" || !date.valid(d, "date") || d < "1000-01-08" || d > "9000-12-31" { return null }
+    date.add_days(d, 1 - date.weekday(d))
+}
+
+// Whether a person is away on a day of the week.
+fn shift_planner_is_off(p: map, day: int, monday: str) -> bool =
+    contains(p.off, day + 1) || contains(p.off, date.add_days(monday, day))
+
+// A week's limit for this person, in minutes.
+fn shift_planner_limit(p: map, rules: map) -> int {
+    let h = p.max_hours ?? rules.max_hours
+    let kind = type_of(h)
+    int(round(dec(kind == "int" || kind == "float" || kind == "dec" ? h : rules.max_hours) * 60, 0, "half_up"))
+}
+
+fn shift_planner_rest(rules: map) -> int = int(round(dec(rules.min_rest) * 60, 0, "half_up"))
+
+// Minutes as hours: 480 is "8", 450 is "7.5".
+fn shift_planner_hours(m: int) -> str {
+    let s = str(dec(m) / 60)
+    contains(s, ".") ? re.replace(re.replace(s, "0+$", ""), "\\.$", "") : s
+}
+
+fn shift_planner_find(shifts: list, id) = shifts | find((s) => s.id == id)
+
+// A person's shifts in day order: [{ day, shift, start, end }], in minutes from Monday 00:00.
+fn shift_planner_runs(p: map, shifts: list, plan: map) -> list {
+    let out = []
+    for d in range(7) {
+        let s = shift_planner_find(shifts, get(plan, shift_planner_key(p.id, d)))
+        if s != null {
+            let start = d * 1440 + s.from
+            out = out | push({ day: d, shift: s, start, end: start + s.minutes })
+        }
+    }
+    out
+}
+
+// The minutes of a person's week.
+fn shift_planner_minutes(p: map, shifts: list, plan: map) -> int = shift_planner_runs(p, shifts, plan) | map((r) => r.shift.minutes) | sum()
+
+// See the top of the file.
+fn shift_planner_check(people: list, shifts: list, week: str, plan: map, rules: map) -> list {
+    let out = []
+    let rest = shift_planner_rest(rules)
+    for p in people {
+        let runs = shift_planner_runs(p, shifts, plan)
+        for [i, r] in enumerate(runs) {
+            let day = shift_planner_names[r.day]
+            if r.shift.skill != null && !contains(p.skills, r.shift.skill) {
+                out = out | push({ kind: "skill", person: p.id, day: r.day, shift: r.shift.id, reason: `${p.name} on ${day}: ${r.shift.name} needs ${r.shift.skill}.` })
+            }
+            if shift_planner_is_off(p, r.day, week) {
+                out = out | push({ kind: "off", person: p.id, day: r.day, shift: r.shift.id, reason: `${p.name} is off on ${day}.` })
+            }
+            if i > 0 {
+                let before = runs[i - 1]
+                let gap = r.start - before.end
+                if gap < rest {
+                    let said = gap < 0 ? `overlaps it by ${shift_planner_hours(0 - gap)} h` : `only ${shift_planner_hours(gap)} h rest after it`
+                    out = out | push({ kind: "rest", person: p.id, day: r.day, shift: r.shift.id,
+                                       reason: `${p.name} on ${day}: ${said}, from ${shift_planner_names[before.day]} ${before.shift.name}; ${shift_planner_hours(rest)} h needed.` })
+                }
+            }
+        }
+        let total = runs | map((r) => r.shift.minutes) | sum()
+        let limit = shift_planner_limit(p, rules)
+        if total > limit {
+            out = out | push({ kind: "hours", person: p.id, day: null, shift: null, reason: `${p.name} has ${shift_planner_hours(total)} h, over the limit of ${shift_planner_hours(limit)} h.` })
+        }
+    }
+    for d in range(7) {
+        for s in shifts {
+            let have = people | filter((p) => get(plan, shift_planner_key(p.id, d)) == s.id) | len
+            if have < s.needs[d] {
+                out = out | push({ kind: "cover", person: null, day: d, shift: s.id, reason: `${shift_planner_names[d]} ${s.name} has ${have} of ${s.needs[d]}.` })
+            }
+        }
+    }
+    out
+}
+
+// Why a person cannot take a shift on a day, in one word, or null when they can.
+fn shift_planner_refuse(p: map, s: map, d: int, week: str, plan: map, shifts: list, rules: map) {
+    if has(plan, shift_planner_key(p.id, d)) { return "taken" }
+    if s.skill != null && !contains(p.skills, s.skill) { return "skill" }
+    if shift_planner_is_off(p, d, week) { return "off" }
+    let runs = shift_planner_runs(p, shifts, plan)
+    if (runs | map((r) => r.shift.minutes) | sum()) + s.minutes > shift_planner_limit(p, rules) { return "hours" }
+    let rest = shift_planner_rest(rules)
+    let start = d * 1440 + s.from
+    let end = start + s.minutes
+    if any(runs, (r) => (r.day < d && start - r.end < rest) || (r.day > d && r.start - end < rest)) { return "rest" }
+    null
+}
+
+// Why nobody could take a place: "2 lack forklift, 1 is off".
+fn shift_planner_because(counts: map, s: map) -> str {
+    let part = (k: str, one: str, many: str) => {
+        let n = get(counts, k) ?? 0
+        n > 0 ? `${n} ${n == 1 ? one : many}` : null
+    }
+    let parts = [part("skill", `lacks ${s.skill}`, `lack ${s.skill}`), part("off", "is off", "are off"), part("taken", "already works that day", "already work that day"),
+                 part("rest", "would get too little rest", "would get too little rest"), part("hours", "would pass their hours", "would pass their hours")]
+    let said = parts | filter((p) => p != null) | join(", ")
+    said == "" ? "there is nobody to ask" : said
+}
+
+// See the top of the file. Places with the fewest possible people go first, so an
+// easy one does not take the only person a hard one could have.
+fn shift_planner_fill(people: list, shifts: list, week: str, plan: map, rules: map) -> map {
+    let work = plan
+    let places = []
+    for d in range(7) {
+        for s in shifts {
+            let have = people | filter((p) => get(work, shift_planner_key(p.id, d)) == s.id) | len
+            // No day can use more people than there are, whatever `need` asks.
+            for _ in range(min([max([s.needs[d] - have, 0]), len(people)])) {
+                let can = people | filter((p) => shift_planner_refuse(p, s, d, week, work, shifts, rules) == null) | len
+                places = places | push({ day: d, shift: s, can })
+            }
+        }
+    }
+    let unfilled = []
+    let counts = {}
+    for at in sort_by(places, (x) => x.can) {
+        let s = at.shift
+        let best = null
+        let why = {}
+        for [i, p] in enumerate(people) {
+            let no = shift_planner_refuse(p, s, at.day, week, work, shifts, rules)
+            if no != null {
+                why = set(why, no, (get(why, no) ?? 0) + 1)
+            } else {
+                let score = { hours: shift_planner_minutes(p, shifts, work), same: get(counts, `${p.id} ${s.id}`) ?? 0, order: i }
+                if best == null || shift_planner_fairer(score, best.score) { best = { person: p, score } }
+            }
+        }
+        if best == null {
+            unfilled = unfilled | push({ day: at.day, shift: s.id, name: s.name, reason: `${shift_planner_names[at.day]} ${s.name}: ${shift_planner_because(why, s)}.` })
+        } else {
+            work = set(work, shift_planner_key(best.person.id, at.day), s.id)
+            let k = `${best.person.id} ${s.id}`
+            counts = set(counts, k, (get(counts, k) ?? 0) + 1)
+        }
+    }
+    { plan: work, unfilled }
+}
+
+fn shift_planner_fairer(a: map, b: map) -> bool {
+    if a.hours != b.hours { return a.hours < b.hours }
+    if a.same != b.same { return a.same < b.same }
+    a.order < b.order
+}
+
+// The plan from the `assigned` prop: entries naming nobody or no shift are left out.
+fn shift_planner_start(assigned, people: list, shifts: list, monday) -> map {
+    let plan = {}
+    for a in type_of(assigned) == "list" ? assigned : [] {
+        if type_of(a) == "map" {
+            let who = str(a.person ?? "")
+            let day = type_of(a.day) == "int" ? a.day : (monday != null && type_of(a.day) == "str" && date.valid(a.day, "date") ? date.days_between(monday, a.day) : -1)
+            if day >= 0 && day <= 6 && any(people, (p) => p.id == who) && shift_planner_find(shifts, str(a.shift ?? "")) != null {
+                plan = set(plan, shift_planner_key(who, day), str(a.shift))
+            }
+        }
+    }
+    plan
+}
+
+// The plan as a list for on_change.
+fn shift_planner_list(people: list, plan: map, monday: str) -> list {
+    let out = []
+    for p in people {
+        for d in range(7) {
+            let s = get(plan, shift_planner_key(p.id, d))
+            if s != null { out = out | push({ person: p.id, day: date.add_days(monday, d), shift: s }) }
+        }
+    }
+    out
+}
+
+component ShiftPlanner(week: str = "", people: list = [], shifts: list = [], assigned: list = [], min_rest = 11, max_hours = 40, title: str = "Shift plan",
+                       id: str = "shift-planner", name: str = "shift", on_change = null, class: str? = null) {
+    style global shift_planner_css
+    let read = shift_planner_read(people, shifts)
+    let monday = shift_planner_monday(week)
+    let rules = { min_rest: type_of(min_rest) == "int" || type_of(min_rest) == "float" || type_of(min_rest) == "dec" ? min_rest : 11, max_hours }
+    state plan = shift_planner_start(assigned, read.people, read.shifts, monday)
+    state unfilled = []
+    state said = ""
+    let ready = monday != null && len(read.people) > 0 && len(read.shifts) > 0
+    let breaches = ready ? shift_planner_check(read.people, read.shifts, monday, plan, rules) : []
+    let bad_cell = (pid: str, d: int) => any(breaches, (b) => b.person == pid && b.day == d)
+    let why_cell = (pid: str, d: int) => breaches | filter((b) => b.person == pid && b.day == d) | map((b) => b.reason) | join(" ")
+    let have = (s: map, d: int) => read.people | filter((p) => get(plan, shift_planner_key(p.id, d)) == s.id) | len
+    let tell = () => { on_change && on_change(shift_planner_list(read.people, plan, monday)) }
+    let put = (pid: str, d: int, v: str) => {
+        plan = v == "" ? remove(plan, shift_planner_key(pid, d)) : set(plan, shift_planner_key(pid, d), v)
+        unfilled = []
+        said = ""
+        tell()
+    }
+    let fill = () => {
+        let r = shift_planner_fill(read.people, read.shifts, monday, plan, rules)
+        plan = r.plan
+        unfilled = r.unfilled
+        let hours = read.people | map((p) => shift_planner_minutes(p, read.shifts, r.plan))
+        said = `Filled. Hours run from ${shift_planner_hours(min(hours))} to ${shift_planner_hours(max(hours))}; ${len(r.unfilled) == 0 ? "every place is covered" : `${len(r.unfilled)} could not be filled`}.`
+        tell()
+    }
+    let clear = () => {
+        plan = {}
+        unfilled = []
+        said = "Cleared."
+        tell()
+    }
+    let problems = (monday == null ? [`"${slice(str(week), 0, 30)}" is not a week: pass a date.`] : []) + read.problems
+    <section class={ui_cls(["ui-shift-planner", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-shift-planner-title id={`${id}-title`}>{title}</h3>
+        {len(problems) > 0 && <ul class="ui-shift-planner-list ui-shift-planner-breach" role="alert">{for p in take(problems, 6) => <li key={p}>{p}</li>}</ul>}
+        {!ready
+            ? <p.ui-shift-planner-said>{len(read.people) == 0 ? "No people to plan." : (len(read.shifts) == 0 ? "No shifts to plan." : "")}</p>
+            : <div.ui-shift-planner-bar>
+                <button class="ui-shift-planner-btn ui-shift-planner-fill" type="button" @click={fill}>Auto-fill</button>
+                <button.ui-shift-planner-btn type="button" @click={clear}>Clear</button>
+              </div>}
+        {ready && <div.ui-shift-planner-wrap tabindex="0" role="region" aria-label="Shifts by person and day">
+            <table.ui-shift-planner-table>
+                <thead><tr>
+                    <th scope="col">Person</th>
+                    {for d in range(7) => <th key={d} scope="col">{date.format(date.add_days(monday, d), "ddd D")}</th>}
+                    <th scope="col">Hours</th>
+                </tr></thead>
+                <tbody>
+                    {for p in read.people => {
+                        let minutes = shift_planner_minutes(p, read.shifts, plan)
+                        <tr key={p.id} data-person={p.id}>
+                            <th scope="row">{p.name}</th>
+                            {for d in range(7) => <td key={d} data-day={d} class={ui_cls(["ui-shift-planner-cell", bad_cell(p.id, d) && "ui-shift-planner-bad"])} title={why_cell(p.id, d)}>
+                                <select id={`${id}-${p.id}-${d}`} name={`${name}_${p.id}_${d}`} aria-label={`${p.name}, ${shift_planner_names[d]}`} aria-invalid={bad_cell(p.id, d) ? "true" : null}
+                                        @change={(e) => { put(p.id, d, e.value) }}>
+                                    <option value="" selected={get(plan, shift_planner_key(p.id, d)) == null}>–</option>
+                                    {for s in read.shifts => <option key={s.id} value={s.id} selected={get(plan, shift_planner_key(p.id, d)) == s.id}>{s.name}</option>}
+                                </select>
+                            </td>}
+                            <td class={ui_cls(["ui-shift-planner-hours", minutes > shift_planner_limit(p, rules) && "ui-shift-planner-over"])}>{shift_planner_hours(minutes)}</td>
+                        </tr>
+                    }}
+                </tbody>
+                <tfoot>
+                    {for s in read.shifts => <tr key={s.id} data-shift={s.id}>
+                        <th scope="row">{s.name}</th>
+                        {for d in range(7) => <td key={d} class={have(s, d) < s.needs[d] ? "ui-shift-planner-short" : null}>{have(s, d)}/{s.needs[d]}</td>}
+                        <td></td>
+                    </tr>}
+                </tfoot>
+            </table>
+        </div>}
+        <div aria-live="polite">
+            {ready && len(breaches) == 0 && <p class="ui-shift-planner-said ui-shift-planner-ok">No rule is broken and every place is covered.</p>}
+            {len(breaches) > 0 && <ul class="ui-shift-planner-list ui-shift-planner-breach" aria-label="What is wrong">
+                {for b in take(breaches, 40) => <li key={b.reason} data-kind={b.kind}>{b.reason}</li>}
+                {len(breaches) > 40 && <li>And {len(breaches) - 40} more.</li>}
+            </ul>}
+            {len(unfilled) > 0 && <ul class="ui-shift-planner-list ui-shift-planner-unfilled" aria-label="Could not be filled">
+                {for u in take(unfilled, 40) => <li key={`${u.day}-${u.shift}-${u.reason}`}>Could not fill {u.reason}</li>}
+            </ul>}
+            <p.ui-shift-planner-said>{said}</p>
+        </div>
+    </section>
+}

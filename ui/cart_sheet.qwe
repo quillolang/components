@@ -1,0 +1,554 @@
+// CartSheet: a cart in a sheet that rises from the bottom of a phone, and sits at the
+// side on a tablet. Each line has its quantity, and goes with a swipe to the left or its
+// Remove button, with Undo for a few seconds. Totals are worked out in decimals as they
+// change, a note says how far off free shipping is, and the checkout button shows the total.
+//
+//   import ui/cart_sheet.qwe use CartSheet
+//
+//   <CartSheet items={lines} free_over="150.00" shipping="6.95" tax_rate="0.08"
+//              on_change={(ls) => { lines = ls }} on_checkout={(ls, t) => { pay(ls, t) }}/>
+//   <CartSheet items={lines} trigger={null} open={showing} on_close={() => { showing = false }}/>
+//
+// items: the lines, each { id, name, price, qty }, with option (a line under the name),
+// image (an address) and stock (the most of it there is). The sheet follows it when your
+// page changes the list; lines that on_change gave back may be passed in as they are. A price is a decimal or text
+// ("19.99"); one that cannot be read shows as "Price unavailable" and counts as nothing,
+// and a line without an id is left out. trigger: the text of a button that opens the
+// sheet, with the count beside it ("Cart"; null for none, then open it by open={...}).
+// open, on_close(): your own state opens and closes it. title: its heading ("Your cart").
+// currency ("USD"), locale. free_over: the subtotal from which shipping is free (null: it
+// never is). shipping: its cost below that (0). tax_rate: a share of the subtotal, "0.08"
+// for 8% (0). most: the most of one line (99). undo_seconds: how long Undo stays (6).
+// checkout_href: the checkout button is this link; else on_checkout(lines, totals), with
+// totals { subtotal, shipping, tax, total, short } as decimals. on_change(lines) after
+// each change of a quantity, a removal or an undo.
+//
+// CartSheetFrame is the sheet itself, for other sheets of the shop to sit in
+// (FilterSheet, VariantSheet, CheckoutSheet): the browser's <dialog>, so focus stays in
+// it and Escape closes it, pulled down by its top to close, kept above the on-screen
+// keyboard. title, open, on_close() as above; footer: what stays at the bottom, as HTML,
+// out of the way while the keyboard is up; wide: what it is from 700 px across, "side"
+// (a panel at the right) or "center" (a dialog in the middle); children: what scrolls.
+//
+// cart_sheet_totals(lines, shipping, free_over, tax_rate, currency) gives the totals of
+// lines kept by cart_sheet_clean(items, most), for a server to work out the same sum.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/price.qwe use price_text
+
+let cart_sheet_css = css`
+/* The page behind stays where it is: a modal dialog does not stop it scrolling on a phone. */
+html:has(.ui-cartsh[open]) { overflow: hidden; }
+.ui-cartsh {
+  box-sizing: border-box; inset: auto 0 var(--ui-cartsh-kb, 0px) 0; width: 100%; max-width: 100vw; height: auto;
+  max-height: calc(100dvh - var(--ui-cartsh-kb, 0px) - env(safe-area-inset-top, 0px) - 24px);
+  margin: 0; padding: 0; overflow: hidden; border: 1px solid var(--ui-border); border-bottom: 0;
+  border-radius: calc(var(--ui-radius) + 8px) calc(var(--ui-radius) + 8px) 0 0; background: var(--ui-surface); color: var(--ui-fg);
+  box-shadow: var(--ui-shadow-lg); font: 15px/1.45 var(--ui-font); transition: transform .2s cubic-bezier(.2, .8, .2, 1);
+  overscroll-behavior: contain;
+}
+.ui-cartsh::backdrop { background: var(--ui-overlay); }
+.ui-cartsh[open] { display: flex; flex-direction: column; animation: ui-cartsh-up .24s cubic-bezier(.2, .8, .2, 1); }
+@keyframes ui-cartsh-up { from { transform: translateY(100%); } }
+/* The top pulls the sheet down: nothing scrolls there, and no callout or selection starts. */
+.ui-cartsh-grab { flex: none; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: grab; }
+.ui-cartsh-grip { display: block; width: 40px; height: 5px; margin: 8px auto 2px; border-radius: 999px; background: var(--ui-strong); }
+.ui-cartsh-head { display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 0 6px 0 18px; border-bottom: 1px solid var(--ui-border); }
+.ui-cartsh-head h2 { flex: 1; min-width: 0; margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; }
+.ui-cartsh-x {
+  display: grid; place-items: center; flex: none; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); cursor: pointer; touch-action: manipulation;
+}
+.ui-cartsh-x:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-cartsh-x svg { width: 20px; height: 20px; }
+.ui-cartsh-body {
+  flex: 1 1 auto; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; padding: 12px 16px;
+  container-type: inline-size; scroll-padding: 16px;
+}
+.ui-cartsh-foot {
+  flex: none; display: grid; gap: 10px; padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--ui-border); background: var(--ui-surface);
+}
+/* With the keyboard up the room goes to the field. */
+.ui-cartsh[data-keyboard] .ui-cartsh-foot { display: none; }
+@media (hover: hover) { .ui-cartsh-x:hover { background: var(--ui-subtle); color: var(--ui-fg); } }
+@media (min-width: 700px) {
+  .ui-cartsh-grab { cursor: default; touch-action: auto; user-select: auto; -webkit-user-select: auto; }
+  .ui-cartsh-grip { display: none; }
+  .ui-cartsh-side {
+    inset: 0 0 var(--ui-cartsh-kb, 0px) auto; width: min(440px, 100vw); max-height: none; height: auto; border: 0; border-left: 1px solid var(--ui-border);
+    border-radius: calc(var(--ui-radius) + 8px) 0 0 calc(var(--ui-radius) + 8px);
+  }
+  .ui-cartsh-side[open] { animation-name: ui-cartsh-in; }
+  .ui-cartsh-center {
+    inset: 0 0 var(--ui-cartsh-kb, 0px) 0; width: min(680px, calc(100vw - 48px)); height: fit-content; max-height: min(calc(100dvh - var(--ui-cartsh-kb, 0px) - 48px), 860px);
+    margin: auto; border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 8px);
+  }
+  .ui-cartsh-center[open] { animation-name: ui-cartsh-fade; }
+}
+@keyframes ui-cartsh-in { from { transform: translateX(100%); } }
+@keyframes ui-cartsh-fade { from { opacity: 0; transform: translateY(12px); } }
+
+.ui-cartsh-host { display: contents; }
+.ui-cartsh-foots { display: grid; gap: 10px; }
+.ui-cartsh-open {
+  display: inline-flex; align-items: center; gap: 8px; min-width: 44px; min-height: 46px; padding: 0 16px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 600 15px var(--ui-font); cursor: pointer;
+  touch-action: manipulation;
+}
+.ui-cartsh-open:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-cartsh-count {
+  display: inline-grid; place-items: center; min-width: 22px; height: 22px; padding: 0 6px; box-sizing: border-box; border-radius: 999px;
+  background: var(--ui-accent); color: var(--ui-accent-fg); font-size: 13px; font-variant-numeric: tabular-nums;
+}
+.ui-cartsh-lines { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-cartsh-row {
+  position: relative; display: grid; grid-template-rows: 1fr; border-radius: var(--ui-radius); background: var(--ui-danger-soft);
+  transition: grid-template-rows .17s ease, opacity .17s ease; overflow: hidden;
+}
+.ui-cartsh-row-in { min-height: 0; overflow: hidden; }
+.ui-cartsh-leaving { grid-template-rows: 0fr; opacity: 0; }
+.ui-cartsh-behind {
+  position: absolute; inset: 0 0 0 auto; display: flex; align-items: center; padding: 0 18px; color: var(--ui-danger); font-weight: 600;
+}
+/* Sideways is the swipe; up and down stay the list's own scrolling. */
+.ui-cartsh-front {
+  position: relative; display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 4px 12px; padding: 10px; background: var(--ui-subtle);
+  border-radius: var(--ui-radius); touch-action: pan-y; transition: transform .2s cubic-bezier(.2, .8, .2, 1);
+}
+.ui-cartsh-swiping { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; transition: none; }
+.ui-cartsh-pic { grid-row: span 2; width: 56px; height: 56px; border-radius: var(--ui-radius-sm); object-fit: cover; background: var(--ui-border); }
+.ui-cartsh-name { min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.ui-cartsh-option { display: block; color: var(--ui-muted); font-size: 13px; font-weight: 400; }
+.ui-cartsh-money { display: block; color: var(--ui-fg); font-variant-numeric: tabular-nums; }
+.ui-cartsh-nomoney { display: block; color: var(--ui-warning); font-size: 13px; }
+.ui-cartsh-acts { display: flex; align-items: center; justify-content: space-between; gap: 8px; grid-column: 2; }
+.ui-cartsh-qty { display: inline-flex; align-items: center; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-cartsh-step, .ui-cartsh-del {
+  display: grid; place-items: center; min-width: 44px; height: 44px; padding: 0; border: 0; background: transparent; color: var(--ui-fg);
+  font: 500 15px var(--ui-font); cursor: pointer; touch-action: manipulation;
+}
+.ui-cartsh-step { font-size: 20px; }
+.ui-cartsh-step:disabled { color: var(--ui-strong); cursor: default; }
+.ui-cartsh-del { padding: 0 8px; color: var(--ui-danger); border-radius: var(--ui-radius-sm); }
+.ui-cartsh-step:focus-visible, .ui-cartsh-del:focus-visible, .ui-cartsh-undo:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-cartsh-n { min-width: 28px; text-align: center; font-variant-numeric: tabular-nums; font-weight: 600; }
+.ui-cartsh-empty { margin: 0; padding: 32px 0; text-align: center; color: var(--ui-muted); }
+.ui-cartsh-note { display: grid; gap: 4px; margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-cartsh-got { color: var(--ui-success); font-weight: 600; }
+.ui-cartsh-meter { height: 6px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-cartsh-meter span { display: block; height: 100%; border-radius: inherit; background: var(--ui-accent); transition: width .2s; }
+.ui-cartsh-sums { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; margin: 0; font-variant-numeric: tabular-nums; font-size: 14px; }
+.ui-cartsh-sums dt { color: var(--ui-muted); }
+.ui-cartsh-sums dd { margin: 0; text-align: right; }
+.ui-cartsh-sums .ui-cartsh-grand { color: var(--ui-fg); font-size: 16px; font-weight: 700; }
+.ui-cartsh-snack {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0; padding: 0 4px 0 12px; border-radius: var(--ui-radius-sm);
+  background: var(--ui-fg); color: var(--ui-bg); font-size: 14px;
+}
+.ui-cartsh-undo {
+  min-width: 64px; min-height: 44px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: inherit;
+  font: 700 14px var(--ui-font); text-decoration: underline; cursor: pointer; touch-action: manipulation;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-cartsh, .ui-cartsh-front, .ui-cartsh-row, .ui-cartsh-meter span { transition: none; }
+  .ui-cartsh[open] { animation: none; }
+}
+`
+
+// How much of the layout the on-screen keyboard covers, from the visual viewport: 0 when
+// it is down. Less than 120 px is a toolbar coming and going, and multiplying by the
+// scale keeps a pinch of the page, which also shrinks the viewport, from counting.
+fn cart_sheet_keyboard(tall, height, top, scale) -> int {
+    let gap = round(tall - top - height * scale)
+    gap < 120 ? 0 : int(gap)
+}
+
+// How far the sheet follows a finger: all the way down, a little way up, as a rubber band.
+fn cart_sheet_pull(dy) = dy >= 0 ? dy : max([dy / 4, -24])
+
+// Whether a pull ends in closing: a third of its height, or a flick of 0.5 px/ms that went
+// at least 24 px. A sheet the finger brought back up stays, however fast it was first.
+fn cart_sheet_closes(dy, speed, height) -> bool = dy >= height / 3 || (dy >= 24 && speed >= 0.5)
+
+// Whether a swipe on a line removes it: dx is negative for leftwards. 40% of the row's
+// width, or a flick of 0.5 px/ms that went at least 30 px.
+fn cart_sheet_swiped(dx, speed, width) -> bool = dx <= 0 - width * 0.4 || (dx <= -30 && speed <= -0.5)
+
+// Speed at release comes from where the finger was a little before it, not at the last
+// move, which may be a moment old and give nothing. mark holds two points, the older in
+// a, each { at, t }, and moves on every 50 ms.
+fn cart_sheet_mark(at, t) -> map = { a: { at: at, t: t }, b: { at: at, t: t } }
+fn cart_sheet_marked(mark: map, at, t) -> map = t - mark.b.t > 50 ? { a: mark.b, b: { at: at, t: t } } : mark
+fn cart_sheet_speed(mark: map, at, t) = (at - mark.a.at) / max([1, t - mark.a.t])
+
+// How many fit a line: a quantity is a whole number from 1 to the line's limit.
+fn cart_sheet_qty(v, most: int) -> int {
+    let n = int(str(v ?? 1))
+    if is_err(n) { return 1 }
+    max([1, min([n, most])])
+}
+
+// A price as a decimal, or null when it is no price at all.
+fn cart_sheet_price(v) {
+    if v == null { return null }
+    let d = dec(v)
+    is_err(d) || d < 0 ? null : d
+}
+
+// The lines kept: a line without an id goes, one seen before adds to the first, and a bad
+// quantity is 1. 200 lines at most, so a list gone wrong cannot stall a phone.
+fn cart_sheet_clean(items, most: int = 99) -> list {
+    if type_of(items) != "list" { return [] }
+    let out = []
+    let ids = []
+    for x in take(items, 200) {
+        if type_of(x) == "map" && get(x, "id") != null {
+            let id = str(x.id)
+            // limit is what this file gave it: lines passed back after on_change keep it.
+            let stock = int(str(get(x, "stock") ?? get(x, "limit") ?? most))
+            let limit = is_err(stock) ? most : max([1, min([stock, most])])
+            let n = cart_sheet_qty(get(x, "qty"), limit)
+            if contains(ids, id) {
+                out = out | map((l) => l.id == id ? set(l, "qty", min([l.limit, l.qty + n])) : l)
+            } else {
+                ids = ids | push(id)
+                let price = cart_sheet_price(get(x, "price"))
+                out = out | push({ id: id, name: str(get(x, "name", id)), price: price, qty: n, limit: limit,
+                                   option: get(x, "option"), image: get(x, "image") })
+            }
+        }
+    }
+    out
+}
+
+// What a line comes to.
+fn cart_sheet_line(l) = l.price == null ? dec("0") : l.price * l.qty
+
+// The sums, in decimals, each rounded half up to the currency's places. short is what is
+// missing for free shipping, 0 once it is free or when it never can be.
+fn cart_sheet_totals(lines: list, shipping = 0, free_over = null, tax_rate = 0, currency: str = "USD") -> map {
+    let places = money.minor_units(currency)
+    let digits = is_err(places) ? 2 : places
+    let subtotal = lines | reduce(dec("0"), (a, l) => a + cart_sheet_line(l))
+    let limit = cart_sheet_price(free_over)
+    let rate = cart_sheet_price(tax_rate) ?? dec("0")
+    let fee = cart_sheet_price(shipping) ?? dec("0")
+    let free = limit != null && subtotal >= limit
+    let ship = len(lines) == 0 || free ? dec("0") : fee
+    let tax = round(subtotal * rate, digits, "half_up")
+    { subtotal: subtotal, shipping: ship, tax: tax, total: subtotal + ship + tax,
+      short: limit != null && !free && len(lines) > 0 ? limit - subtotal : dec("0") }
+}
+
+// How far towards free shipping, as a whole percentage.
+fn cart_sheet_percent(subtotal, free_over) -> int {
+    let limit = cart_sheet_price(free_over)
+    if limit == null || limit <= 0 { return 100 }
+    int(floor(min([subtotal * 100 / limit, dec("100")])))
+}
+
+fn cart_sheet_count(lines: list) -> int = lines | reduce(0, (a, l) => a + l.qty)
+
+component CartSheetFrame(title: str, open: bool = false, wide: str = "side", footer = null, on_close = null, children) {
+    style global cart_sheet_css
+    state box = null
+    state grab = null       // where a pull began: { x, y }
+    state mark = null       // points of it not long ago, for its speed at the end
+    state axis = null       // "y" once it is a pull, "x" when it went sideways and is not one
+    state going = false     // sliding away, until the dialog closes
+    state wide_q = null     // the browser's answer to whether this is a sheet at all, read as a field: js() would wait
+    state outside = false   // the press began on the backdrop, so its click closes
+    if open && box != null && !box.open { box.showModal() }
+    if !open && box != null && box.open { box.close() }
+    if going {
+        every(200, () => {
+            going = false
+            box.close()
+            box.style.transform = ""
+        })
+    }
+    let spring = () => {
+        box.style.transition = ""
+        box.style.transform = ""
+    }
+    let let_go = (e) => {
+        if grab != null {
+            let dy = e.clientY - grab.y
+            let speed = cart_sheet_speed(mark, e.clientY, e.timeStamp)
+            let was = axis
+            grab = null
+            axis = null
+            if was == "y" && e.type == "pointerup" && cart_sheet_closes(dy, speed, box.offsetHeight) {
+                box.style.transition = ""
+                box.style.transform = "translateY(100%)"
+                going = true
+            } else {
+                spring()
+            }
+        }
+    }
+    <dialog class={ui_cls(["ui-cartsh", wide == "center" ? "ui-cartsh-center" : "ui-cartsh-side"])} aria-label={title}
+            @mount={(el) => {
+                // js() waits, and what reads `box` runs during a wait, so these come first.
+                let w = js("window")
+                let d = js("document")
+                wide_q = js("matchMedia", "(min-width: 700px)")
+                box = el
+                if open && !el.open { el.showModal() }
+                // Above the on-screen keyboard: iOS lays it over the page, Android may shrink
+                // the page, and only the first needs moving; the visual viewport tells both.
+                let vv = w.visualViewport
+                let fit = (_e = null) => {
+                    let gap = vv != null ? cart_sheet_keyboard(w.innerHeight, vv.height, vv.offsetTop, vv.scale) : 0
+                    el.style.setProperty("--ui-cartsh-kb", `${gap}px`)
+                    if gap > 0 {
+                        el.setAttribute("data-keyboard", "")
+                        let f = d.activeElement
+                        if f != null && el.contains(f) { f.scrollIntoView({ block: "nearest" }) }
+                    } else {
+                        el.removeAttribute("data-keyboard")
+                    }
+                }
+                if vv != null {
+                    vv.addEventListener("resize", fit)
+                    vv.addEventListener("scroll", fit)
+                }
+                () => {
+                    if vv != null {
+                        vv.removeEventListener("resize", fit)
+                        vv.removeEventListener("scroll", fit)
+                    }
+                }
+            }}
+            @close={() => {
+                box.style.transform = ""
+                on_close && on_close()
+            }}
+            @pointerdown={(e) => { outside = e.target.isSameNode(box) }}
+            @click={(e) => {
+                // On the backdrop only, from start to end: a press inside that ends outside stays.
+                if e.target.isSameNode(box) && outside && !going { box.close() }
+                outside = false
+            }}>
+        <div.ui-cartsh-grab
+             @pointerdown={(e) => {
+                 // On a phone only: from 700 px it is not a sheet. A pointer that starts on the
+                 // close button is a press of the button.
+                 if e.button == 0 && e.target.closest(".ui-cartsh-x") == null && wide_q != null && !wide_q.matches {
+                     e.target.closest(".ui-cartsh-grab").setPointerCapture(e.pointerId)
+                     grab = { x: e.clientX, y: e.clientY }
+                     mark = cart_sheet_mark(e.clientY, e.timeStamp)
+                     axis = null
+                 }
+             }}
+             @pointermove={(e) => {
+                 if grab != null {
+                     let dy = e.clientY - grab.y
+                     if axis == null && (abs(dy) > 8 || abs(e.clientX - grab.x) > 8) {
+                         axis = abs(dy) >= abs(e.clientX - grab.x) ? "y" : "x"
+                     }
+                     if axis == "y" {
+                         box.style.transition = "none"
+                         box.style.transform = `translateY(${cart_sheet_pull(dy)}px)`
+                     }
+                     mark = cart_sheet_marked(mark, e.clientY, e.timeStamp)
+                 }
+             }}
+             @pointerup={let_go}
+             @pointercancel={let_go}>
+            <span.ui-cartsh-grip aria-hidden="true"></span>
+            <div.ui-cartsh-head>
+                <h2>{title}</h2>
+                <button.ui-cartsh-x type="button" aria-label="Close" @click={() => { box.close() }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                         aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+        </div>
+        <div.ui-cartsh-body>{children}</div>
+        {footer != null && <div.ui-cartsh-foot>{footer}</div>}
+    </dialog>
+}
+
+component CartSheet(items: list = [], trigger: str? = "Cart", open: bool = false, title: str = "Your cart", currency: str = "USD",
+                    locale: str? = null, free_over = null, shipping = 0, tax_rate = 0, most: int = 99, undo_seconds: int = 6,
+                    checkout_href: str? = null, on_change = null, on_checkout = null, on_close = null) {
+    style global cart_sheet_css
+    state lines = cart_sheet_clean(items, most)
+    state given = items      // what the page last passed
+    state own = false        // opened by its own button
+    state gone = []          // what Undo brings back, the latest last: { line, at }
+    state left = 0           // seconds Undo stays
+    state leaving = null     // the id of the line on its way out
+    state by_keys = false    // the last removal came from a key, so focus follows it
+    state undo_at = null     // the Undo button, while it shows
+    state swipe = null       // the line under a finger: { id, el, x, y }
+    state mark = null        // points of the swipe not long ago
+    state axis = null        // "x" once it is a swipe, "y" once it is not
+    if items != given {
+        given = items
+        lines = cart_sheet_clean(items, most)
+    }
+    let totals = cart_sheet_totals(lines, shipping, free_over, tax_rate, currency)
+    let count = cart_sheet_count(lines)
+    let cash = (v) => price_text(v, currency, locale)
+    let told = () => { on_change && on_change(lines) }
+    let finish = () => {
+        let id = leaving
+        if id != null {
+            leaving = null
+            let at = lines | map((l) => l.id) | index_of(id)
+            if at != null {
+                gone = gone + [{ line: lines[at], at: at }]
+                left = undo_seconds
+                lines = lines | filter((l) => l.id != id)
+                told()
+                if by_keys && undo_at != null && undo_at.isConnected { undo_at.focus() }
+            }
+        }
+    }
+    if leaving != null { every(170, finish) }
+    if len(gone) > 0 {
+        every(1000, () => {
+            left -= 1
+            if left <= 0 { gone = [] }
+        })
+    }
+    let remove = (id, keys) => {
+        finish()
+        by_keys = keys
+        leaving = id
+    }
+    let undo = () => {
+        if len(gone) > 0 {
+            let last = gone[len(gone) - 1]
+            gone = slice(gone, 0, len(gone) - 1)
+            left = undo_seconds
+            let at = min([last.at, len(lines)])
+            lines = slice(lines, 0, at) + [last.line] + slice(lines, at, len(lines))
+            told()
+        }
+    }
+    let quantity = (id, by) => {
+        lines = lines | map((l) => l.id == id ? set(l, "qty", max([1, min([l.qty + by, l.limit])])) : l)
+        told()
+    }
+    let spring = () => {
+        if swipe != null {
+            swipe.el.classList.remove("ui-cartsh-swiping")
+            swipe.el.style.transform = ""
+        }
+        swipe = null
+        axis = null
+    }
+    <div.ui-cartsh-host>
+        {trigger != null && <button.ui-cartsh-open type="button" aria-haspopup="dialog" @click={() => { own = true }}>
+            {trigger}
+            {count > 0 && <span.ui-cartsh-count aria-label={`${count} in the cart`}>{count}</span>}
+        </button>}
+        <CartSheetFrame title={title} open={open || own}
+                        on_close={() => {
+                            own = false
+                            on_close && on_close()
+                        }}
+                        footer={<div.ui-cartsh-foots>
+                            {len(gone) > 0 && <p.ui-cartsh-snack role="status">
+                                <span>{len(gone) == 1 ? `${gone[0].line.name} removed` : `${len(gone)} lines removed`}</span>
+                                <button.ui-cartsh-undo type="button" aria-label={`Undo, ${left} seconds left`}
+                                        @mount={(el) => {
+                                            undo_at = el
+                                            if by_keys { el.focus() }
+                                        }}
+                                        @click={undo}>Undo</button>
+                            </p>}
+                            {free_over != null && len(lines) > 0 && <div.ui-cartsh-note role="status">
+                                {totals.short > 0
+                                    ? <span>Add {cash(totals.short)} more for free shipping</span>
+                                    : <span.ui-cartsh-got>Shipping is free</span>}
+                                <div.ui-cartsh-meter aria-hidden="true"><span style={`width: ${cart_sheet_percent(totals.subtotal, free_over)}%`}></span></div>
+                            </div>}
+                            <dl.ui-cartsh-sums>
+                                <dt>Subtotal</dt><dd>{cash(totals.subtotal)}</dd>
+                                <dt>Shipping</dt><dd>{totals.shipping > 0 || len(lines) == 0 ? cash(totals.shipping) : "Free"}</dd>
+                                {totals.tax > 0 && <dt>Tax</dt>}
+                                {totals.tax > 0 && <dd>{cash(totals.tax)}</dd>}
+                                <dt.ui-cartsh-grand>Total</dt><dd.ui-cartsh-grand>{cash(totals.total)}</dd>
+                            </dl>
+                            <Button full={true} size="lg" href={len(lines) > 0 ? checkout_href : null} disabled={len(lines) == 0}
+                                    on_click={() => { on_checkout && on_checkout(lines, totals) }}>Checkout</Button>
+                        </div>}>
+            {len(lines) == 0 && <p.ui-cartsh-empty>Your cart is empty.</p>}
+            <ul.ui-cartsh-lines
+                @pointerdown={(e) => {
+                    let front = e.target.closest(".ui-cartsh-front")
+                    if e.button == 0 && front != null && e.target.closest("button, a, input") == null {
+                        front.setPointerCapture(e.pointerId)
+                        swipe = { id: front.dataset.line, el: front, x: e.clientX, y: e.clientY }
+                        mark = cart_sheet_mark(e.clientX, e.timeStamp)
+                        axis = null
+                    }
+                }}
+                @pointermove={(e) => {
+                    if swipe != null {
+                        let dx = e.clientX - swipe.x
+                        let dy = e.clientY - swipe.y
+                        if axis == null && (abs(dx) > 10 || abs(dy) > 10) {
+                            axis = abs(dx) > abs(dy) ? "x" : "y"
+                            if axis == "x" { swipe.el.classList.add("ui-cartsh-swiping") }
+                        }
+                        if axis == "y" { spring() } else if axis == "x" {
+                            // A line moves left only: to the right there is nothing to find.
+                            swipe.el.style.transform = `translateX(${min([dx, 0])}px)`
+                            mark = cart_sheet_marked(mark, e.clientX, e.timeStamp)
+                        }
+                    }
+                }}
+                @pointerup={(e) => {
+                    if swipe != null {
+                        let dx = e.clientX - swipe.x
+                        let speed = cart_sheet_speed(mark, e.clientX, e.timeStamp)
+                        if axis == "x" && cart_sheet_swiped(dx, speed, swipe.el.offsetWidth) {
+                            let id = swipe.id
+                            swipe.el.classList.remove("ui-cartsh-swiping")
+                            swipe.el.style.transform = "translateX(-100%)"
+                            swipe = null
+                            axis = null
+                            remove(id, false)
+                        } else {
+                            spring()
+                        }
+                    }
+                }}
+                @pointercancel={spring}>
+                {for l in lines => <li key={l.id} class={ui_cls(["ui-cartsh-row", leaving == l.id && "ui-cartsh-leaving"])}>
+                    <div.ui-cartsh-row-in>
+                        <span.ui-cartsh-behind aria-hidden="true">Remove</span>
+                        <div.ui-cartsh-front data-line={l.id}>
+                            {l.image != null ? <img.ui-cartsh-pic src={l.image} alt="" loading="lazy" draggable="false"/> : <span.ui-cartsh-pic aria-hidden="true"></span>}
+                            <div.ui-cartsh-name>
+                                {l.name}
+                                {l.option != null && <span.ui-cartsh-option>{l.option}</span>}
+                                {l.price != null
+                                    ? <span.ui-cartsh-money>{cash(cart_sheet_line(l))}</span>
+                                    : <span.ui-cartsh-nomoney>Price unavailable</span>}
+                            </div>
+                            <div.ui-cartsh-acts>
+                                <div.ui-cartsh-qty role="group" aria-label={`Quantity of ${l.name}`}>
+                                    <button.ui-cartsh-step type="button" aria-label={`One fewer ${l.name}`} disabled={l.qty <= 1}
+                                            @click={() => { quantity(l.id, -1) }}>−</button>
+                                    <span.ui-cartsh-n aria-live="polite">{l.qty}</span>
+                                    <button.ui-cartsh-step type="button" aria-label={`One more ${l.name}`} disabled={l.qty >= l.limit}
+                                            @click={() => { quantity(l.id, 1) }}>+</button>
+                                </div>
+                                <button.ui-cartsh-del type="button" aria-label={`Remove ${l.name}`}
+                                        @click={(e) => { remove(l.id, e.detail == 0) }}>Remove</button>
+                            </div>
+                        </div>
+                    </div>
+                </li>}
+            </ul>
+        </CartSheetFrame>
+    </div>
+}

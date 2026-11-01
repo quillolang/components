@@ -1,0 +1,435 @@
+// SwipeKanban: a board on a phone. One column shows at a time and a swipe goes to the next,
+// by the browser's own scroll snap, and the column names above jump to any. A card is moved by
+// its grip at once, or by a long press anywhere on it: held near the edge of the screen,
+// the board turns to the neighbouring column, and letting go drops it where the line shows.
+// Each card's menu moves it without a drag, and from the grip the arrow keys do: left and right
+// to the next column, up and down inside this one. On a tablet two or three columns
+// stand side by side, and a card goes straight across.
+//
+//   component Work() {
+//       <SwipeKanban columns={[{ id: "todo", title: "To do" }, { id: "doing", title: "Doing" }, { id: "done", title: "Done" }]}
+//                    cards={tasks} on_move={(id, column, index) => { save_move(id, column, index) }}
+//                    on_open={(card) => { show(card) }}/>
+//   }
+//
+// It fills the height it is given, each column scrolling inside it; with none set it is as tall as it needs.
+// columns: each { id, title }. cards: each { id, column, title, note?, tone? ("accent", "success",
+// "warning", "danger", "info") }, in order; one with an unknown column goes in the first,
+// one without a title or an id seen before is left out. Followed when it changes. edge_ms: how
+// long a card is held at the edge before the board turns (450). hold_ms: the long press (320).
+// label: its name for screen readers. class.
+// on_move(id, column, index): inside one of your components, a card has moved, index being its
+// place in the column from 0, ids as text. It shows at once, and goes back with a message if the
+// function gives false or an error; one that waits is waited for. on_open(card): a card was tapped.
+
+import ui/theme.qwe use ui_cls
+
+let swipe_kanban_css = css`
+.ui-swipe-kanban { position: relative; container-type: inline-size; display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; color: var(--ui-fg); font: 15px/1.35 var(--ui-font); background: var(--ui-bg); }
+.ui-swipe-kanban-tabs { display: flex; flex: none; gap: 2px; padding: env(safe-area-inset-top) 8px 0; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; border-bottom: 1px solid var(--ui-border); }
+.ui-swipe-kanban-tabs::-webkit-scrollbar { display: none; }
+.ui-swipe-kanban-tab { flex: none; min-width: 44px; min-height: 44px; padding: 0 12px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--ui-muted); font: 500 14px/1 var(--ui-font); white-space: nowrap; cursor: pointer; }
+.ui-swipe-kanban-seen { border-bottom-color: var(--ui-accent); color: var(--ui-fg); }
+.ui-swipe-kanban-tab span { margin-left: 4px; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-swipe-kanban-track { display: flex; flex: 1; gap: 10px; min-height: 0; padding: 10px 12px max(10px, env(safe-area-inset-bottom)); overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; scroll-snap-type: x mandatory; scroll-padding: 0 12px; scrollbar-width: none; }
+.ui-swipe-kanban-track::-webkit-scrollbar { display: none; }
+.ui-swipe-kanban-col { display: flex; flex: 0 0 calc(100cqw - 44px); flex-direction: column; min-width: 0; min-height: 0; border-radius: var(--ui-radius); background: var(--ui-subtle); scroll-snap-align: start; scroll-snap-stop: always; }
+.ui-swipe-kanban-col h3 { flex: none; margin: 0; padding: 10px 12px 2px; font-size: 14px; font-weight: 600; }
+.ui-swipe-kanban-list { display: grid; flex: 1; align-content: start; gap: 6px; min-height: 80px; margin: 0; padding: 6px; overflow-y: auto; overscroll-behavior-y: contain; list-style: none; }
+.ui-swipe-kanban-card { position: relative; display: flex; align-items: stretch; min-height: 60px; border-radius: var(--ui-radius-sm); background: var(--ui-surface); box-shadow: var(--ui-shadow); touch-action: pan-x pan-y; -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
+.ui-swipe-kanban-card[data-tone]::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: var(--ui-accent); }
+.ui-swipe-kanban-card[data-tone="success"]::before { background: var(--ui-success); }
+.ui-swipe-kanban-card[data-tone="warning"]::before { background: var(--ui-warning); }
+.ui-swipe-kanban-card[data-tone="danger"]::before { background: var(--ui-danger); }
+.ui-swipe-kanban-card[data-tone="info"]::before { background: var(--ui-info); }
+.ui-swipe-kanban-pressed { background: var(--ui-accent-soft); }
+.ui-swipe-kanban-lifted { opacity: .35; }
+.ui-swipe-kanban-grip { display: grid; flex: none; place-items: center; width: 44px; min-height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm) 0 0 var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: grab; touch-action: none; }
+.ui-swipe-kanban-grip svg { width: 18px; height: 18px; }
+.ui-swipe-kanban-open { flex: 1; min-width: 0; min-height: 44px; padding: 8px 2px; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.ui-swipe-kanban-title { display: block; font-weight: 500; overflow-wrap: anywhere; }
+.ui-swipe-kanban-note { display: block; color: var(--ui-muted); font-size: 13px; overflow-wrap: anywhere; }
+.ui-swipe-kanban-more { display: grid; flex: none; place-items: center; width: 44px; min-height: 44px; padding: 0; border: 0; border-radius: 0 var(--ui-radius-sm) var(--ui-radius-sm) 0; background: transparent; color: var(--ui-muted); cursor: pointer; }
+.ui-swipe-kanban-more svg { width: 20px; height: 20px; }
+.ui-swipe-kanban-none { padding: 14px 8px; color: var(--ui-muted); font-size: 14px; text-align: center; }
+.ui-swipe-kanban-ghost { position: absolute; top: 0; left: 0; z-index: 6; min-height: 52px; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-surface); box-shadow: var(--ui-shadow-lg); pointer-events: none; will-change: transform; }
+.ui-swipe-kanban-ghost[hidden], .ui-swipe-kanban-line[hidden], .ui-swipe-kanban-edge[hidden] { display: none; }
+.ui-swipe-kanban-line { position: absolute; top: 0; left: 0; z-index: 5; height: 3px; border-radius: 2px; background: var(--ui-accent); pointer-events: none; }
+.ui-swipe-kanban-edge { position: absolute; top: 0; bottom: 0; z-index: 4; width: 44px; pointer-events: none; }
+.ui-swipe-kanban-edge[data-side="left"] { left: 0; background: linear-gradient(to right, var(--ui-accent-soft), transparent); }
+.ui-swipe-kanban-edge[data-side="right"] { right: 0; background: linear-gradient(to left, var(--ui-accent-soft), transparent); }
+.ui-swipe-kanban-say { flex: none; margin: 0; padding: 0 14px 6px; color: var(--ui-muted); font-size: 13px; }
+.ui-swipe-kanban-say:empty { display: none; }
+.ui-swipe-kanban-say[data-bad] { color: var(--ui-danger); }
+.ui-swipe-kanban-sheet { box-sizing: border-box; inset: auto 0 0 0; width: min(100vw, 560px); max-width: 100vw; max-height: 80dvh; margin: 0 auto; padding: 10px 14px max(14px, env(safe-area-inset-bottom)); overflow-y: auto; border: 1px solid var(--ui-border); border-bottom: 0; border-radius: calc(var(--ui-radius) + 6px) calc(var(--ui-radius) + 6px) 0 0; background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 15px/1.4 var(--ui-font); }
+.ui-swipe-kanban-sheet[open] { display: grid; gap: 6px; animation: ui-swipe-kanban-up .22s cubic-bezier(.2, .8, .2, 1); }
+.ui-swipe-kanban-sheet::backdrop { background: var(--ui-overlay); }
+@keyframes ui-swipe-kanban-up { from { transform: translateY(100%); } }
+.ui-swipe-kanban-sheet h2 { margin: 0 0 4px; font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+.ui-swipe-kanban-pick { width: 100%; min-height: 50px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 15px/1 var(--ui-font); text-align: left; cursor: pointer; }
+.ui-swipe-kanban-pick:disabled { color: var(--ui-muted); cursor: default; }
+.ui-swipe-kanban :is(.ui-swipe-kanban-tab, .ui-swipe-kanban-grip, .ui-swipe-kanban-open, .ui-swipe-kanban-more, .ui-swipe-kanban-pick):focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+/* A tablet stands columns side by side, as many as are readable, so a card goes across without turning. */
+@container (min-width: 600px) {
+  .ui-swipe-kanban-col { flex-basis: calc((100cqw - 34px) / 2); }
+  .ui-swipe-kanban-sheet { inset: 0; width: 420px; height: fit-content; margin: auto; border-bottom: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 6px); }
+}
+@container (min-width: 780px) {
+  .ui-swipe-kanban-col { flex-basis: calc((100cqw - 44px) / 3); }
+}
+@media (hover: hover) {
+  .ui-swipe-kanban-more:hover, .ui-swipe-kanban-grip:hover { color: var(--ui-fg); }
+  .ui-swipe-kanban-pick:hover:not(:disabled) { background: var(--ui-subtle); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-swipe-kanban-sheet[open] { animation: none; } }
+`
+
+fn swipe_kanban_columns(columns) -> list {
+    if type_of(columns) != "list" { return [] }
+    let good = columns | filter((c) => type_of(c) == "map" && get(c, "id") != null)
+    let all = good | map((c) => ({ id: str(c.id), title: get(c, "title") != null ? str(c.title) : str(c.id) }))
+    let ids = all | map((c) => c.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+fn swipe_kanban_cards(cards, cols: list) -> list {
+    if type_of(cards) != "list" || len(cols) == 0 { return [] }
+    let known = cols | map((c) => c.id)
+    let good = cards | filter((c) => type_of(c) == "map" && get(c, "id") != null && get(c, "title") != null)
+    let all = good | map((c) => {
+        let col = str(get(c, "column"))
+        ({ ...c, id: str(c.id), title: str(c.title), column: contains(known, col) ? col : known[0] })
+    })
+    let ids = all | map((c) => c.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+fn swipe_kanban_tone(t) = contains(["accent", "success", "warning", "danger", "info"], t) ? t : null
+
+// The list with the card in column `to`, before what stands `at` there, itself not counted.
+fn swipe_kanban_place(rows: list, id: str, to: str, at: int) -> list {
+    let it = find(rows, (r) => r.id == id)
+    if it == null { return rows }
+    let rest = rows | filter((r) => r.id != id)
+    let peers = rest | filter((r) => r.column == to)
+    let moved = { ...it, column: to }
+    if at >= len(peers) { return rest + [moved] }
+    let spot = index_of(rest | map((r) => r.id), peers[max([at, 0])].id)
+    slice(rest, 0, spot) + [moved] + slice(rest, spot, len(rest))
+}
+
+// Where the card stands in its column, counting from 0.
+fn swipe_kanban_at(rows: list, id: str) -> int {
+    let it = find(rows, (r) => r.id == id)
+    if it == null { return 0 }
+    index_of(rows | filter((r) => r.column == it.column) | map((r) => r.id), id)
+}
+
+// The place in a column for a finger at y, from the middles of the cards in it.
+fn swipe_kanban_index(mids: list, y: num) -> int = len(mids | filter((m) => m < y))
+
+// -1 at the left edge, 1 at the right, 0 between.
+fn swipe_kanban_edge(x: num, left: num, right: num, band: num) -> int {
+    if x <= left + band { return -1 }
+    x >= right - band ? 1 : 0
+}
+
+// The column a card goes to by a key or menu step, by the list's order, or null at the end.
+fn swipe_kanban_neighbour(cols: list, id: str, by: int) {
+    let at = index_of(cols | map((c) => c.id), id)
+    if at == null { return null }
+    let to = at + by
+    to >= 0 && to < len(cols) ? cols[to] : null
+}
+
+component SwipeKanban(columns = [], cards = [], label: str = "Board", edge_ms: int = 450, hold_ms: int = 320, on_move = null, on_open = null, class: str? = null) {
+    style global swipe_kanban_css
+    let cols = swipe_kanban_columns(columns)
+    state rows = swipe_kanban_cards(cards, cols)
+    state page = 0
+    state fit = 1            // columns in view
+    state press = null       // a finger waiting to be a long press: { id, pid, x, y, el }
+    state lifted = ""        // the card in the air
+    state landed = -1000     // when it came down
+    state g = null
+    state menu = ""
+    state said = ""
+    state bad = false
+    state root = null
+    state track = null
+    state ghost = null
+    state line = null
+    state dlg = null
+    rows = swipe_kanban_cards(cards, cols)
+    let held = lifted != "" ? find(rows, (r) => r.id == lifted) : null
+    let opened = menu != "" ? find(rows, (r) => r.id == menu) : null
+    let opened_at = opened != null ? swipe_kanban_at(rows, opened.id) : 0
+    let opened_count = opened != null ? len(rows | filter((r) => r.column == opened.column)) : 0
+    let columns_el = () => js("Array.from", track.querySelectorAll(".ui-swipe-kanban-col"))
+    let measure = () => {
+        let els = columns_el()
+        let step = len(els) > 1 ? els[1].offsetLeft - els[0].offsetLeft : max([track.clientWidth, 1])
+        let i = int(round(track.scrollLeft / step))
+        let n = max([1, int(floor((track.clientWidth + 2) / step))])
+        if i != page { page = i }
+        if n != fit { fit = n }
+    }
+    let go_page = (i: int) => {
+        let els = columns_el()
+        let calm = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+        if i >= 0 && i < len(els) {
+            track.scrollTo({ left: els[i].offsetLeft - els[0].offsetLeft, behavior: calm ? "auto" : "smooth" })
+        }
+    }
+    let commit = (id: str, to: str, at: int) => {
+        let it = find(rows, (r) => r.id == id)
+        let same = it != null && it.column == to && swipe_kanban_at(rows, id) == at
+        if it != null && !same {
+            let was = rows
+            let there = find(cols, (c) => c.id == to)
+            rows = swipe_kanban_place(rows, id, to, at)
+            said = `${it.title} moved to ${there.title}.`
+            bad = false
+            if on_move != null {
+                let r = js("Promise.resolve", on_move(id, to, swipe_kanban_at(rows, id)))
+                if is_err(r) || r == false {
+                    rows = was
+                    said = `${it.title} could not be moved.`
+                    bad = true
+                }
+            }
+        }
+    }
+    let over = () => {
+        let box = root.getBoundingClientRect()
+        let x = max([box.left + 1, min([box.right - 1, g.x])])
+        let hit = columns_el() | filter((c) => {
+            let r = c.getBoundingClientRect()
+            x >= r.left - 5 && x <= r.right + 5
+        })
+        if len(hit) > 0 {
+            let c = hit[0]
+            let others = js("Array.from", c.querySelectorAll(".ui-swipe-kanban-card:not(.ui-swipe-kanban-lifted)"))
+            let spots = others | map((o) => o.getBoundingClientRect())
+            let at = swipe_kanban_index(spots | map((r) => r.top + r.height / 2), g.y)
+            let cr = c.getBoundingClientRect()
+            let list_top = c.querySelector(".ui-swipe-kanban-list").getBoundingClientRect().top + 4
+            let y = len(spots) == 0 ? list_top : at < len(spots) ? spots[at].top - 4 : spots[len(spots) - 1].bottom + 3
+            line.hidden = false
+            line.style.width = `${cr.width - 12}px`
+            line.style.transform = `translate(${cr.left - box.left + 6}px, ${y - box.top}px)`
+            g = { ...g, to: c.dataset.id, at }
+        }
+    }
+    let float_it = () => {
+        let box = root.getBoundingClientRect()
+        ghost.style.transform = `translate(${g.x - g.ox - box.left}px, ${g.y - g.oy - box.top}px) rotate(1.5deg)`
+    }
+    let lift = (card, id: str, pid: int, x: num, y: num) => {
+        let r = card.getBoundingClientRect()
+        let col = find(rows, (c) => c.id == id)
+        press = null
+        g = { pid, id, x, y, ox: x - r.left, oy: y - r.top, to: col.column, at: swipe_kanban_at(rows, id), edge: 0, since: 0 }
+        ghost.style.width = `${r.width}px`
+        lifted = id
+        ghost.hidden = false
+        float_it()
+        card.setPointerCapture(pid)
+        over()
+        js("quilloNative.haptic", "medium")
+    }
+    let land = () => {
+        lifted = ""
+        ghost.hidden = true
+        line.hidden = true
+        root.querySelector('.ui-swipe-kanban-edge[data-side="left"]').hidden = true
+        root.querySelector('.ui-swipe-kanban-edge[data-side="right"]').hidden = true
+    }
+    let tick = () => {
+        if g != null {
+            let t = js("Date.now")
+            if g.edge != 0 && t - g.since >= edge_ms {
+                g = { ...g, since: t + 250 }
+                go_page(page + g.edge)
+            }
+            over()
+        }
+    }
+    if press != null { every(hold_ms, () => {
+        if press != null { lift(press.el, press.id, press.pid, press.x, press.y) }
+    }) }
+    if lifted != "" { every(100, tick) }
+    let step_column = (id: str, by: int) => {
+        let it = find(rows, (r) => r.id == id)
+        let next = swipe_kanban_neighbour(cols, it.column, by)
+        if next != null {
+            commit(id, next.id, len(rows | filter((r) => r.column == next.id)))
+            let i = index_of(cols | map((c) => c.id), next.id)
+            if i < page || i >= page + fit { go_page(i) }
+        }
+    }
+    let step_place = (id: str, by: int) => {
+        let it = find(rows, (r) => r.id == id)
+        let at = swipe_kanban_at(rows, id)
+        let last = len(rows | filter((r) => r.column == it.column)) - 1
+        if at + by >= 0 && at + by <= last { commit(id, it.column, at + by) }
+    }
+    <div class={ui_cls(["ui-swipe-kanban", class])} role="group" aria-label={label}
+         @mount={(me) => {
+             root = me
+             track = me.querySelector(".ui-swipe-kanban-track")
+             ghost = me.querySelector(".ui-swipe-kanban-ghost")
+             line = me.querySelector(".ui-swipe-kanban-line")
+             dlg = me.querySelector("dialog")
+             measure()
+             // Once a card is in the air the finger is the drag's: nothing else stops the browser
+             // scrolling in the middle of a touch.
+             let guard = (e) => { if lifted != "" && e.cancelable { e.preventDefault() } }
+             me.addEventListener("touchmove", guard, { passive: false })
+             // Turning the phone changes a column's width: this keeps the same one in view.
+             let win = js("window")
+             let turned = (_e = null) => {
+                 let at = page
+                 js("requestAnimationFrame", (_t = null) => {
+                     let els = columns_el()
+                     if at < len(els) { track.scrollLeft = els[at].offsetLeft - els[0].offsetLeft }
+                     measure()
+                 })
+             }
+             win.addEventListener("resize", turned)
+             () => {
+                 me.removeEventListener("touchmove", guard)
+                 win.removeEventListener("resize", turned)
+             }
+         }}
+         @contextmenu={(e) => { if press != null || lifted != "" { e.preventDefault() } }}
+         @selectstart={(e) => { if press != null || lifted != "" { e.preventDefault() } }}
+         @pointerdown={(e) => {
+             let card = e.target.closest(".ui-swipe-kanban-card")
+             let on_menu = e.target.closest(".ui-swipe-kanban-more") != null
+             if card != null && !on_menu && e.isPrimary && e.button == 0 && lifted == "" {
+                 if e.target.closest(".ui-swipe-kanban-grip") != null {
+                     lift(card, card.dataset.id, e.pointerId, e.clientX, e.clientY)
+                 } else if e.pointerType != "mouse" {
+                     press = { id: card.dataset.id, pid: e.pointerId, x: e.clientX, y: e.clientY, el: card }
+                 }
+             }
+         }}
+         @pointermove={(e) => {
+             if press != null && e.pointerId == press.pid && abs(e.clientX - press.x) + abs(e.clientY - press.y) > 10 { press = null }
+             if g != null && e.pointerId == g.pid {
+                 let box = root.getBoundingClientRect()
+                 let edge = swipe_kanban_edge(e.clientX, box.left, box.right, 44)
+                 g = { ...g, x: e.clientX, y: e.clientY }
+                 if edge != g.edge {
+                     g = { ...g, edge, since: js("Date.now") }
+                     root.querySelector('.ui-swipe-kanban-edge[data-side="left"]').hidden = edge != -1
+                     root.querySelector('.ui-swipe-kanban-edge[data-side="right"]').hidden = edge != 1
+                 }
+                 float_it()
+                 over()
+             }
+         }}
+         @pointerup={(e) => {
+             if press != null && e.pointerId == press.pid { press = null }
+             if g != null && e.pointerId == g.pid {
+                 let was = g
+                 g = null
+                 // The click that follows a long press is not a tap.
+                 landed = e.timeStamp
+                 land()
+                 commit(was.id, was.to, was.at)
+             }
+         }}
+         @pointercancel={(e) => {
+             if press != null && e.pointerId == press.pid { press = null }
+             if g != null && e.pointerId == g.pid {
+                 g = null
+                 land()
+             }
+         }}
+         @keydown={(e) => {
+             let grip = e.target.closest(".ui-swipe-kanban-grip")
+             if grip != null {
+                 let k = e.key
+                 if k == "ArrowLeft" || k == "ArrowRight" || k == "ArrowUp" || k == "ArrowDown" {
+                     e.preventDefault()
+                     let id = grip.closest(".ui-swipe-kanban-card").dataset.id
+                     if k == "ArrowLeft" { step_column(id, -1) }
+                     if k == "ArrowRight" { step_column(id, 1) }
+                     if k == "ArrowUp" { step_place(id, -1) }
+                     if k == "ArrowDown" { step_place(id, 1) }
+                     js("requestAnimationFrame", (_t = null) => {
+                         let again = root.querySelector(`.ui-swipe-kanban-card[data-id="${id}"] .ui-swipe-kanban-grip`)
+                         again && again.focus({ preventScroll: true })
+                     })
+                 }
+             }
+         }}>
+        <div.ui-swipe-kanban-tabs role="tablist" aria-label={label}
+             @keydown={(e) => {
+                 if e.key == "ArrowRight" { e.preventDefault(); go_page(min([page + 1, len(cols) - 1])) }
+                 if e.key == "ArrowLeft" { e.preventDefault(); go_page(max([page - 1, 0])) }
+             }}>
+            {for [i, c] in enumerate(cols) => <button class={ui_cls(["ui-swipe-kanban-tab", i >= page && i < page + fit && "ui-swipe-kanban-seen"])} type="button" role="tab" key={c.id}
+                    aria-selected={i == page ? "true" : "false"} tabindex={i == page ? "0" : "-1"} @click={() => { go_page(i) }}>{c.title}<span>{len(rows | filter((r) => r.column == c.id))}</span></button>}
+        </div>
+        <div.ui-swipe-kanban-track @scroll={() => { measure() }}>
+            {len(cols) == 0 && <p.ui-swipe-kanban-none>No columns.</p>}
+            {for c in cols => <section.ui-swipe-kanban-col key={c.id} data-id={c.id} aria-label={c.title}>
+                <h3>{c.title}</h3>
+                <ul.ui-swipe-kanban-list>
+                    {len(rows | filter((r) => r.column == c.id)) == 0 && <li.ui-swipe-kanban-none>Nothing here.</li>}
+                    {for r in rows | filter((x) => x.column == c.id) => <li class={ui_cls(["ui-swipe-kanban-card", press != null && press.id == r.id && "ui-swipe-kanban-pressed", lifted == r.id && "ui-swipe-kanban-lifted"])}
+                            key={r.id} data-id={r.id} data-tone={swipe_kanban_tone(get(r, "tone"))}>
+                        <button.ui-swipe-kanban-grip type="button" aria-label={`Move ${r.title}. Arrow keys move it.`}>
+                            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>
+                        </button>
+                        <button.ui-swipe-kanban-open type="button" @click={(e) => { if e.timeStamp - landed > 350 { on_open && on_open(r) } }}>
+                            <span.ui-swipe-kanban-title>{r.title}</span>
+                            {get(r, "note") != null && <span.ui-swipe-kanban-note>{r.note}</span>}
+                        </button>
+                        <button.ui-swipe-kanban-more type="button" aria-haspopup="dialog" aria-label={`Move ${r.title} to another column`}
+                                @click={() => {
+                                    menu = r.id
+                                    dlg.showModal()
+                                }}>
+                            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="19" cy="12" r="1.9"/></svg>
+                        </button>
+                    </li>}
+                </ul>
+            </section>}
+        </div>
+        <p.ui-swipe-kanban-say role="status" data-bad={bad ? "" : null}>{said}</p>
+        <div.ui-swipe-kanban-edge data-side="left" hidden="true"></div>
+        <div.ui-swipe-kanban-edge data-side="right" hidden="true"></div>
+        <div.ui-swipe-kanban-line hidden="true"></div>
+        <div.ui-swipe-kanban-ghost hidden="true" aria-hidden="true">
+            <span.ui-swipe-kanban-title>{held != null ? held.title : ""}</span>
+        </div>
+        <dialog.ui-swipe-kanban-sheet aria-label="Move"
+                @close={() => { menu = "" }}
+                @click={(e) => { if e.target.tagName == "DIALOG" { dlg.close() } }}>
+            <h2>{opened != null ? `Move ${opened.title}` : ""}</h2>
+            {for c in cols => <button.ui-swipe-kanban-pick type="button" key={c.id} disabled={opened != null && opened.column == c.id ? true : null}
+                    @click={() => {
+                        let id = menu
+                        let i = index_of(cols | map((x) => x.id), c.id)
+                        dlg.close()
+                        commit(id, c.id, len(rows | filter((r) => r.column == c.id)))
+                        if i < page || i >= page + fit { go_page(i) }
+                    }}>{opened != null && opened.column == c.id ? `In ${c.title}` : `To ${c.title}`}</button>}
+            <button.ui-swipe-kanban-pick type="button" disabled={opened_at == 0 ? true : null} @click={() => {
+                let id = menu
+                dlg.close()
+                step_place(id, -1)
+            }}>Up one place</button>
+            <button.ui-swipe-kanban-pick type="button" disabled={opened_at >= opened_count - 1 ? true : null} @click={() => {
+                let id = menu
+                dlg.close()
+                step_place(id, 1)
+            }}>Down one place</button>
+            <button.ui-swipe-kanban-pick type="button" @click={() => { dlg.close() }}>Close</button>
+        </dialog>
+    </div>
+}

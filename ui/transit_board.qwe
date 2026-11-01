@@ -1,0 +1,230 @@
+// TransitBoard: the departures from a stop, as a platform's board has them: the line, where it
+// goes, the platform, and the minutes until it leaves, counted down by itself. A delay moves a
+// departure to where it belongs and shows both times; a cancelled one stays, struck out,
+// until its time has gone. It says when its data has gone stale, or the phone is offline, as a
+// board that looks live but is not is worse than no board. Data comes from the page: give it
+// new `departures` and the rows update in place, with no server call of its own.
+//
+//   import ui/transit_board.qwe use TransitBoard
+//
+//   <TransitBoard stop="Cais do Sodre" now="2026-11-03T14:05:00+00:00" updated="2026-11-03T14:04:30+00:00" departures={[
+//       { id: "t1", line: "15E", to: "Alges", at: "2026-11-03T14:09:00+00:00", delay: 3, platform: "2" },
+//   ]} on_refresh={() => { departures = fetch_them() }}/>
+//
+// stop: the stop's name. departures: a list of { id, line, to, at, delay?, expected?, platform?,
+// was_platform?, cancelled?, colour?, step_free? }. at: the scheduled time, an ISO date-time
+// with its offset, shown as written, so in the stop's own time. delay: minutes late (0), or
+// expected: the date-time it now leaves, which wins. colour: the line's, as #rgb or #rrggbb. A row
+// whose time cannot be read is left out, and counted. now: the time at the stop, the same
+// form, so the server's page has the same words as the browser's; left out, the page first
+// shows clock times, then minutes from the phone's own clock. tick: seconds between looks at the
+// clock (15). updated: the date-time the data was fetched. stale: minutes after which that
+// is said (3). grace: seconds a departure stays after its time, as a tram at the stop is
+// still there to catch (30). limit: rows at most (0, all). on_refresh(): shows a Refresh
+// button, for the page to fetch again, inside one of your components.
+//
+// transit_board_rows and transit_board_wait are the working.
+
+import ui/theme.qwe use ui_cls
+
+let transit_board_css = css`
+.ui-tboard { position: relative; container-type: inline-size; font: 15px/1.35 var(--ui-font); color: var(--ui-fg); }
+.ui-tboard-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 2px 12px; margin-bottom: 8px; }
+.ui-tboard-stop { margin: 0; font-size: 20px; font-weight: 700; overflow-wrap: anywhere; }
+.ui-tboard-clock { font: 600 18px/1 var(--ui-mono); font-variant-numeric: tabular-nums; }
+.ui-tboard-note { margin: 0 0 8px; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-fg); font-size: 14px; }
+.ui-tboard-note:empty { display: none; }
+.ui-tboard-fresh { margin: 0 0 8px; color: var(--ui-muted); font-size: 13px; }
+.ui-tboard-fresh:empty { display: none; }
+.ui-tboard-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 10px; }
+.ui-tboard-chip {
+  box-sizing: border-box; min-width: 44px; min-height: 44px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-tboard-chip[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-tboard-chip:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-tboard-refresh { margin-left: auto; }
+.ui-tboard-list { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--ui-border); }
+.ui-tboard-row {
+  display: grid; grid-template-columns: 66px minmax(0, 1fr) auto; align-items: center; gap: 2px 10px; min-height: 60px; padding: 8px 2px; border-bottom: 1px solid var(--ui-border);
+}
+.ui-tboard-line {
+  grid-row: 1 / span 2; display: grid; place-items: center; min-height: 34px; padding: 2px 4px; border-radius: 6px; background: var(--c, var(--ui-fg)); color: var(--i, var(--ui-bg));
+  font-weight: 700; font-size: 13px; overflow-wrap: anywhere; text-align: center;
+}
+.ui-tboard-to { font-weight: 600; overflow-wrap: anywhere; }
+.ui-tboard-wait { grid-column: 3; grid-row: 1 / span 2; font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.ui-tboard-sub { display: flex; flex-wrap: wrap; gap: 0 8px; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-tboard-sub-times { display: inline-flex; gap: 0 6px; }
+.ui-tboard-sub s { opacity: .8; }
+.ui-tboard-late { color: var(--ui-danger); font-weight: 600; }
+.ui-tboard-row[data-state="due"] .ui-tboard-wait { color: var(--ui-success); }
+.ui-tboard-row[data-state="cancelled"] .ui-tboard-to { text-decoration: line-through; color: var(--ui-muted); }
+.ui-tboard-row[data-state="cancelled"] .ui-tboard-wait { color: var(--ui-danger); font-size: 15px; }
+.ui-tboard-empty { padding: 20px 8px; color: var(--ui-muted); text-align: center; }
+.ui-tboard-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+/* With the room it is a board: columns that line up, the platform on its own. */
+@container (min-width: 620px) {
+  .ui-tboard-row { grid-template-columns: 72px minmax(0, 1fr) 150px 110px; }
+  .ui-tboard-line { grid-row: auto; }
+  .ui-tboard-sub { display: contents; }
+  .ui-tboard-sub-times { grid-column: 3; grid-row: 1; display: flex; flex-wrap: wrap; gap: 0 8px; color: var(--ui-muted); font-size: 14px; }
+  .ui-tboard-sub-where { grid-column: 2; grid-row: 2; color: var(--ui-muted); font-size: 13px; }
+  .ui-tboard-wait { grid-column: 4; grid-row: 1 / span 2; }
+  .ui-tboard-to { grid-column: 2; grid-row: 1; font-size: 17px; }
+  .ui-tboard-line { grid-column: 1; grid-row: 1 / span 2; }
+}
+`
+
+fn transit_board_clock() = now()
+
+fn transit_board_num(x) = (type_of(x) == "int" || type_of(x) == "float" || type_of(x) == "dec") && math.isfinite(float(x))
+
+fn transit_board_time(s) = type_of(s) == "str" && date.valid(s, "date-time")
+
+// A colour fit for a style attribute: data may not write CSS.
+fn transit_board_colour(c) = type_of(c) == "str" && re.test(c, "^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$") ? c : null
+
+// Black or white, whichever reads on a line's colour: a colour comes from data, and a pale one
+// with white text cannot be read. By the usual weights for red, green and blue.
+fn transit_board_ink(c) {
+    if c == null { return null }
+    let digits = split(lower(slice(c, 1, len(c))), "")
+    let hex = (d) => index_of(split("0123456789abcdef", ""), d) ?? 0
+    let wide = len(digits) == 3 ? [hex(digits[0]) * 17, hex(digits[1]) * 17, hex(digits[2]) * 17]
+        : [hex(digits[0]) * 16 + hex(digits[1]), hex(digits[2]) * 16 + hex(digits[3]), hex(digits[4]) * 16 + hex(digits[5])]
+    wide[0] * 0.299 + wide[1] * 0.587 + wide[2] * 0.114 > 160 ? "#111" : "#fff"
+}
+
+// HH:mm of a moment, at the offset the stop's own time was written in.
+fn transit_board_clock_text(ms, off) = date.format(date.from_ms(ms, off), "HH:mm")
+
+// "Due", "4 min", or past the hour the clock's time, which is how a board says it.
+fn transit_board_wait(ms, now_ms, off) {
+    let mins = floor((ms - now_ms) / 60000)
+    if mins < 1 { return "Due" }
+    mins < 60 ? `${mins} min` : transit_board_clock_text(ms, off)
+}
+
+// Rows in the order they leave: { id, line, to, ms, late (whole minutes, not below 0),
+// wait, state ("due", "soon", "later" or "cancelled"), ... }. Gone departures are left out, and
+// `now_ms` null keeps everything, for a page with no clock yet.
+fn transit_board_rows(deps, now_ms, grace: num = 30) {
+    let good = (type_of(deps) == "list" ? deps : []) | filter((d) => type_of(d) == "map" && transit_board_time(d.at))
+    let made = good | map((d) => {
+        let sched = date.ms(d.at)
+        let off = date.parts(d.at).offset
+        let exp = transit_board_time(d.expected) ? date.ms(d.expected) : sched + (transit_board_num(d.delay) ? round(float(d.delay) * 60000) : 0)
+        let out = d.cancelled == true
+        let when = out ? sched : exp
+        let late = out ? 0 : round((exp - sched) / 60000)
+        { id: d.id ?? `${d.line}-${d.at}`, line: str(d.line ?? ""), to: str(d.to ?? ""), platform: d.platform, was: d.was_platform, colour: transit_board_colour(d.colour),
+          step_free: d.step_free == true, ms: when, sched: transit_board_clock_text(sched, off), exp: transit_board_clock_text(exp, off), late: late, out: out, off: off,
+          wait: now_ms == null ? transit_board_clock_text(when, off) : (out ? "Cancelled" : transit_board_wait(when, now_ms, off)),
+          state: out ? "cancelled" : (now_ms == null ? "later" : (when - now_ms < 60000 ? "due" : (when - now_ms < 600000 ? "soon" : "later"))) }
+    })
+    let kept = now_ms == null ? made : made | filter((r) => r.ms + grace * 1000 >= now_ms)
+    kept | sort_by((r) => r.ms)
+}
+
+// The lines on the board, in the order they first come.
+fn transit_board_lines(rows) = unique(rows | map((r) => r.line))
+
+// "12 s ago" is no use: a board's data is minutes old or it is not.
+fn transit_board_age(updated_ms, now_ms) {
+    let m = floor((now_ms - updated_ms) / 60000)
+    m < 1 ? "just now" : (m == 1 ? "1 minute ago" : `${m} minutes ago`)
+}
+
+fn transit_board_offset() {
+    let off = 0 - js_new("Date").getTimezoneOffset()
+    let hh = floor(abs(off) / 60)
+    `${off < 0 ? "-" : "+"}${hh < 10 ? "0" : ""}${hh}:${abs(off) % 60 < 10 ? "0" : ""}${abs(off) % 60}`
+}
+
+component TransitBoard(stop: str = "Departures", departures = [], now: str? = null, tick: num = 15, updated: str? = null, stale: num = 3,
+                       grace: num = 30, limit: int = 0, on_refresh = null, class: str? = null) {
+    style global transit_board_css
+    state base = transit_board_time(now) ? date.ms(now) : null
+    state offset = transit_board_time(now) ? date.parts(now).offset : null
+    state seen_now = now
+    state since = 0
+    state moved_on = 0
+    state online = true
+    state only = null
+    if now != seen_now {
+        seen_now = now
+        if transit_board_time(now) {
+            base = date.ms(now)
+            offset = date.parts(now).offset
+            since = transit_board_clock()
+            moved_on = 0
+        }
+    }
+    if tick > 0 && base != null { every(round(tick * 1000), () => { moved_on = transit_board_clock() - since }) }
+
+    let at_ms = base == null ? null : base + moved_on
+    let all = transit_board_rows(departures, at_ms, grace)
+    let lines = transit_board_lines(all)
+    let chosen = only != null && contains(lines, only) ? only : null
+    let some = chosen == null ? all : all | filter((r) => r.line == chosen)
+    let rows = limit > 0 ? take(some, limit) : some
+    let left_out = type_of(departures) == "list" ? len(departures | filter((d) => type_of(d) != "map" || !transit_board_time(d.at))) : 0
+    let age_ms = transit_board_time(updated) && at_ms != null ? at_ms - date.ms(updated) : null
+    let old = age_ms != null && age_ms > stale * 60000
+    let warn = !online ? `You are offline. Times are from ${transit_board_time(updated) ? date.format(updated, "HH:mm") : "the last update"} and may have changed.`
+        : (old ? `These times may be out of date. Last update ${date.format(updated, "HH:mm")}.` : "")
+    let fresh = !old && online && age_ms != null ? `Updated ${transit_board_age(date.ms(updated), at_ms)}` : ""
+    let next_say = len(rows) > 0 ? `Next: ${rows[0].line} to ${rows[0].to}, ${rows[0].wait}` : ""
+    <section class={ui_cls(["ui-tboard", class])} aria-label={`Departures from ${stop}`} @mount={(_el) => {
+        let win = js("window")
+        since = transit_board_clock()
+        if base == null {
+            offset = transit_board_offset()
+            base = since
+        }
+        online = win.navigator.onLine != false
+        let up = (_e) => { online = true }
+        let down = (_e) => { online = false }
+        win.addEventListener("online", up)
+        win.addEventListener("offline", down)
+        () => {
+            win.removeEventListener("online", up)
+            win.removeEventListener("offline", down)
+        }
+    }}>
+        <header.ui-tboard-head>
+            <h3.ui-tboard-stop>{stop}</h3>
+            <span.ui-tboard-clock>{at_ms != null ? transit_board_clock_text(at_ms, offset) : ""}</span>
+        </header>
+        <p.ui-tboard-note role="status">{warn}</p>
+        <p.ui-tboard-fresh>{fresh}</p>
+        <div.ui-tboard-bar role="group" aria-label="Lines">
+            {len(lines) > 1 && <button.ui-tboard-chip type="button" data-line="" aria-pressed={chosen == null ? "true" : "false"} @click={() => { only = null }}>All</button>}
+            {len(lines) > 1 && for l in lines => <button.ui-tboard-chip key={l} type="button" data-line={l} aria-pressed={chosen == l ? "true" : "false"}
+                @click={() => { only = l }}>{l}</button>}
+            {on_refresh != null && <button.ui-tboard-chip.ui-tboard-refresh type="button" @click={() => { on_refresh() }}>Refresh</button>}
+        </div>
+        <span.ui-tboard-sr aria-live="polite">{next_say}</span>
+        {len(rows) == 0
+            ? <p.ui-tboard-empty>{chosen != null ? `No more ${chosen} departures on the list.` : "No departures on the list."}</p>
+            : <ol.ui-tboard-list>
+                  {for r in rows => <li.ui-tboard-row key={r.id} data-id={str(r.id)} data-state={r.state}>
+                      <span.ui-tboard-line style={r.colour != null ? `--c: ${r.colour}; --i: ${transit_board_ink(r.colour)}` : null}>{r.line}</span>
+                      <span.ui-tboard-to>{r.to}</span>
+                      <span.ui-tboard-sub>
+                          <span.ui-tboard-sub-times>
+                              {r.late != 0 ? <s>{r.sched}</s> : <span>{r.sched}</span>}
+                              {r.late != 0 && <span.ui-tboard-late>{r.late > 0 ? `+${r.late} min` : `${r.late} min`}</span>}
+                              {r.late == 0 && !r.out && <span>On time</span>}
+                          </span>
+                          <span.ui-tboard-sub-where>
+                              {r.platform != null ? `Platform ${r.platform}` : ""}{r.was != null && r.was != r.platform ? ` (was ${r.was})` : ""}{r.step_free ? ", step free" : ""}
+                          </span>
+                      </span>
+                      <span.ui-tboard-wait>{r.wait}</span>
+                  </li>}
+              </ol>}
+        {left_out > 0 && <p.ui-tboard-fresh>{left_out == 1 ? "One departure has no time that can be read." : `${left_out} departures have no time that can be read.`}</p>}
+    </section>
+}

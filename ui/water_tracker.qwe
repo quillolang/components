@@ -1,0 +1,251 @@
+// WaterTracker: what was drunk today, a tap at a time. Tap the glass, or one of the sizes,
+// and it fills, felt in the hand; Undo takes back the last, as often as there is something to
+// take back. Each new day starts empty, at midnight where the phone is, whether the page was
+// open then or comes back later, and says what yesterday came to.
+//
+//   <WaterTracker goal={2000} sizes={[150, 250, 500]}/>
+//
+//   component Water() {
+//       state kept = load_water()                  // a server fn
+//       <WaterTracker goal={64} sizes={[8, 12, 16]} unit="oz" saved={kept} on_change={(day) => { save_water(day) }}/>
+//   }
+//
+// goal: how much a day (2000). sizes: the amounts offered, the middle one being what a tap
+// on the glass adds ([150, 250, 500]). unit: what goal and sizes are in, "ml" or "oz" ("ml"),
+// as text beside the numbers; there is no converting. today: the date, "2026-11-01", for the first
+// picture from the server, which cannot know the phone's midnight. saved: { day, entries }, as
+// on_change gave it. store: a localStorage key to keep it under as well. A phone app's localStorage
+// lasts one launch, so an app keeps it with saved and on_change, through a server fn.
+// on_change(day): inside one of your components, { day, entries } after each change, entries
+// being the amounts in order. on_goal(total): when today's total reaches the goal. on_reset(day):
+// when a new day clears the old one, given the old one. check_seconds: how often it looks to
+// see whether the day has changed while open (30). label: its name for screen readers ("Water
+// today"). class.
+//
+// A person who flies west can see a date earlier than the one kept: nothing is cleared then, as
+// the day they are in has not ended.
+
+import ui/theme.qwe use ui_cls
+
+let water_tracker_css = css`
+.ui-water { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-water-in { display: grid; gap: 14px; justify-items: center; }
+.ui-water-glass { position: relative; display: block; width: 150px; height: 190px; padding: 0; border: 0; background: none; cursor: pointer;
+  touch-action: manipulation; -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; border-radius: var(--ui-radius); }
+.ui-water-glass:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-water-glass svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.ui-water-glass path { fill: none; stroke: var(--ui-strong); stroke-width: 2; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+/* The same shape as the outline, by percentages, so what fills it has its walls. */
+.ui-water-inside { position: absolute; inset: 0; overflow: hidden; clip-path: polygon(6% 0, 94% 0, 82% 100%, 18% 100%); background: var(--ui-subtle); }
+.ui-water-fill { position: absolute; inset: 0; background: var(--ui-info); opacity: .85; transition: transform .45s cubic-bezier(.2, .8, .2, 1); }
+.ui-water-fill::before { content: ""; position: absolute; left: -10%; right: -10%; top: -6px; height: 12px; border-radius: 50%; background: color-mix(in srgb, var(--ui-info) 60%, #fff); }
+.ui-water-dry::before { display: none; }
+.ui-water-done .ui-water-fill { background: var(--ui-success); }
+.ui-water-done .ui-water-fill::before { background: color-mix(in srgb, var(--ui-success) 60%, #fff); }
+.ui-water-pct { position: absolute; inset: 0; display: grid; place-items: center; font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--ui-fg); }
+.ui-water-side { display: grid; gap: 10px; width: 100%; min-width: 0; }
+.ui-water-total { margin: 0; text-align: center; font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-water-note { margin: 0; min-height: 21px; text-align: center; color: var(--ui-muted); font-size: 14px; }
+.ui-water-sizes { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 8px; }
+.ui-water-add, .ui-water-undo { min-height: 52px; padding: 0 6px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg);
+  font: 600 16px/1.1 var(--ui-font); font-variant-numeric: tabular-nums; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.ui-water-add { background: var(--ui-info-soft); border-color: transparent; color: var(--ui-info); }
+.ui-water-undo { min-height: 46px; font-weight: 500; font-size: 15px; }
+.ui-water-undo:disabled { opacity: .5; cursor: default; }
+.ui-water-add:focus-visible, .ui-water-undo:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-water-undo:not(:disabled):hover { background: var(--ui-subtle); } }
+@container (min-width: 480px) {
+  .ui-water-in { grid-template-columns: auto minmax(0, 1fr); gap: 28px; align-items: center; }
+  .ui-water-glass { width: 180px; height: 228px; }
+  .ui-water-total { text-align: left; font-size: 26px; }
+  .ui-water-note { text-align: left; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-water-fill { transition: none; } }
+`
+
+// A number from what came, else 0, and at most 100000.
+fn water_tracker_num(x) -> num {
+    let t = type_of(x)
+    if t != "int" && t != "float" { return 0 }
+    if x != x || x <= 0 { return 0 }
+    x > 100000 ? 100000 : x
+}
+
+fn water_tracker_sizes(sizes) {
+    if type_of(sizes) != "list" { return [250] }
+    let good = take(sizes, 6) | map((s) => water_tracker_num(s)) | filter((s) => s > 0)
+    len(good) > 0 ? good : [250]
+}
+
+// What a tap on the glass adds: the middle size.
+fn water_tracker_main(sizes) = sizes[floor((len(sizes) - 1) / 2)]
+
+// A kept day, or a new one with the given date: anything else counts as nothing kept.
+fn water_tracker_clean(saved, day) {
+    if type_of(saved) != "map" { return { day, entries: [] } }
+    let kept = get(saved, "day")
+    let list = get(saved, "entries")
+    let ok = type_of(kept) == "str" && len(kept) == 10
+    {
+        day: ok ? kept : day,
+        entries: type_of(list) == "list" ? take(list, 500) | map((x) => water_tracker_num(x)) | filter((x) => x > 0) : [],
+    }
+}
+
+// A date from the phone's own year, month and day.
+fn water_tracker_date(y: int, m: int, d: int) -> str = `${y}-${m < 10 ? "0" : ""}${m}-${d < 10 ? "0" : ""}${d}`
+
+// Whether a day kept has ended, on the date now. Dates in this form sort as text; an empty
+// date is a page that has not yet asked, and one earlier than kept is a person gone west.
+fn water_tracker_ended(kept, day) -> bool = kept != null && kept != "" && day != null && day != "" && day > kept
+
+fn water_tracker_total(entries) -> num = round(sum(entries), 1)
+
+fn water_tracker_trim(x: num) -> str = x == floor(x) ? str(floor(x)) : str(x)
+
+// As it is read: litres from a thousand millilitres up.
+fn water_tracker_show(x: num, unit: str) -> str {
+    if unit == "ml" && x >= 1000 { return `${water_tracker_trim(round(x / 1000, 2))} L` }
+    `${water_tracker_trim(x)} ${unit}`
+}
+
+fn water_tracker_pct(total: num, goal: num) -> int = goal > 0 ? round(total * 100 / goal) : 0
+
+// How much of the glass to show: full at the goal, and no fuller after it.
+fn water_tracker_fill(total: num, goal: num) -> num {
+    if goal <= 0 { return 0 }
+    let p = round(total * 100 / goal, 1)
+    p > 100 ? 100 : p
+}
+
+// What is said under the total.
+fn water_tracker_left(total: num, goal: num, unit: str) -> str {
+    if goal <= 0 { return "" }
+    if total >= goal {
+        let over = round(total - goal, 1)
+        return over > 0 ? `Goal reached, ${water_tracker_show(over, unit)} over.` : "Goal reached."
+    }
+    `${water_tracker_show(round(goal - total, 1), unit)} to go.`
+}
+
+component WaterTracker(goal: num = 2000, sizes = [150, 250, 500], unit: str = "ml", today: str? = null, saved = null, store: str? = null, on_change = null,
+                       on_goal = null, on_reset = null, check_seconds: int = 30, label: str = "Water today", class: str? = null) {
+    style global water_tracker_css
+    state log = water_tracker_clean(saved, today ?? "")
+    state win = null
+    state note = ""          // a line for what just happened
+    state said = ""
+    let aim = water_tracker_num(goal)
+    let cups = water_tracker_sizes(sizes)
+    let main_cup = water_tracker_main(cups)
+    let total = water_tracker_total(log.entries)
+    let reached = aim > 0 && total >= aim
+    let buzz = (kind: str, ms: int) => {
+        if win != null {
+            if win.quilloNative != null {
+                js("quilloNative.haptic", kind)
+            } else {
+                if win.navigator.vibrate != null && js("navigator.userActivation.hasBeenActive") == true { js("navigator.vibrate", ms) }
+            }
+        }
+    }
+    let kept_now = () => {
+        on_change && on_change(log)
+        if store != null {
+            let text = json.stringify(log)
+            // Storage can throw when it is blocked or full, which would stop the handler where it stands.
+            js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.setItem", store, text) ?? true) }))
+        }
+    }
+    let local_day = () => {
+        let d = js_new("Date", now())
+        water_tracker_date(d.getFullYear(), d.getMonth() + 1, d.getDate())
+    }
+    // A new day clears the old, once, whenever it is noticed: on a tick, on coming back, or on a tap.
+    let roll = () => {
+        let day = local_day()
+        if log.day == "" {
+            log = { ...log, day }
+            kept_now()
+        } else if water_tracker_ended(log.day, day) {
+            let old = log
+            log = { day, entries: [] }
+            note = `A new day. The last one came to ${water_tracker_show(water_tracker_total(old.entries), unit)}.`
+            said = note
+            kept_now()
+            on_reset && on_reset(old)
+        }
+    }
+    let add = (x: num) => {
+        roll()
+        if len(log.entries) < 500 {
+            let was = water_tracker_total(log.entries)
+            log = { ...log, entries: log.entries + [x] }
+            let now_total = water_tracker_total(log.entries)
+            note = ""
+            said = `Added ${water_tracker_show(x, unit)}. ${water_tracker_show(now_total, unit)} today.`
+            kept_now()
+            if aim > 0 && was < aim && now_total >= aim {
+                buzz("success", 60)
+                on_goal && on_goal(now_total)
+            } else {
+                buzz("light", 12)
+            }
+        }
+    }
+    let undo = () => {
+        roll()
+        if len(log.entries) > 0 {
+            let gone = last(log.entries)
+            log = { ...log, entries: slice(log.entries, 0, len(log.entries) - 1) }
+            note = ""
+            said = `Took back ${water_tracker_show(gone, unit)}. ${water_tracker_show(water_tracker_total(log.entries), unit)} today.`
+            kept_now()
+            buzz("selection", 8)
+        }
+    }
+    if win != null { every(max([check_seconds, 1]) * 1000, () => { roll() }) }
+    <section class={ui_cls(["ui-water", reached && "ui-water-done", class])} aria-label={label}
+             @mount={(_me) => {
+                 let d = js("document")
+                 let w = js("window")
+                 if store != null && saved == null {
+                     let text = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.getItem", store)) }))
+                     if type_of(text) == "str" {
+                         let got = json.parse(text)
+                         if !is_err(got) { log = water_tracker_clean(got, log.day) }
+                     }
+                 }
+                 win = w
+                 let back = (_e = null) => { if d.visibilityState == "visible" { roll() } }
+                 d.addEventListener("visibilitychange", back)
+                 w.addEventListener("pageshow", back)
+                 roll()
+                 () => {
+                     d.removeEventListener("visibilitychange", back)
+                     w.removeEventListener("pageshow", back)
+                 }
+             }}>
+        <div.ui-water-in>
+            <button.ui-water-glass type="button" aria-label={`Add ${water_tracker_show(main_cup, unit)}`} @click={() => { add(main_cup) }}>
+                <span.ui-water-inside aria-hidden="true">
+                    <span class={ui_cls(["ui-water-fill", total == 0 && "ui-water-dry"])} style={`transform: translateY(${100 - water_tracker_fill(total, aim)}%)`}></span>
+                </span>
+                <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><path d="M6 0 L94 0 L82 100 L18 100 Z"/></svg>
+                <span.ui-water-pct aria-hidden="true">{water_tracker_pct(total, aim)}%</span>
+            </button>
+            <div.ui-water-side>
+                <p.ui-water-total>{water_tracker_show(total, unit)} of {water_tracker_show(aim, unit)}</p>
+                <p.ui-water-note>{note != "" ? note : water_tracker_left(total, aim, unit)}</p>
+                <div.ui-water-sizes role="group" aria-label="Add">
+                    {for [i, c] in enumerate(cups) => <button.ui-water-add key={i} type="button" aria-label={`Add ${water_tracker_show(c, unit)}`} @click={() => { add(c) }}>+{water_tracker_show(c, unit)}</button>}
+                </div>
+                // It stays where it is, only greyed, so nothing slides under a finger on its way back to tap.
+                <button.ui-water-undo type="button" disabled={len(log.entries) == 0} @click={() => { undo() }}>
+                    {len(log.entries) > 0 ? `Undo +${water_tracker_show(last(log.entries), unit)}` : "Nothing to undo"}
+                </button>
+            </div>
+        </div>
+        <span.ui-sr role="status">{said}</span>
+    </section>
+}

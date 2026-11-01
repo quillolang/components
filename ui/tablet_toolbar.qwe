@@ -1,0 +1,427 @@
+// TabletToolbar: the bar across the top of an editor on a tablet. Its controls come in
+// groups, and as the width shrinks whole groups go into a menu, the least needed first, so
+// the bar is never a scrolled strip. A person can choose what shows and in what order, and
+// buttons open popovers tied to them, which fall back to the menu's button when theirs has
+// gone. Width means its own box, so a turn, Split View and Slide Over are all the same to it.
+//
+//   import ui/tablet_toolbar.qwe use TabletToolbar
+//
+//   <TabletToolbar label="Format" groups={[
+//       { id: "text", label: "Text", priority: 2, items: [
+//           { id: "bold", label: "Bold", icon: "B", toggle: true },
+//           { id: "size", label: "Size", icon: "S", options: ["Small", "Normal", "Large"] },
+//           { id: "colour", label: "Colour", icon: "C" },
+//       ] },
+//       { id: "insert", label: "Insert", items: [{ id: "image", label: "Image", icon: "I" }] },
+//   ]} panels={{ colour: <Swatches/> }} on_action={(id, value) => { run(id, value) }}/>
+//
+// groups: { id, label, priority?, items }. priority: the higher stays longer (0); of equals,
+// the last goes first. items: { id, label, icon, toggle?, options? }. icon: a character, or
+// an SVG path when it starts with "M". toggle: it stays pressed, with aria-pressed. options:
+// a list of text or { value, label }, shown in a popover tied to the button, one chosen.
+// An item with neither, and no panel, is a plain button.
+// panels: inside one of your components, a map from an item's id to HTML to show in its popover.
+// on_action(id, value): inside one of your components, at each press: value is null for a
+// plain button, true or false for a toggle, the option's value for options.
+// customize: offer "Customise" in the menu, to hide items and reorder groups (true).
+// saved: { order, hidden }, as on_customize gave it: ids that no longer exist are dropped,
+// and groups it does not name go last, so an old saved value never breaks a newer bar.
+// on_customize({ order, hidden }): inside one of your components, at each change. Keep it
+// through a server fn in a phone app, where a page's own storage does not last.
+// label: what screen readers call it ("Toolbar"). id: names its parts: give each its own.
+//
+// Tab reaches it once; the arrow keys, Home and End move along it. Popovers are
+// AnchoredPopovers: Escape and a tap elsewhere close them, and on a phone they are sheets.
+// In Customise a group's handle drags it, and its Up and Down buttons do the same.
+
+import ui/theme.qwe use ui_cls
+import ui/anchored_popover.qwe use AnchoredPopover
+
+let tablet_toolbar_css = css`
+.ui-tablet-bar {
+  position: relative; display: flex; align-items: center; gap: 4px; box-sizing: border-box; min-width: 0; min-height: 60px; padding: max(6px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) 6px max(8px, env(safe-area-inset-left));
+  container: ui-tablet-bar / inline-size; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.2 var(--ui-font);
+}
+.ui-tablet-bar-row { display: flex; align-items: center; flex: 1; gap: 12px; min-width: 0; overflow: hidden; }
+.ui-tablet-bar-group { display: flex; align-items: center; flex: none; gap: 2px; }
+.ui-tablet-bar-group + .ui-tablet-bar-group { position: relative; }
+.ui-tablet-bar-group + .ui-tablet-bar-group::before { content: ""; position: absolute; left: -7px; top: 8px; bottom: 8px; width: 1px; background: var(--ui-border); }
+.ui-tablet-bar-gone { display: none; }
+.ui-tablet-bar-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: none; box-sizing: border-box; min-width: 44px; height: 46px; padding: 0 10px; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-fg); font: 500 14px/1.2 var(--ui-font); white-space: nowrap; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-tablet-bar-btn[aria-pressed="true"], .ui-tablet-bar-btn[aria-expanded="true"] { background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-tablet-bar-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-tablet-bar-btn:hover { background: var(--ui-subtle); } }
+.ui-tablet-bar-icon { display: inline-grid; place-items: center; flex: none; width: 24px; height: 24px; font-weight: 600; font-size: 16px; line-height: 1; }
+.ui-tablet-bar-icon svg { width: 22px; height: 22px; }
+.ui-tablet-bar-more { flex: none; }
+.ui-tablet-bar-more-none { display: none; }
+/* Every group at its full width, out of sight, so what fits can be worked out at any width. */
+.ui-tablet-bar-measure { position: absolute; left: 0; top: 0; display: flex; gap: 12px; width: 0; height: 0; overflow: hidden; visibility: hidden; pointer-events: none; }
+@container ui-tablet-bar (max-width: 839.98px) {
+  .ui-tablet-bar-word { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+}
+.ui-tablet-bar-rows { display: grid; gap: 2px; }
+.ui-tablet-bar-rows h3 { margin: 10px 0 2px; color: var(--ui-muted); font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+.ui-tablet-bar-rows h3:first-child { margin-top: 0; }
+.ui-tablet-bar-row-btn {
+  display: flex; align-items: center; gap: 10px; box-sizing: border-box; width: 100%; min-height: 46px; padding: 4px 8px; border: 0; border-radius: var(--ui-radius-sm); background: transparent;
+  color: var(--ui-fg); font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-tablet-bar-row-btn[aria-pressed="true"], .ui-tablet-bar-row-btn[aria-checked="true"] { background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-tablet-bar-row-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-tablet-bar-custom { display: grid; gap: 8px; }
+.ui-tablet-bar-custom-group {
+  position: relative; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); transition: transform .2s cubic-bezier(.2, .8, .2, 1);
+}
+.ui-tablet-bar-custom-dragging { z-index: 2; transition: none; box-shadow: var(--ui-shadow-lg); }
+.ui-tablet-bar-custom-top { display: flex; align-items: center; gap: 2px; min-height: 46px; padding-left: 2px; }
+.ui-tablet-bar-custom-top b { flex: 1; min-width: 0; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-tablet-bar-handle { display: grid; place-items: center; flex: none; width: 44px; height: 44px; touch-action: none; cursor: grab; color: var(--ui-muted); -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.ui-tablet-bar-handle svg { width: 20px; height: 20px; pointer-events: none; }
+.ui-tablet-bar-small { flex: none; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 500 18px/1 var(--ui-font); cursor: pointer; }
+.ui-tablet-bar-small:disabled { color: var(--ui-strong); cursor: default; }
+.ui-tablet-bar-small:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-tablet-bar-check { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 0 10px; cursor: pointer; }
+.ui-tablet-bar-check input { width: 22px; height: 22px; margin: 0; accent-color: var(--ui-accent); }
+.ui-tablet-bar-reset { width: 100%; }
+@media (prefers-reduced-motion: reduce) { .ui-tablet-bar-custom-group { transition: none; } }
+`
+
+fn tablet_toolbar_same(a, b) -> bool = a != null && b != null && str(a) == str(b)
+
+// A list out of what was saved, as text. Anything else is an empty list.
+fn tablet_toolbar_kept(saved, name: str) -> list {
+    let xs = type_of(saved) == "map" ? get(saved, name) : null
+    type_of(xs) == "list" ? xs | map((x) => str(x)) : []
+}
+
+// The groups as a person wants them: in `order`, without the `hidden` items or any group left
+// empty. Ids that have gone are dropped, and groups not named follow in their own order.
+fn tablet_toolbar_arrange(groups: list, order: list, hidden: list) -> list {
+    let named = order | map((id) => find(groups, (g) => tablet_toolbar_same(get(g, "id"), id))) | filter((g) => g != null)
+    let rest = groups | filter((g) => !any(order, (id) => tablet_toolbar_same(get(g, "id"), id)))
+    (named + rest)
+        | map((g) => set(g, "items", get(g, "items", []) | filter((it) => !contains(hidden, str(get(it, "id"))))))
+        | filter((g) => len(g.items) > 0)
+}
+
+// Which groups go to the menu. shown: { id, w, priority } in the order they stand. room:
+// the width there is. more: what the menu's button takes if it has to come. gap: between groups. The bar keeps
+// everything if it can, and else makes room for the menu and lets groups go, lowest
+// priority first and the last of equals first, until the rest fit.
+fn tablet_toolbar_fit(shown: list, room: num, more: num, gap: num) -> list {
+    let total = (xs) => sum(xs | map((g) => g.w)) + (len(xs) > 1 ? (len(xs) - 1) * gap : 0)
+    if total(shown) <= room { return [] }
+    let indexed = range(len(shown)) | map((i) => { i: i, p: get(shown[i], "priority", 0) })
+    // Highest priority first, and of equals the earliest: the order they are kept in.
+    let keep_order = indexed | sort_by((x) => x.p * -100000 + x.i)
+    let kept = tablet_toolbar_keep(shown, keep_order, room - more, gap)
+    range(len(shown)) | filter((i) => !contains(kept, i)) | map((i) => shown[i].id)
+}
+
+// The most of `order` that fit, taken in turn, skipping none: once one does not fit the rest go too.
+fn tablet_toolbar_keep(shown: list, order: list, room: num, gap: num) -> list {
+    let kept = []
+    let used = 0
+    let open = true
+    for o in order {
+        let w = shown[o.i].w + (len(kept) > 0 ? gap : 0)
+        if open && used + w <= room {
+            kept = kept + [o.i]
+            used = used + w
+        } else {
+            open = false
+        }
+    }
+    kept
+}
+
+// An order with one group moved by `by` places, kept to the ends. An id not there changes nothing.
+fn tablet_toolbar_move(order: list, id: str, by: int) -> list {
+    let at = index_of(order, id)
+    if at == null { return order }
+    let to = at + by < 0 ? 0 : at + by >= len(order) ? len(order) - 1 : at + by
+    let without = order | filter((x) => x != id)
+    slice(without, 0, to) + [id] + slice(without, to, len(without))
+}
+
+// How many places a dragged group moves: by distance, a row at a time, or one for a flick.
+fn tablet_toolbar_places(moved: num, height: num, speed: num) -> int {
+    let by = round(moved / max([height, 1]))
+    if by != 0 { return by }
+    speed > 0.5 && moved > 12 ? 1 : speed < -0.5 && moved < -12 ? -1 : 0
+}
+
+fn tablet_toolbar_option(o) = type_of(o) == "map" ? { value: str(get(o, "value", "")), label: str(get(o, "label", get(o, "value", ""))) }
+                                                  : { value: str(o), label: str(o) }
+
+fn tablet_toolbar_step(key: str, at: int, count: int) -> int? {
+    match key {
+        "ArrowRight" | "ArrowDown" => at + 1 < count ? at + 1 : 0
+        "ArrowLeft" | "ArrowUp" => at > 0 ? at - 1 : count - 1
+        "Home" => 0
+        "End" => count > 0 ? count - 1 : 0
+        _ => null
+    }
+}
+
+// Whether a press opens a popover of the item's own.
+fn tablet_toolbar_opens(it, panels) -> bool = get(it, "options") != null || (panels != null && get(panels, str(get(it, "id"))) != null)
+
+fn tablet_toolbar_ids(groups: list) -> list = groups | map((g) => str(get(g, "id")))
+
+view TabletToolbarFace(it) {
+    let icon = get(it, "icon")
+    <span.ui-tablet-bar-icon aria-hidden="true">
+        {type_of(icon) == "str" && starts_with(icon, "M") && len(icon) > 2
+            ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d={icon}/></svg>
+            : str(icon ?? "")}
+    </span>
+}
+
+component TabletToolbar(groups: list = [], panels = null, label: str = "Toolbar", customize: bool = true, saved = null, id: str = "ui-bar",
+                        on_action = null, on_customize = null, class: str? = null) {
+    style global tablet_toolbar_css
+    state order = tablet_toolbar_kept(saved, "order")
+    state hidden = tablet_toolbar_kept(saved, "hidden")
+    state pressed = []
+    state chosen = {}
+    state over = []            // the groups in the menu
+    state showing = ""         // the popover showing: an item's id, "more" or "custom"
+    state before = null        // what showed when the finger came down, as the browser closes it on the way
+    state active = ""          // the one control Tab lands on
+    state root = null
+    let live = tablet_toolbar_arrange(groups, order, hidden)
+    let more_id = `${id}-more`
+    let in_row = live | filter((g) => !contains(over, str(g.id)))
+    let in_menu = live | filter((g) => contains(over, str(g.id)))
+    let has_more = customize || len(in_menu) > 0
+    let row_ids = flatten(in_row | map((g) => g.items | map((it) => str(it.id))))
+    let tab_on = contains(row_ids, active) ? active : (len(row_ids) > 0 ? row_ids[0] : "")
+    let all_ids = tablet_toolbar_ids(groups)
+    let order_now = (order + (all_ids | filter((g) => !contains(order, g)))) | filter((g) => contains(all_ids, g))
+    let measure = (el) => {
+        if el != null {
+            let row = el.querySelector(".ui-tablet-bar-row")
+            let more = el.querySelector(".ui-tablet-bar-more")
+            let probes = el.querySelectorAll("[data-measure]")
+            let widths = range(probes.length) | map((n) => { id: probes[n].dataset.measure, w: probes[n].offsetWidth })
+            let shown = live | map((g) => {
+                let m = find(widths, (x) => x.id == str(g.id))
+                { id: str(g.id), w: m != null ? m.w : 0, priority: get(g, "priority", 0) }
+            })
+            // All the room there is, with the menu's button out of it when it stands there.
+            // With Customise on offer the button is always there; else only with something in it.
+            let full = row.clientWidth + (more.offsetWidth > 0 ? more.offsetWidth + 4 : 0)
+            let next = customize ? tablet_toolbar_fit(shown, full - 48, 0, 12) : tablet_toolbar_fit(shown, full, 48, 12)
+            if json.stringify(next) != json.stringify(over) { over = next }
+        }
+    }
+    let tell = () => {
+        on_customize && on_customize({ order: order_now, hidden: hidden })
+    }
+    // A press on what opens a popover: the browser has closed it by the time of the click.
+    let toggle_panel = (name: str) => {
+        let prior = before != null ? before : showing
+        before = null
+        showing = prior == name ? "" : name
+    }
+    let act = (it, from_menu: bool) => {
+        let key_id = str(it.id)
+        if tablet_toolbar_opens(it, panels) {
+            if from_menu { showing = key_id } else { toggle_panel(key_id) }
+        } else if get(it, "toggle") == true {
+            let on = !contains(pressed, key_id)
+            pressed = on ? pressed + [key_id] : pressed | filter((p) => p != key_id)
+            on_action && on_action(key_id, on)
+        } else {
+            if from_menu { showing = "" }
+            on_action && on_action(key_id, null)
+        }
+    }
+    let pick = (it, value: str) => {
+        chosen = set(chosen, str(it.id), value)
+        showing = ""
+        on_action && on_action(str(it.id), value)
+    }
+    let shift = (group: str, by: int) => {
+        order = tablet_toolbar_move(order_now, group, by)
+        tell()
+    }
+    let flip_item = (item_id: str, on: bool) => {
+        hidden = on ? hidden | filter((h) => h != item_id) : hidden + [item_id]
+        tell()
+    }
+    let along = (e) => {
+        let tools = root.querySelectorAll(".ui-tablet-bar-row button, .ui-tablet-bar-more")
+        let on = range(tools.length) | filter((n) => tools[n].getClientRects().length > 0)
+        let at = range(len(on)) | filter((n) => tools[on[n]].isSameNode(e.target))
+        let next = len(at) > 0 ? tablet_toolbar_step(e.key, at[0], len(on)) : null
+        if next != null {
+            e.preventDefault()
+            tools[on[next]].focus()
+        }
+    }
+    <div class={ui_cls(["ui-tablet-bar", class])} role="toolbar" aria-label={label}
+         @keydown={along}
+         @mount={(el) => {
+             let doc = js("document")
+             let look = (_e = null) => { measure(el) }
+             let seen = js_new("ResizeObserver", look)
+             seen.observe(el)
+             if doc.fonts != null { doc.fonts.addEventListener("loadingdone", look) }
+             root = el
+             look()
+             () => {
+                 seen.disconnect()
+                 if doc.fonts != null { doc.fonts.removeEventListener("loadingdone", look) }
+             }
+         }}>
+        <div.ui-tablet-bar-row>
+            {for g in live =>
+                <div class={ui_cls(["ui-tablet-bar-group", contains(over, str(g.id)) && "ui-tablet-bar-gone"])} key={str(g.id)} role="group" aria-label={str(get(g, "label", ""))} data-group={str(g.id)}>
+                    {for it in g.items =>
+                        <button.ui-tablet-bar-btn key={str(it.id)} type="button" id={`${id}-${str(it.id)}`} data-tool={str(it.id)} aria-label={str(get(it, "label", ""))}
+                                tabindex={str(it.id) == tab_on ? "0" : "-1"}
+                                aria-pressed={get(it, "toggle") == true ? (contains(pressed, str(it.id)) ? "true" : "false") : null}
+                                aria-haspopup={tablet_toolbar_opens(it, panels) ? "dialog" : null}
+                                aria-expanded={tablet_toolbar_opens(it, panels) ? (showing == str(it.id) ? "true" : "false") : null}
+                                @focus={() => { active = str(it.id) }}
+                                @pointerdown={() => { before = showing }}
+                                @click={() => { act(it, false) }}>
+                            <TabletToolbarFace it={it}/>
+                            <span.ui-tablet-bar-word>{str(get(it, "label", ""))}</span>
+                        </button>}
+                </div>}
+        </div>
+        <button class={ui_cls(["ui-tablet-bar-btn", "ui-tablet-bar-more", !has_more && "ui-tablet-bar-more-none"])} id={more_id} type="button" aria-label="More" aria-haspopup="dialog"
+                aria-expanded={showing == "more" ? "true" : "false"}
+                @pointerdown={() => { before = showing }}
+                @click={() => { toggle_panel("more") }}>
+            <span.ui-tablet-bar-icon aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+            </span>
+        </button>
+        <div.ui-tablet-bar-measure aria-hidden="true">
+            {for g in live =>
+                <span.ui-tablet-bar-group key={str(g.id)} data-measure={str(g.id)}>
+                    {for it in g.items =>
+                        <span.ui-tablet-bar-btn key={str(it.id)}><TabletToolbarFace it={it}/><span.ui-tablet-bar-word>{str(get(it, "label", ""))}</span></span>}
+                </span>}
+        </div>
+        <AnchoredPopover id={`${id}-menu`} trigger={null} anchor={more_id} open={showing == "more"} label="More" width={280}
+                         on_close={() => { if showing == "more" { showing = "" } }}>
+            <div.ui-tablet-bar-rows>
+                {for g in in_menu =>
+                    <div key={str(g.id)} data-menu-group={str(g.id)}>
+                        <h3>{str(get(g, "label", ""))}</h3>
+                        {for it in g.items =>
+                            <button.ui-tablet-bar-row-btn key={str(it.id)} type="button" data-menu-tool={str(it.id)}
+                                    aria-pressed={get(it, "toggle") == true ? (contains(pressed, str(it.id)) ? "true" : "false") : null}
+                                    @click={() => { act(it, true) }}>
+                                <TabletToolbarFace it={it}/>{str(get(it, "label", ""))}
+                            </button>}
+                    </div>}
+                {customize && <button.ui-tablet-bar-row-btn type="button" data-customize="true" @click={() => { showing = "custom" }}>Customise</button>}
+            </div>
+        </AnchoredPopover>
+        {for g in live =>
+            <div key={str(g.id)} style="display: contents">
+                {for it in g.items | filter((x) => tablet_toolbar_opens(x, panels)) =>
+                    <AnchoredPopover key={str(it.id)} id={`${id}-panel-${str(it.id)}`} trigger={null} title={str(get(it, "label", ""))} width={260}
+                                     anchor={contains(over, str(g.id)) ? more_id : `${id}-${str(it.id)}`} open={showing == str(it.id)}
+                                     on_close={() => { if showing == str(it.id) { showing = "" } }}>
+                        {get(it, "options") != null && <div.ui-tablet-bar-rows role="radiogroup" aria-label={str(get(it, "label", ""))}>
+                            {for o in get(it, "options", []) | map(tablet_toolbar_option) =>
+                                <button.ui-tablet-bar-row-btn key={o.value} type="button" role="radio" data-option={o.value}
+                                        aria-checked={get(chosen, str(it.id)) == o.value ? "true" : "false"} @click={() => { pick(it, o.value) }}>{o.label}</button>}
+                        </div>}
+                        {get(it, "options") == null && <div>{get(panels, str(it.id))}</div>}
+                    </AnchoredPopover>}
+            </div>}
+        {customize && <AnchoredPopover id={`${id}-custom`} trigger={null} anchor={more_id} open={showing == "custom"} title="Customise" width={340}
+                                       on_close={() => { if showing == "custom" { showing = "" } }}>
+            <div.ui-tablet-bar-custom>
+                {for gid in order_now =>
+                    <TabletToolbarCustomRow key={gid} group={find(groups, (g) => str(get(g, "id")) == gid)} gid={gid} hidden={hidden}
+                                            first={index_of(order_now, gid) == 0} last={index_of(order_now, gid) == len(order_now) - 1}
+                                            on_shift={shift} on_flip={flip_item}/>}
+                <button.ui-tablet-bar-row-btn.ui-tablet-bar-reset type="button" data-reset="true" @click={() => {
+                    order = []
+                    hidden = []
+                    tell()
+                }}>Reset</button>
+            </div>
+        </AnchoredPopover>}
+    </div>
+}
+
+// One group in Customise. Its own component so a drag's state stays out of the bar's; the
+// box a finger moves has no style in its markup, as a style={...} is written whole when what
+// it reads changes, and it would jump home mid-drag.
+component TabletToolbarCustomRow(group, gid: str, hidden: list, first: bool, last: bool, on_shift = null, on_flip = null) {
+    state pull = null          // { y, last_y, last_at, speed, on, row }
+    let name = str(get(group, "label", gid))
+    let reset_row = (row) => {
+        row.classList.remove("ui-tablet-bar-custom-dragging")
+        row.style.transform = ""
+    }
+    <div.ui-tablet-bar-custom-group data-custom-group={gid}>
+        <div.ui-tablet-bar-custom-top>
+            <span.ui-tablet-bar-handle aria-hidden="true"
+                  @pointerdown={(e) => {
+                      if e.button == 0 {
+                          e.preventDefault()
+                          e.target.setPointerCapture(e.pointerId)
+                          pull = { y: e.clientY, last_y: e.clientY, last_at: e.timeStamp, speed: 0, on: false, row: e.target.closest(".ui-tablet-bar-custom-group") }
+                      }
+                  }}
+                  @pointermove={(e) => {
+                      if pull != null {
+                          let dy = e.clientY - pull.y
+                          let on = pull.on || abs(dy) > 6
+                          if on {
+                              if !pull.on { pull.row.classList.add("ui-tablet-bar-custom-dragging") }
+                              pull.row.style.transform = `translateY(${dy}px)`
+                          }
+                          let dt = e.timeStamp - pull.last_at
+                          let step = dt > 0 ? (e.clientY - pull.last_y) / dt : pull.speed
+                          pull = { y: pull.y, last_y: e.clientY, last_at: e.timeStamp, speed: pull.speed == 0 ? step : pull.speed * 0.4 + step * 0.6, on: on, row: pull.row }
+                      }
+                  }}
+                  @pointerup={(e) => {
+                      if pull != null {
+                          let was = pull
+                          pull = null
+                          if was.on {
+                              let run = e.timeStamp - was.last_at < 100 ? was.speed : 0
+                              let by = tablet_toolbar_places(e.clientY - was.y, was.row.offsetHeight + 8, run)
+                              reset_row(was.row)
+                              if by != 0 { on_shift && on_shift(gid, by) }
+                          }
+                      }
+                  }}
+                  @pointercancel={() => {
+                      if pull != null {
+                          let was = pull
+                          pull = null
+                          reset_row(was.row)
+                      }
+                  }}>
+                <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>
+            </span>
+            <b>{name}</b>
+            <button.ui-tablet-bar-small type="button" aria-label={`Move ${name} up`} disabled={first} @click={() => { on_shift && on_shift(gid, -1) }}>↑</button>
+            <button.ui-tablet-bar-small type="button" aria-label={`Move ${name} down`} disabled={last} @click={() => { on_shift && on_shift(gid, 1) }}>↓</button>
+        </div>
+        {for it in get(group, "items", []) =>
+            <label.ui-tablet-bar-check key={str(it.id)}>
+                <input type="checkbox" data-show={str(it.id)} checked={!contains(hidden, str(it.id))} data-small-target
+                       @change={(e) => { on_flip && on_flip(str(it.id), e.checked) }}/>
+                {str(get(it, "label", ""))}
+            </label>}
+    </div>
+}

@@ -1,0 +1,543 @@
+// NaturalDateInput: a date field that takes words. It reads "next friday 5pm", "in 3
+// days", "end of month", "tomorrow noon", "3rd of December" and "12/3", says what it
+// understood in full, and keeps the ISO value in a real field. Where the words mean two
+// things ("next friday" on a Wednesday, "12/3" read either way round, "at 5") it goes
+// with the likeliest and offers the others as buttons, so nobody has to guess what was
+// taken. Nothing is sent anywhere: the parsing is here.
+//
+//   <NaturalDateInput id="due" name="due" label="Due" today="2026-11-04" now="09:30" locale="en-US"/>
+//   <NaturalDateInput id="born" label="Born" time={false} prefer="past" locale="en-GB"
+//                     on_change={(v) => { born = v }}/>
+//
+// id: a prefix for its ids, unique on the page. name: the hidden field that holds the
+// value: "2026-11-13T17:00" with a time (as <input type="datetime-local"> sends it,
+// with no zone), "2026-11-13" without, empty when nothing was understood. label, hint,
+// placeholder, required, disabled as for every field. value: the ISO value to start
+// with, shown as it is. today ("YYYY-MM-DD"), now ("HH:MM"): the moment the words count
+// from; left out, the browser's clock when typing starts, which is the visitor's own
+// day (the server's would be UTC's). locale: which way round "12/3" goes and how the
+// answer is written ("en-US"). order: "mdy", "dmy" or "ymd" instead of the locale's.
+// week_start: 1 for Monday, 7 for Sunday, instead of the locale's: it says where "next
+// week" begins. time: false for a date only (a time typed is left out, and it says
+// so). prefer: "future" (the default: "3 May" is the next 3 May) or "past" (the last).
+// earliest, latest: ISO dates a value must fall between. class: more classes.
+// on_change(value): inside one of your components, the value after each change ("" when
+// there is none).
+//
+// natural_date_input_parse(text, today, now, order, week_start, prefer, time) is the
+// reading, for a program's own use (a route given the words with no JavaScript):
+// { status, value, readings, message }. status is "empty", "ok", "ambiguous" (several
+// readings; value is the first) or "bad" (message says what is wrong); each reading is
+// { value, why }. natural_date_input_order(locale), natural_date_input_week_start(locale)
+// and natural_date_input_words_for(value, locale) go from a locale to those arguments,
+// and from a value to words.
+
+import ui/theme.qwe use ui_cls
+
+let natural_date_input_css = css`
+.ui-natdate { display: grid; gap: 6px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-natdate-label { font-size: 13px; font-weight: 500; }
+.ui-natdate-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-natdate-control { box-sizing: border-box; width: 100%; height: 38px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1 var(--ui-font);
+  transition: border-color .15s, box-shadow .15s; }
+.ui-natdate-control::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-natdate-control:hover { border-color: var(--ui-strong); }
+.ui-natdate-control:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-natdate-control[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-natdate-control:disabled { opacity: .55; cursor: not-allowed; }
+.ui-natdate-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-natdate-said { margin: 0; min-height: 20px; font-size: 13px; color: var(--ui-muted); }
+.ui-natdate-said strong { color: var(--ui-fg); font-weight: 600; }
+.ui-natdate-bad { color: var(--ui-danger); }
+.ui-natdate-note { display: block; color: var(--ui-muted); font-size: 12px; }
+.ui-natdate-alts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-natdate-alts-label { color: var(--ui-muted); font-size: 12px; }
+.ui-natdate-alt { min-height: 30px; padding: 4px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 13px/1.3 var(--ui-font); text-align: left; cursor: pointer; }
+.ui-natdate-alt:hover { border-color: var(--ui-accent); color: var(--ui-accent); }
+.ui-natdate-alt:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-natdate-alt small { display: block; color: var(--ui-muted); font-size: 11px; }
+@media (prefers-reduced-motion: reduce) { .ui-natdate-control { transition: none; } }
+`
+
+// Text past this is not a date; reading it would only make a long error.
+let natural_date_input_limit = 80
+let natural_date_input_month_re = "jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+let natural_date_input_day_re = "mon(?:day)?|tue(?:s(?:day)?)?|wed(?:s|nesday)?|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?"
+let natural_date_input_unit_re = "minutes?|mins?|hours?|hrs?|days?|weeks?|wks?|fortnights?|months?|years?|yrs?"
+let natural_date_input_count_re = "\\d{1,12}|an?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|a couple of|a couple|a few"
+let natural_date_input_month_keys = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+let natural_date_input_day_keys = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+let natural_date_input_day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+let natural_date_input_month_names = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+let natural_date_input_counts = { a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11,
+    twelve: 12, "a couple": 2, "a couple of": 2, "a few": 3 }
+// The time words mean when they stand beside a day: "tomorrow morning".
+let natural_date_input_parts_of_day = { morning: "09:00", afternoon: "15:00", evening: "18:00", night: "20:00", tonight: "20:00" }
+
+// Which way round a locale writes a short date.
+fn natural_date_input_order(locale) {
+    let tag = str(locale ?? "en-US")
+    if tag == "en-US" || tag == "en-PH" || tag == "en" || starts_with(tag, "fil") { return "mdy" }
+    let lang = lower(slice(tag, 0, 2))
+    contains(["ja", "zh", "ko", "hu", "sv", "lt"], lang) ? "ymd" : "dmy"
+}
+
+// The first day of a locale's week: 7 for Sunday, 1 for Monday.
+fn natural_date_input_week_start(locale) {
+    let tag = str(locale ?? "en-US")
+    let region = upper(slice(tag, 3, 5))
+    let lang = lower(slice(tag, 0, 2))
+    contains(["US", "CA", "MX", "BR", "JP", "IL", "PH", "KR", "TW", "HK", "ZA", "AU", "IN"], region) || lang == "ja" || tag == "en" ? 7 : 1
+}
+
+fn natural_date_input_pad(n: int) = n < 10 ? `0${n}` : str(n)
+
+// The one date, or null when the calendar has no such day (and a year it cannot hold).
+fn natural_date_input_day_of(y: int, m: int, d: int) {
+    if y < 1 || y > 9999 || m < 1 || m > 12 || d < 1 { return null }
+    if d > date.days_in_month(y, m) { return null }
+    date.of(y, m, d)
+}
+
+fn natural_date_input_month_name(m: int) = natural_date_input_month_names[m - 1]
+
+// A date with no year: the next such day from today, or the last with prefer "past".
+// 29 February looks up to eight years on, past a century that has none.
+fn natural_date_input_with_year(m: int, d: int, today: str, prefer: str) {
+    let y = date.parts(today).year
+    let step = prefer == "past" ? -1 : 1
+    let tries = 0
+    while tries < 9 {
+        let found = natural_date_input_day_of(y, m, d)
+        if found != null && (prefer == "past" ? found <= today : found >= today) { return found }
+        y += step
+        tries += 1
+    }
+    null
+}
+
+// Two digits of a year are this century's, as date.parse reads them.
+fn natural_date_input_full_year(y: int) = y < 100 ? 2000 + y : y
+
+fn natural_date_input_clean(text) {
+    let s = lower(trim(text))
+    s = re.replace(s, "\\b(a|p)\\.m\\.?", "$1m")
+    s = re.replace(s, "[,]", " ")
+    s = re.replace(s, "\\s+", " ")
+    // An ISO date-time, as this field's own value is written.
+    re.replace(trim(s), "^(\\d{4}-\\d{2}-\\d{2})t(\\d{2}:\\d{2})(?::\\d{2})?$", "$1 $2")
+}
+
+// Takes the time out of the words: { hour, minute, alt, rest, error }. hour is null
+// when none was written. alt is the other half of the day where only the clock face
+// was given ("at 5"); the likelier half goes first: 1 to 6 are afternoons, 7 to 11
+// mornings, as an office would say them.
+fn natural_date_input_time(s: str) {
+    let cut = (m) => trim(re.replace(slice(s, 0, m.start) + " " + slice(s, m.end, len(s)), "\\s+", " "))
+    let tail = (rest: str) => trim(re.replace(rest, "(?:^|\\s)(?:at|@)$", ""))
+    let word = re.find(s, "\\b(noon|midday|midnight)\\b")
+    if word != null {
+        return { hour: word.groups[0] == "midnight" ? 0 : 12, minute: 0, alt: null, rest: tail(cut(word)), error: null }
+    }
+    let half = re.find(s, "(?:\\bat |@ ?)?\\b(\\d{1,2})(?:[:.](\\d{2}))? ?(am|pm|a|p)\\b")
+    if half != null {
+        let h = int(half.groups[0])
+        let mins = half.groups[1] != null ? int(half.groups[1]) : 0
+        let pm = starts_with(half.groups[2], "p")
+        if h > 12 || h == 0 { return { error: `${half.text}: a time with am or pm has hours from 1 to 12.` } }
+        if mins > 59 { return { error: `${half.text}: minutes go up to 59.` } }
+        return { hour: pm ? (h == 12 ? 12 : h + 12) : (h == 12 ? 0 : h), minute: mins, alt: null, rest: tail(cut(half)), error: null }
+    }
+    let clock = re.find(s, "(?:\\bat |@ ?)?\\b(\\d{1,2}):(\\d{2})\\b")
+    let bare = clock ?? re.find(s, "(?:\\bat |@ ?)\\b(\\d{1,2})\\b(?:$| )")
+    if bare != null {
+        let digits = bare.groups[0]
+        let h = int(digits)
+        let mins = len(bare.groups) > 1 ? int(bare.groups[1]) : 0
+        if h > 23 { return { error: `${trim(bare.text)}: hours go up to 23.` } }
+        if mins > 59 { return { error: `${trim(bare.text)}: minutes go up to 59.` } }
+        // "17:30" and "05:30" say which half of the day; "5:30" and "at 5" do not.
+        if h >= 1 && h <= 11 && len(digits) == 1 || h >= 10 && h <= 11 && clock == null {
+            let later = h <= 6
+            return { hour: later ? h + 12 : h, minute: mins, alt: later ? h : h + 12, rest: tail(cut(bare)), error: null }
+        }
+        return { hour: h, minute: mins, alt: null, rest: tail(cut(bare)), error: null }
+    }
+    { hour: null, minute: 0, alt: null, rest: s, error: null }
+}
+
+fn natural_date_input_week_of(d: str, week_start: int) {
+    let back = (date.weekday(d) - week_start + 7) % 7
+    date.add_days(d, 0 - back)
+}
+
+fn natural_date_input_weekday(text: str) = index_of(natural_date_input_day_keys, slice(text, 0, 3)) + 1
+
+fn natural_date_input_month(text: str) = index_of(natural_date_input_month_keys, slice(text, 0, 3)) + 1
+
+fn natural_date_input_count(text: str) = natural_date_input_counts[text] ?? int(text)
+
+fn natural_date_input_reading(day: str, why: str, clock: str? = null) = { day, why, clock }
+
+// "in 3 days", forward or back. Minutes and hours carry a time with them. Past the
+// years the calendar holds it says so, where date.add_days would stop the program:
+// months and years are measured long here, so what passes this check fits.
+fn natural_date_input_moved(n: int, unit: str, sign: int, today: str, now: str) {
+    let u = slice(unit, 0, 2)
+    let span = u == "mi" ? n / 1440 : u == "ho" || u == "hr" ? n / 24 : u == "da" ? n : u == "we" || u == "wk" ? n * 7 : u == "fo" ? n * 14 : u == "mo" ? n * 31 : n * 366
+    let year = date.parts(today).year + sign * span / 365
+    if year < 1 || year > 9998 { return { error: "That is further off than the calendar goes (years 1 to 9999)." } }
+    let said = `${n} ${re.replace(unit, "s$", "")}${n == 1 ? "" : "s"}`
+    if u == "mi" || u == "ho" || u == "hr" {
+        let parts = split(now, ":")
+        let total = int(parts[0]) * 60 + int(parts[1]) + sign * n * (u == "mi" ? 1 : 60)
+        let days = floor(total / 1440)
+        let rest = total - days * 1440
+        return [natural_date_input_reading(date.add_days(today, days), sign > 0 ? `In ${said}` : `${said} ago`,
+                                           `${natural_date_input_pad(floor(rest / 60))}:${natural_date_input_pad(rest % 60)}`)]
+    }
+    let day = u == "mo" ? date.add_months(today, sign * n) : u == "ye" || u == "yr" ? date.add_years(today, sign * n) : date.add_days(today, sign * n * (u == "da" ? 1 : u == "fo" ? 14 : 7))
+    [natural_date_input_reading(day, sign > 0 ? `In ${said}` : `${said} ago`)]
+}
+
+// "end of month", "start of next week", "the last day of next year".
+fn natural_date_input_edge(end: bool, which: str, unit: str, today: str, week_start: int) {
+    let shift = which == "next" ? 1 : which == "last" ? -1 : 0
+    let name = `${end ? "End" : "Start"} of ${which == "" || which == "this" ? "this" : which} ${unit}`
+    if unit == "week" {
+        let monday = date.add_days(natural_date_input_week_of(today, week_start), shift * 7)
+        return [natural_date_input_reading(end ? date.add_days(monday, 6) : monday, name)]
+    }
+    if unit == "month" {
+        let start = date.add_months(date.start_of_month(today), shift)
+        return [natural_date_input_reading(end ? date.end_of_month(start) : start, name)]
+    }
+    let y = date.parts(today).year + shift
+    [natural_date_input_reading(date.of(y, end ? 12 : 1, end ? 31 : 1), name)]
+}
+
+// "12/3": both ways round where both are dates, the locale's first, and a date whose
+// year was left out read as the next one, with the one just gone as an alternative.
+fn natural_date_input_numeric(a: int, b: int, year, order: str, today: str, prefer: str) {
+    if natural_date_input_year_fault(year) != null { return natural_date_input_year_fault(year) }
+    let first_month = order != "dmy"
+    let spell = (m: int, d: int) => `${natural_date_input_month_name(m)} ${d}`
+    let reads = first_month ? [[a, b], [b, a]] : [[b, a], [a, b]]
+    let found = []
+    for [i, pair] in enumerate(reads) {
+        let m = pair[0]
+        let d = pair[1]
+        if !(i == 1 && a == b) {
+            let day = year != null ? natural_date_input_day_of(year, m, d) : (m >= 1 && m <= 12 && d >= 1 && d <= 31 ? natural_date_input_with_year(m, d, today, prefer) : null)
+            if day != null {
+                let side = (i == 0) == first_month ? "month first" : "day first"
+                found = push(found, natural_date_input_reading(day, `${spell(m, d)}, ${side}`))
+            }
+        }
+    }
+    if len(found) == 0 {
+        let m = first_month ? a : b
+        let d = first_month ? b : a
+        if a > 31 || b > 31 || (a > 12 && b > 12) { return { error: `${a}/${b} is neither a month and day nor a day and month.` } }
+        return { error: m >= 1 && m <= 12 ? `${natural_date_input_month_name(m)} has no day ${d}.` : `There is no month ${m}.` }
+    }
+    found
+}
+
+fn natural_date_input_year_fault(year) = year != null && (year < 1 || year > 9999) ? { error: "Years go from 1 to 9999." } : null
+
+fn natural_date_input_named(m: int, d: int, year, today: str, prefer: str) {
+    let name = `${natural_date_input_month_name(m)} ${d}`
+    if natural_date_input_year_fault(year) != null { return natural_date_input_year_fault(year) }
+    if d < 1 || d > 31 { return { error: `${natural_date_input_month_name(m)} has no day ${d}.` } }
+    let day = year != null ? natural_date_input_day_of(year, m, d) : natural_date_input_with_year(m, d, today, prefer)
+    if day == null { return { error: `${natural_date_input_month_name(m)} ${year ?? ""} has no day ${d}.` } }
+    [natural_date_input_reading(day, name)]
+}
+
+fn natural_date_input_ordinal(d: int) {
+    let teen = d >= 11 && d <= 13
+    let unit = d % 10
+    `${d}${teen ? "th" : unit == 1 ? "st" : unit == 2 ? "nd" : unit == 3 ? "rd" : "th"}`
+}
+
+// The next day with this number: "the 15th", and past the months too short for it.
+fn natural_date_input_day_number(d: int, today: str, prefer: str) {
+    if d < 1 || d > 31 { return { error: `No month has a day ${d}.` } }
+    let p = date.parts(today)
+    let step = prefer == "past" ? -1 : 1
+    let turns = 0
+    let y = p.year
+    let m = p.month
+    while turns < 14 {
+        let day = natural_date_input_day_of(y, m, d)
+        if day != null && (prefer == "past" ? day <= today : day >= today) { return [natural_date_input_reading(day, `The ${natural_date_input_ordinal(d)}`)] }
+        m += step
+        if m > 12 { m = 1; y += 1 }
+        if m < 1 { m = 12; y -= 1 }
+        turns += 1
+    }
+    { error: `No month has a day ${d}.` }
+}
+
+fn natural_date_input_weekday_readings(which: str, wd: int, tail: str, today: str, week_start: int, prefer: str) {
+    let name = natural_date_input_day_names[wd - 1]
+    let ahead = (wd - date.weekday(today) + 7) % 7
+    let coming = date.add_days(today, ahead == 0 ? 7 : ahead)
+    let start = natural_date_input_week_of(today, week_start)
+    let in_week = (s: str) => date.add_days(s, (wd - week_start + 7) % 7)
+    if tail == "next week" || which == "next" {
+        // "next friday" on a Wednesday: the Friday of next week, or the Friday coming.
+        let later = in_week(date.add_days(start, 7))
+        let say = `${name} of next week`
+        if tail == "next week" || later == coming { return [natural_date_input_reading(later, say)] }
+        return [natural_date_input_reading(later, say), natural_date_input_reading(coming, `The coming ${name}`)]
+    }
+    if tail == "last week" { return [natural_date_input_reading(in_week(date.add_days(start, -7)), `${name} of last week`)] }
+    if which == "last" || prefer == "past" && which == "" {
+        let back = (date.weekday(today) - wd + 7) % 7
+        return [natural_date_input_reading(date.add_days(today, back == 0 ? -7 : 0 - back), `Last ${name}`)]
+    }
+    if tail == "this week" || which == "this" {
+        return [natural_date_input_reading(date.add_days(today, ahead), `This ${name}`)]
+    }
+    // A plain "friday" on a Friday: most often the next one, but it may be today.
+    if ahead == 0 {
+        return [natural_date_input_reading(coming, `Next ${name}`), natural_date_input_reading(today, "Today")]
+    }
+    [natural_date_input_reading(coming, `The coming ${name}`)]
+}
+
+// What the words other than the time say: readings, the likeliest first, or { error }.
+fn natural_date_input_days(s: str, today: str, now: str, order: str, week_start: int, prefer: str) {
+    let lookup = (pattern: str) => re.find(s, pattern)
+    let plain = re.replace(s, "^(?:on|the|by|for) ", "")
+    let word = (r: str) => plain == r
+    if word("today") || word("now") || word("tonight") { return [natural_date_input_reading(today, "Today")] }
+    if word("tomorrow") || word("tmrw") || word("tmr") { return [natural_date_input_reading(date.add_days(today, 1), "Tomorrow")] }
+    if word("yesterday") { return [natural_date_input_reading(date.add_days(today, -1), "Yesterday")] }
+    if word("day after tomorrow") { return [natural_date_input_reading(date.add_days(today, 2), "The day after tomorrow")] }
+    if word("day before yesterday") { return [natural_date_input_reading(date.add_days(today, -2), "The day before yesterday")] }
+    if word("next week") {
+        let start = date.add_days(natural_date_input_week_of(today, week_start), 7)
+        return [natural_date_input_reading(date.add_days(today, 7), "A week from today"), natural_date_input_reading(start, "The start of next week")]
+    }
+    if word("next month") {
+        let start = date.add_months(date.start_of_month(today), 1)
+        let same = date.add_months(today, 1)
+        return same == start ? [natural_date_input_reading(same, "A month from today")]
+            : [natural_date_input_reading(same, "A month from today"), natural_date_input_reading(start, "The start of next month")]
+    }
+    if word("next year") { return [natural_date_input_reading(date.add_years(today, 1), "A year from today")] }
+    if word("last week") { return [natural_date_input_reading(date.add_days(today, -7), "A week ago")] }
+    if word("last month") { return [natural_date_input_reading(date.add_months(today, -1), "A month ago")] }
+    if word("last year") { return [natural_date_input_reading(date.add_years(today, -1), "A year ago")] }
+    if word("eom") { return natural_date_input_edge(true, "", "month", today, week_start) }
+    if word("eow") { return natural_date_input_edge(true, "", "week", today, week_start) }
+    if word("eoy") { return natural_date_input_edge(true, "", "year", today, week_start) }
+
+    let edge = lookup("^(?:the )?(?:very )?(end|start|beginning|begin|first day|last day|first|last) of (?:the )?(?:(this|next|last) )?(week|month|year)$")
+    if edge != null {
+        let what = edge.groups[0]
+        return natural_date_input_edge(what == "end" || what == "last day" || what == "last", edge.groups[1] ?? "", edge.groups[2], today, week_start)
+    }
+    let edge_of = lookup(`^(?:the )?(?:(first|last)(?: day)?|end|start) of (${natural_date_input_month_re})(?: (\\d{4}))?$`)
+    if edge_of != null {
+        let m = natural_date_input_month(edge_of.groups[1])
+        let end = edge_of.groups[0] == "last" || starts_with(plain, "end") || starts_with(s, "the end")
+        let y = edge_of.groups[2] != null ? int(edge_of.groups[2]) : date.parts(natural_date_input_with_year(m, 28, today, prefer)).year
+        if y < 1 || y > 9999 { return { error: "Years go from 1 to 9999." } }
+        return [natural_date_input_reading(natural_date_input_day_of(y, m, end ? date.days_in_month(y, m) : 1), `${end ? "End" : "Start"} of ${natural_date_input_month_name(m)}`)]
+    }
+    let inn = lookup(`^(?:in |after )(${natural_date_input_count_re}) (${natural_date_input_unit_re})(?: (?:from now|from today|time))?$`)
+    let from = lookup(`^(${natural_date_input_count_re}) (${natural_date_input_unit_re}) (?:from now|from today|later|on)$`)
+    let ago = lookup(`^(${natural_date_input_count_re}) (${natural_date_input_unit_re}) (?:ago|back|before)$`)
+    let gone = inn ?? from ?? ago
+    if gone != null {
+        return natural_date_input_moved(natural_date_input_count(gone.groups[0]), gone.groups[1], ago != null ? -1 : 1, today, now)
+    }
+    let weekend = lookup("^(?:(this|next|last) )?weekend$")
+    if weekend != null {
+        let which = weekend.groups[0] ?? "this"
+        let sat = date.add_days(natural_date_input_week_of(today, 1), 5 + (which == "next" ? 7 : which == "last" ? -7 : 0))
+        return [natural_date_input_reading(which == "this" && today == date.add_days(sat, 1) ? today : sat, which == "this" ? "This weekend" : `The ${which} weekend`)]
+    }
+    let day = lookup(`^(?:on )?(?:(this|next|last|coming) )?(${natural_date_input_day_re})\\.?(?: (next week|this week|last week))?$`)
+    if day != null {
+        let which = day.groups[0] ?? ""
+        return natural_date_input_weekday_readings(which == "coming" ? "this" : which, natural_date_input_weekday(day.groups[1]), day.groups[2] ?? "", today, week_start, prefer)
+    }
+    let iso = lookup("^(\\d{4})[-/.](\\d{1,2})[-/.](\\d{1,2})$")
+    if iso != null {
+        let y = int(iso.groups[0])
+        let m = int(iso.groups[1])
+        let d = int(iso.groups[2])
+        if natural_date_input_year_fault(y) != null { return natural_date_input_year_fault(y) }
+        let found = natural_date_input_day_of(y, m, d)
+        if found == null { return { error: m >= 1 && m <= 12 ? `${natural_date_input_month_name(m)} ${y} has no day ${d}.` : `There is no month ${m}.` } }
+        return [natural_date_input_reading(found, "As written")]
+    }
+    let short = lookup("^(\\d{1,2})[-/.](\\d{1,2})(?:[-/.](\\d{4}|\\d{2}))?$")
+    if short != null {
+        let g = short.groups
+        if g[2] != null && order == "ymd" && len(g[2]) == 2 {
+            return natural_date_input_numeric(int(g[1]), int(g[2]), natural_date_input_full_year(int(g[0])), "mdy", today, prefer)
+        }
+        let year = g[2] == null ? null : len(g[2]) == 2 ? natural_date_input_full_year(int(g[2])) : int(g[2])
+        return natural_date_input_numeric(int(g[0]), int(g[1]), year, order, today, prefer)
+    }
+    let long_day = lookup(`^(?:the )?(\\d{1,2})(?:st|nd|rd|th)?(?: of)? (${natural_date_input_month_re})\\.?(?: (\\d{4}))?$`)
+    if long_day != null {
+        let g = long_day.groups
+        return natural_date_input_named(natural_date_input_month(g[1]), int(g[0]), g[2] != null ? int(g[2]) : null, today, prefer)
+    }
+    let long_month = lookup(`^(${natural_date_input_month_re})\\.? (?:the )?(\\d{1,2})(?:st|nd|rd|th)?(?: (\\d{4}))?$`)
+    if long_month != null {
+        let g = long_month.groups
+        return natural_date_input_named(natural_date_input_month(g[0]), int(g[1]), g[2] != null ? int(g[2]) : null, today, prefer)
+    }
+    let month_only = lookup(`^(?:in )?(${natural_date_input_month_re})\\.?(?: (\\d{4}))?$`)
+    if month_only != null {
+        let m = natural_date_input_month(month_only.groups[0])
+        let y = month_only.groups[1] != null ? int(month_only.groups[1]) : null
+        return natural_date_input_named(m, 1, y, today, prefer)
+    }
+    let nth = lookup("^(?:the )?(\\d{1,2})(?:st|nd|rd|th)$")
+    if nth != null { return natural_date_input_day_number(int(nth.groups[0]), today, prefer) }
+    { error: null }
+}
+
+// The words the parser did not get: the first of them, for the message.
+fn natural_date_input_stuck(s: str) {
+    let known = "^(?:on|the|by|for|in|at|of|next|last|this|coming|end|start|today|tomorrow|yesterday|week|month|year|days?|weeks?|months?|years?|hours?|ago|from|now|\\d+(?:st|nd|rd|th)?|\\d+[-/.]\\d+.*)$"
+    let words = split(s, " ")
+    let wrong = find(words, (w) => !re.test(w, known) && !re.test(w, `^(?:${natural_date_input_day_re}|${natural_date_input_month_re})\\.?$`))
+    wrong
+}
+
+// The whole reading: see the opening comment.
+fn natural_date_input_parse(text, today: str, now: str = "00:00", order: str = "mdy", week_start: int = 1, prefer: str = "future", time: bool = true) {
+    let bad = (message: str) => { status: "bad", value: "", readings: [], message }
+    let raw = trim(str(text ?? ""))
+    if raw == "" { return { status: "empty", value: "", readings: [], message: null } }
+    if len(raw) > natural_date_input_limit { return bad(`That is too long to be a date (over ${natural_date_input_limit} characters).`) }
+    let s = natural_date_input_clean(raw)
+    let clock = natural_date_input_time(s)
+    if clock.error != null { return bad(clock.error) }
+    let parts_of_day = re.find(clock.rest, "(?:^| )(?:in the |at )?(morning|afternoon|evening|night)$")
+    let tonight = clock.rest == "tonight"
+    let when = parts_of_day != null ? natural_date_input_parts_of_day[parts_of_day.groups[0]] : tonight ? natural_date_input_parts_of_day.tonight : null
+    let rest = trim(parts_of_day != null ? slice(clock.rest, 0, parts_of_day.start) : clock.rest)
+    let has_clock = clock.hour != null || when != null
+    let found = rest == "" && has_clock ? null : natural_date_input_days(rest, today, now, order, week_start, prefer)
+    if found != null && type_of(found) == "map" {
+        if found.error != null { return bad(found.error) }
+        let wrong = natural_date_input_stuck(rest)
+        return bad(wrong != null ? `Could not read "${wrong}". Try "next friday 5pm", "in 3 days" or "12/3".` : `Could not read that as a date. Try "next friday 5pm", "in 3 days" or "12/3".`)
+    }
+    let hour = clock.hour
+    let minute = clock.minute
+    let picked = when != null && hour == null ? when : hour != null ? `${natural_date_input_pad(hour)}:${natural_date_input_pad(minute)}` : null
+    // A time alone is the next time it comes round.
+    let days = found ?? (picked > now ? [natural_date_input_reading(today, "Today")]
+        : [natural_date_input_reading(date.add_days(today, 1), "Tomorrow"), natural_date_input_reading(today, "Today")])
+    let readings = []
+    for r in days {
+        let at = r.clock ?? picked
+        readings = push(readings, { value: time && at != null ? `${r.day}T${at}` : r.day, why: r.why })
+    }
+    if clock.alt != null && time {
+        let other = `${natural_date_input_pad(clock.alt)}:${natural_date_input_pad(minute)}`
+        readings = push(readings, { value: `${days[0].day}T${other}`, why: clock.alt >= 12 ? "In the afternoon" : "In the morning" })
+    }
+    { status: len(readings) > 1 ? "ambiguous" : "ok", value: readings[0].value, readings, message: !time && picked != null ? "This field takes a date: the time is left out." : null }
+}
+
+// A value in words: "Friday, November 13, 2026 at 5:00 PM".
+fn natural_date_input_words_for(value: str, locale) {
+    let tag = str(locale ?? "en-US")
+    let day = slice(value, 0, 10)
+    if !date.valid(day, "date") { return value }
+    let said = date.format(day, { locale: tag, style: "full" })
+    if len(value) < 16 { return said }
+    let instant = `${day}T${slice(value, 11, 16)}:00Z`
+    if !date.valid(instant, "date-time") { return said }
+    let twelve = natural_date_input_order(tag) == "mdy" || starts_with(tag, "en")
+    `${said} at ${date.format(instant, twelve ? "h:mm A" : "HH:mm")}`
+}
+
+// A value starting a field, or a limit, as a date for comparing.
+fn natural_date_input_outside(value: str, earliest, latest) {
+    let day = slice(value, 0, 10)
+    if earliest != null && day < earliest { return `That is before the earliest date, ${earliest}.` }
+    if latest != null && day > latest { return `That is after the latest date, ${latest}.` }
+    null
+}
+
+component NaturalDateInput(id: str, name: str? = null, label: str? = null, value: str = "", placeholder: str = "next friday 5pm, in 3 days, 12/3",
+                           hint: str? = null, required: bool = false, disabled: bool = false, today: str? = null, now: str? = null,
+                           locale: str = "en-US", order: str? = null, week_start: int? = null, time: bool = true, prefer: str = "future",
+                           earliest: str? = null, latest: str? = null, on_change = null, class: str? = null) {
+    style global natural_date_input_css
+    state text = value
+    // What the words count from: the props, or the browser's clock once someone types.
+    state clock_day = today != null && date.valid(today, "date") ? today : null
+    state clock_time = now != null && re.test(now, "^(?:[01]\\d|2[0-3]):[0-5]\\d$") ? now : "00:00"
+    // An alternative picked: the value it gave, kept until the text changes.
+    state chosen = null
+    let way = order ?? natural_date_input_order(locale)
+    let week = week_start ?? natural_date_input_week_start(locale)
+    let read = text != "" && clock_day == null ? { status: "ok", value: value, readings: [], message: null }
+        : natural_date_input_parse(text, clock_day ?? "2000-01-01", clock_time, way, week, prefer, time)
+    let taken = read.status == "bad" || read.status == "empty" ? "" : chosen ?? read.value
+    let outside = taken != "" ? natural_date_input_outside(taken, earliest, latest) : null
+    let result = outside != null ? "" : taken
+    let others = read.status == "ambiguous" ? read.readings | filter((r) => r.value != taken) : []
+    let wrong = read.status == "bad" ? read.message : outside
+    let described = ui_cls([hint != null && `${id}-hint`, `${id}-said`])
+    let settle = () => {
+        if clock_day == null {
+            let d = js_new("Date")
+            clock_day = date.of(d.getFullYear(), d.getMonth() + 1, d.getDate())
+            if now == null { clock_time = `${natural_date_input_pad(d.getHours())}:${natural_date_input_pad(d.getMinutes())}` }
+        }
+    }
+    let tell = (v: str) => { on_change && on_change(v) }
+    let current = (typed: str) => {
+        let r = natural_date_input_parse(typed, clock_day, clock_time, way, week, prefer, time)
+        let v = r.status == "bad" || r.status == "empty" ? "" : r.value
+        v != "" && natural_date_input_outside(v, earliest, latest) != null ? "" : v
+    }
+    <div class={ui_cls(["ui-natdate", class])}>
+        {label != null && <label.ui-natdate-label for={id}>
+            {label}{required && <span.ui-natdate-req aria-hidden="true">*</span>}
+        </label>}
+        <input.ui-natdate-control type="text" id={id} value={text} placeholder={placeholder} required={required} disabled={disabled}
+               autocomplete="off" spellcheck="false" aria-invalid={wrong != null ? "true" : null} aria-describedby={described}
+               @input={(e) => {
+                   // Before anything that waits: e.value is the state's again after a wait.
+                   let typed = e.value
+                   text = typed
+                   chosen = null
+                   settle()
+                   tell(current(typed))
+               }}/>
+        {name != null && <input type="hidden" name={name} value={result}/>}
+        {hint != null && <p.ui-natdate-hint id={`${id}-hint`}>{hint}</p>}
+        <p.ui-natdate-said id={`${id}-said`} aria-live="polite">
+            {wrong != null ? <span.ui-natdate-bad>{wrong}</span>
+                : result != "" ? <span><strong>{natural_date_input_words_for(result, locale)}</strong>{read.message != null && <span.ui-natdate-note>{read.message}</span>}</span>
+                : null}
+        </p>
+        {len(others) > 0 && <ul.ui-natdate-alts aria-label="Other readings">
+            <li.ui-natdate-alts-label aria-hidden="true">Or did you mean</li>
+            {for r in others => <li key={r.value}>
+                <button.ui-natdate-alt type="button" data-value={r.value} @click={() => { chosen = r.value; tell(r.value) }}>
+                    {natural_date_input_words_for(r.value, locale)}<small>{r.why}</small>
+                </button>
+            </li>}
+        </ul>}
+    </div>
+}

@@ -1,0 +1,313 @@
+// BoardingPassCard: a boarding pass for the phone in a person's hand at the gate: the gate and
+// the boarding time large, a countdown that moves to what comes next, and the code ready to
+// scan. Pressing the code fills the screen with it, turns the brightness up and keeps the
+// screen on until it is put away, as scanners read a bright code and a dim phone wastes the
+// queue's time. Everything is drawn in the page, so it needs no network: offline it says
+// so and goes on working.
+//
+//   import ui/boarding_pass_card.qwe use BoardingPassCard
+//
+//   <BoardingPassCard now="2026-11-03T20:40:00+00:00" pass={{
+//       airline: "Quillo Air", flight: "QA 204", passenger: "Ada Lovelace", seat: "14A", group: "2", gate: "B12",
+//       from: { code: "LIS", city: "Lisbon" }, to: { code: "DXB", city: "Dubai" },
+//       departs: "2026-11-03T22:40:00+00:00", boarding: "2026-11-03T21:55:00+00:00", code: "M1LOVELACE/ADA EQA204",
+//   }}/>
+//
+// pass: { airline, flight, passenger, from, to, departs, boarding?, closes?, gate?, was_gate?,
+// terminal?, seat?, group?, cabin?, code, kind? }. from, to: { code, city }. departs, boarding,
+// closes: ISO date-times with the offset of the airport, shown as written; boarding is 45 and
+// closes 15 minutes before departs when left out. was_gate: the gate before a change. code:
+// what the scanner reads. kind: "qr" (default) or "barcode", for a short code.
+// now: the time, in that form, so the server writes what the browser does; left out, the
+// countdown appears once the page has started, from the phone's clock.
+// keep: saves the pass in this browser (localStorage), under `keep_key` ("quillo-boarding-pass"),
+// and a page that gives no `pass` shows the saved one (true). on_keep(pass): called once with the
+// pass, for a program to keep it. In the phone apps localStorage comes back empty at each
+// launch, as the app's address changes: there, keep it through a `server fn` and SQLite and give
+// it back as `pass`. A web page itself reloads offline only under a service worker, which
+// a component cannot install: this keeps the data, not the page.
+//
+// In the apps the brightness is set through quilloNative and put back after, and the screen is
+// kept on; in a browser, where nothing can set the brightness, it says to turn it up, and
+// asks for a Wake Lock where there is one.
+//
+// boarding_pass_card_phase and boarding_pass_card_span are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/qr_code.qwe use QrCode
+import ui/barcode.qwe use Barcode
+
+let boarding_pass_card_css = css`
+.ui-bpcard { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.35 var(--ui-font); }
+.ui-bpcard-in { display: grid; gap: 12px; overflow: hidden; padding: 16px; border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 6px); background: var(--ui-surface); box-shadow: var(--ui-shadow); }
+.ui-bpcard-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 10px; font-weight: 600; }
+.ui-bpcard-flight { font-variant-numeric: tabular-nums; }
+.ui-bpcard-route { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 8px; }
+.ui-bpcard-code3 { display: block; font-size: 32px; font-weight: 800; line-height: 1; letter-spacing: -.01em; }
+.ui-bpcard-city { display: block; color: var(--ui-muted); font-size: 13px; overflow-wrap: anywhere; }
+.ui-bpcard-to { text-align: right; }
+.ui-bpcard-line { width: 40px; border-top: 2px dashed var(--ui-strong); }
+.ui-bpcard-big { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 0; }
+.ui-bpcard-big > div { min-width: 0; padding: 10px 12px; border-radius: var(--ui-radius); background: var(--ui-accent-soft); }
+.ui-bpcard-big dt { color: var(--ui-muted); font-size: 12px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
+.ui-bpcard-big dd { margin: 0; font-size: 40px; font-weight: 800; line-height: 1.05; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-bpcard-was { display: block; color: var(--ui-danger); font-size: 13px; font-weight: 600; line-height: 1.3; }
+.ui-bpcard-count { margin: 0; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ui-bpcard-count[data-phase="boarding"] { color: var(--ui-success); }
+.ui-bpcard-count[data-phase="closed"], .ui-bpcard-count[data-phase="gone"] { color: var(--ui-danger); }
+.ui-bpcard-count span { display: block; color: var(--ui-muted); font-size: 14px; font-weight: 500; }
+.ui-bpcard-show {
+  display: grid; justify-items: center; gap: 4px; width: 100%; padding: 12px 8px; border: 1px dashed var(--ui-strong); border-radius: var(--ui-radius); background: transparent; color: var(--ui-fg);
+  font: 500 14px/1.3 var(--ui-font); cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-bpcard-show:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-bpcard-more { display: grid; grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); gap: 6px 12px; margin: 0; }
+.ui-bpcard-more dt { color: var(--ui-muted); font-size: 12px; }
+.ui-bpcard-more dd { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+.ui-bpcard-net { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-bpcard-net[data-off] { color: var(--ui-fg); font-weight: 600; }
+.ui-bpcard-empty { padding: 20px; color: var(--ui-muted); text-align: center; }
+/* The code's own page: light whatever the theme, since a scanner reads dark on light. */
+.ui-bpcard-full {
+  box-sizing: border-box; position: fixed; inset: 0; width: 100%; max-width: none; height: 100dvh; max-height: none; margin: 0; padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+  border: 0; background: #fff; color: #111; font: 15px/1.35 var(--ui-font); overscroll-behavior: contain;
+}
+.ui-bpcard-full[open] { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; }
+.ui-bpcard-full::backdrop { background: #fff; }
+.ui-bpcard-full-code { display: grid; place-items: center; width: 100%; min-height: 0; }
+.ui-bpcard-full-code svg { display: block; width: min(92vw, 62dvh); height: auto; max-width: 100%; }
+.ui-bpcard-full-code .ui-barcode svg { height: 30dvh; }
+.ui-bpcard-full-line { margin: 0; font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; text-align: center; }
+.ui-bpcard-full-say { margin: 0; color: #444; font-size: 14px; text-align: center; }
+.ui-bpcard-full-say:empty { display: none; }
+.ui-bpcard-done {
+  box-sizing: border-box; min-width: 160px; min-height: 48px; padding: 0 24px; border: 1px solid #111; border-radius: 999px; background: #111; color: #fff; font: 600 16px/1 var(--ui-font); cursor: pointer;
+}
+.ui-bpcard-done:focus-visible { outline: 3px solid #0a66ff; outline-offset: 2px; }
+/* With the room, the code stands beside what it stands for, and a turned phone does the same. */
+@container (min-width: 560px) {
+  .ui-bpcard-in { grid-template-columns: minmax(0, 1fr) 240px; column-gap: 20px; }
+  .ui-bpcard-head, .ui-bpcard-route, .ui-bpcard-big, .ui-bpcard-count, .ui-bpcard-more, .ui-bpcard-net { grid-column: 1; }
+  .ui-bpcard-show { grid-column: 2; grid-row: 1 / span 6; align-self: center; }
+  .ui-bpcard-big dd { font-size: 48px; }
+}
+@media (orientation: landscape) and (max-height: 500px) {
+  .ui-bpcard-full[open] { flex-direction: row; flex-wrap: wrap; align-content: center; }
+  .ui-bpcard-full-code { width: auto; }
+  .ui-bpcard-full-code svg { width: min(70dvh, 46vw); }
+}
+`
+
+fn boarding_pass_card_clock() = now()
+
+fn boarding_pass_card_time(s) = type_of(s) == "str" && date.valid(s, "date-time")
+
+// 2 days 3 h, 1 h 12 min. Below the hour the seconds count: 09:05.
+fn boarding_pass_card_span(ms) {
+    let s = max([0, ceil(ms / 1000)])
+    if s < 3600 {
+        let m = floor(s / 60)
+        let r = s % 60
+        return `${m < 10 ? "0" : ""}${m}:${r < 10 ? "0" : ""}${r}`
+    }
+    let mins = floor(s / 60)
+    let days = floor(mins / 1440)
+    let hours = floor((mins % 1440) / 60)
+    if days > 0 { return hours > 0 ? `${days} ${days == 1 ? "day" : "days"} ${hours} h` : `${days} ${days == 1 ? "day" : "days"}` }
+    mins % 60 == 0 ? `${hours} h` : `${hours} h ${mins % 60} min`
+}
+
+// The moments of a pass: { departs, boards, closes } in ms, or null with no departure. An
+// order that cannot be (boarding after the doors close) is put right from `departs`.
+fn boarding_pass_card_times(p) {
+    if type_of(p) != "map" || !boarding_pass_card_time(p.departs) { return null }
+    let departs = date.ms(p.departs)
+    let closes = boarding_pass_card_time(p.closes) && date.ms(p.closes) <= departs ? date.ms(p.closes) : departs - 15 * 60000
+    let boards = boarding_pass_card_time(p.boarding) && date.ms(p.boarding) <= closes ? date.ms(p.boarding) : departs - 45 * 60000
+    { departs: departs, boards: boards, closes: closes }
+}
+
+// Where things stand at `ms`: { phase, head, sub }, phase being "wait", "boarding", "closed"
+// or "gone". Null with nothing to count from.
+fn boarding_pass_card_phase(t, ms) {
+    if t == null || ms == null { return null }
+    if ms < t.boards { return { phase: "wait", head: `Boards in ${boarding_pass_card_span(t.boards - ms)}`, sub: "" } }
+    if ms < t.closes { return { phase: "boarding", head: "Boarding now", sub: `Gate closes in ${boarding_pass_card_span(t.closes - ms)}` } }
+    if ms < t.departs { return { phase: "closed", head: "Gate closed", sub: `Departs in ${boarding_pass_card_span(t.departs - ms)}` } }
+    { phase: "gone", head: "Departed", sub: "" }
+}
+
+// The clock's time of a moment given as text, or a dash where there is none.
+fn boarding_pass_card_hhmm(s) = boarding_pass_card_time(s) ? date.format(s, "HH:mm") : "--:--"
+
+// What the card says about being offline. A pass drawn here works either way; what differs
+// is whether it will still be here next time.
+fn boarding_pass_card_net(online, kept) {
+    if !online { return kept ? "Offline. This pass is saved and still works." : "Offline. This pass still works while this page stays open." }
+    kept ? "Saved for offline use." : "Keep this page open to use it offline."
+}
+
+component BoardingPassCard(pass = null, now: str? = null, keep: bool = true, keep_key: str = "quillo-boarding-pass", on_keep = null, class: str? = null) {
+    style global boarding_pass_card_css
+    state copy = null
+    state from_copy = false
+    state kept = on_keep != null
+    state online = true
+    state base = boarding_pass_card_time(now) ? date.ms(now) : null
+    state seen_now = now
+    state since = 0
+    state moved_on = 0
+    state dlg = null
+    state win = null
+    state wake = null           // the Wake Lock held, to let go of it
+    state before = null         // the brightness to go back to
+    state showing = false
+    state say = ""
+    if now != seen_now {
+        seen_now = now
+        if boarding_pass_card_time(now) {
+            base = date.ms(now)
+            since = boarding_pass_card_clock()
+            moved_on = 0
+        }
+    }
+    if base != null { every(1000, () => { moved_on = boarding_pass_card_clock() - since }) }
+
+    // Brightness and the screen staying on. Each is asked for in order, and each may be missing.
+    let boost = () => {
+        let app = win.quilloNative != null
+        say = ""
+        if app {
+            let was = js("quilloNative.brightness")
+            if !is_err(was) {
+                before = was
+                js("quilloNative.brightness", 1)
+            }
+            js("quilloNative.keepAwake", true)
+        } else {
+            say = "Turn your screen's brightness up for the scanner."
+            if win.navigator.wakeLock != null {
+                let lock = js("navigator.wakeLock.request", "screen")
+                if !is_err(lock) { wake = lock }
+            }
+        }
+    }
+    let ease = () => {
+        if win.quilloNative != null {
+            if before != null { js("quilloNative.brightness", before) }
+            before = null
+            js("quilloNative.keepAwake", false)
+        }
+        if wake != null {
+            js("Promise.resolve", wake.release())
+            wake = null
+        }
+    }
+    let shut = () => {
+        if showing {
+            showing = false
+            ease()
+        }
+    }
+
+    let p = from_copy ? copy : pass
+    let times = boarding_pass_card_times(p)
+    let at_ms = base == null ? null : base + moved_on
+    let phase = boarding_pass_card_phase(times, at_ms)
+    let ok = type_of(p) == "map" && times != null
+    let scan = ok && p.code != null ? str(p.code) : ""
+    let is_bar = ok && p.kind == "barcode"
+    <section class={ui_cls(["ui-bpcard", class])} aria-label="Boarding pass" @mount={(_el) => {
+        win = js("window")
+        let d = js("document")
+        since = boarding_pass_card_clock()
+        if base == null { base = since }
+        online = win.navigator.onLine != false
+        // Storage may be refused, and a read that throws would stop this handler.
+        if keep {
+            let store = js("Promise.resolve", js_new("Promise", (done) => { done(win.localStorage) }))
+            if !is_err(store) {
+                if ok {
+                    let wrote = js("Promise.resolve", js_new("Promise", (done) => { done(store.setItem(keep_key, json.stringify(pass))) }))
+                    if !is_err(wrote) { kept = true }
+                } else {
+                    let text = js("Promise.resolve", js_new("Promise", (done) => { done(store.getItem(keep_key)) }))
+                    if type_of(text) == "str" {
+                        let back = json.parse(text)
+                        if type_of(back) == "map" {
+                            copy = back
+                            from_copy = true
+                            kept = true
+                        }
+                    }
+                }
+            }
+        }
+        if ok && on_keep != null { on_keep(pass) }
+        let up = (_e) => { online = true }
+        let down = (_e) => { online = false }
+        win.addEventListener("online", up)
+        win.addEventListener("offline", down)
+        // Going away lets go of a Wake Lock, so it is asked for again on coming back.
+        let back = (_e) => {
+            if showing && js("document.visibilityState") == "visible" { boost() }
+        }
+        d.addEventListener("visibilitychange", back)
+        () => {
+            win.removeEventListener("online", up)
+            win.removeEventListener("offline", down)
+            d.removeEventListener("visibilitychange", back)
+            if showing { ease() }
+        }
+    }}>
+        {!ok
+            ? <p.ui-bpcard-empty>No boarding pass to show.</p>
+            : <div.ui-bpcard-in>
+                  <div.ui-bpcard-head><span>{p.airline ?? ""}</span><span.ui-bpcard-flight>{p.flight ?? ""}</span></div>
+                  <div.ui-bpcard-route>
+                      <span><b.ui-bpcard-code3>{p.from.code ?? ""}</b><span.ui-bpcard-city>{p.from.city ?? ""}</span></span>
+                      <span.ui-bpcard-line aria-hidden="true"></span>
+                      <span.ui-bpcard-to><b.ui-bpcard-code3>{p.to.code ?? ""}</b><span.ui-bpcard-city>{p.to.city ?? ""}</span></span>
+                  </div>
+                  <dl.ui-bpcard-big>
+                      <div>
+                          <dt>Gate</dt>
+                          <dd.ui-bpcard-gate>{p.gate ?? "TBA"}</dd>
+                          {p.was_gate != null && p.was_gate != p.gate && <span.ui-bpcard-was>Changed from {p.was_gate}</span>}
+                      </div>
+                      <div>
+                          <dt>Boarding</dt>
+                          <dd.ui-bpcard-boards>{boarding_pass_card_hhmm(date.from_ms(times.boards, date.parts(p.departs).offset))}</dd>
+                      </div>
+                  </dl>
+                  <p.ui-bpcard-count role="timer" data-phase={phase != null ? phase.phase : "none"}>
+                      {phase != null ? phase.head : ""}<span>{phase != null ? phase.sub : ""}</span>
+                  </p>
+                  {scan == "" && <p.ui-bpcard-net>This pass has no code. Ask at the desk.</p>}
+                  {scan != "" && <button.ui-bpcard-show type="button" aria-haspopup="dialog" @click={() => {
+                      showing = true
+                      dlg.showModal()
+                      boost()
+                  }}>
+                      {is_bar ? <Barcode text={scan} bar={1} height={72} show_text={false} label="Boarding code"/> : <QrCode text={scan} size={180} label="Boarding code"/>}
+                      <span>Show full screen</span>
+                  </button>}
+                  <dl.ui-bpcard-more>
+                      <div><dt>Passenger</dt><dd>{p.passenger ?? ""}</dd></div>
+                      {p.seat != null && <div><dt>Seat</dt><dd.ui-bpcard-seat>{p.seat}</dd></div>}
+                      {p.group != null && <div><dt>Group</dt><dd>{p.group}</dd></div>}
+                      {p.terminal != null && <div><dt>Terminal</dt><dd>{p.terminal}</dd></div>}
+                      <div><dt>Departs</dt><dd>{boarding_pass_card_hhmm(p.departs)}</dd></div>
+                  </dl>
+                  <p.ui-bpcard-net role="status" data-off={online ? null : ""}>{from_copy ? "Saved copy. " : ""}{boarding_pass_card_net(online, kept)}</p>
+              </div>}
+        <dialog.ui-bpcard-full aria-label="Boarding code" @mount={(el) => { dlg = el }} @close={shut}>
+            {showing && <div.ui-bpcard-full-code>
+                {is_bar ? <Barcode text={scan} bar={2} height={160} show_text={false} label="Boarding code"/> : <QrCode text={scan} size={320} label="Boarding code"/>}
+            </div>}
+            {ok && <p.ui-bpcard-full-line>{p.flight ?? ""} {p.seat != null ? `Seat ${p.seat}` : ""} {p.gate != null ? `Gate ${p.gate}` : ""}</p>}
+            <p.ui-bpcard-full-say role="status">{say}</p>
+            <button.ui-bpcard-done type="button" @click={() => { dlg.close() }}>Done</button>
+        </dialog>
+    </section>
+}

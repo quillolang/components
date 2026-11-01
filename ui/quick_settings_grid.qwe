@@ -1,0 +1,394 @@
+// QuickSettingsGrid: settings as big tiles, as a phone's control centre has them. A tap turns one
+// on or off. A long press, or the arrow in its corner, opens its details: what it does,
+// and any choices it offers. Edit lets the tiles be put in another order, by dragging one, by
+// the Earlier and Later buttons on it, or by the arrow keys. What is on, what is chosen and
+// the order are all kept, and given back as data.
+//
+//   component Controls() {
+//       state kept = load_controls()             // a server fn
+//       <QuickSettingsGrid saved={kept} on_change={(rows) => { save_controls(rows) }} on_toggle={(id, on) => { apply(id, on) }} tiles={[
+//           { id: "wifi", label: "Wi-Fi", icon: "globe", on: true, detail: "Joins saved networks by itself.", options: ["Home", "Office"], value: "Home" },
+//           { id: "focus", label: "Do not disturb", icon: "moon" },
+//           { id: "roam", label: "Data roaming", icon: "phone", unavailable: "Needs a SIM." },
+//       ]}/>
+//   }
+//
+// tiles: each { id, label, icon?, on?, detail?, options?, value?, unavailable? }. icon: a name
+// from the kit's Icon. options: choices shown in the details, as text; value: the one chosen,
+// shown on the tile. unavailable: why it cannot be turned on: it stays off, and its details say
+// so. One with no label or a second with the same id is left out. saved: what on_change gave.
+// It is read once, as is each tile's on: the page does not reach in afterwards. store: a localStorage key to keep it under
+// as well, which in a phone app lasts one launch. on_change(rows): inside one of your
+// components, after any change, a list in order of { id, on, value }. on_toggle(id, on):
+// a tile turned. on_detail(id, value): a choice made. label: for screen readers ("Quick
+// settings"). delay: the long press, in milliseconds (450). class.
+//
+// In Edit the tiles stop answering a tap and drag at once, so the page does not scroll from
+// on top of one: there is room round them, and Done is above them.
+
+import ui/theme.qwe use ui_cls
+import ui/icon.qwe use Icon
+
+let quick_settings_grid_css = css`
+.ui-qset { position: relative; color: var(--ui-fg); font: 15px/1.3 var(--ui-font); }
+.ui-qset-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.ui-qset-title { margin: 0; font-size: 13px; font-weight: 600; color: var(--ui-muted); }
+.ui-qset-edit { min-width: 64px; min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-qset-edit:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-qset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); grid-auto-rows: 96px; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.ui-qset-tile { position: relative; min-width: 0; border-radius: var(--ui-radius); background: var(--ui-subtle); color: var(--ui-fg); outline: none;
+  transition: transform .18s cubic-bezier(.2, .8, .2, 1), background .15s, box-shadow .15s; -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+.ui-qset-on { background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-qset-off-limits { opacity: .62; }
+.ui-qset-main { display: grid; align-content: space-between; justify-items: start; width: 100%; height: 100%; padding: 12px; border: 0; border-radius: inherit; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; touch-action: manipulation; }
+.ui-qset-main:focus-visible, .ui-qset-tile:focus-visible, .ui-qset-more:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-qset-name { display: block; width: 100%; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-qset-state { display: block; width: 100%; font-size: 13px; opacity: .8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-qset-more { position: absolute; top: 0; right: 0; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius); background: none; color: inherit; cursor: pointer; touch-action: manipulation; }
+.ui-qset-moves { position: absolute; inset: auto 6px 6px 6px; display: none; gap: 6px; }
+.ui-qset-move { flex: 1; min-height: 44px; min-width: 44px; padding: 0 4px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-qset-move:disabled { opacity: .5; cursor: default; }
+.ui-qset-move:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+/* In Edit a tile is for dragging: its own surface takes the finger. */
+.ui-qset-editing .ui-qset-tile { touch-action: none; cursor: grab; outline: 1px dashed var(--ui-strong); outline-offset: -1px; }
+.ui-qset-editing .ui-qset-main { pointer-events: none; }
+.ui-qset-editing .ui-qset-state, .ui-qset-editing .ui-qset-more, .ui-qset-editing .ui-qset-main svg { display: none; }
+.ui-qset-editing .ui-qset-moves { display: flex; }
+.ui-qset-pressing { transform: scale(.97); }
+.ui-qset-lifted { z-index: 3; transition: background .15s, box-shadow .15s; box-shadow: var(--ui-shadow-lg); cursor: grabbing; }
+.ui-qset-still .ui-qset-tile { transition: none; }
+.ui-qset-dlg { width: 100%; max-width: none; max-height: 80dvh; margin: auto 0 0; padding: 16px 16px max(16px, env(safe-area-inset-bottom)); border: 0; border-radius: calc(var(--ui-radius) + 6px) calc(var(--ui-radius) + 6px) 0 0;
+  background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); overscroll-behavior: contain; }
+.ui-qset-dlg::backdrop { background: var(--ui-overlay); }
+.ui-qset-dlg h3 { margin: 0 0 4px; font-size: 18px; }
+.ui-qset-dlg p { margin: 0 0 10px; color: var(--ui-muted); font-size: 14px; }
+.ui-qset-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-height: 48px; margin-bottom: 6px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 15px/1.2 var(--ui-font); text-align: left; cursor: pointer; touch-action: manipulation; }
+.ui-qset-row[aria-pressed="true"], .ui-qset-row[aria-checked="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-qset-row:disabled { opacity: .55; cursor: default; }
+.ui-qset-row:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-qset-close { justify-content: center; margin: 6px 0 0; }
+/* A <dialog> stands over the whole window, so the window's width is the one to ask, Split View included. */
+@media (min-width: 600px) {
+  .ui-qset-dlg { inset: var(--ui-qset-top, 50%) auto auto var(--ui-qset-left, 50%); width: 320px; margin: 0; border-radius: calc(var(--ui-radius) + 6px); padding-bottom: 16px; }
+  .ui-qset-dlg::backdrop { background: transparent; }
+}
+@media (hover: hover) {
+  .ui-qset-edit:hover, .ui-qset-move:not(:disabled):hover { background: var(--ui-subtle); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-qset-tile { transition: none; } }
+`
+
+let quick_settings_grid_gap = 10
+
+// The tiles that can be shown: with a label, each id once, ids as text.
+fn quick_settings_grid_clean(tiles) {
+    if type_of(tiles) != "list" { return [] }
+    let named = take(tiles, 60) | filter((t) => type_of(t) == "map" && filled(get(t, "label")) != null)
+    let all = for [i, t] in enumerate(named) => {
+        let opts = get(t, "options")
+        {
+            id: get(t, "id") != null ? str(t.id) : `_${i}`, label: str(t.label), icon: get(t, "icon"), detail: get(t, "detail"),
+            options: type_of(opts) == "list" ? opts | filter((o) => o != null) | map((o) => str(o)) : [],
+            on: get(t, "on") == true && filled(get(t, "unavailable")) == null, value: get(t, "value"), unavailable: filled(get(t, "unavailable")),
+        }
+    }
+    let ids = all | map((t) => t.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// What is kept, for the tiles there are: their kept order first, then any new.
+fn quick_settings_grid_merge(tiles, saved) {
+    let given = type_of(saved) == "list" ? saved | filter((r) => type_of(r) == "map" && get(r, "id") != null) : []
+    let ids = tiles | map((t) => t.id)
+    let kept_all = given | filter((r) => contains(ids, str(r.id))) | map((r) => {
+        let t = find(tiles, (x) => x.id == str(r.id))
+        { id: t.id, on: get(r, "on") == true && t.unavailable == null, value: get(r, "value") ?? t.value }
+    })
+    let seen = kept_all | map((r) => r.id)
+    let kept = enumerate(kept_all) | filter((p) => index_of(seen, p[1].id) == p[0]) | map((p) => p[1])
+    let fresh = tiles | filter((t) => !contains(seen, t.id)) | map((t) => { id: t.id, on: t.on, value: t.value })
+    kept + fresh
+}
+
+// Each kept row with its tile, those no longer given left out, and new ones last.
+fn quick_settings_grid_join(rows, tiles) {
+    let kept_ids = rows | map((r) => r.id)
+    let known = rows | filter((r) => find(tiles, (t) => t.id == r.id) != null) | map((r) => { ...find(tiles, (t) => t.id == r.id), on: r.on, value: r.value })
+    known + (tiles | filter((t) => !contains(kept_ids, t.id)))
+}
+
+fn quick_settings_grid_status(t) -> str {
+    if t.unavailable != null { return "Unavailable" }
+    if t.on && t.value != null { return str(t.value) }
+    t.on ? "On" : "Off"
+}
+
+// A list with the item at one place moved to another.
+fn quick_settings_grid_move(xs, from: int, to: int) {
+    let item = xs[from]
+    let rest = slice(xs, 0, from) + slice(xs, from + 1, len(xs))
+    slice(rest, 0, to) + [item] + slice(rest, to, len(rest))
+}
+
+// Which place a point falls on, in a grid of equal cells, kept inside it.
+fn quick_settings_grid_cell(x: num, y: num, n: int, cols: int, w: num, h: num) -> int {
+    let col = floor(x / (w + quick_settings_grid_gap))
+    let row = floor(y / (h + quick_settings_grid_gap))
+    let c = col < 0 ? 0 : (col >= cols ? cols - 1 : col)
+    let r = row < 0 ? 0 : row
+    let i = r * cols + c
+    i >= n ? n - 1 : i
+}
+
+// Where the item at a place stands while one is dragged from `from` to `to`: those between step aside.
+fn quick_settings_grid_slot(i: int, from: int, to: int) -> int {
+    if i == from { return to }
+    if from < to && i > from && i <= to { return i - 1 }
+    if from > to && i >= to && i < from { return i + 1 }
+    i
+}
+
+// Where the details stand on a tablet: beside the tile, on the screen, with a margin.
+fn quick_settings_grid_place(a, w: num, h: num, vw: num, vh: num) {
+    let margin = 12
+    let left = max([margin, min([a.left, vw - w - margin])])
+    let below = a.bottom + 8
+    let top = below + h <= vh - margin ? below : max([margin, a.top - 8 - h])
+    { left: round(left), top: round(top) }
+}
+
+component QuickSettingsGrid(tiles = [], saved = null, store: str? = null, label: str = "Quick settings", delay: int = 450,
+                            on_change = null, on_toggle = null, on_detail = null, class: str? = null) {
+    style global quick_settings_grid_css
+    let clean = quick_settings_grid_clean(tiles)
+    state rows = quick_settings_grid_merge(clean, saved)
+    state editing = false
+    state press = null       // a finger that may become a long press
+    state held = false       // a long press happened, so the click after it is not a tap
+    state g = null           // a drag in Edit
+    state lifted = ""
+    state still = false      // no transitions, for the moment the order is committed
+    state open_id = ""
+    state down_out = false   // the press began on the backdrop
+    state grid = null
+    state dlg = null
+    state win = null
+    state said = ""
+    let shown = quick_settings_grid_join(rows, clean)
+    let n = len(shown)
+    let open_tile = find(shown, (t) => t.id == open_id)
+    let buzz = (kind: str, ms: int) => {
+        if win != null {
+            if win.quilloNative != null {
+                js("quilloNative.haptic", kind)
+            } else {
+                if win.navigator.vibrate != null && js("navigator.userActivation.hasBeenActive") == true { js("navigator.vibrate", ms) }
+            }
+        }
+    }
+    let told = () => {
+        let list = shown | map((t) => { id: t.id, on: t.on, value: t.value })
+        on_change && on_change(list)
+        if store != null {
+            let text = json.stringify(list)
+            // Storage can throw when it is blocked or full, which would stop the handler where it stands.
+            js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.setItem", store, text) ?? true) }))
+        }
+    }
+    let flip = (t) => {
+        if t.unavailable == null {
+            let on = !t.on
+            rows = quick_settings_grid_join(rows, clean) | map((r) => { id: r.id, on: r.id == t.id ? on : r.on, value: r.value })
+            said = `${t.label} ${on ? "on" : "off"}.`
+            told()
+            on_toggle && on_toggle(t.id, on)
+            buzz("selection", 8)
+        }
+    }
+    let choose = (t, v) => {
+        rows = quick_settings_grid_join(rows, clean) | map((r) => { id: r.id, on: r.id == t.id ? true : r.on, value: r.id == t.id ? v : r.value })
+        said = `${t.label}: ${v}.`
+        told()
+        on_detail && on_detail(t.id, v)
+        buzz("selection", 8)
+    }
+    let reorder = (from: int, to: int) => {
+        if from != to && to >= 0 && to < n {
+            rows = quick_settings_grid_move(quick_settings_grid_join(rows, clean) | map((r) => { id: r.id, on: r.on, value: r.value }), from, to)
+            said = `Moved to place ${to + 1} of ${n}.`
+            told()
+        }
+    }
+    let open_it = (id: str) => {
+        open_id = id
+        dlg.showModal()
+        let tile = grid.querySelector(`[data-place="${index_of(shown | map((t) => t.id), id)}"]`)
+        if tile != null {
+            let d = dlg.getBoundingClientRect()
+            let at = quick_settings_grid_place(tile.getBoundingClientRect(), d.width, d.height, win.innerWidth, win.innerHeight)
+            dlg.style.setProperty("--ui-qset-left", `${at.left}px`)
+            dlg.style.setProperty("--ui-qset-top", `${at.top}px`)
+        }
+    }
+    let cols_of = () => len(split(trim(win.getComputedStyle(grid).gridTemplateColumns), " "))
+    let lift = (e) => {
+        let r0 = g.el.getBoundingClientRect()
+        grid.setPointerCapture(g.pid)
+        let cells = grid.querySelectorAll(".ui-qset-tile")
+        g = { ...g, on: true, to: g.i, cols: cols_of(), w: r0.width, h: r0.height, cells, rect: grid.getBoundingClientRect() }
+        lifted = g.id
+        buzz("medium", 15)
+    }
+    // What the drag looks like, by hand: only transforms until the finger lifts.
+    let follow = (e) => {
+        let dx = e.clientX - g.x
+        let dy = e.clientY - g.y
+        let to = quick_settings_grid_cell(e.clientX - g.rect.left, e.clientY - g.rect.top, n, g.cols, g.w, g.h)
+        if to != g.to {
+            g = { ...g, to }
+            for i in range(0, n) {
+                if i != g.i {
+                    let at = quick_settings_grid_slot(i, g.i, to)
+                    let ddx = (at % g.cols - i % g.cols) * (g.w + quick_settings_grid_gap)
+                    let ddy = (floor(at / g.cols) - floor(i / g.cols)) * (g.h + quick_settings_grid_gap)
+                    g.cells[i].style.transform = at == i ? "" : `translate(${ddx}px, ${ddy}px)`
+                }
+            }
+        }
+        g.el.style.transform = `translate(${dx}px, ${dy}px)`
+    }
+    let drop = (commit: bool) => {
+        let was = g
+        g = null
+        if was.on {
+            lifted = ""
+            still = true
+            for i in range(0, n) { was.cells[i].style.transform = "" }
+            if commit { reorder(was.i, was.to) }
+            js("requestAnimationFrame", (_t = null) => { still = false })
+        }
+    }
+    if press != null {
+        every(delay, () => {
+            if press != null {
+                let id = press.id
+                press = null
+                held = true
+                buzz("medium", 15)
+                open_it(id)
+            }
+        })
+    }
+    <section class={ui_cls(["ui-qset", editing && "ui-qset-editing", still && "ui-qset-still", class])} aria-label={label}>
+        <div.ui-qset-bar>
+            <p.ui-qset-title>{label}</p>
+            <button.ui-qset-edit type="button" aria-pressed={editing ? "true" : "false"} @click={() => { editing = !editing }}>{editing ? "Done" : "Edit"}</button>
+        </div>
+        <ul.ui-qset-grid
+            @mount={(me) => {
+                grid = me
+                win = js("window")
+                if store != null && saved == null {
+                    let text = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.getItem", store)) }))
+                    if type_of(text) == "str" {
+                        let got = json.parse(text)
+                        if !is_err(got) { rows = quick_settings_grid_merge(clean, got) }
+                    }
+                }
+                // Once a tile is in the air the finger is the drag's.
+                let guard = (e) => { if g != null && e.cancelable { e.preventDefault() } }
+                me.addEventListener("touchmove", guard, { passive: false })
+                () => { me.removeEventListener("touchmove", guard) }
+            }}
+            @contextmenu={(e) => { if press != null || held || g != null { e.preventDefault() } }}
+            @pointerdown={(e) => {
+                held = false
+                let tile = e.target.closest(".ui-qset-tile")
+                let free = tile != null && e.isPrimary && e.button == 0
+                // The Earlier and Later buttons cover half a tile, so a drag may start on one too: a press stays theirs.
+                if free && editing {
+                    g = { pid: e.pointerId, id: tile.dataset.id, i: int(tile.dataset.place), x: e.clientX, y: e.clientY, on: false, el: tile }
+                } else if free && e.target.closest(".ui-qset-more") == null {
+                    press = { pid: e.pointerId, id: tile.dataset.id, x: e.clientX, y: e.clientY }
+                }
+            }}
+            @pointermove={(e) => {
+                if press != null && e.pointerId == press.pid && abs(e.clientX - press.x) + abs(e.clientY - press.y) > 10 { press = null }
+                if g != null && e.pointerId == g.pid {
+                    if !g.on && abs(e.clientX - g.x) + abs(e.clientY - g.y) > 6 { lift(e) }
+                    if g.on { follow(e) }
+                }
+            }}
+            @pointerup={(e) => {
+                if press != null && e.pointerId == press.pid { press = null }
+                if g != null && e.pointerId == g.pid { drop(true) }
+            }}
+            @pointercancel={(e) => {
+                if press != null && e.pointerId == press.pid { press = null }
+                if g != null && e.pointerId == g.pid { drop(false) }
+            }}>
+            {for [i, t] in enumerate(shown) => <li key={t.id} data-id={t.id} data-place={i} tabindex={editing ? "0" : null}
+                    aria-label={editing ? `${t.label}, place ${i + 1} of ${n}. Move with the arrow keys.` : null}
+                    class={ui_cls(["ui-qset-tile", t.on && "ui-qset-on", t.unavailable != null && "ui-qset-off-limits", lifted == t.id && "ui-qset-lifted",
+                                   press != null && press.id == t.id && "ui-qset-pressing"])}
+                    @keydown={(e) => {
+                        if editing && e.target.closest(".ui-qset-move") == null {
+                            let cols = cols_of()
+                            let to = match e.key {
+                                "ArrowLeft" => i - 1
+                                "ArrowRight" => i + 1
+                                "ArrowUp" => i - cols
+                                "ArrowDown" => i + cols
+                                _ => -1
+                            }
+                            if e.key == "ArrowLeft" || e.key == "ArrowRight" || e.key == "ArrowUp" || e.key == "ArrowDown" { e.preventDefault() }
+                            reorder(i, to)
+                        }
+                    }}>
+                <button.ui-qset-main type="button" role="switch" aria-checked={t.on ? "true" : "false"} aria-disabled={t.unavailable != null ? "true" : null}
+                        tabindex={editing ? "-1" : null}
+                        aria-label={`${t.label}, ${quick_settings_grid_status(t)}`}
+                        @click={() => {
+                            if held { held = false } else { if !editing { flip(t) } }
+                        }}>
+                    {t.icon != null ? <Icon name={str(t.icon)} size="lg"/> : <span></span>}
+                    <span>
+                        <span.ui-qset-name>{t.label}</span>
+                        <span.ui-qset-state>{quick_settings_grid_status(t)}</span>
+                    </span>
+                </button>
+                <button.ui-qset-more type="button" aria-label={`${t.label} details`} tabindex={editing ? "-1" : null} @click={() => { open_it(t.id) }}><Icon name="chevron-right" size="sm"/></button>
+                <span.ui-qset-moves>
+                    <button.ui-qset-move type="button" aria-label={`Move ${t.label} earlier`} disabled={i == 0} @click={() => { reorder(i, i - 1) }}>Earlier</button>
+                    <button.ui-qset-move type="button" aria-label={`Move ${t.label} later`} disabled={i == n - 1} @click={() => { reorder(i, i + 1) }}>Later</button>
+                </span>
+            </li>}
+        </ul>
+        <dialog.ui-qset-dlg aria-label={open_tile != null ? `${open_tile.label} details` : "Details"}
+                @mount={(me) => { dlg = me }}
+                @pointerdown={(e) => { down_out = e.target.isSameNode(dlg) }}
+                @click={(e) => {
+                    // A press that began on the backdrop, not the lifting of the finger that opened this.
+                    if e.target.isSameNode(dlg) && down_out { dlg.close() }
+                }}
+                @close={() => {
+                    let tile = open_id != "" ? grid.querySelector(`[data-id="${open_id}"] .ui-qset-main`) : null
+                    open_id = ""
+                    if tile != null { tile.focus() }
+                }}>
+            {open_tile != null && <div>
+                <h3>{open_tile.label}</h3>
+                {open_tile.detail != null && <p>{str(open_tile.detail)}</p>}
+                {open_tile.unavailable != null && <p.ui-qset-why>{open_tile.unavailable}</p>}
+                <button.ui-qset-row.ui-qset-turn type="button" role="switch" aria-checked={open_tile.on ? "true" : "false"} disabled={open_tile.unavailable != null}
+                        @click={() => { flip(open_tile) }}><span>{open_tile.label}</span><span>{open_tile.on ? "On" : "Off"}</span></button>
+                {for o in open_tile.options => <button.ui-qset-row.ui-qset-opt key={o} type="button" aria-pressed={open_tile.value == o ? "true" : "false"} disabled={open_tile.unavailable != null}
+                        @click={() => { choose(open_tile, o) }}>{o}</button>}
+                <button.ui-qset-row.ui-qset-close type="button" @click={() => { dlg.close() }}>Done</button>
+            </div>}
+        </dialog>
+        <span.ui-sr role="status">{said}</span>
+    </section>
+}

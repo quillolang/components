@@ -1,0 +1,401 @@
+// TouchChart: a line chart for a thumb. A finger along it stops on any point, with a
+// crosshair and the value in a label that keeps clear of the edges, and the page still
+// scrolls up and down under a passing finger. Two fingers pinch to a range and slide it, and
+// the scale fits what is in view. Range buttons, zoom buttons and keys do the same, and a
+// table holds what is in view for screen readers.
+//
+//   <TouchChart title="Daily active people" unit="k" points={[
+//       { label: "1 Mar", value: 41.2 },
+//       { label: "2 Mar", value: 43.8 },
+//   ]} ranges={[{ label: "7 days", count: 7 }, { label: "30 days", count: 30 }, { label: "All", count: 0 }]}/>
+//
+// points: each { label, value }, or a plain number. A value that is not a number is a hole,
+// over which the line lifts. ranges: buttons, each { label, count }, showing the last count
+// points, 0 being all of them. least: the fewest points a pinch comes down to (5). prefix,
+// unit: around a value ("$", "k"), digits: decimals shown (1). title. on_select(info): inside
+// one of your components, when a finger lifts or a key moves, with { index, label, value }, or
+// null on clearing. on_range(from, to): when the range changes, with the first and last
+// index in view. class.
+//
+// Keys, on the focused chart: left and right move from point to point, Home and End go to
+// the ends of the range, + and - zoom, Page Up and Down slide the range, Escape clears.
+// An upright pinch reads as a scroll on some phones, as touch-action keeps the page's
+// up and down: a pinch across the chart is the one that always works.
+
+import ui/theme.qwe use ui_cls
+
+let touch_chart_css = css`
+.ui-tchart { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-tchart-title { margin: 0; font-size: 13px; font-weight: 600; color: var(--ui-muted); }
+.ui-tchart-span { margin: 0 0 8px; color: var(--ui-muted); font-size: 14px; font-variant-numeric: tabular-nums; }
+.ui-tchart-body { display: grid; gap: 10px; }
+.ui-tchart-main { min-width: 0; }
+.ui-tchart-plot { position: relative; height: 240px; overflow: hidden; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); outline: none; cursor: crosshair;
+  touch-action: pan-y; overscroll-behavior-x: contain; -webkit-tap-highlight-color: transparent; }
+.ui-tchart-plot:focus-visible { box-shadow: var(--ui-focus); }
+.ui-tchart-busy { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-tchart-plot svg { position: absolute; inset: 0; display: block; width: 100%; height: 100%; transform-origin: 0 0; }
+.ui-tchart-line { fill: none; stroke: var(--ui-accent); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.ui-tchart-grid { position: absolute; left: 0; right: 0; height: 0; border-top: 1px solid var(--ui-border); pointer-events: none; }
+.ui-tchart-grid span { position: absolute; left: 4px; top: 1px; color: var(--ui-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+/* As wide as the plot, the line at its left edge, so a percentage of its own width is a place on the plot at any size. */
+.ui-tchart-cross { position: absolute; inset: 0; pointer-events: none; }
+.ui-tchart-cross::before { content: ""; position: absolute; inset: 0 auto 0 -1px; width: 2px; background: var(--ui-fg); }
+.ui-tchart-pt { position: absolute; left: -7px; width: 14px; height: 14px; margin-top: -7px; border: 3px solid var(--ui-surface); border-radius: 50%; background: var(--ui-accent); }
+/* left: X% with translateX(-X%) keeps the label inside the plot at both ends, at any size. */
+.ui-tchart-tip { position: absolute; top: 6px; max-width: 70%; padding: 4px 8px; border-radius: var(--ui-radius-sm); background: var(--ui-fg); color: var(--ui-bg); font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; pointer-events: none; overflow: hidden; text-overflow: ellipsis; }
+.ui-tchart-pinching .ui-tchart-cross, .ui-tchart-pinching .ui-tchart-tip { visibility: hidden; }
+.ui-tchart-axis { display: flex; justify-content: space-between; gap: 8px; margin-top: 2px; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-tchart-keys { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.ui-tchart-key { flex: 1 1 auto; min-width: 44px; min-height: 44px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; white-space: nowrap; }
+.ui-tchart-key[aria-pressed="true"] { background: var(--ui-accent-soft); border-color: var(--ui-accent); color: var(--ui-accent); }
+.ui-tchart-key:disabled { opacity: .45; cursor: default; }
+.ui-tchart-key:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-tchart-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.ui-tchart-stats div { min-width: 0; }
+.ui-tchart-stats dt { color: var(--ui-muted); font-size: 12px; }
+.ui-tchart-stats dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-tchart-none { margin: 0; color: var(--ui-muted); }
+@container (min-width: 620px) {
+  .ui-tchart-body { grid-template-columns: minmax(0, 1fr) 170px; gap: 24px; }
+  .ui-tchart-plot { height: 340px; }
+  .ui-tchart-stats { grid-template-columns: minmax(0, 1fr); align-content: start; gap: 18px; }
+  .ui-tchart-stats dd { font-size: 20px; }
+}
+@media (hover: hover) { .ui-tchart-key:not(:disabled):hover { background: var(--ui-subtle); } }
+`
+
+// The points to draw, at most 20000: a value is a real number or null, a label always text.
+fn touch_chart_clean(points) {
+    if type_of(points) != "list" { return [] }
+    for [i, p] in enumerate(take(points, 20000)) => {
+        let m = type_of(p) == "map"
+        let v = m ? get(p, "value") : p
+        let t = type_of(v)
+        let ok = (t == "int" || t == "float" || t == "dec") && float(v) == float(v) && abs(float(v)) < 1000000000000000
+        { i, label: m && get(p, "label") != null ? str(p.label) : `${i + 1}`, value: ok ? float(v) : null }
+    }
+}
+
+fn touch_chart_show(v, prefix: str, unit: str, digits: int) -> str {
+    if v == null { return "no value" }
+    let r = round(abs(v), digits)
+    let text = r == floor(r) ? str(floor(r)) : str(r)
+    `${v < 0 ? "-" : ""}${prefix}${text}${unit != "" ? " " + unit : ""}`
+}
+
+// The range a pinch comes to. scale is how much further apart the fingers are, share where
+// they began across the chart (0 to 1), and shift how far they slid, in widths: what was under
+// the fingers stays under them, and it stays inside the data and no closer than least.
+fn touch_chart_zoom(a0: num, b0: num, n: int, scale: num, share: num, shift: num, least: int) {
+    let top = n - 1
+    let floor_span = least < 1 ? 1 : (least > top ? top : least)
+    let span0 = b0 - a0
+    let wanted = span0 / (scale < 0.01 ? 0.01 : scale)
+    let span = wanted < floor_span ? floor_span : (wanted > top ? top : wanted)
+    let start = a0 + share * span0 - (share + shift) * span
+    let a = start < 0 ? 0.0 : (start > top - span ? top - span : start)
+    { from: a, to: a + span }
+}
+
+// Whole points, for what is kept once the fingers lift.
+fn touch_chart_whole(r) {
+    let a = round(r.from)
+    { from: a, to: a + round(r.to - r.from) }
+}
+
+// The last count points, or all.
+fn touch_chart_last(n: int, count: int) {
+    if count <= 0 || count >= n { return { from: 0, to: n - 1 } }
+    { from: n - count, to: n - 1 }
+}
+
+// The scale for what is in view: a little room around it, and something to show when flat.
+fn touch_chart_scale(vals) {
+    if len(vals) == 0 { return { lo: 0, hi: 1 } }
+    let a = min(vals)
+    let b = max(vals)
+    let wide = b - a
+    let room = wide > 0 ? wide * 0.1 : (a != 0 ? abs(a) * 0.1 : 1)
+    { lo: a - room, hi: b + room }
+}
+
+fn touch_chart_y(v: num, lo: num, hi: num) -> float = round((hi - v) * 300 / (hi - lo), 2)
+
+fn touch_chart_x(i: num, a: num, b: num) -> float = b > a ? round((i - a) * 1000 / (b - a), 2) : 500.0
+
+// A long range has more points than the plot has pixels: each stretch of it gives only
+// its lowest and highest, so a spike is never lost.
+fn touch_chart_thin(rows) {
+    let n = len(rows)
+    if n <= 600 { return rows }
+    let each = ceil(n / 300)
+    let chunks = for k in range(0, ceil(n / each)) => slice(rows, k * each, (k + 1) * each)
+    flatten(for c in chunks => {
+        let vals = c | filter((r) => r.value != null)
+        if len(vals) == 0 { [c[0]] } else {
+            let hi = reduce(vals, vals[0], (m, r) => r.value > m.value ? r : m)
+            let lo = reduce(vals, vals[0], (m, r) => r.value < m.value ? r : m)
+            lo.i == hi.i ? [lo] : (lo.i < hi.i ? [lo, hi] : [hi, lo])
+        }
+    })
+}
+
+// The line, lifted over a hole. A lone point between two holes gets a dot, or it would not show.
+fn touch_chart_path(rows, a: num, b: num, lo: num, hi: num) -> str {
+    let n = len(rows)
+    let parts = for [k, r] in enumerate(rows) => {
+        if r.value == null { "" } else {
+            let start = k == 0 || rows[k - 1].value == null
+            let alone = start && (k == n - 1 || rows[k + 1].value == null)
+            `${start ? "M" : "L"}${touch_chart_x(r.i, a, b)} ${touch_chart_y(r.value, lo, hi)}${alone ? "h.01" : ""}`
+        }
+    }
+    join(parts, "")
+}
+
+// Lines at round numbers.
+fn touch_chart_ticks(lo: num, hi: num) {
+    let wide = hi - lo
+    if wide <= 0 { return [] }
+    let rough = wide / 4
+    let power = pow(10, floor(math.log10(rough)))
+    let unit = rough / power
+    let step = (unit <= 1 ? 1 : (unit <= 2 ? 2 : (unit <= 5 ? 5 : 10))) * power
+    let first = ceil(lo / step)
+    let n = floor(hi / step) - first + 1
+    for i in range(0, n > 8 ? 8 : (n < 0 ? 0 : n)) => round((first + i) * step, 6)
+}
+
+// The nearest point to a share of the chart's width.
+fn touch_chart_at(share: num, a: int, b: int) -> int {
+    let s = share < 0 ? 0 : (share > 1 ? 1 : share)
+    a + round(s * (b - a))
+}
+
+// Low, high and how far it moved, in what is in view.
+fn touch_chart_stats(rows) {
+    let vals = rows | filter((r) => r.value != null) | map((r) => r.value)
+    if len(vals) == 0 { return null }
+    { low: min(vals), high: max(vals), change: last(vals) - first(vals) }
+}
+
+component TouchChart(points = [], title: str? = null, ranges = null, least: int = 5, prefix: str = "", unit: str = "", digits: int = 1, on_select = null, on_range = null, class: str? = null) {
+    style global touch_chart_css
+    let rows = touch_chart_clean(points)
+    let n = len(rows)
+    let chips = type_of(ranges) == "list" ? ranges | filter((r) => type_of(r) == "map" && filled(get(r, "label")) != null) : []
+    state from = 0
+    state to = n - 1
+    state pick = null        // the point chosen
+    state busy = false
+    state pinching = false
+    state g = null           // one finger
+    state pin = null         // two fingers: { a, b, x0, y0, x1, y1, ... }
+    state plot = null
+    state cross = null
+    state point = null
+    state tip = null
+    state svg = null
+    state span_el = null
+    let at_max = from == 0 && to == n - 1
+    let view_rows = n > 0 ? slice(rows, from, to + 1) : []
+    let vals = view_rows | filter((r) => r.value != null) | map((r) => r.value)
+    let sc = touch_chart_scale(vals)
+    let stats = touch_chart_stats(view_rows)
+    let say = (r) => `${r.label}: ${touch_chart_show(r.value, prefix, unit, digits)}`
+    let range_text = (a: int, b: int) => n > 0 ? `${rows[a].label} to ${rows[b].label}` : ""
+    // By hand, as these change with every move of a finger.
+    let show_it = (i) => {
+        if cross != null && i != null {
+            let r = rows[i]
+            let pct = touch_chart_x(i, from, to) / 10
+            cross.style.transform = `translateX(${pct}%)`
+            point.hidden = r.value == null
+            if r.value != null { point.style.top = `${touch_chart_y(r.value, sc.lo, sc.hi) / 3}%` }
+            tip.style.left = `${pct}%`
+            tip.style.transform = `translateX(${0 - pct}%)`
+            tip.textContent = say(r)
+        }
+    }
+    let share_of = (x: num) => {
+        let box = plot.getBoundingClientRect()
+        (x - box.left) / box.width
+    }
+    let choose = (i) => {
+        pick = i
+        if on_select != null {
+            on_select(i == null ? null : { index: i, label: rows[i].label, value: rows[i].value })
+        }
+    }
+    let settle = (a: int, b: int) => {
+        svg.style.transform = ""
+        span_el.textContent = range_text(a, b)
+        if a != from || b != to {
+            from = a
+            to = b
+            if pick != null && (pick < a || pick > b) { pick = null }
+            on_range && on_range(a, b)
+        }
+    }
+    let zoom_by = (scale: num, shift: num) => {
+        let middle = pick != null ? (pick - from) / (to - from) : 0.5
+        let r = touch_chart_whole(touch_chart_zoom(from, to, n, scale, middle, shift, least))
+        settle(r.from, r.to)
+    }
+    let pin_range = () => {
+        let dist = sqrt(pow(pin.x1 - pin.x0, 2) + pow(pin.y1 - pin.y0, 2))
+        let mid = (pin.x0 + pin.x1) / 2
+        let width = plot.getBoundingClientRect().width
+        touch_chart_zoom(pin.a0, pin.b0, n, dist / pin.dist, pin.share, (mid - pin.mid) / width, least)
+    }
+    // Follows the choice, the range and new data, but not under a finger, which has the line for now.
+    if cross != null && pick != null && from >= 0 && to >= 0 && !busy { show_it(pick) }
+    <section class={ui_cls(["ui-tchart", class])} aria-label={title ?? "Chart"}>
+        {filled(title) != null && <p.ui-tchart-title>{title}</p>}
+        {n > 0 && <p.ui-tchart-span @mount={(me) => { span_el = me }}>{range_text(from, to)}</p>}
+        {n == 0 && <p.ui-tchart-none>Nothing to show yet.</p>}
+        {n > 0 && <div.ui-tchart-body>
+            <div.ui-tchart-main>
+                <div class={ui_cls(["ui-tchart-plot", busy && "ui-tchart-busy", pinching && "ui-tchart-pinching"])} tabindex="0" role="slider" aria-label={`${title ?? "Chart"}: a point`}
+                     aria-valuemin={from + 1} aria-valuemax={to + 1} aria-valuenow={pick != null ? pick + 1 : from + 1}
+                     aria-valuetext={pick != null ? say(rows[pick]) : "Nothing chosen. Use the arrow keys."}
+                     @mount={(me) => { plot = me }}
+                     @contextmenu={(e) => { if busy { e.preventDefault() } }}
+                     @pointerdown={(e) => {
+                         if pin == null && g != null && e.pointerId != g.id && n > 2 {
+                             // The second finger: a pinch, and whatever the first was reading is put back.
+                             plot.setPointerCapture(g.id)
+                             plot.setPointerCapture(e.pointerId)
+                             pin = { id0: g.id, id1: e.pointerId, x0: g.lx, y0: g.ly, x1: e.clientX, y1: e.clientY, a0: from, b0: to,
+                                     dist: 1, mid: 0, share: 0 }
+                             let dist = sqrt(pow(pin.x1 - pin.x0, 2) + pow(pin.y1 - pin.y0, 2))
+                             let mid = (pin.x0 + pin.x1) / 2
+                             pin = { ...pin, dist: dist < 1 ? 1 : dist, mid, share: share_of(mid) }
+                             g = null
+                             busy = true
+                             pinching = true
+                             cross.hidden = pick == null
+                             tip.hidden = pick == null
+                             show_it(pick)
+                         } else if pin == null && g == null && e.isPrimary && e.button == 0 {
+                             g = { id: e.pointerId, x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, on: false }
+                         }
+                     }}
+                     @pointermove={(e) => {
+                         if pin != null {
+                             if e.pointerId == pin.id0 { pin = { ...pin, x0: e.clientX, y0: e.clientY } }
+                             if e.pointerId == pin.id1 { pin = { ...pin, x1: e.clientX, y1: e.clientY } }
+                             if e.pointerId == pin.id0 || e.pointerId == pin.id1 {
+                                 let r = pin_range()
+                                 let sx = (pin.b0 - pin.a0) / (r.to - r.from)
+                                 let tx = (pin.a0 - r.from) * 100 * sx / (pin.b0 - pin.a0)
+                                 // What the fingers do shows at once on what is drawn; the true scale comes on lifting.
+                                 svg.style.transform = `translateX(${tx}%) scaleX(${sx})`
+                                 span_el.textContent = range_text(round(r.from), round(r.to))
+                             }
+                         } else if g != null && e.pointerId == g.id {
+                             g = { ...g, lx: e.clientX, ly: e.clientY }
+                             if !g.on {
+                                 let dx = abs(e.clientX - g.x)
+                                 let dy = abs(e.clientY - g.y)
+                                 // Up and down is the page's.
+                                 if dy > 6 && dy > dx { g = null }
+                                 if g != null && dx > 6 && dx >= dy {
+                                     plot.setPointerCapture(e.pointerId)
+                                     busy = true
+                                     g = { ...g, on: true }
+                                 }
+                             }
+                             if g != null && g.on {
+                                 cross.hidden = false
+                                 tip.hidden = false
+                                 show_it(touch_chart_at(share_of(e.clientX), from, to))
+                             }
+                         }
+                     }}
+                     @pointerup={(e) => {
+                         if pin != null && (e.pointerId == pin.id0 || e.pointerId == pin.id1) {
+                             let r = touch_chart_whole(pin_range())
+                             pin = null
+                             busy = false
+                             pinching = false
+                             settle(r.from, r.to)
+                         } else if g != null && e.pointerId == g.id {
+                             let x = e.clientX
+                             g = null
+                             busy = false
+                             choose(touch_chart_at(share_of(x), from, to))
+                         }
+                     }}
+                     @pointercancel={(e) => {
+                         if pin != null && (e.pointerId == pin.id0 || e.pointerId == pin.id1) {
+                             pin = null
+                             busy = false
+                             pinching = false
+                             settle(from, to)
+                         } else if g != null && e.pointerId == g.id {
+                             g = null
+                             busy = false
+                             cross.hidden = pick == null
+                             tip.hidden = pick == null
+                             show_it(pick)
+                         }
+                     }}
+                     @keydown={(e) => {
+                         let k = e.key
+                         if k == "Escape" && pick != null { choose(null) }
+                         let i = pick ?? from - 1
+                         let to_i = match k {
+                             "ArrowRight" => i + 1
+                             "ArrowLeft" => pick == null ? to : i - 1
+                             "Home" => from
+                             "End" => to
+                             _ => null
+                         }
+                         if to_i != null {
+                             e.preventDefault()
+                             choose(to_i < from ? from : (to_i > to ? to : to_i))
+                         }
+                         if k == "+" || k == "=" { e.preventDefault(); zoom_by(2, 0) }
+                         if k == "-" { e.preventDefault(); zoom_by(0.5, 0) }
+                         if k == "PageDown" { e.preventDefault(); zoom_by(1, 0 - 0.5) }
+                         if k == "PageUp" { e.preventDefault(); zoom_by(1, 0.5) }
+                     }}>
+                    {for t in touch_chart_ticks(sc.lo, sc.hi) => <div.ui-tchart-grid key={t} style={`top: ${touch_chart_y(t, sc.lo, sc.hi) / 3}%`}><span>{touch_chart_show(t, prefix, "", digits)}</span></div>}
+                    <svg viewBox="0 0 1000 300" preserveAspectRatio="none" aria-hidden="true" @mount={(me) => { svg = me }}>
+                        <path.ui-tchart-line d={touch_chart_path(touch_chart_thin(view_rows), from, to, sc.lo, sc.hi)}/>
+                    </svg>
+                    <div.ui-tchart-cross hidden={pick == null} @mount={(me) => { cross = me }}>
+                        <i.ui-tchart-pt @mount={(me) => { point = me }}></i>
+                    </div>
+                    <div.ui-tchart-tip hidden={pick == null} aria-hidden="true" @mount={(me) => { tip = me }}></div>
+                </div>
+                <div.ui-tchart-axis aria-hidden="true"><span>{rows[from].label}</span><span>{rows[to].label}</span></div>
+                <div.ui-tchart-keys role="group" aria-label="Range">
+                    {for [i, c] in enumerate(chips) => <button.ui-tchart-key key={i} type="button"
+                        aria-pressed={touch_chart_last(n, get(c, "count", 0)).from == from && to == n - 1 ? "true" : "false"}
+                        @click={() => {
+                            let r = touch_chart_last(n, get(c, "count", 0))
+                            settle(r.from, r.to)
+                        }}>{c.label}</button>}
+                    <button.ui-tchart-key.ui-tchart-in type="button" aria-label="Zoom in" disabled={to - from <= least} @click={() => { zoom_by(2, 0) }}>+</button>
+                    <button.ui-tchart-key.ui-tchart-out type="button" aria-label="Zoom out" disabled={at_max} @click={() => { zoom_by(0.5, 0) }}>-</button>
+                    <button.ui-tchart-key.ui-tchart-back type="button" aria-label="Earlier" disabled={from == 0} @click={() => { zoom_by(1, 0.5) }}>Earlier</button>
+                    <button.ui-tchart-key.ui-tchart-on type="button" aria-label="Later" disabled={to == n - 1} @click={() => { zoom_by(1, 0 - 0.5) }}>Later</button>
+                </div>
+            </div>
+            <dl.ui-tchart-stats>
+                <div><dt>Low</dt><dd>{stats != null ? touch_chart_show(stats.low, prefix, unit, digits) : "None"}</dd></div>
+                <div><dt>High</dt><dd>{stats != null ? touch_chart_show(stats.high, prefix, unit, digits) : "None"}</dd></div>
+                <div><dt>Change</dt><dd>{stats != null ? touch_chart_show(stats.change, prefix, unit, digits) : "None"}</dd></div>
+            </dl>
+        </div>}
+        <div.ui-sr><table>
+            <caption>{title ?? "Chart"}, {n > 0 ? range_text(from, to) : "no data"}{len(view_rows) > 400 ? ", the first 400 points" : ""}</caption>
+            <thead><tr><th scope="col">Point</th><th scope="col">Value</th></tr></thead>
+            <tbody>{for r in take(view_rows, 400) => <tr key={r.i}><td>{r.label}</td><td>{touch_chart_show(r.value, prefix, unit, digits)}</td></tr>}</tbody>
+        </table></div>
+    </section>
+}

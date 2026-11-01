@@ -1,0 +1,255 @@
+// HoverCursorRow: rows as iPadOS shows them to a trackpad or mouse. The row under the pointer
+// lifts toward it, leaning a little as the pointer moves, and on touch nothing lifts, so a
+// finger never leaves a row stuck in that state. A right-click gives a menu at the pointer; so
+// does a long press, the More button at the end of a row, and the keyboard's menu key.
+//
+//   import ui/hover_cursor_row.qwe use HoverCursorRow
+//
+//   component Files() {
+//       state list = load_files()
+//       <HoverCursorRow rows={list} actions={[{ id: "rename", label: "Rename" }, { id: "del", label: "Delete", tone: "danger" }]}
+//                       on_open={(id) => { open_file(id) }} on_action={(id, act) => { run(id, act) }}/>
+//   }
+//
+// rows: each { id, title, detail?, side? }, side being a short text at the right; one
+// without a title is left out, as is an id already seen. actions: the menu's items, each { id,
+// label, tone? }, tone "danger" being red; without any there is no menu. label: the list's name
+// for screen readers. delay: the long press, in milliseconds (450). columns: true sets rows in
+// as many columns as fit a wide pane (true). lift: false leaves rows flat. class.
+// on_open(id): inside one of your components, a row pressed. on_action(id, action_id): an item
+// chosen. Ids arrive as text.
+//
+// The lift is decided by the pointer, not by the screen: a mouse or trackpad lifts a row
+// whatever the (hover) media says, as iPadOS calls itself a touch device with a trackpad
+// attached; a pen hovering lifts only where (any-hover: hover) says that is real; touch never does.
+// Under prefers-reduced-motion the row is marked but does not move.
+
+import ui/theme.qwe use ui_cls
+
+let hover_cursor_row_css = css`
+.ui-hover-cursor-row { container-type: inline-size; color: var(--ui-fg); font: 15px/1.35 var(--ui-font); }
+.ui-hover-cursor-row-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-hover-cursor-row-item { position: relative; display: flex; align-items: stretch; gap: 2px; min-height: 60px; border-radius: var(--ui-radius); background: var(--ui-surface); transition: transform .14s cubic-bezier(.2, .8, .2, 1), box-shadow .14s, background .14s; -webkit-touch-callout: none; }
+.ui-hover-cursor-row-lifted { z-index: 1; background: var(--ui-subtle); box-shadow: var(--ui-shadow); }
+.ui-hover-cursor-row-pressing { background: var(--ui-subtle); user-select: none; -webkit-user-select: none; }
+.ui-hover-cursor-row-main { display: flex; flex: 1; align-items: center; gap: 10px; min-width: 0; min-height: 60px; padding: 8px 6px 8px 14px; border: 0; border-radius: var(--ui-radius); background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; touch-action: pan-y; }
+.ui-hover-cursor-row-main:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-hover-cursor-row-main[aria-current="true"] { box-shadow: inset 3px 0 0 var(--ui-accent); }
+.ui-hover-cursor-row-text { flex: 1; min-width: 0; }
+.ui-hover-cursor-row-title { display: block; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-hover-cursor-row-detail { display: block; overflow: hidden; color: var(--ui-muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.ui-hover-cursor-row-side { flex: none; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-hover-cursor-row-more { flex: none; align-self: center; width: 44px; height: 44px; margin-right: 6px; padding: 0; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); font: 700 18px/1 var(--ui-font); cursor: pointer; }
+.ui-hover-cursor-row-more:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-hover-cursor-row-more:hover { background: var(--ui-border); color: var(--ui-fg); } }
+.ui-hover-cursor-row-menu { box-sizing: border-box; position: fixed; inset: auto; min-width: 200px; max-height: 70dvh; margin: 0; padding: 6px; overflow-y: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); box-shadow: var(--ui-shadow-lg); color: var(--ui-fg); font: 15px/1.3 var(--ui-font); }
+.ui-hover-cursor-row-action { display: block; box-sizing: border-box; width: 100%; min-height: 44px; padding: 0 12px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.ui-hover-cursor-row-action:focus-visible { outline: none; background: var(--ui-accent-soft); }
+.ui-hover-cursor-row-danger { color: var(--ui-danger); }
+@media (hover: hover) { .ui-hover-cursor-row-action:hover { background: var(--ui-subtle); } }
+@container (min-width: 760px) { .ui-hover-cursor-row-columns { grid-template-columns: 1fr 1fr; } }
+@media (prefers-reduced-motion: reduce) { .ui-hover-cursor-row-item { transition: none; } }
+`
+
+// The rows that can be shown: those with a title, each id once, ids as text.
+fn hover_cursor_row_clean(rows) -> list {
+    if type_of(rows) != "list" { return [] }
+    let named = rows | filter((r) => type_of(r) == "map" && get(r, "title") != null)
+    let all = enumerate(named) | map((p) => { ...p[1], id: get(p[1], "id") != null ? str(p[1].id) : `_${p[0]}` })
+    let ids = all | map((r) => r.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// Does this pointer lift a row? A touch never does. A mouse or trackpad always does, being
+// proof of a hovering pointer. A pen does in the air only, where the system says it can hover.
+fn hover_cursor_row_lifts(kind: str, buttons: int, any_hover: bool) -> bool {
+    if kind == "mouse" { return true }
+    kind == "pen" && buttons == 0 && any_hover
+}
+
+// How far a lifted row leans: up to `most` pixels toward the pointer, from its middle.
+fn hover_cursor_row_lean(at: num, size: num, most: num) -> num {
+    if size <= 0 { return 0 }
+    let share = (at - size / 2) / (size / 2)
+    round(max([-1, min([1, share])]) * most * 100) / 100
+}
+
+// A menu's corner for a press at at, along one side of the screen. It opens away from the
+// press where it fits, flips where that is the only way to fit, and else stays on screen.
+fn hover_cursor_row_place(at: num, size: num, room: num, pad: num) -> num {
+    if at + size + pad <= room { return at }
+    if at - size >= pad { return at - size }
+    max([pad, room - size - pad])
+}
+
+component HoverCursorRow(rows = [], actions: list = [], label: str = "List", delay: int = 450, columns: bool = true, lift: bool = true,
+                         on_open = null, on_action = null, class: str? = null) {
+    style global hover_cursor_row_css
+    let shown = hover_cursor_row_clean(rows)
+    state win = null
+    state menu = null
+    state current = ""
+    state menu_for = ""        // the id the menu is open for
+    state back_to = null       // what takes focus when the menu closes
+    state press = null         // a touch held on a row, waiting for its time: { id, x, y, row }
+    state held = false         // that press became a menu, so the click that follows is not a press
+    state said = ""
+    let title_of = (id: str) => (find(shown, (r) => r.id == id) ?? { title: "" }).title
+    let open_menu = (id: str, x: num, y: num, focus_item: bool, from) => {
+        if len(actions) > 0 {
+            menu_for = id
+            back_to = from
+            menu.showPopover()
+            let w = menu.offsetWidth
+            let h = menu.offsetHeight
+            menu.style.left = `${hover_cursor_row_place(x, w, win.innerWidth, 8)}px`
+            menu.style.top = `${hover_cursor_row_place(y, h, win.innerHeight, 8)}px`
+            let items = menu.querySelectorAll("[role=menuitem]")
+            if focus_item { items[0].focus() } else { menu.focus({ preventScroll: true }) }
+            said = `Menu for ${title_of(id)}.`
+        }
+    }
+    let close_menu = (give_back: bool) => {
+        if menu_for != "" {
+            menu_for = ""
+            if menu.matches(":popover-open") { menu.hidePopover() }
+            if give_back && back_to != null { back_to.focus({ preventScroll: true }) }
+            back_to = null
+        }
+    }
+    let by_rect = (id: str, el, focus_item: bool, from) => {
+        let r = el.getBoundingClientRect()
+        open_menu(id, r.left, r.bottom, focus_item, from)
+    }
+    let unlift = (row) => {
+        row.classList.remove("ui-hover-cursor-row-lifted")
+        row.style.transform = ""
+    }
+    let lean = (e, row) => {
+        if lift && hover_cursor_row_lifts(e.pointerType, e.buttons, win.matchMedia("(any-hover: hover)").matches) {
+            row.classList.add("ui-hover-cursor-row-lifted")
+            if !win.matchMedia("(prefers-reduced-motion: reduce)").matches {
+                let r = row.getBoundingClientRect()
+                let tilt_x = hover_cursor_row_lean(e.clientX - r.left, r.width, 3)
+                let tilt_y = hover_cursor_row_lean(e.clientY - r.top, r.height, 2)
+                row.style.transform = `translate(${tilt_x}px, ${tilt_y}px) scale(1.012)`
+            }
+        } else {
+            unlift(row)
+        }
+    }
+    let stop_press = () => {
+        if press != null {
+            press.row.classList.remove("ui-hover-cursor-row-pressing")
+            press = null
+        }
+    }
+    if press != null { every(delay, () => {
+        if press != null {
+            let p = press
+            stop_press()
+            held = true
+            open_menu(p.id, p.x, p.y, false, p.row.querySelector(".ui-hover-cursor-row-main"))
+        }
+    }) }
+    let keys = (e) => {
+        let items = menu.querySelectorAll("[role=menuitem]")
+        let n = items.length
+        let at = range(0, n) | filter((i) => items[i] == js("document").activeElement)
+        let now = len(at) > 0 ? at[0] : -1
+        let to = match e.key {
+            "ArrowDown" => (now + 1) % n
+            "ArrowUp" => now <= 0 ? n - 1 : now - 1
+            "Home" => 0
+            "End" => n - 1
+            _ => -1
+        }
+        if to >= 0 {
+            e.preventDefault()
+            items[to].focus()
+        }
+        if e.key == "Escape" {
+            e.preventDefault()
+            close_menu(true)
+        }
+        if e.key == "Tab" { close_menu(true) }
+    }
+    <div class={ui_cls(["ui-hover-cursor-row", class])}
+         @mount={(me) => {
+             win = js("window")
+             menu = me.querySelector(".ui-hover-cursor-row-menu")
+             let doc = js("document")
+             // Not popover="auto": its light dismiss runs when the press that opened a menu is let go.
+             let away = (e) => { if menu_for != "" && !menu.contains(e.target) { close_menu(false) } }
+             doc.addEventListener("pointerdown", away, true)
+             () => { doc.removeEventListener("pointerdown", away, true) }
+         }}>
+        <ul class={ui_cls(["ui-hover-cursor-row-list", columns && "ui-hover-cursor-row-columns"])} aria-label={label}>
+            {for r in shown => <li.ui-hover-cursor-row-item key={r.id} data-id={r.id}
+                    @pointerenter={(e) => { lean(e, e.target) }}
+                    @pointermove={(e) => {
+                        let row = e.target.closest(".ui-hover-cursor-row-item")
+                        if press != null && e.pointerType == "touch" && abs(e.clientX - press.x) + abs(e.clientY - press.y) > 10 { stop_press() }
+                        lean(e, row)
+                    }}
+                    @pointerleave={(e) => { unlift(e.target) }}
+                    @pointercancel={(e) => {
+                        stop_press()
+                        unlift(e.target.closest(".ui-hover-cursor-row-item"))
+                    }}
+                    @pointerdown={(e) => {
+                        let row = e.target.closest(".ui-hover-cursor-row-item")
+                        held = false
+                        // The More button is a press of its own.
+                        if e.pointerType == "touch" && e.target.closest(".ui-hover-cursor-row-more") == null {
+                            row.classList.add("ui-hover-cursor-row-pressing")
+                            press = { id: r.id, x: e.clientX, y: e.clientY, row }
+                        }
+                    }}
+                    @pointerup={() => { stop_press() }}
+                    @contextmenu={(e) => {
+                        e.preventDefault()
+                        // Chrome on a phone sends this for a long press too, in step with the timer.
+                        if menu_for == "" && len(actions) > 0 {
+                            stop_press()
+                            held = e.pointerType == "touch"
+                            open_menu(r.id, e.clientX, e.clientY, false, e.target.closest(".ui-hover-cursor-row-item").querySelector(".ui-hover-cursor-row-main"))
+                        }
+                    }}>
+                <button.ui-hover-cursor-row-main type="button" aria-current={current == r.id ? "true" : null}
+                        @click={() => {
+                            if held {
+                                held = false
+                            } else {
+                                current = r.id
+                                on_open && on_open(r.id)
+                            }
+                        }}
+                        @keydown={(e) => {
+                            if e.key == "ContextMenu" || (e.key == "F10" && e.shiftKey) {
+                                e.preventDefault()
+                                by_rect(r.id, e.target, true, e.target)
+                            }
+                        }}>
+                    <span.ui-hover-cursor-row-text>
+                        <span.ui-hover-cursor-row-title>{r.title}</span>
+                        {get(r, "detail") != null && <span.ui-hover-cursor-row-detail>{r.detail}</span>}
+                    </span>
+                    {get(r, "side") != null && <span.ui-hover-cursor-row-side>{r.side}</span>}
+                </button>
+                {len(actions) > 0 && <button.ui-hover-cursor-row-more type="button" aria-haspopup="menu" aria-expanded={menu_for == r.id ? "true" : "false"} aria-label={`More for ${r.title}`}
+                        @click={(e) => { by_rect(r.id, e.target, true, e.target) }}>...</button>}
+            </li>}
+        </ul>
+        <div.ui-hover-cursor-row-menu popover="manual" role="menu" tabindex="-1" aria-label={`Actions for ${title_of(menu_for)}`} @keydown={keys}>
+            {for a in actions => <button key={a.id} type="button" role="menuitem"
+                    class={ui_cls(["ui-hover-cursor-row-action", get(a, "tone") == "danger" && "ui-hover-cursor-row-danger"])}
+                    @click={() => {
+                        let id = menu_for
+                        close_menu(true)
+                        on_action && on_action(id, a.id)
+                    }}>{a.label}</button>}
+        </div>
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

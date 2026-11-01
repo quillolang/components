@@ -1,0 +1,548 @@
+// FormulaGrid: a small spreadsheet. A cell holds a number, text or a formula such as
+// =A1+B2 or =SUM(A1:A9): + - * / with brackets, & joins text, = <> < <= > >= compare,
+// and SUM, AVG, MIN, MAX, COUNT and IF. Cells are worked out in dependency order, each
+// after those it reads, in exact decimals, so 0.1 + 0.2 is 0.3. What cannot be worked
+// out says why in the cell: #REF! (a cell outside the grid), #CYCLE! (a cell that
+// comes back to itself, and all that read it), #DIV/0!, #NAME? (no such function or
+// name), #VALUE! (text where a number is needed), #NUM! (too large) and #ERROR! (a
+// formula that cannot be read).
+//
+//   <FormulaGrid id="budget" label="Budget" cols={4} rows={8} name="sheet"
+//                cells={{ A1: "Rent", B1: "1200.00", A2: "Food", B2: "312.40", B3: "=SUM(B1:B2)" }}
+//                on_change={(s) => { total = s.values.B3 }}/>
+//
+// id: a prefix for its ids, unique on the page. cells: what it starts with, a map from
+// a cell's name to its text. cols, rows: the grid's size (6 by 10; at most 26 by 50).
+// label: its name for screen readers ("Spreadsheet"). name: a hidden field with the
+// cells as JSON, so a plain <form> sends them. on_change(sheet): inside one of your
+// components, after each edit, given { cells, values, changed }: cells as above,
+// values each cell's result as text, changed the cell's name. class: more classes for
+// its outer element.
+//
+// Keys: the arrows, Home, End, Page Up and Page Down move; Enter or F2 edits (or start
+// typing); Enter and Tab keep what was typed and move on, Shift the other way; Escape
+// drops it; Delete empties the cell. The bar above edits the cell picked too. Outside
+// an edit Tab leaves the grid, as it does any other control.
+//
+// As in other spreadsheets, a range skips text and empty cells; an error in it is the
+// answer; an empty cell in a sum counts as 0. AVG of nothing is #DIV/0!. IF works out
+// only the branch it takes, though a cycle through either is a cycle. Each result
+// shows at most ten decimals, and the bar's status line says it in full.
+//
+// formula_grid_compute(cells, cols, rows) does the work, for a program: a map from each
+// cell's name to its value (a decimal, text, true or false, or { err }).
+
+import ui/theme.qwe use ui_cls
+
+let formula_grid_css = css`
+.ui-fgrid { display: grid; gap: 8px; min-width: 0; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-fgrid-bar { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ui-fgrid-bar label { flex: none; min-width: 2.6em; padding: 0 6px; border-radius: 4px; background: var(--ui-subtle); color: var(--ui-muted); font: 600 12px/28px var(--ui-mono); text-align: center; }
+.ui-fgrid-input { box-sizing: border-box; flex: 1; min-width: 0; height: 32px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-mono); }
+.ui-fgrid-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-fgrid-scroll { overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-fgrid table { border-collapse: separate; border-spacing: 0; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-fgrid table:focus { outline: none; }
+.ui-fgrid table:focus-visible .ui-fgrid-at { box-shadow: inset 0 0 0 2px var(--ui-accent), var(--ui-focus); }
+.ui-fgrid th { position: sticky; top: 0; z-index: 1; min-width: 28px; padding: 3px 8px; border-right: 1px solid var(--ui-border); border-bottom: 1px solid var(--ui-border);
+  background: var(--ui-subtle); color: var(--ui-muted); font-weight: 600; text-align: center; }
+.ui-fgrid tbody th { position: sticky; left: 0; z-index: 1; }
+.ui-fgrid thead th:first-child { left: 0; z-index: 2; }
+.ui-fgrid td { box-sizing: border-box; min-width: 92px; max-width: 180px; height: 28px; padding: 0 7px; overflow: hidden; border-right: 1px solid var(--ui-border); border-bottom: 1px solid var(--ui-border);
+  text-overflow: ellipsis; white-space: nowrap; cursor: cell; }
+.ui-fgrid-num { text-align: right; }
+.ui-fgrid-at { box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-fgrid-err { color: var(--ui-danger); font-weight: 600; text-align: center; }
+.ui-fgrid td .ui-fgrid-edit { box-sizing: border-box; display: block; width: 100%; height: 26px; margin: 0; padding: 0; border: 0; outline: none; background: transparent; color: var(--ui-fg); font: 13px var(--ui-mono); }
+.ui-fgrid-hint { margin: 0; color: var(--ui-muted); font-size: 12px; }
+`
+
+let formula_grid_levels = [["=", "<>", "<", "<=", ">", ">="], ["&"], ["+", "-"], ["*", "/"]]
+let formula_grid_token = "\"(?:[^\"]|\"\")*\"|\\$?[A-Za-z]{1,3}\\$?\\d+|[A-Za-z_][A-Za-z0-9_.]*|\\d+(?:\\.\\d*)?|\\.\\d+|<=|>=|<>|[-+*/&=<>(),:]|\\S"
+
+// ---- Names --------------------------------------------------------------------
+
+// A column's letters from its place: 0 is A, 25 is Z.
+fn formula_grid_letter(c: int) -> str = slice("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c, c + 1)
+
+fn formula_grid_id(c: int, r: int) -> str = `${formula_grid_letter(c)}${r + 1}`
+
+// A cell's place from text like A1 or $B$2: { c, r }, or null. Columns count as
+// letters do, past Z too, so that AA1 is outside the grid rather than unreadable.
+fn formula_grid_place(text: str) {
+    let m = re.find(upper(text), "^\\$?([A-Z]{1,3})\\$?(\\d{1,6})$")
+    if m == null { return null }
+    let c = reduce(split(m.groups[0], ""), 0, (n, l) => n * 26 + index_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ", l) + 1)
+    { c: c - 1, r: int(m.groups[1]) - 1 }
+}
+
+// ---- Parsing ------------------------------------------------------------------
+// A formula becomes a tree of { t, ... }: num, str, bool, ref, range, neg, bin, call.
+// What cannot be read is { t: "err", code }, which stops the rest of the parse. Each
+// step gives { n (the node), at (the next token) }.
+
+fn formula_grid_fail(code: str, at: int) -> map = { n: { t: "err", code }, at }
+
+fn formula_grid_atom(ts: list, at: int, deep: int) -> map {
+    let tk = ts[at]
+    if tk == null || deep > 40 { return formula_grid_fail("#ERROR!", at) }
+    if tk == "(" {
+        let inner = formula_grid_level(ts, at + 1, deep + 1, 0)
+        if inner.n.t == "err" { return inner }
+        return ts[inner.at] == ")" ? { n: inner.n, at: inner.at + 1 } : formula_grid_fail("#ERROR!", inner.at)
+    }
+    if starts_with(tk, "\"") {
+        if len(tk) < 2 || !ends_with(tk, "\"") { return formula_grid_fail("#ERROR!", at) }
+        return { n: { t: "str", v: replace(slice(tk, 1, len(tk) - 1), "\"\"", "\"") }, at: at + 1 }
+    }
+    if re.test(tk, "^(\\d|\\.\\d)") {
+        let d = dec(tk)
+        return is_err(d) || len(tk) > 28 ? formula_grid_fail("#NUM!", at) : { n: { t: "num", v: d }, at: at + 1 }
+    }
+    if !re.test(tk, "^[$A-Za-z_]") { return formula_grid_fail("#ERROR!", at) }
+    let word = upper(tk)
+    if ts[at + 1] == "(" { return formula_grid_call(word, ts, at + 2, deep) }
+    let place = formula_grid_place(tk)
+    if place != null {
+        if ts[at + 1] != ":" { return { n: { t: "ref", place }, at: at + 1 } }
+        let far = ts[at + 2] != null ? formula_grid_place(ts[at + 2]) : null
+        return far == null ? formula_grid_fail("#ERROR!", at) : { n: { t: "range", a: place, b: far }, at: at + 3 }
+    }
+    if word == "TRUE" || word == "FALSE" { return { n: { t: "bool", v: word == "TRUE" }, at: at + 1 } }
+    formula_grid_fail("#NAME?", at)
+}
+
+fn formula_grid_call(name: str, ts: list, start: int, deep: int) -> map {
+    let args = []
+    let at = start
+    if ts[at] == ")" { return { n: { t: "call", name, args }, at: at + 1 } }
+    while true {
+        let one = formula_grid_level(ts, at, deep + 1, 0)
+        if one.n.t == "err" { return one }
+        args = push(args, one.n)
+        at = one.at
+        if ts[at] == ")" { return { n: { t: "call", name, args }, at: at + 1 } }
+        if ts[at] != "," { return formula_grid_fail("#ERROR!", at) }
+        at += 1
+    }
+    // Never reached: quillo check takes `while true` for a loop that can end.
+    formula_grid_fail("#ERROR!", at)
+}
+
+fn formula_grid_unary(ts: list, at: int, deep: int) -> map {
+    if ts[at] == "-" {
+        if deep > 40 { return formula_grid_fail("#ERROR!", at) }
+        let x = formula_grid_unary(ts, at + 1, deep + 1)
+        return x.n.t == "err" ? x : { n: { t: "neg", x: x.n }, at: x.at }
+    }
+    if ts[at] == "+" { return formula_grid_unary(ts, at + 1, deep + 1) }
+    formula_grid_atom(ts, at, deep)
+}
+
+// One level of operators, tightest last in formula_grid_levels.
+fn formula_grid_level(ts: list, at: int, deep: int, lv: int) -> map {
+    if lv >= len(formula_grid_levels) { return formula_grid_unary(ts, at, deep) }
+    let first = formula_grid_level(ts, at, deep, lv + 1)
+    let n = first.n
+    let i = first.at
+    while n.t != "err" && ts[i] != null && contains(formula_grid_levels[lv], ts[i]) {
+        let op = ts[i]
+        let right = formula_grid_level(ts, i + 1, deep, lv + 1)
+        n = right.n.t == "err" ? right.n : { t: "bin", op, l: n, r: right.n }
+        i = right.at
+    }
+    { n, at: i }
+}
+
+// A formula's text, without its =, as a tree.
+fn formula_grid_parse(text: str) -> map {
+    if len(text) > 2000 { return { t: "err", code: "#ERROR!" } }
+    let ts = re.find_all(text, formula_grid_token) | map((m) => m.text)
+    if len(ts) == 0 { return { t: "err", code: "#ERROR!" } }
+    let got = formula_grid_level(ts, 0, 0, 0)
+    if got.n.t == "err" { return got.n }
+    got.at < len(ts) ? { t: "err", code: "#ERROR!" } : got.n
+}
+
+// The cells a range covers: places, row by row, corners in any order.
+fn formula_grid_cover(a: map, b: map) -> list {
+    let lo_c = min([a.c, b.c])
+    let hi_c = max([a.c, b.c])
+    let lo_r = min([a.r, b.r])
+    let hi_r = max([a.r, b.r])
+    flatten(for r in lo_r..(hi_r + 1) => for c in lo_c..(hi_c + 1) => { c, r })
+}
+
+// The cells a tree reads, in the grid or not.
+fn formula_grid_reads(n: map, cols: int, rows: int) -> list = match n.t {
+    "ref" => [n.place]
+    // A range past the grid is #REF! however large it is: its corners are enough.
+    "range" => n.a.c >= cols || n.b.c >= cols || n.a.r >= rows || n.b.r >= rows ? [] : formula_grid_cover(n.a, n.b)
+    "neg" => formula_grid_reads(n.x, cols, rows)
+    "bin" => formula_grid_reads(n.l, cols, rows) + formula_grid_reads(n.r, cols, rows)
+    "call" => flatten(n.args | map((a) => formula_grid_reads(a, cols, rows)))
+    _ => []
+}
+
+// ---- Working out ---------------------------------------------------------------
+// A value is a decimal, text, true or false, null for an empty cell, or { err }.
+
+fn formula_grid_err(code: str) -> map = { err: code }
+
+fn formula_grid_is_err(v) -> bool = type_of(v) == "map"
+
+// A value as a number: a decimal, or { err }. Empty is 0, true is 1, as elsewhere;
+// text is a number only when it is written as one.
+fn formula_grid_number(v) {
+    let t = type_of(v)
+    if t == "dec" || t == "map" { return v }
+    if t == "null" { return 0m }
+    if t == "bool" { return v ? 1m : 0m }
+    let d = re.test(trim(v), "^[-+]?\\d+(\\.\\d+)?$") ? dec(trim(v)) : err("text")
+    is_err(d) ? formula_grid_err("#VALUE!") : d
+}
+
+// a op b, kept from a decimal overflow, which would stop the page: the float says
+// whether the answer fits before the exact sum is tried.
+fn formula_grid_math(op: str, a, b) {
+    let x = float(a)
+    let y = float(b)
+    if op == "/" && b == 0m { return formula_grid_err("#DIV/0!") }
+    let size = match op {
+        "+" => abs(x) + abs(y)
+        "-" => abs(x) + abs(y)
+        "*" => abs(x) * abs(y)
+        _ => abs(x) / abs(y)
+    }
+    if size >= 70000000000000000000000000000.0 { return formula_grid_err("#NUM!") }
+    match op {
+        "+" => a + b
+        "-" => a - b
+        "*" => a * b
+        _ => a / b
+    }
+}
+
+// A value as text.
+fn formula_grid_text(v) -> str = match type_of(v) {
+    "null" => ""
+    "bool" => v ? "TRUE" : "FALSE"
+    "map" => v.err
+    "dec" => formula_grid_shown(v)
+    _ => v
+}
+
+// Numbers before text, text before TRUE and FALSE, as other spreadsheets order them;
+// text without regard to case. An empty cell takes the other side's kind.
+fn formula_grid_compare(op: str, a, b) -> bool {
+    let rank = (v) => type_of(v) == "dec" ? 0 : (type_of(v) == "str" ? 1 : 2)
+    let l = a == null ? (type_of(b) == "str" ? "" : (type_of(b) == "bool" ? false : 0m)) : a
+    let r = b == null ? (type_of(a) == "str" ? "" : (type_of(a) == "bool" ? false : 0m)) : b
+    let order = rank(l) != rank(r) ? rank(l) - rank(r)
+        : (type_of(l) == "dec" ? (l < r ? -1 : (l > r ? 1 : 0))
+        : (type_of(l) == "str" ? (lower(l) < lower(r) ? -1 : (lower(l) > lower(r) ? 1 : 0))
+        : (l == r ? 0 : (r ? -1 : 1))))
+    match op {
+        "=" => order == 0
+        "<>" => order != 0
+        "<" => order < 0
+        "<=" => order <= 0
+        ">" => order > 0
+        _ => order >= 0
+    }
+}
+
+fn formula_grid_in(p: map, cols: int, rows: int) -> bool = p.c >= 0 && p.r >= 0 && p.c < cols && p.r < rows
+
+// The numbers an aggregate reads: { nums, err }. In a range, text and empties are
+// skipped; given directly, text is an error.
+fn formula_grid_gather(args: list, vals: map, cols: int, rows: int) -> map {
+    let nums = []
+    for a in args {
+        if a.t == "range" {
+            if !formula_grid_in(a.a, cols, rows) || !formula_grid_in(a.b, cols, rows) { return { err: "#REF!" } }
+            for p in formula_grid_cover(a.a, a.b) {
+                let v = get(vals, formula_grid_id(p.c, p.r))
+                if formula_grid_is_err(v) { return { err: v.err } }
+                if type_of(v) == "dec" { nums = push(nums, v) }
+            }
+        } else if a.t == "ref" {
+            if !formula_grid_in(a.place, cols, rows) { return { err: "#REF!" } }
+            let v = get(vals, formula_grid_id(a.place.c, a.place.r))
+            if formula_grid_is_err(v) { return { err: v.err } }
+            if type_of(v) == "dec" { nums = push(nums, v) }
+        } else {
+            let v = formula_grid_number(formula_grid_eval(a, vals, cols, rows))
+            if formula_grid_is_err(v) { return { err: v.err } }
+            nums = push(nums, v)
+        }
+    }
+    { nums }
+}
+
+fn formula_grid_sum(nums: list) =
+    reduce(nums, 0m, (t, x) => formula_grid_is_err(t) ? t : formula_grid_math("+", t, x))
+
+fn formula_grid_call_eval(n: map, vals: map, cols: int, rows: int) {
+    if n.name == "IF" {
+        if len(n.args) < 2 || len(n.args) > 3 { return formula_grid_err("#ERROR!") }
+        let test = formula_grid_eval(n.args[0], vals, cols, rows)
+        if formula_grid_is_err(test) { return test }
+        if type_of(test) == "str" { return formula_grid_err("#VALUE!") }
+        let on = type_of(test) == "bool" ? test : (test != null && test != 0m)
+        if on { return formula_grid_eval(n.args[1], vals, cols, rows) }
+        return len(n.args) == 3 ? formula_grid_eval(n.args[2], vals, cols, rows) : false
+    }
+    if !contains(["SUM", "AVG", "AVERAGE", "MIN", "MAX", "COUNT"], n.name) { return formula_grid_err("#NAME?") }
+    let g = formula_grid_gather(n.args, vals, cols, rows)
+    if g.err != null { return formula_grid_err(g.err) }
+    match n.name {
+        "SUM" => formula_grid_sum(g.nums)
+        "COUNT" => dec(len(g.nums))
+        "MIN" => min(g.nums) ?? 0m
+        "MAX" => max(g.nums) ?? 0m
+        _ => {
+            if len(g.nums) == 0 { return formula_grid_err("#DIV/0!") }
+            let total = formula_grid_sum(g.nums)
+            formula_grid_is_err(total) ? total : total / len(g.nums)
+        }
+    }
+}
+
+// What a tree comes to.
+fn formula_grid_eval(n: map, vals: map, cols: int, rows: int) {
+    match n.t {
+        "num" | "str" | "bool" => n.v
+        "err" => formula_grid_err(n.code)
+        "ref" => formula_grid_in(n.place, cols, rows) ? get(vals, formula_grid_id(n.place.c, n.place.r)) : formula_grid_err("#REF!")
+        // A range means something only to an aggregate.
+        "range" => formula_grid_err(formula_grid_in(n.a, cols, rows) && formula_grid_in(n.b, cols, rows) ? "#VALUE!" : "#REF!")
+        "neg" => {
+            let x = formula_grid_number(formula_grid_eval(n.x, vals, cols, rows))
+            formula_grid_is_err(x) ? x : -x
+        }
+        "call" => formula_grid_call_eval(n, vals, cols, rows)
+        _ => {
+            let a = formula_grid_eval(n.l, vals, cols, rows)
+            if formula_grid_is_err(a) { return a }
+            let b = formula_grid_eval(n.r, vals, cols, rows)
+            if formula_grid_is_err(b) { return b }
+            if n.op == "&" { return formula_grid_text(a) + formula_grid_text(b) }
+            if contains(["+", "-", "*", "/"], n.op) {
+                let x = formula_grid_number(a)
+                if formula_grid_is_err(x) { return x }
+                let y = formula_grid_number(b)
+                formula_grid_is_err(y) ? y : formula_grid_math(n.op, x, y)
+            } else {
+                formula_grid_compare(n.op, a, b)
+            }
+        }
+    }
+}
+
+// What a cell without a formula holds: a decimal when it reads as a number.
+fn formula_grid_literal(raw: str) {
+    let s = trim(raw)
+    if !re.test(s, "^-?(\\d+(\\.\\d*)?|\\.\\d+)$") || len(s) > 28 { return s == "" ? null : raw }
+    let d = dec(s)
+    is_err(d) ? raw : d
+}
+
+// Every cell's value, in dependency order: a formula is worked out once all it reads
+// are, so a chain as long as the grid needs no recursion. Formulas left over when none
+// can go are on a cycle or read one.
+fn formula_grid_compute(cells: map, cols: int, rows: int) -> map {
+    let vals = {}
+    let trees = {}
+    for [id, raw] in cells {
+        let place = formula_grid_place(id)
+        let text = type_of(raw) == "str" ? raw : str(raw)
+        if place != null && formula_grid_in(place, cols, rows) {
+            if starts_with(trim(text), "=") {
+                trees = set(trees, formula_grid_id(place.c, place.r), formula_grid_parse(slice(trim(text), 1, len(trim(text)))))
+            } else {
+                vals = set(vals, formula_grid_id(place.c, place.r), formula_grid_literal(text))
+            }
+        }
+    }
+    let waits = {}
+    let readers = {}
+    for [id, tree] in trees {
+        let reads = unique(formula_grid_reads(tree, cols, rows) | filter((p) => formula_grid_in(p, cols, rows)) | map((p) => formula_grid_id(p.c, p.r)))
+        let open = reads | filter((r) => has(trees, r))
+        waits = set(waits, id, len(open))
+        for r in open { readers = set(readers, r, push(get(readers, r) ?? [], id)) }
+    }
+    let ready = keys(waits) | filter((id) => get(waits, id) == 0)
+    let i = 0
+    while i < len(ready) {
+        let id = ready[i]
+        vals = set(vals, id, formula_grid_eval(get(trees, id), vals, cols, rows))
+        for r in get(readers, id) ?? [] {
+            let left = get(waits, r) - 1
+            waits = set(waits, r, left)
+            if left == 0 { ready = push(ready, r) }
+        }
+        i += 1
+    }
+    for id in keys(trees) {
+        if !has(vals, id) { vals = set(vals, id, formula_grid_err("#CYCLE!")) }
+    }
+    vals
+}
+
+// A result for the cell: at most ten decimals, and no zeros a rounding left behind.
+fn formula_grid_shown(d) -> str {
+    let s = str(d)
+    let dot = index_of(s, ".")
+    if dot == null || len(s) - dot - 1 <= 10 { return s }
+    let cut = str(round(d, 10))
+    re.replace(cut, "\\.?0+$", "")
+}
+
+// The cells as given: text by upper-case name, what names no cell left out.
+fn formula_grid_cells(cells) -> map {
+    let given = type_of(cells) == "map" ? cells : {}
+    reduce(keys(given), {}, (m, k) => {
+        let p = formula_grid_place(k)
+        let v = get(given, k)
+        p == null || p.c > 25 || p.r < 0 || v == null ? m : set(m, formula_grid_id(p.c, p.r), type_of(v) == "str" ? v : str(v))
+    })
+}
+
+component FormulaGrid(id: str, cells = {}, cols: int = 6, rows: int = 10, label: str = "Spreadsheet", name: str? = null,
+                      on_change = null, class: str? = null) {
+    style global formula_grid_css
+    let ncols = min([26, max([1, cols])])
+    let nrows = min([50, max([1, rows])])
+    state raw = formula_grid_cells(cells)
+    state at_c = 0
+    state at_r = 0
+    state editing = false
+    state draft = ""
+    state said = ""
+    let grid = null
+    let vals = formula_grid_compute(raw, ncols, nrows)
+    let at_id = formula_grid_id(at_c, at_r)
+    let held = (cid: str) => get(raw, cid) ?? ""
+    let bar_text = editing ? draft : held(at_id)
+    let go = (c: int, r: int) => {
+        at_c = min([ncols - 1, max([0, c])])
+        at_r = min([nrows - 1, max([0, r])])
+        let el = grid == null ? null : grid.querySelector(`[data-cell="${formula_grid_id(at_c, at_r)}"]`)
+        el && el.scrollIntoView({ block: "nearest", inline: "nearest" })
+    }
+    let store = (cid: str, text: str) => {
+        raw = trim(text) == "" ? remove(raw, cid) : set(raw, cid, text)
+        let now_vals = formula_grid_compute(raw, ncols, nrows)
+        said = trim(text) == "" ? `${cid} emptied` : `${cid} is ${formula_grid_text(get(now_vals, cid))}`
+        if on_change != null {
+            let shown = reduce(keys(now_vals), {}, (m, k) => set(m, k, formula_grid_text(get(now_vals, k))))
+            on_change({ cells: raw, values: shown, changed: cid })
+        }
+    }
+    let start = (text: str) => {
+        draft = text
+        editing = true
+    }
+    let commit = () => {
+        if editing {
+            editing = false
+            if draft != held(at_id) { store(at_id, draft) }
+        }
+    }
+    let cancel = () => {
+        editing = false
+        grid && grid.focus()
+    }
+    let finish = (dc: int, dr: int) => {
+        commit()
+        go(at_c + dc, at_r + dr)
+        grid && grid.focus()
+    }
+    let edit_keys = (e) => {
+        if e.key == "Enter" {
+            e.preventDefault()
+            e.stopPropagation()
+            finish(0, e.shiftKey ? -1 : 1)
+        } else if e.key == "Tab" {
+            e.preventDefault()
+            e.stopPropagation()
+            finish(e.shiftKey ? -1 : 1, 0)
+        } else if e.key == "Escape" {
+            e.preventDefault()
+            e.stopPropagation()
+            cancel()
+        }
+    }
+    let grid_keys = (e) => {
+        if !editing {
+            let k = e.key
+            let moved = match k {
+                "ArrowUp" => [at_c, at_r - 1]
+                "ArrowDown" => [at_c, at_r + 1]
+                "ArrowLeft" => [at_c - 1, at_r]
+                "ArrowRight" => [at_c + 1, at_r]
+                "Home" => e.ctrlKey ? [0, 0] : [0, at_r]
+                "End" => e.ctrlKey ? [ncols - 1, nrows - 1] : [ncols - 1, at_r]
+                "PageUp" => [at_c, at_r - 5]
+                "PageDown" => [at_c, at_r + 5]
+                _ => null
+            }
+            if moved != null {
+                e.preventDefault()
+                go(moved[0], moved[1])
+            } else if k == "Enter" || k == "F2" {
+                e.preventDefault()
+                start(held(at_id))
+            } else if k == "Delete" || k == "Backspace" {
+                e.preventDefault()
+                if held(at_id) != "" { store(at_id, "") }
+            } else if len(k) == 1 && !e.ctrlKey && !e.metaKey && !e.altKey {
+                e.preventDefault()
+                start(k)
+            }
+        }
+    }
+    <div class={ui_cls(["ui-fgrid", class])}>
+        <div.ui-fgrid-bar>
+            <label for={`${id}-bar`} id={`${id}-where`}>{at_id}</label>
+            <input.ui-fgrid-input type="text" id={`${id}-bar`} autocomplete="off" spellcheck="false" value={bar_text} aria-label={`Contents of ${at_id}`}
+                   @input={(e) => { draft = e.value; editing = true }} @keydown={edit_keys}/>
+        </div>
+        <div.ui-fgrid-scroll>
+            <table id={id} role="grid" tabindex="0" aria-label={label} aria-rowcount={str(nrows + 1)} aria-colcount={str(ncols + 1)}
+                   aria-activedescendant={`${id}-${at_id}`} @mount={(el) => { grid = el }} @keydown={grid_keys}>
+                <thead>
+                    <tr>
+                        <th scope="col"><span.ui-sr>Row</span></th>
+                        {for c in 0..ncols => <th key={c} scope="col">{formula_grid_letter(c)}</th>}
+                    </tr>
+                </thead>
+                <tbody>
+                    {for r in 0..nrows => <tr key={r}>
+                        <th scope="row">{r + 1}</th>
+                        {for c in 0..ncols => {
+                            let cid = formula_grid_id(c, r)
+                            let v = get(vals, cid)
+                            let here = cid == at_id
+                            <td key={c} id={`${id}-${cid}`} data-cell={cid} role="gridcell" aria-selected={here ? "true" : "false"}
+                                class={ui_cls([here && "ui-fgrid-at", type_of(v) == "dec" && "ui-fgrid-num", formula_grid_is_err(v) && "ui-fgrid-err"])}
+                                title={type_of(v) == "dec" ? str(v) : null}
+                                @click={() => { commit(); go(c, r); grid && grid.focus() }}
+                                @dblclick={() => { go(c, r); start(held(cid)) }}>
+                                {here && editing
+                                    ? <input.ui-fgrid-edit type="text" value={draft} autocomplete="off" spellcheck="false" aria-label={`Editing ${cid}`}
+                                             @mount={(el) => { el.focus() }} @input={(e) => { draft = e.value }} @keydown={edit_keys} @blur={commit}/>
+                                    : formula_grid_text(v)}
+                            </td>
+                        }}
+                    </tr>}
+                </tbody>
+            </table>
+        </div>
+        <p.ui-fgrid-hint id={`${id}-said`} role="status">{said != "" ? said : "Arrows move; type or press Enter to edit."}</p>
+        {name != null && <input type="hidden" {name} value={json.stringify(raw)}/>}
+    </div>
+}

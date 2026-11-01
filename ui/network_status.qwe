@@ -1,0 +1,180 @@
+// NetworkStatus: what the phone says about its connection: online or not, the kind of
+// connection, how fast it behaves, and whether the person asked to save data. It follows
+// them as they change, and works out one thing a page can use: whether to treat this as a
+// slow link. iOS and Firefox do not tell a page about the connection at all, only
+// online or offline, and it says so rather than guessing. Nothing is sent to measure it.
+//
+//   <NetworkStatus/>
+//   <NetworkStatus compact={true}/>                     a pill, for a header
+//   <NetworkStatus on_change={(n) => { hd_video = n.plan.video }}/>
+//
+// html[data-slow-link] .hero-video { display: none; }   a page's own rule
+//
+// While the link is slow, or the person saves data, <html> has data-slow-link, so a page
+// can act in CSS alone. compact: only the pill (false). slow_rtt: a delay in milliseconds
+// that counts as slow (800). slow_mbps: a speed in megabits a second that counts as slow
+// (0.7). on_change(info): inside one of your components, called when anything changes,
+// with { online, known, type, effective, downlink, rtt, save_data, slow, why, plan }.
+// known is false where the phone does not say, and then type, effective, downlink and
+// rtt are null and slow is null, not false. slow is true, false or null. why is what
+// made it slow. plan is what a page should fetch: { images: "low" or "full", video:
+// bool, prefetch: bool }. "Online" means a network is there, not that the internet
+// answers: a captive portal is online.
+
+import ui/theme.qwe use ui_cls
+
+let network_status_css = css`
+.ui-netstat { container-type: inline-size; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-netstat-pill { display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px 5px 10px; border-radius: 999px; background: var(--s); font-weight: 500; font-size: 13px;
+  --t: var(--ui-success); --s: var(--ui-success-soft); }
+.ui-netstat-pill[data-state="slow"] { --t: var(--ui-warning); --s: var(--ui-warning-soft); }
+.ui-netstat-pill[data-state="offline"] { --t: var(--ui-danger); --s: var(--ui-danger-soft); }
+.ui-netstat-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--t); }
+.ui-netstat-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 10px 0 0; }
+.ui-netstat-grid > div { padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-netstat-grid dt { color: var(--ui-muted); font-size: 12px; }
+.ui-netstat-grid dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-netstat-say { margin: 8px 0 0; color: var(--ui-muted); font-size: 13px; }
+.ui-netstat-say:empty { display: none; }
+/* A wide pane has room for all four in a row. */
+@container (min-width: 420px) { .ui-netstat-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+`
+
+fn network_status_num(x) = (type_of(x) == "int" || type_of(x) == "float") && math.isfinite(x)
+
+// Only Android's browsers give `type`, and a value like "unknown" says nothing.
+fn network_status_type(t) = ["wifi", "cellular", "ethernet", "bluetooth", "wimax", "none"] | contains(t) ? t : null
+
+fn network_status_effective(t) = ["slow-2g", "2g", "3g", "4g"] | contains(t) ? t : null
+
+// A browser reports 0 for what it has not measured yet.
+fn network_status_measure(x) = network_status_num(x) && x > 0 ? x : null
+
+// Why this link is slow, or "" when it is not. `effective` is the browser's own class,
+// from what it has measured: it is about how the link behaves, not the radio, so "4g"
+// can be on Wi-Fi. 3g is left to the numbers, since a good 3g is fine for most pages.
+fn network_status_why(effective, rtt, downlink, slow_rtt, slow_mbps) {
+    if effective == "slow-2g" || effective == "2g" {
+        "2G speed"
+    } else if rtt != null && rtt >= slow_rtt {
+        "long delays"
+    } else if downlink != null && downlink < slow_mbps {
+        "low bandwidth"
+    } else {
+        ""
+    }
+}
+
+// What a page should fetch on this link. Save-data counts as much as a slow link: the
+// person asked. While offline nothing can be fetched, so nothing should be tried.
+fn network_status_plan(online, slow, save_data) {
+    let lean = slow == true || save_data
+    { images: lean ? "low" : "full", video: online && !lean, prefetch: online && !lean }
+}
+
+// All that is known, in one shape. `conn` is navigator.connection, or null.
+fn network_status_read(online, conn, slow_rtt, slow_mbps) {
+    let known = conn != null && !is_err(conn) && network_status_effective(conn.effectiveType) != null
+    let effective = known ? network_status_effective(conn.effectiveType) : null
+    let downlink = known ? network_status_measure(conn.downlink) : null
+    let rtt = known ? network_status_measure(conn.rtt) : null
+    let save_data = conn != null && !is_err(conn) && conn.saveData == true
+    let why = known ? network_status_why(effective, rtt, downlink, slow_rtt, slow_mbps) : ""
+    let slow = known ? why != "" : null
+    { online: online, known: known, type: known ? network_status_type(conn.type) : null, effective: effective, downlink: downlink,
+      rtt: rtt, save_data: save_data, slow: slow, why: why, plan: network_status_plan(online, slow, save_data) }
+}
+
+// The short word for the pill.
+fn network_status_word(n) {
+    if !n.online {
+        "Offline"
+    } else {
+        let kind = match n.type {
+            "wifi" => "Wi-Fi"
+            "cellular" => "Mobile data"
+            "ethernet" => "Ethernet"
+            "bluetooth" => "Bluetooth"
+            "wimax" => "WiMAX"
+            "none" => "No connection"
+            _ => "Online"
+        }
+        n.slow == true ? `${kind}, slow` : kind
+    }
+}
+
+fn network_status_speed(effective) = match effective {
+    "slow-2g" => "Very slow"
+    "2g" => "Like 2G"
+    "3g" => "Like 3G"
+    "4g" => "Like 4G or better"
+    _ => "Not said"
+}
+
+fn network_status_mbps(x) = x == null ? "Not said" : `${format_number(x, "en-US", 2)} Mb/s`
+
+fn network_status_delay(x) = x == null ? "Not said" : `${format_number(x, "en-US", 0)} ms`
+
+// What goes under the numbers: the limit where the phone does not say comes first, as
+// everything else on the card then depends on it.
+fn network_status_say(n) {
+    if !n.online {
+        "Anything that needs the internet waits until the connection is back."
+    } else if !n.known {
+        "This phone or browser says only whether it is online, not what kind of connection it has or how fast it is."
+    } else if n.slow == true {
+        `Slow link (${n.why}): this page should fetch less.`
+    } else if n.save_data {
+        "The person asked to save data: this page should fetch less."
+    } else {
+        ""
+    }
+}
+
+component NetworkStatus(compact: bool = false, slow_rtt: num = 800, slow_mbps: num = 0.7, on_change = null, class: str? = null) {
+    style global network_status_css
+    state net = network_status_read(true, null, slow_rtt, slow_mbps)
+    state flagged = ""       // what data-slow-link says: "", "slow" or "save-data"
+    let refresh = (_e = null) => {
+        let c = js("navigator.connection")
+        let n = network_status_read(js("navigator.onLine") != false, is_err(c) ? null : c, slow_rtt, slow_mbps)
+        let flag = n.slow == true ? "slow" : (n.save_data ? "save-data" : "")
+        if flag != flagged {
+            flagged = flag
+            let html = js("document.documentElement")
+            if flag != "" { html.setAttribute("data-slow-link", flag) } else { html.removeAttribute("data-slow-link") }
+        }
+        // Assigning an equal map still counts as a change, so this keeps quiet ones out.
+        if str(n) != str(net) {
+            net = n
+            on_change && on_change(n)
+        }
+    }
+    <div class={ui_cls(["ui-netstat", class])} @mount={(_el) => {
+        let w = js("window")
+        let c = js("navigator.connection")
+        w.addEventListener("online", refresh)
+        w.addEventListener("offline", refresh)
+        if !is_err(c) && c != null { c.addEventListener("change", refresh) }
+        refresh()
+        () => {
+            w.removeEventListener("online", refresh)
+            w.removeEventListener("offline", refresh)
+            if !is_err(c) && c != null { c.removeEventListener("change", refresh) }
+            if flagged != "" { js("document.documentElement").removeAttribute("data-slow-link") }
+        }
+    }}>
+        <div role="status">
+            <span.ui-netstat-pill data-state={!net.online ? "offline" : (net.slow == true ? "slow" : "online")}>
+                <span.ui-netstat-dot aria-hidden="true"></span>{network_status_word(net)}
+            </span>
+            {!compact && net.online && net.known && <dl.ui-netstat-grid>
+                <div><dt>Behaves</dt><dd>{network_status_speed(net.effective)}</dd></div>
+                <div><dt>Speed</dt><dd>{network_status_mbps(net.downlink)}</dd></div>
+                <div><dt>Delay</dt><dd>{network_status_delay(net.rtt)}</dd></div>
+                <div><dt>Save data</dt><dd>{net.save_data ? "On" : "Off"}</dd></div>
+            </dl>}
+            {!compact && <p.ui-netstat-say>{network_status_say(net)}</p>}
+        </div>
+    </div>
+}

@@ -1,0 +1,284 @@
+// WelcomeCarousel: the pages of a first run, filling the screen: swiped by finger,
+// with dots, a Skip, Next, and Get started on the last page. It is shown once: when it
+// ends, by either way, that is remembered, and it stays away after that.
+//
+//   <WelcomeCarousel remember="welcome-1" on_done={(how) => { started = true }} pages={[
+//       { art: "M3 11 12 3l9 8M5 9.5V21h14V9.5", title: "Your notes, on your phone", text: "They work with no signal." },
+//       { art: "📍", title: "Know where you were", text: "Each note can keep its place." },
+//       { image: "/first-run/share.png", alt: "Two phones", title: "Share a page", text: "Send a link to anyone." }
+//   ]}/>
+//
+// pages: a list of { title, text, art, image, alt }. art: a character or an emoji, or an
+// SVG path (24x24, stroked) when it starts with "M". image: a picture's address, which
+// art gives way to; alt is its description. remember: the name it is remembered under;
+// null shows it every time. label: what screen readers call it ("Welcome"). fixed: it
+// fills the screen (true); false puts it where it is written, in a box with a height.
+// next_label ("Next"), skip_label ("Skip"), done_label ("Get started"): the buttons.
+// on_done(how): inside one of your components, called once with "finished" or "skipped".
+// on_page(i): called with the page's number, from 0, when it changes.
+//
+// A swipe goes one page: past a quarter of the width, or a quick flick. Vertical
+// movement is left to the page. The dots, the buttons and the arrow keys, Home and End
+// do all the same, for those who do not swipe. It comes up only after the browser has
+// asked whether it was seen, so a person who has seen it never sees it flash by.
+//
+// welcome_carousel_keep(name, text), welcome_carousel_recall(name) and
+// welcome_carousel_forget(name) are how it remembers, for other components: recall
+// gives a Promise, so `js("Promise.resolve", welcome_carousel_recall(name))` in a handler
+// or @mount waits for the text, or null, or an error value. A phone app's page has a new
+// port, so a new origin and an empty localStorage, at each launch; cookies do not go by
+// port, so a value is written to both, and read from the cookie first.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let welcome_carousel_css = css`
+.ui-welcome-carousel-host { display: contents; }
+.ui-welcome-carousel {
+  position: relative; z-index: 60; display: flex; flex-direction: column; box-sizing: border-box; width: 100%; height: 100%; overflow: hidden;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  background: var(--ui-bg); color: var(--ui-fg); font: 16px/1.5 var(--ui-font); container: ui-welcome-carousel / size; overscroll-behavior: contain;
+}
+.ui-welcome-carousel-fixed { position: fixed; inset: 0; width: auto; height: auto; }
+.ui-welcome-carousel-top { display: flex; justify-content: flex-end; flex: none; min-height: 46px; padding: 8px 8px 0; }
+.ui-welcome-carousel-off { visibility: hidden; }
+.ui-welcome-carousel-view { position: relative; flex: 1; min-height: 0; overflow: hidden; touch-action: pan-y; outline: none; }
+.ui-welcome-carousel-view:focus-visible { box-shadow: inset 0 0 0 2px var(--ui-accent); }
+/* The place at rest comes from the box around it, not a style on the track: a drag writes the track's style by hand, and an
+   attribute written from state would be put back whole whenever what it reads changed. */
+.ui-welcome-carousel-track { display: flex; height: 100%; transform: translateX(var(--ui-welcome-carousel-at, 0%)); transition: transform .32s cubic-bezier(.2, .8, .2, 1); will-change: transform; }
+.ui-welcome-carousel-held .ui-welcome-carousel-track { transition: none; }
+.ui-welcome-carousel-held { user-select: none; -webkit-user-select: none; cursor: grabbing; }
+.ui-welcome-carousel-page {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; box-sizing: border-box; flex: 0 0 100%; min-width: 0; height: 100%;
+  padding: 16px 24px; overflow: auto; text-align: center; touch-action: pan-y; /* Not inherited, and a scroller inside would otherwise take a sideways pan. */
+}
+.ui-welcome-carousel-art {
+  display: grid; place-items: center; flex: none; width: 112px; height: 112px; border-radius: 50%; background: var(--ui-accent-soft); color: var(--ui-accent);
+  font-size: 52px; line-height: 1; -webkit-touch-callout: none; user-select: none; -webkit-user-select: none;
+}
+.ui-welcome-carousel-art svg { width: 54px; height: 54px; }
+.ui-welcome-carousel-pic { display: block; flex: 0 1 auto; min-height: 0; max-width: 100%; max-height: 46cqh; border-radius: var(--ui-radius); object-fit: contain; -webkit-touch-callout: none; -webkit-user-drag: none; }
+.ui-welcome-carousel-words { min-width: 0; max-width: 34em; }
+.ui-welcome-carousel-words h2 { margin: 0 0 8px; font-size: 24px; line-height: 1.25; }
+.ui-welcome-carousel-words p { margin: 0; color: var(--ui-muted); }
+.ui-welcome-carousel-foot { display: grid; gap: 8px; flex: none; padding: 0 20px 16px; }
+.ui-welcome-carousel-dots { display: flex; flex-wrap: wrap; justify-content: center; }
+.ui-welcome-carousel-dot { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; cursor: pointer; }
+.ui-welcome-carousel-dot::before { content: ""; width: 9px; height: 9px; border-radius: 999px; background: var(--ui-strong); transition: width .2s, background .2s; }
+.ui-welcome-carousel-dot[aria-current="true"]::before { width: 22px; background: var(--ui-accent); }
+.ui-welcome-carousel-dot:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-welcome-carousel-dot:hover::before { background: var(--ui-muted); } }
+/* A tablet, or a phone on its side: the picture beside the words, not a long way above them. */
+@container ui-welcome-carousel (min-width: 600px) {
+  .ui-welcome-carousel-page { flex-direction: row; gap: 48px; padding: 16px 64px; text-align: start; }
+  .ui-welcome-carousel-art { width: 180px; height: 180px; font-size: 84px; }
+  .ui-welcome-carousel-art svg { width: 86px; height: 86px; }
+  .ui-welcome-carousel-pic { max-width: 48%; max-height: 80cqh; }
+  .ui-welcome-carousel-words h2 { font-size: 30px; }
+  .ui-welcome-carousel-foot { grid-template-columns: 1fr minmax(220px, 300px); align-items: center; padding: 0 64px 20px; }
+  .ui-welcome-carousel-dots { justify-content: flex-start; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-welcome-carousel-track, .ui-welcome-carousel-dot::before { transition: none; } }
+`
+
+// The page a swipe lands on: `dx` pixels along, at `speed` pixels a millisecond, in a
+// box `width` wide. Forward is to the left, so `sign` is -1 where pages run right to left.
+fn welcome_carousel_settle(at: int, count: int, dx: num, speed: num, width: num, sign: int = 1) -> int {
+    let far = abs(dx) >= width * 0.25
+    let flick = abs(dx) >= 12 && abs(speed) >= 0.45 && (speed < 0) == (dx < 0)
+    if !far && !flick { return at }
+    let to = dx * sign < 0 ? at + 1 : at - 1
+    max([0, min([to, count - 1])])
+}
+
+// How far the track moves for a finger `dx` along: a third as far past either end.
+fn welcome_carousel_rubber(at: int, count: int, dx: num, sign: int = 1) -> num {
+    let beyond = (at == 0 && dx * sign > 0) || (at == count - 1 && dx * sign < 0)
+    beyond ? dx / 3 : dx
+}
+
+// The value of cookie `name` in document.cookie's text, as written, or null.
+fn welcome_carousel_crumb(cookies: str?, name: str) -> str? {
+    let want = `${url_encode(name)}=`
+    let hit = split(cookies ?? "", ";") | map((c) => trim(c)) | filter((c) => starts_with(c, want))
+    len(hit) > 0 ? slice(hit[0], len(want)) : null
+}
+
+// A Promise of what was kept under `name`. In a Promise, as localStorage throws where it
+// is blocked, and a throw in a handler stops the handler.
+fn welcome_carousel_recall(name: str) =
+    js("Promise.resolve", js_new("Promise", (done) => {
+        let crumb = welcome_carousel_crumb(js("document.cookie"), name)
+        done(crumb != null ? js("decodeURIComponent", crumb) : js("localStorage.getItem", name))
+    }))
+
+// The cookie is for a phone app's next launch (see above); it lasts 400 days, the most a
+// browser allows.
+fn welcome_carousel_keep(name: str, text: str) {
+    let d = js("document")
+    d.cookie = `${url_encode(name)}=${url_encode(text)}; max-age=34560000; path=/; samesite=lax`
+    js_new("Promise", (done) => { done(js("localStorage.setItem", name, text) ?? true) }).catch((_e = null) => null)
+}
+
+fn welcome_carousel_forget(name: str) {
+    let d = js("document")
+    d.cookie = `${url_encode(name)}=; max-age=0; path=/; samesite=lax`
+    js_new("Promise", (done) => { done(js("localStorage.removeItem", name) ?? true) }).catch((_e = null) => null)
+}
+
+view WelcomeCarouselArt(page) {
+    let art = get(page, "art")
+    let image = get(page, "image")
+    image != null
+        ? <img.ui-welcome-carousel-pic src={image} alt={get(page, "alt") ?? ""} draggable="false"/>
+        : art != null && <div.ui-welcome-carousel-art aria-hidden="true">
+            {starts_with(art, "M") && len(art) > 2
+                ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                       stroke-linejoin="round"><path d={art}/></svg>
+                : art}
+        </div>
+}
+
+component WelcomeCarousel(pages: list = [], remember: str? = null, label: str = "Welcome", fixed: bool = true,
+                          next_label: str = "Next", skip_label: str = "Skip", done_label: str = "Get started",
+                          on_done = null, on_page = null, class: str? = null) {
+    style global welcome_carousel_css
+    state show = remember == null
+    state at = 0
+    state sign = 1          // -1 where pages run right to left
+    state view_el = null
+    state track = null
+    state held = false
+    // The finger, between one event and the next: plain variables, as nothing shows them.
+    let finger = null       // its pointer's id, while it may be a swipe
+    let axis = ""           // "x" once it is one
+    let x0 = 0
+    let y0 = 0
+    let last_x = 0
+    let last_t = 0
+    let speed = 0
+    let n = len(pages)
+    let go = (i: int) => {
+        // Nothing but the finger's own release turns a page while a finger is on it.
+        if !held {
+            let to = max([0, min([i, n - 1])])
+            if to != at {
+                at = to
+                on_page && on_page(to)
+            }
+            if track != null { track.style.transform = "" }
+        }
+    }
+    let end = (how: str) => {
+        if show {
+            show = false
+            if remember != null { welcome_carousel_keep(remember, "1") }
+            on_done && on_done(how)
+        }
+    }
+    let let_go = () => {
+        finger = null
+        axis = ""
+        held = false
+    }
+    <div.ui-welcome-carousel-host
+         @mount={(el) => {
+             if remember != null {
+                 let seen = js("Promise.resolve", welcome_carousel_recall(remember))
+                 show = is_err(seen) || seen != "1"
+             }
+             if js("getComputedStyle", el).direction == "rtl" { sign = -1 }
+         }}>
+        {show && n > 0 && <section class={ui_cls(["ui-welcome-carousel", fixed && "ui-welcome-carousel-fixed", held && "ui-welcome-carousel-held", class])}
+                 aria-roledescription="carousel" aria-label={label}
+                 @keydown={(e) => {
+                     let forward = sign == 1 ? "ArrowRight" : "ArrowLeft"
+                     let back = sign == 1 ? "ArrowLeft" : "ArrowRight"
+                     if e.key == forward { e.preventDefault(); go(at + 1) }
+                     if e.key == back { e.preventDefault(); go(at - 1) }
+                     if e.key == "Home" { e.preventDefault(); go(0) }
+                     if e.key == "End" { e.preventDefault(); go(n - 1) }
+                 }}>
+            <div.ui-welcome-carousel-top>
+                <Button variant="ghost" tone="neutral" size="lg" class={at == n - 1 ? "ui-welcome-carousel-off" : null}
+                        on_click={() => { end("skipped") }}>{skip_label}</Button>
+            </div>
+            <div.ui-welcome-carousel-view tabindex="0" aria-label={`Page ${at + 1} of ${n}. The arrow keys change it.`}
+                 style={`--ui-welcome-carousel-at: ${-at * 100 * sign}%`}
+                 @mount={(el) => { view_el = el }}
+                 @pointerdown={(e) => {
+                     if finger == null && e.button == 0 {
+                         finger = e.pointerId
+                         axis = ""
+                         x0 = e.clientX
+                         y0 = e.clientY
+                         last_x = e.clientX
+                         last_t = e.timeStamp
+                         speed = 0
+                     }
+                 }}
+                 @pointermove={(e) => {
+                     if e.pointerId == finger {
+                         let dx = e.clientX - x0
+                         let dy = e.clientY - y0
+                         // Nothing is decided until it has moved 8 px; then the larger way wins for good.
+                         if axis == "" && max([abs(dx), abs(dy)]) >= 8 {
+                             if abs(dx) > abs(dy) {
+                                 axis = "x"
+                                 held = true
+                                 view_el.setPointerCapture(e.pointerId)
+                             } else {
+                                 finger = null
+                             }
+                         }
+                         if axis == "x" {
+                             let gap = e.timeStamp - last_t
+                             if gap > 0 { speed = speed * 0.4 + (e.clientX - last_x) / gap * 0.6 }
+                             last_x = e.clientX
+                             last_t = e.timeStamp
+                             track.style.transform = `translateX(calc(${-at * 100 * sign}% + ${welcome_carousel_rubber(at, n, dx, sign)}px))`
+                         }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     if e.pointerId == finger {
+                         let swiped = axis == "x"
+                         let dx = e.clientX - x0
+                         // A finger resting at the end of a swipe has no speed left.
+                         let still = e.timeStamp - last_t > 80
+                         let_go()
+                         if swiped { go(welcome_carousel_settle(at, n, dx, still ? 0 : speed, view_el.clientWidth, sign)) }
+                     }
+                 }}
+                 @pointercancel={(e) => {
+                     // The system took the gesture: back where it was, as a short swipe.
+                     if e.pointerId == finger {
+                         let_go()
+                         go(at)
+                     }
+                 }}>
+                <div.ui-welcome-carousel-track @mount={(el) => { track = el }}>
+                    {for [i, p] in enumerate(pages) =>
+                        <article.ui-welcome-carousel-page key={i} aria-hidden={i == at ? null : "true"} inert={i != at}>
+                            <WelcomeCarouselArt page={p}/>
+                            <div.ui-welcome-carousel-words>
+                                <h2>{get(p, "title") ?? ""}</h2>
+                                {get(p, "text") != null && <p>{p.text}</p>}
+                            </div>
+                        </article>}
+                </div>
+            </div>
+            <span.ui-sr aria-live="polite">Page {at + 1} of {n}: {get(pages[min([at, n - 1])], "title") ?? ""}</span>
+            <div.ui-welcome-carousel-foot>
+                <div.ui-welcome-carousel-dots>
+                    {for i in range(0, n) =>
+                        <button.ui-welcome-carousel-dot key={i} type="button" aria-label={`Page ${i + 1} of ${n}`}
+                                aria-current={i == at ? "true" : "false"} @click={() => { go(i) }}></button>}
+                </div>
+                {/* One button, not two swapped: a finger resting on Next while a swipe lands on the last page would lift on Get started. */}
+                <Button size="lg" full={true} on_click={() => { if at == n - 1 { end("finished") } else { go(at + 1) } }}>{at == n - 1 ? done_label : next_label}</Button>
+            </div>
+        </section>}
+    </div>
+}

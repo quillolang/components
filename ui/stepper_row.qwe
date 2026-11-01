@@ -1,0 +1,237 @@
+// StepperRow: a row of a form with a minus and a plus, for a number of something: guests,
+// tickets, a dose. The buttons are big enough for a thumb; hold one and it repeats, faster
+// the longer it is held; the number can be typed too. It stops at its limits and says
+// so, and a screen reader hears it as a spin button with its smallest and largest.
+//
+//   <StepperRow label="Adults" name="adults" value={2} least={1} most={9}/>
+//   <StepperRow label="Dose" hint="Up to 2.5 ml" unit="ml" value={0.5} least={0} most={2.5} step={0.25} on_change={(n) => { dose = n }}/>
+//
+// value: the number, and it moves when this changes. least, most: the limits (none). step: what
+// a press adds (1); decimal places come from it, so 0.25 reads 0.50 and 1.75. label: what it
+// counts. hint: a line under the label. unit: after the number, for reading. name: makes
+// the field a form's. typed: false keeps people to the buttons. disabled, field (the
+// id), class as for every field. on_change(number): inside one of your components, given
+// the number after a tap, when a hold ends and when typing is done, not on every repeat.
+//
+// Keys, in the field: arrows step, Page Up and Page Down ten steps, Home and End go to the
+// limits. Text that is no number goes back to what it was; a number past a limit stops
+// at the limit and says so; a comma counts as the point.
+// On a wide container (440 px and up) the hint stands beside the label.
+//
+// stepper_row_places, stepper_row_add, stepper_row_text, stepper_row_read, stepper_row_range
+// and stepper_row_rate are the logic.
+
+import ui/theme.qwe use ui_cls
+
+let stepper_row_css = css`
+.ui-stepper-row { container-type: inline-size; min-width: 0; font: 16px/1.35 var(--ui-font); color: var(--ui-fg); }
+.ui-stepper-row-body { display: flex; align-items: center; gap: 12px; min-height: 60px; min-width: 0; }
+.ui-stepper-row-words { flex: 1; display: grid; min-width: 0; }
+.ui-stepper-row-label { font-weight: 500; }
+.ui-stepper-row-hint { font-size: 13px; color: var(--ui-muted); }
+.ui-stepper-row-box { flex: none; display: flex; align-items: center; gap: 4px; }
+.ui-stepper-row-btn {
+  display: grid; place-items: center; width: 48px; height: 48px; margin: 0; padding: 0; border: 1px solid var(--ui-border); border-radius: 50%;
+  background: var(--ui-surface); color: var(--ui-accent); cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.ui-stepper-row-btn svg { width: 22px; height: 22px; }
+.ui-stepper-row-btn:active { background: var(--ui-subtle); }
+.ui-stepper-row-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-stepper-row-btn[aria-disabled="true"] { color: var(--ui-muted); opacity: .5; cursor: not-allowed; }
+.ui-stepper-row-value {
+  box-sizing: border-box; width: 72px; height: 48px; margin: 0; padding: 0 2px; border: 1px solid transparent; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-fg); font: 600 18px var(--ui-font); text-align: center; font-variant-numeric: tabular-nums;
+}
+.ui-stepper-row-value:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-stepper-row-value[readonly] { cursor: default; }
+/* The unit sits inside the number's own width, so rows with and without one line up. */
+.ui-stepper-row-num { position: relative; display: block; }
+.ui-stepper-row-unit { position: absolute; inset: auto 0 1px; font-size: 11px; line-height: 1; text-align: center; color: var(--ui-muted); pointer-events: none; }
+.ui-stepper-row-united .ui-stepper-row-value { padding-bottom: 9px; }
+@media (hover: hover) { .ui-stepper-row-btn:hover:not([aria-disabled="true"]) { border-color: var(--ui-accent); } }
+@container (min-width: 440px) {
+  .ui-stepper-row-words { display: flex; align-items: baseline; gap: 14px; }
+  .ui-stepper-row-value { width: 96px; }
+}
+`
+
+// How many decimals a step has.
+fn stepper_row_places(step) -> int {
+    let parts = split(str(step), ".")
+    len(parts) > 1 && parts[1] != "0" ? min([len(parts[1]), 6]) : 0
+}
+
+// The number kept inside its limits.
+fn stepper_row_keep(n: num, least, most) -> num {
+    let a = least != null && n < least ? least : n
+    most != null && a > most ? most : a
+}
+
+// `n` plus `times` steps, inside the limits. Rounded, as 0.1 + 0.2 is not 0.3 in floats.
+fn stepper_row_add(n: num, step: num, times: int, least, most) -> num =
+    stepper_row_keep(round(n + step * times, stepper_row_places(step)), least, most)
+
+// The number with its step's decimals: 1.5 by 0.25 is "1.50".
+fn stepper_row_text(n: num, places: int) -> str {
+    if places == 0 { return str(round(n)) }
+    let parts = split(str(round(n, places)), ".")
+    let frac = len(parts) > 1 ? parts[1] : ""
+    `${parts[0]}.${frac}${join(range(max([0, places - len(frac)])) | map((_i) => "0"), "")}`
+}
+
+// A typed number, or null. A comma counts as the point, and no more digits than a
+// number holds exactly.
+fn stepper_row_read(text: str) {
+    let t = re.replace(trim(text), ",", ".")
+    if !re.test(t, "^-?[0-9]{1,12}([.][0-9]{1,6})?$") { return null }
+    float(t)
+}
+
+// What a screen reader is told of the limits.
+fn stepper_row_range(least, most, places: int) -> str {
+    let a = least != null ? stepper_row_text(least, places) : null
+    let b = most != null ? stepper_row_text(most, places) : null
+    a != null && b != null ? `From ${a} to ${b}.` : a != null ? `At least ${a}.` : b != null ? `At most ${b}.` : ""
+}
+
+// The wait before the next repeat, in ms, after `done` repeats: slow to fast.
+fn stepper_row_rate(done: int) -> int = done < 3 ? 220 : done < 8 ? 120 : done < 20 ? 60 : 30
+
+// How many steps one repeat is: past 40 repeats a long range goes by fives, then by tens.
+fn stepper_row_stride(done: int) -> int = done < 40 ? 1 : done < 80 ? 5 : 10
+
+component StepperRow(value: num = 0, least: num? = null, most: num? = null, step: num = 1, label: str = "Number", hint: str? = null, unit: str? = null,
+                     name: str? = null, typed: bool = true, disabled: bool = false, field: str? = null, on_change = null, class: str? = null) {
+    style global stepper_row_css
+    let places = stepper_row_places(step)
+    let start = stepper_row_keep(value, least, most)
+    state now = start
+    state seen = start
+    state draft = null          // what is being typed, while it is
+    state holding = 0           // 1 or -1 while a button is held
+    state rate = 420
+    state done = 0
+    state said = ""
+    if start != seen {
+        seen = start
+        now = start
+    }
+    let id = field ?? `stepper-row-${re.replace(lower(label), "[^a-z0-9]+", "-")}`
+    let shown = draft ?? stepper_row_text(now, places)
+    let at_least = least != null && now <= least
+    let at_most = most != null && now >= most
+    let tell_limit = (n: num) => {
+        said = least != null && n <= least ? `${stepper_row_text(least, places)} is the least.`
+             : most != null && n >= most ? `${stepper_row_text(most, places)} is the most.` : ""
+    }
+    let change = (n: num, silent: bool = false) => {
+        let moved = n != now
+        now = n
+        tell_limit(n)
+        if moved && !silent { on_change && on_change(n) }
+    }
+    let press = (way: int, times: int = 1) => {
+        draft = null
+        change(stepper_row_add(now, step, way * times, least, most))
+    }
+    let tick = () => {
+        let next = stepper_row_add(now, step, holding * stepper_row_stride(done), least, most)
+        done += 1
+        rate = stepper_row_rate(done)
+        if next == now { holding = 0 } else { change(next, true) }
+    }
+    if holding != 0 { every(rate, tick) }
+    let let_go = () => { holding = 0 }
+    // The system took the finger: no click will come, so say where it got to here.
+    let lost = () => {
+        holding = 0
+        if done > 0 {
+            done = 0
+            on_change && on_change(now)
+        }
+    }
+    let hold = (e, way: int) => {
+        if e.button == 0 && !disabled {
+            e.target.closest("button").setPointerCapture(e.pointerId)
+            draft = null
+            done = 0
+            rate = 420
+            holding = way
+        }
+    }
+    // A tap is one step, from click, so a keyboard and a screen reader are the same as a
+    // finger; a click that ends a hold has done its work, and only says the end of it.
+    let clicked = (e, way: int) => {
+        if done == 0 || e.detail == 0 {
+            press(way)
+        } else {
+            on_change && on_change(now)
+        }
+        done = 0
+    }
+    let commit = (text: str) => {
+        draft = null
+        let n = stepper_row_read(text)
+        if n != null { change(stepper_row_keep(round(n, places), least, most)) }
+    }
+    <div class={ui_cls(["ui-stepper-row", class])}>
+        <div.ui-stepper-row-body>
+            <div.ui-stepper-row-words>
+                <label.ui-stepper-row-label for={id}>{label}</label>
+                {hint != null && <span.ui-stepper-row-hint>{hint}</span>}
+            </div>
+            <div class={ui_cls(["ui-stepper-row-box", unit != null && "ui-stepper-row-united"])}>
+                <button.ui-stepper-row-btn type="button" aria-label={`Less ${label}`} aria-controls={id} disabled={disabled} aria-disabled={at_least ? "true" : null}
+                        @pointerdown={(e) => { hold(e, -1) }} @pointerup={let_go} @pointercancel={lost}
+                        @contextmenu={(e) => { e.preventDefault() }} @click={(e) => { clicked(e, -1) }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14"/></svg>
+                </button>
+                <span.ui-stepper-row-num>
+                <input.ui-stepper-row-value id={id} name={name} type="text" inputmode={places > 0 || (least != null && least < 0) ? "decimal" : "numeric"}
+                       role="spinbutton" autocomplete="off" enterkeyhint="done" readonly={!typed} disabled={disabled} value={shown}
+                       aria-valuenow={now} aria-valuemin={least} aria-valuemax={most} aria-valuetext={unit != null ? `${stepper_row_text(now, places)} ${unit}` : null}
+                       aria-describedby={`${id}-range`}
+                       @input={(e) => { draft = e.value }}
+                       @focus={(e) => { e.target.select() }}
+                       @blur={(e) => { if draft != null { commit(e.target.value) } }}
+                       @keydown={(e) => {
+                           if e.key == "Enter" {
+                               e.preventDefault()
+                               e.target.blur()
+                           }
+                           let by = match e.key {
+                               "ArrowUp" => 1
+                               "ArrowDown" => -1
+                               "PageUp" => 10
+                               "PageDown" => -10
+                               _ => 0
+                           }
+                           if by != 0 {
+                               e.preventDefault()
+                               press(by > 0 ? 1 : -1, abs(by))
+                           }
+                           if e.key == "Home" && least != null {
+                               e.preventDefault()
+                               draft = null
+                               change(least)
+                           }
+                           if e.key == "End" && most != null {
+                               e.preventDefault()
+                               draft = null
+                               change(most)
+                           }
+                       }}/>
+                {unit != null && <span.ui-stepper-row-unit aria-hidden="true">{unit}</span>}
+                </span>
+                <button.ui-stepper-row-btn type="button" aria-label={`More ${label}`} aria-controls={id} disabled={disabled} aria-disabled={at_most ? "true" : null}
+                        @pointerdown={(e) => { hold(e, 1) }} @pointerup={let_go} @pointercancel={lost}
+                        @contextmenu={(e) => { e.preventDefault() }} @click={(e) => { clicked(e, 1) }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14M12 5v14"/></svg>
+                </button>
+            </div>
+        </div>
+        <span.ui-sr id={`${id}-range`}>{stepper_row_range(least, most, places)}</span>
+        <span.ui-sr aria-live="polite">{said}</span>
+    </div>
+}

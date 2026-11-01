@@ -1,0 +1,277 @@
+// PullDownMenu: a menu that comes out of a header when a finger pulls down on it. Keep the
+// finger down, slide to an item and let go: one movement, without looking for a button.
+// Pulled less than the distance it springs back. Pulled far enough and let go anywhere
+// but on an item, it stays open for a tap. On a tablet, or in any pane 600 px wide or more,
+// it is a small menu at the header's right end and not a band across it.
+//
+//   import ui/pull_down_menu.qwe use PullDownMenu
+//
+//   <PullDownMenu label="Inbox" items={[{ label: "New message", value: "new" }, "Mark all read",
+//                 { label: "Empty trash", value: "trash", destructive: true }]}
+//                 on_pick={(what) => { run(what) }}>
+//       <h1>Inbox</h1>
+//   </PullDownMenu>
+//
+// children: the header, which is what is pulled. items: a list of maps or plain text, as
+// for ActionSheet: label, value, destructive, disabled. label: what the menu is called, for
+// screen readers ("Menu"). pull: how far, in pixels, it must be pulled to open (56).
+// on_pick(value): called with the item's value. on_open(), on_close(): when it opens and
+// when it closes, however it does.
+//
+// The equal of the gesture is the arrow button in the header: Enter or a tap opens the
+// menu, Up and Down move in it, Enter chooses, and Escape or a tap away closes it, with focus
+// back on the button. The parent needs room below the header: it is not clipped by the
+// page, but an element around it with overflow hidden would cut it.
+
+import ui/action_sheet.qwe use action_sheet_rows, action_sheet_step
+import ui/bottom_sheet.qwe use bottom_sheet_track, bottom_sheet_track_move, bottom_sheet_rubber, bottom_sheet_haptic
+
+let pull_down_menu_css = css`
+.ui-pull-down-menu { position: relative; container-type: inline-size; container-name: ui-pull-down-menu; }
+.ui-pull-down-menu-head {
+  position: relative; z-index: 2; display: flex; align-items: center; gap: 8px; min-height: 56px; padding: 0 4px 0 16px;
+  border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); color: var(--ui-fg); font: 15px/1.4 var(--ui-font);
+  /* Sideways stays the page's, and on browsers that know pan-down, so does a push upward. iOS does not, and keeps the first. */
+  touch-action: pan-x; touch-action: pan-x pan-down; -webkit-touch-callout: none; user-select: none;
+}
+.ui-pull-down-menu-title { flex: 1; min-width: 0; }
+.ui-pull-down-menu-title > :first-child { margin-top: 0; }
+.ui-pull-down-menu-title > :last-child { margin-bottom: 0; }
+.ui-pull-down-menu-button {
+  display: grid; place-items: center; flex: none; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); cursor: pointer; touch-action: inherit;
+}
+@media (hover: hover) { .ui-pull-down-menu-button:hover { background: var(--ui-subtle); color: var(--ui-fg); } }
+.ui-pull-down-menu-button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-pull-down-menu-button svg { width: 20px; height: 20px; transition: transform .2s; }
+.ui-pull-down-menu-showing .ui-pull-down-menu-button svg { transform: rotate(180deg); }
+.ui-pull-down-menu-panel {
+  position: absolute; inset: 100% 0 auto 0; z-index: 1; max-height: 70dvh; overflow: auto; border-radius: 0 0 calc(var(--ui-radius) + 4px) calc(var(--ui-radius) + 4px);
+  background: var(--ui-surface); box-shadow: var(--ui-shadow-lg); opacity: 0; pointer-events: none; transform: translateY(-12px);
+  transition: transform .22s cubic-bezier(.22, 1, .36, 1), opacity .16s; overscroll-behavior: contain;
+}
+.ui-pull-down-menu-showing .ui-pull-down-menu-panel { opacity: 1; pointer-events: auto; transform: none; }
+.ui-pull-down-menu-row {
+  display: block; box-sizing: border-box; width: 100%; min-height: 50px; padding: 8px 16px; border: 0; background: transparent; color: var(--ui-fg);
+  font: 16px/1.3 var(--ui-font); text-align: left; cursor: pointer;
+}
+.ui-pull-down-menu-row + .ui-pull-down-menu-row { border-top: 1px solid var(--ui-border); }
+.ui-pull-down-menu-danger { color: var(--ui-danger); }
+.ui-pull-down-menu-row:disabled { color: var(--ui-muted); opacity: .6; cursor: not-allowed; }
+.ui-pull-down-menu-over, .ui-pull-down-menu-row:active:not(:disabled) { background: var(--ui-subtle); }
+@media (hover: hover) { .ui-pull-down-menu-row:hover:not(:disabled) { background: var(--ui-subtle); } }
+.ui-pull-down-menu-row:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: -2px; }
+@container ui-pull-down-menu (min-width: 600px) {
+  .ui-pull-down-menu-panel { inset: calc(100% + 6px) 8px auto auto; width: 300px; border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 4px); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-pull-down-menu-panel, .ui-pull-down-menu-button svg { transition: none; } }
+`
+
+// Which row a finger at `y` is on, given where each row starts and where the last ends.
+// -1 above or below them, and on a row that cannot be chosen.
+fn pull_down_menu_row_at(tops, end: num, y: num, rows) {
+    let count = len(tops)
+    if count == 0 || y < tops[0] || y >= end { return -1 }
+    let found = -1
+    for i in range(count) {
+        if y >= tops[i] { found = i }
+    }
+    found >= 0 && !rows[found].disabled ? found : -1
+}
+
+// The rows' elements, as a list.
+fn pull_down_menu_list(panel) {
+    let found = panel.querySelectorAll(".ui-pull-down-menu-row")
+    range(found.length) | map((i) => found[i])
+}
+
+// Where an element is among the rows, or -1. By isSameNode: `==` on elements says nothing.
+fn pull_down_menu_place(panel, el) {
+    let els = pull_down_menu_list(panel)
+    let found = -1
+    for i in range(len(els)) {
+        if els[i].isSameNode(el) { found = i }
+    }
+    found
+}
+
+fn pull_down_menu_row_class(r, is_over: bool) {
+    let danger = r.destructive ? " ui-pull-down-menu-danger" : ""
+    let lit = is_over ? " ui-pull-down-menu-over" : ""
+    `ui-pull-down-menu-row${danger}${lit}`
+}
+
+component PullDownMenu(items = [], label: str = "Menu", pull: int = 56, on_pick = null, on_open = null, on_close = null, children) {
+    style global pull_down_menu_css
+    let rows = action_sheet_rows(items)
+    state root = null
+    state head = null
+    state panel = null
+    state button = null
+    state win = null
+    state phase = "closed"      // "pulling", with a finger pulling it out, or "open"
+    state armed = false         // pulled far enough
+    state over = -1             // the row under the finger
+    state track = null
+    state pulling = false
+    state tops = []
+    state bottom = 0
+    let is_shown = phase != "closed"
+    let spring = () => {
+        head.style.removeProperty("transform")
+        head.style.removeProperty("transition")
+        panel.style.removeProperty("transform")
+        panel.style.removeProperty("opacity")
+        panel.style.removeProperty("transition")
+    }
+    let close = () => {
+        if phase != "closed" {
+            phase = "closed"
+            armed = false
+            over = -1
+            spring()
+            on_close && on_close()
+        }
+    }
+    let settle_open = () => {
+        phase = "open"
+        spring()
+        on_open && on_open()
+    }
+    let measure = () => {
+        let els = pull_down_menu_list(panel)
+        tops = els | map((el) => el.getBoundingClientRect().top)
+        bottom = len(els) > 0 ? els[len(els) - 1].getBoundingClientRect().bottom : 0
+    }
+    let moving = (e) => {
+        if track != null {
+            track = bottom_sheet_track_move(track, e.clientX, e.clientY, e.timeStamp)
+            if track.lock == "x" && !pulling { track = null }
+            if track != null && track.lock == "y" {
+                let dy = track.y - track.y0
+                if !pulling {
+                    if dy <= 0 {
+                        track = null
+                    } else {
+                        pulling = true
+                        head.setPointerCapture(e.pointerId)
+                        phase = "pulling"
+                        over = -1
+                        panel.style.transition = "none"
+                        measure()
+                    }
+                }
+                if pulling {
+                    // The header gives a little, and the menu comes out with the finger.
+                    let shown = min([1, max([0, dy]) / pull])
+                    let lit = dy >= pull
+                    head.style.transition = "none"
+                    head.style.transform = `translateY(${bottom_sheet_rubber(dy, 14)}px)`
+                    panel.style.opacity = str(round(shown, 3))
+                    panel.style.transform = `translateY(${round((shown - 1) * 12, 2)}px)`
+                    armed = lit
+                    let i = lit ? pull_down_menu_row_at(tops, bottom, e.clientY, rows) : -1
+                    if i != over {
+                        over = i
+                        if i >= 0 { bottom_sheet_haptic(win, "selection") }
+                    }
+                }
+            }
+        }
+    }
+    let ended = () => {
+        let was_pulling = pulling
+        let chosen = over
+        let far = armed
+        track = null
+        pulling = false
+        if was_pulling {
+            if chosen >= 0 {
+                let r = rows[chosen]
+                close()
+                on_pick && on_pick(r.value)
+            } else {
+                if far { settle_open() } else { close() }
+            }
+        }
+    }
+    let cancelled = () => {
+        track = null
+        if pulling {
+            pulling = false
+            close()
+        }
+    }
+    let pick = (r) => {
+        close()
+        button.focus()
+        on_pick && on_pick(r.value)
+    }
+    let focus_row = (i: int) => {
+        let els = panel.querySelectorAll(".ui-pull-down-menu-row")
+        if i >= 0 { els[i].focus() }
+    }
+    <div class={is_shown ? "ui-pull-down-menu ui-pull-down-menu-showing" : "ui-pull-down-menu"}
+         @mount={(el) => {
+             win = js("window")
+             root = el
+             // Capturing, to hear of a tap whatever it lands on, and open or not, as one
+             // listener a menu costs nothing and needs no way to remove itself.
+             let outside = (e) => {
+                 if phase == "open" && !root.contains(e.target) { close() }
+             }
+             win.document.addEventListener("pointerdown", outside, true)
+             () => { win.document.removeEventListener("pointerdown", outside, true) }
+         }}
+         @keydown={(e) => {
+             if e.key == "Escape" && phase == "open" {
+                 close()
+                 button.focus()
+             }
+             if phase == "open" && (e.key == "ArrowDown" || e.key == "ArrowUp") {
+                 e.preventDefault()
+                 let here = pull_down_menu_place(panel, win.document.activeElement)
+                 focus_row(action_sheet_step(rows, here < 0 && e.key == "ArrowUp" ? 0 : here, e.key == "ArrowDown" ? 1 : -1))
+             }
+         }}
+         @focusout={(e) => {
+             // Tabbed out of it.
+             if phase == "open" && e.relatedTarget != null && !root.contains(e.relatedTarget) { close() }
+         }}>
+        <div.ui-pull-down-menu-head
+             @mount={(el) => { head = el }}
+             @pointerdown={(e) => {
+                 if e.button == 0 && phase == "closed" && e.target.closest(".ui-pull-down-menu-button") == null {
+                     track = bottom_sheet_track(e.clientX, e.clientY, e.timeStamp)
+                 }
+             }}
+             @pointermove={moving}
+             @pointerup={ended}
+             @pointercancel={cancelled}
+             @touchmove={(e) => {
+                 if pulling && e.cancelable { e.preventDefault() }
+             }}>
+            <div.ui-pull-down-menu-title>{children}</div>
+            <button.ui-pull-down-menu-button type="button" aria-label={label} aria-haspopup="menu" aria-expanded={is_shown ? "true" : "false"}
+                    @mount={(el) => { button = el }}
+                    @click={() => {
+                        if phase == "open" {
+                            close()
+                        } else {
+                            settle_open()
+                            // The page updates after this handler, and an inert row takes no focus.
+                            panel.inert = false
+                            focus_row(action_sheet_step(rows, -1, 1))
+                        }
+                    }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+            </button>
+        </div>
+        <div.ui-pull-down-menu-panel role="menu" aria-label={label} inert={!is_shown}
+             @mount={(el) => { panel = el }}>
+            {for [i, r] in enumerate(rows) =>
+                <button key={r.label} type="button" role="menuitem" class={pull_down_menu_row_class(r, i == over)}
+                        disabled={r.disabled} @click={() => pick(r)}>{r.label}</button>}
+        </div>
+    </div>
+}

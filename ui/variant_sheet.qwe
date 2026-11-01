@@ -1,0 +1,248 @@
+// VariantSheet: pick a size and a colour, or any options, in a sheet, with what is in
+// stock worked out for each combination. An option that cannot be had is marked with why
+// beside it: not made in that colour, sold out in that size, sold out everywhere, back on
+// a date. Tapping one sold out only with the current choice takes it and clears the choice
+// it clashes with, so nobody is stuck; one that cannot be had at all says why and stays
+// unpicked. They are real radio buttons, so the arrow keys and screen readers work. On a
+// tablet it is a dialog with the picture beside the options.
+//
+//   import ui/variant_sheet.qwe use VariantSheet
+//
+//   <VariantSheet title="Linen shirt" price="48.00"
+//                 options={[{ key: "size", label: "Size", values: ["S", "M", "L"] },
+//                           { key: "colour", label: "Colour", values: [{ value: "Sand", swatch: "#d8c7a8" }, { value: "Navy", swatch: "#1f2a44" }] }]}
+//                 stock={[{ size: "S", colour: "Sand", qty: 4 }, { size: "M", colour: "Navy", qty: 0, due: "2026-12-12" }]}
+//                 on_pick={(row) => { add_to_cart(row) }}/>
+//
+// options: what to choose, in order: key (a field of a stock row), label, and values, each
+// text, or { value, label, swatch } with swatch a CSS colour. stock: one row for each
+// combination there is: the options' fields, qty, and if it differs price, or due (a date
+// it is back, "2026-12-12"). A combination with no row is not made. title: the heading
+// and what it is. image: a picture's address. price: what it costs where a row names none.
+// currency ("USD"), locale. low: at this many or fewer it says how few are left (3). picks:
+// the choices to start from, { size: "M" }. trigger: the text of a button that opens it
+// ("Choose options"; null for none, then open it by open={...} and on_close()). confirm:
+// the words on the button ("Add to cart"). id: a prefix for its ids, unique on the page, and
+// the radio buttons' group ("ui-varsh"). on_pick(row): at the button, the stock row with
+// its price. on_change(picks): after each choice.
+//
+// variant_sheet_look(options, stock, picks, key, value) says what one option is now, and
+// variant_sheet_row(options, stock, picks) finds the row of a whole choice.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/price.qwe use price_text
+import ui/cart_sheet.qwe use CartSheetFrame
+
+let variant_sheet_css = css`
+.ui-varsh-host { display: contents; }
+.ui-varsh-open {
+  display: inline-flex; align-items: center; min-width: 44px; min-height: 46px; padding: 0 16px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 600 15px var(--ui-font); cursor: pointer;
+  touch-action: manipulation;
+}
+.ui-varsh-open:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-varsh-wrap { display: grid; gap: 14px; }
+.ui-varsh-pic { display: block; width: 100%; height: 150px; object-fit: cover; border-radius: var(--ui-radius); background: var(--ui-subtle); }
+.ui-varsh-groups { display: grid; gap: 16px; min-width: 0; }
+.ui-varsh-group { min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-varsh-group legend { padding: 0 0 6px; font-weight: 600; }
+.ui-varsh-group legend span { color: var(--ui-muted); font-weight: 400; }
+.ui-varsh-opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; }
+.ui-varsh-opt {
+  position: relative; display: grid; align-content: center; gap: 0; min-height: 56px; padding: 6px 8px; box-sizing: border-box; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); cursor: pointer; text-align: center; touch-action: manipulation;
+}
+.ui-varsh-opt input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: inherit; }
+.ui-varsh-opt:has(input:checked) { border-color: var(--ui-accent); box-shadow: inset 0 0 0 1px var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-varsh-opt:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-varsh-name { display: inline-flex; align-items: center; justify-content: center; gap: 6px; font-weight: 600; overflow-wrap: anywhere; }
+.ui-varsh-swatch { flex: none; width: 16px; height: 16px; border: 1px solid var(--ui-strong); border-radius: 50%; }
+.ui-varsh-why { color: var(--ui-muted); font-size: 12px; line-height: 1.25; }
+.ui-varsh-low { color: var(--ui-warning); font-size: 12px; line-height: 1.25; }
+/* Struck through, as well as the words: colour alone says nothing to some. */
+.ui-varsh-out { border-style: dashed; background: var(--ui-subtle); }
+.ui-varsh-out .ui-varsh-name { color: var(--ui-muted); text-decoration: line-through; }
+.ui-varsh-said { min-height: 20px; margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-varsh-foot { display: grid; gap: 10px; }
+.ui-varsh-sum { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.ui-varsh-price { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ui-varsh-state { color: var(--ui-muted); font-size: 13px; text-align: right; }
+@container (min-width: 520px) {
+  .ui-varsh-withpic { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); align-items: start; gap: 20px; }
+  .ui-varsh-withpic .ui-varsh-pic { height: 100%; min-height: 260px; }
+}
+`
+
+// The options that can be used: each needs a key and a list of values.
+fn variant_sheet_clean(options) -> list =
+    type_of(options) != "list" ? [] : options | filter((o) => type_of(o) == "map" && get(o, "key") != null && type_of(get(o, "values")) == "list")
+        | map((o) => { key: str(o.key), label: str(get(o, "label", o.key)), values: o.values })
+
+// A value of an option, whichever way it was written.
+fn variant_sheet_value(v) -> map =
+    type_of(v) == "map" ? { value: str(get(v, "value", "")), label: str(get(v, "label") ?? get(v, "value", "")), swatch: get(v, "swatch") }
+                        : { value: str(v), label: str(v), swatch: null }
+
+// How many of a row there are: bad numbers count as none.
+fn variant_sheet_qty(row) -> int {
+    let n = int(str(get(row, "qty") ?? 0))
+    is_err(n) || n < 0 ? 0 : n
+}
+
+// The rows that fit: picks is a map of what must match.
+fn variant_sheet_rows(stock: list, picks: map) -> list =
+    stock | filter((r) => keys(picks) | all((k) => str(get(r, k, "")) == get(picks, k)))
+
+// A date as people say it, or null for one that cannot be read.
+fn variant_sheet_date(d) {
+    if type_of(d) != "str" || !date.valid(d, "date") { return null }
+    date.format(d, "D MMM")
+}
+
+// The soonest a row among these is back.
+fn variant_sheet_due(rows: list) {
+    let dates = rows | map((r) => get(r, "due")) | filter((d) => type_of(d) == "str" && date.valid(d, "date")) | sort()
+    len(dates) > 0 ? dates[0] : null
+}
+
+// The other choices as words: "Navy" or "M, Navy".
+fn variant_sheet_others(options: list, picks: map, key: str) -> str =
+    options | filter((o) => o.key != key && get(picks, o.key) != null) | map((o) => {
+        let chosen = get(picks, o.key)
+        let v = o.values | map((x) => variant_sheet_value(x)) | find((x) => x.value == chosen)
+        v != null ? v.label : chosen
+    }) | join(", ")
+
+// What one option is, given the other choices:
+//   { state: "ok", qty }             it can be had
+//   { state: "clash", why }          it can be had, but not with the other choices
+//   { state: "gone", why }           it cannot be had at all
+fn variant_sheet_look(options: list, stock: list, picks: map, key: str, value: str) -> map {
+    let others = keys(picks) | filter((k) => k != key && get(picks, k) != null)
+    let mine = others | reduce({}, (m, k) => set(m, k, get(picks, k)))
+    let any_row = variant_sheet_rows(stock, set({}, key, value))
+    let fits = variant_sheet_rows(stock, set(mine, key, value))
+    let qty = fits | reduce(0, (n, r) => n + variant_sheet_qty(r))
+    if qty > 0 { return { state: "ok", qty: qty } }
+    let words = variant_sheet_others(options, mine, key)
+    let anywhere = any_row | reduce(0, (n, r) => n + variant_sheet_qty(r))
+    if anywhere == 0 {
+        let due = variant_sheet_date(variant_sheet_due(any_row))
+        return { state: "gone", why: due != null ? `Back ${due}` : len(any_row) > 0 ? "Sold out" : "Not made" }
+    }
+    if len(fits) == 0 { return { state: "clash", why: `Not made in ${words}` } }
+    let due = variant_sheet_date(variant_sheet_due(fits))
+    { state: "clash", why: due != null ? `Back ${due} in ${words}` : `Sold out in ${words}` }
+}
+
+// The stock row of a whole choice, or null while something is not chosen. Several rows
+// that fit count as their sum.
+fn variant_sheet_row(options: list, stock: list, picks: map) {
+    if !(options | all((o) => get(picks, o.key) != null)) { return null }
+    let fits = variant_sheet_rows(stock, picks)
+    if len(fits) == 0 { return null }
+    set(fits[0], "qty", fits | reduce(0, (n, r) => n + variant_sheet_qty(r)))
+}
+
+// Only the choices that are still good: what does not exist in the options goes.
+fn variant_sheet_start(options: list, picks) -> map {
+    if type_of(picks) != "map" { return {} }
+    options | reduce({}, (m, o) => {
+        let v = get(picks, o.key)
+        v != null && (o.values | any((x) => variant_sheet_value(x).value == str(v))) ? set(m, o.key, str(v)) : m
+    })
+}
+
+view VariantSheetOption(group: str, id: str, value: map, shown: map, on: bool, low: int, on_tap) {
+    <label class={ui_cls(["ui-varsh-opt", shown.state != "ok" && "ui-varsh-out"])} for={id}>
+        <input type="radio" name={group} id={id} value={value.value} checked={on} aria-disabled={shown.state == "gone" ? "true" : null}
+               @click={(e) => { on_tap(e) }}/>
+        <span.ui-varsh-name>
+            {value.swatch != null && <span.ui-varsh-swatch style={`background: ${value.swatch}`} aria-hidden="true"></span>}
+            {value.label}
+        </span>
+        {shown.state != "ok" && <span.ui-varsh-why>{shown.why}</span>}
+        {shown.state == "ok" && shown.qty <= low && <span.ui-varsh-low>Only {shown.qty} left</span>}
+    </label>
+}
+
+component VariantSheet(options = [], stock = [], title: str = "Choose options", image: str? = null, price = null,
+                       currency: str = "USD", locale: str? = null, low: int = 3, picks = null, trigger: str? = "Choose options",
+                       open: bool = false, confirm: str = "Add to cart", id: str = "ui-varsh", on_pick = null, on_change = null, on_close = null) {
+    style global variant_sheet_css
+    state own = false
+    state chosen = variant_sheet_start(variant_sheet_clean(options), picks)
+    state said = ""
+    let opts = variant_sheet_clean(options)
+    let rows = type_of(stock) == "list" ? stock | filter((r) => type_of(r) == "map") : []
+    let row = variant_sheet_row(opts, rows, chosen)
+    let left = row != null ? row.qty : 0
+    let missing = opts | filter((o) => get(chosen, o.key) == null) | map((o) => lower(o.label))
+    let amount = (row != null ? get(row, "price") : null) ?? price
+    let cost = amount != null && !is_err(dec(amount)) ? price_text(dec(amount), currency, locale) : ""
+    let tell = () => { on_change && on_change(chosen) }
+    let tap = (e, o, value, shown) => {
+        if shown.state == "gone" {
+            // A radio button that cannot be chosen: it says why, and the choice stays.
+            e.preventDefault()
+            said = `${value.label}: ${lower(shown.why)}.`
+        } else if shown.state == "clash" {
+            let clear = opts | filter((x) => x.key != o.key) | map((x) => lower(x.label)) | join(" and ")
+            chosen = set({}, o.key, value.value)
+            said = `${value.label} chosen. ${shown.why}, so pick the ${clear} again.`
+            tell()
+        } else {
+            chosen = set(chosen, o.key, value.value)
+            said = ""
+            tell()
+        }
+    }
+    <div.ui-varsh-host>
+        {trigger != null && <button.ui-varsh-open type="button" aria-haspopup="dialog" @click={() => { own = true }}>{trigger}</button>}
+        <CartSheetFrame title={title} open={open || own} wide="center"
+                        on_close={() => {
+                            own = false
+                            on_close && on_close()
+                        }}
+                        footer={<div.ui-varsh-foot>
+                            <div.ui-varsh-sum>
+                                <span.ui-varsh-price>{cost}</span>
+                                <span.ui-varsh-state role="status">{len(missing) > 0 ? `Pick a ${join(missing, " and ")}`
+                                    : row == null ? "This choice is not made"
+                                    : left == 0 ? "Sold out"
+                                    : left <= low ? `Only ${left} left` : "In stock"}</span>
+                            </div>
+                            <Button full={true} size="lg" disabled={left == 0} on_click={() => {
+                                on_pick && on_pick(amount != null ? set(row, "price", str(amount)) : row)
+                                own = false
+                                on_close && on_close()
+                            }}>{confirm}</Button>
+                        </div>}>
+            <div class={ui_cls(["ui-varsh-wrap", image != null && "ui-varsh-withpic"])}>
+                {image != null && <img.ui-varsh-pic src={image} alt="" loading="lazy"/>}
+                <div.ui-varsh-groups>
+                    {for o in opts => <fieldset.ui-varsh-group key={o.key}>
+                        <legend>{o.label}: <span>{get(chosen, o.key) == null ? "not chosen" : variant_sheet_picked(o, chosen)}</span></legend>
+                        <div.ui-varsh-opts>
+                            {for v in o.values {
+                                let value = variant_sheet_value(v)
+                                <VariantSheetOption key={value.value} group={`${id}-${o.key}`} id={`${id}-${o.key}-${value.value}`} value={value} low={low}
+                                    shown={variant_sheet_look(opts, rows, chosen, o.key, value.value)}
+                                    on={get(chosen, o.key) == value.value}
+                                    on_tap={(e) => { tap(e, o, value, variant_sheet_look(opts, rows, chosen, o.key, value.value)) }}/>
+                            }}
+                        </div>
+                    </fieldset>}
+                    <p.ui-varsh-said role="status">{said}</p>
+                </div>
+            </div>
+        </CartSheetFrame>
+    </div>
+}
+
+// The label of what is chosen in one option.
+fn variant_sheet_picked(o: map, chosen: map) -> str {
+    let v = o.values | map((x) => variant_sheet_value(x)) | find((x) => x.value == get(chosen, o.key))
+    v != null ? v.label : ""
+}

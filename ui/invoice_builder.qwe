@@ -1,0 +1,469 @@
+// InvoiceBuilder: writes an invoice whose figures reconcile. Each line is a quantity
+// times a price less its own discount, written as "10%" or as an amount, with its own tax
+// rate. An order discount is then shared over the lines in proportion, by largest
+// remainder, so it lands exactly on the rates they carry. Tax is worked out once per rate
+// on what that rate's lines come to, as tax offices ask, not line by line, so the summary
+// by rate adds up to the totals to the cent; prices may include the tax or not. Due dates
+// follow from the terms, invoice numbers run on from the last one saved (keeping
+// their padding, INV-0099 then INV-0100), and a number already used is refused.
+//
+//   <InvoiceBuilder today="2026-11-01" number="INV-0042" bill_to="Acme Ltd" terms="net30"
+//                   lines={[{ description: "Design", quantity: 12.5, unit_price: "80.00", discount: "10%", tax_rate: 20 }]}/>
+//   <InvoiceBuilder today={date} currency="EUR" tax_inclusive={true} tax_rate={21} on_save={(inv) => { keep(inv) }}/>
+//
+// today: the issue date it starts with, "YYYY-MM-DD" (a prop so that the page does not depend on
+// the clock; left out, the field starts empty). number: the invoice number it starts with
+// ("INV-0001"). used: numbers already taken. bill_to: who it is for. terms: "receipt",
+// "net7", "net14", "net15", "net30" (the default), "net45", "net60", "net90" or "eom" (the end of
+// next month). lines: maps { description, quantity, unit_price, discount, tax_rate }, at most
+// 100; quantity left blank is 1. discount: the order discount, "5%" or an amount.
+// tax_inclusive: prices include tax (false). tax_rate: the rate of a new line (0).
+// currency: ISO code ("USD"; one Quillo does not know falls back to it). locale: how to write amounts
+// (the program's). title: the heading ("New invoice"). id: a prefix for its ids
+// ("invoice-builder"), unique on the page. name: a prefix for the names of its fields ("invoice":
+// invoice_number, invoice_bill_to, invoice_issued, invoice_terms, invoice_description,
+// invoice_quantity, invoice_unit_price, invoice_line_discount, invoice_tax_rate, invoice_discount,
+// invoice_tax_inclusive). on_save(invoice): inside one of your components, when Save
+// passes, given { number, bill_to, issued, due, terms, currency, tax_inclusive, lines:
+// [{ description, quantity, unit_price, discount, tax_rate, amount }], subtotal, line_discounts,
+// order_discount, tax, total, tax_summary: [{ rate, base, tax }] } with amounts as decimals; the
+// form then starts the next invoice. on_change(totals): after each change, given
+// { subtotal, line_discounts, order_discount, tax, total } when the figures are good.
+// class: more classes for its outer element.
+//
+// invoice_builder_totals(lines, order, inclusive, code) is the arithmetic, in minor units,
+// invoice_builder_due(issued, terms) the due date and invoice_builder_next(number) the
+// next number, for a program's own use.
+
+import ui/theme.qwe use ui_cls
+
+let invoice_builder_css = css`
+.ui-invoice-builder { container-type: inline-size; display: grid; gap: 16px; min-width: 0; max-width: 860px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-invoice-builder .ui-invoice-builder-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-invoice-builder-head { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px 14px; }
+.ui-invoice-builder-field { display: grid; gap: 5px; min-width: 0; align-content: start; }
+.ui-invoice-builder-field > label, .ui-invoice-builder-field > span { font-size: 13px; font-weight: 500; }
+.ui-invoice-builder-field input, .ui-invoice-builder-field select, .ui-invoice-builder-cell input { box-sizing: border-box; width: 100%; min-width: 0; height: 36px; padding: 0 10px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font);
+  font-variant-numeric: tabular-nums; }
+.ui-invoice-builder-field input:hover, .ui-invoice-builder-field select:hover, .ui-invoice-builder-cell input:hover { border-color: var(--ui-strong); }
+.ui-invoice-builder-field input:focus, .ui-invoice-builder-field select:focus, .ui-invoice-builder-cell input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-invoice-builder input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-invoice-builder-due { display: flex; align-items: center; height: 36px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-invoice-builder-lines { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-invoice-builder-row, .ui-invoice-builder-labels { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1.3fr) 34px; gap: 8px; align-items: center; }
+.ui-invoice-builder-labels { color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-invoice-builder-cell { display: grid; gap: 3px; min-width: 0; }
+.ui-invoice-builder-cell label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.ui-invoice-builder-amount { min-width: 0; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-invoice-builder-end { text-align: right; }
+.ui-invoice-builder-drop { width: 34px; height: 34px; padding: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-muted); font: 16px var(--ui-font); cursor: pointer; }
+.ui-invoice-builder-drop:hover { border-color: var(--ui-strong); color: var(--ui-danger); }
+.ui-invoice-builder-drop:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+@container (max-width: 600px) {
+  .ui-invoice-builder-labels { display: none; }
+  .ui-invoice-builder-row { grid-template-columns: repeat(2, minmax(0, 1fr)); padding-bottom: 10px; border-bottom: 1px solid var(--ui-border); }
+  .ui-invoice-builder-cell:first-child { grid-column: 1 / -1; }
+  .ui-invoice-builder-cell label { position: static; width: auto; height: auto; clip: auto; color: var(--ui-muted); font-size: 12px; }
+}
+.ui-invoice-builder-btn { box-sizing: border-box; height: 34px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-invoice-builder-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-invoice-builder-btn:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-invoice-builder-btn:disabled { color: var(--ui-muted); cursor: not-allowed; }
+.ui-invoice-builder-save { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-invoice-builder-save:hover:not(:disabled) { background: var(--ui-accent); filter: brightness(1.08); }
+.ui-invoice-builder-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
+.ui-invoice-builder-check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ui-invoice-builder-check input { margin: 0; accent-color: var(--ui-accent); }
+.ui-invoice-builder-order { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; max-width: 280px; }
+.ui-invoice-builder-order label { font-size: 13px; font-weight: 500; }
+.ui-invoice-builder-order input { box-sizing: border-box; width: 110px; height: 34px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); }
+.ui-invoice-builder-order input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-invoice-builder-errors { margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-invoice-builder-out { display: grid; gap: 14px; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+@container (min-width: 620px) { .ui-invoice-builder-out { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); } }
+.ui-invoice-builder-rates { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-invoice-builder-rates caption { padding-bottom: 4px; color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: left; }
+.ui-invoice-builder-rates th { padding: 3px 0; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: right; }
+.ui-invoice-builder-rates td { padding: 3px 0; border-bottom: 1px solid var(--ui-border); text-align: right; }
+.ui-invoice-builder-rates th + th, .ui-invoice-builder-rates td + td { padding-left: 10px; }
+.ui-invoice-builder-rates th:first-child, .ui-invoice-builder-rates td:first-child { text-align: left; }
+.ui-invoice-builder-sums { display: grid; grid-template-columns: 1fr auto; gap: 3px 14px; margin: 0; align-content: start; }
+.ui-invoice-builder-sums dt { color: var(--ui-muted); }
+.ui-invoice-builder-sums dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.ui-invoice-builder-sums .ui-invoice-builder-total { padding-top: 4px; color: var(--ui-fg); font-size: 16px; font-weight: 700; }
+.ui-invoice-builder-saved { margin: 0; color: var(--ui-success); font-size: 13px; font-weight: 500; }
+`
+
+// The currency's code, USD when Quillo does not know it.
+fn invoice_builder_code(currency) -> str {
+    let c = upper(trim(str(currency ?? "")))
+    type_of(money.minor_units(c)) == "error" ? "USD" : c
+}
+
+// What was typed as a decimal: `blank` when empty, null when it is not a plain number from
+// 0 to most. A comma counts only as a thousands comma, so "12,50" is refused, not 1250.
+fn invoice_builder_read(text, most, blank) {
+    let t = trim(str(text ?? ""))
+    if t == "" { return blank }
+    if len(t) > 40 { return null }
+    let plain = re.test(t, "^[0-9]{1,3}(,[0-9]{3})+(\\.[0-9]*)?$") ? replace(t, ",", "") : t
+    if !re.test(plain, "^([0-9]+\\.?[0-9]*|\\.[0-9]+)$") { return null }
+    let d = dec(plain)
+    is_err(d) || d > most ? null : d
+}
+
+// A discount as typed: { percent, value }, "10%" a percent up to 100 and "5.00" an amount;
+// no discount when empty, null when it is neither.
+fn invoice_builder_discount(text) {
+    let t = trim(str(text ?? ""))
+    if ends_with(t, "%") {
+        let p = invoice_builder_read(trim(slice(t, 0, len(t) - 1)), 100m, null)
+        return p == null ? null : { percent: true, value: p }
+    }
+    let a = invoice_builder_read(t, 100000000000m, 0m)
+    a == null ? null : { percent: false, value: a }
+}
+
+// A discount of `base` minor units in minor units, percents rounded half up.
+fn invoice_builder_off(base: int, d: map, code: str) -> int {
+    if d.percent { return money.to_minor(money.mul(money.from_minor(base, code), dec(d.value) / 100, "half_up")) }
+    money.to_minor(money.of(d.value, code, "half_up"))
+}
+
+// Whole minor units over weights, largest remainder first, the first on a tie, so they
+// add up to total. All zeros when the weights come to nothing.
+fn invoice_builder_share(total: int, weights: list) -> list {
+    let all = sum(weights)
+    if all <= 0 { return weights | map((w) => 0) }
+    let exact = weights | map((w) => dec(total) * (dec(w) / dec(all)))
+    let floors = exact | map((x) => int(floor(x)))
+    let left = total - sum(floors)
+    let order = sort_by(range(len(weights)), (i) => 0m - round(exact[i] - floor(exact[i]), 12))
+    let ranks = range(len(weights)) | map((i) => index_of(order, i))
+    range(len(weights)) | map((i) => floors[i] + (ranks[i] < left ? 1 : 0))
+}
+
+// The invoice's arithmetic in minor units. lines: [{ quantity, unit_price, discount, tax_rate }]
+// (decimals, discount as invoice_builder_discount gives); order: the order discount, likewise.
+// Gives { lines: [{ gross, off, net, after }], subtotal, line_discounts, order_discount,
+// tax, total, summary: [{ rate, base, tax }] } where, whichever way tax goes,
+// subtotal - line_discounts - order_discount is what the lines come to, each rate's base
+// and tax add up to total, and excluded tax is added on top. Null if a discount is larger
+// than what it comes off.
+fn invoice_builder_totals(lines: list, order: map, inclusive: bool, code: str) {
+    let worked = lines | map((l) => {
+        let gross = money.to_minor(money.mul(money.of(l.unit_price, code, "half_up"), l.quantity, "half_up"))
+        let off = invoice_builder_off(gross, l.discount, code)
+        { gross, off, net: gross - off, rate: l.tax_rate }
+    })
+    if worked | any((l) => l.net < 0) { return null }
+    let subtotal = sum(worked | map((l) => l.gross))
+    let line_discounts = sum(worked | map((l) => l.off))
+    let nets = worked | map((l) => l.net)
+    let net_sum = sum(nets)
+    let order_discount = invoice_builder_off(net_sum, order, code)
+    if order_discount > net_sum { return null }
+    let shares = invoice_builder_share(order_discount, nets)
+    let done = worked | enumerate() | map((row) => merge(row[1], { after: row[1].net - shares[row[0]] }))
+    let rates = sort(unique(done | map((l) => l.rate)))
+    let summary = rates | map((rate) => {
+        let amount = sum(done | filter((l) => l.rate == rate) | map((l) => l.after))
+        let money_amount = money.from_minor(amount, code)
+        let tax = inclusive
+            ? money.to_minor(money.mul(money_amount, dec(rate) / (100 + dec(rate)), "half_up"))
+            : money.to_minor(money.mul(money_amount, dec(rate) / 100, "half_up"))
+        { rate, base: inclusive ? amount - tax : amount, tax }
+    })
+    let tax = sum(summary | map((s) => s.tax))
+    let total = sum(summary | map((s) => s.base + s.tax))
+    { lines: done, subtotal, line_discounts, order_discount, tax, total, summary }
+}
+
+// The terms offered: { id, label, days }, days null for the end of next month.
+fn invoice_builder_terms() -> list = [
+    { id: "receipt", label: "Due on receipt", days: 0 }, { id: "net7", label: "Net 7", days: 7 }, { id: "net14", label: "Net 14", days: 14 },
+    { id: "net15", label: "Net 15", days: 15 }, { id: "net30", label: "Net 30", days: 30 }, { id: "net45", label: "Net 45", days: 45 },
+    { id: "net60", label: "Net 60", days: 60 }, { id: "net90", label: "Net 90", days: 90 }, { id: "eom", label: "End of next month", days: null }]
+
+// True for a date this file can count from: years past 9000 would run off the calendar.
+fn invoice_builder_date_ok(text) -> bool {
+    let t = str(text ?? "")
+    date.valid(t, "date") && date.parts(t).year < 9000
+}
+
+// The due date of an issue date on terms, or null for a date it cannot read.
+fn invoice_builder_due(issued, terms: str) {
+    if !invoice_builder_date_ok(issued) { return null }
+    let term = invoice_builder_terms() | find((t) => t.id == terms)
+    if term == null || term.days == null { return date.end_of_month(date.add_months(date.start_of_month(issued), 1)) }
+    date.add_days(issued, term.days)
+}
+
+// The number after this one: its last digits counted up as text, so any length works and
+// padding stays (INV-0099, INV-0100; 999, 1000). Without digits, "-2" goes on the end.
+fn invoice_builder_next(number) -> str {
+    let t = trim(str(number ?? ""))
+    if t == "" { return "1" }
+    let tail = re.find(t, "[0-9]+$")
+    if tail == null { return `${t}-2` }
+    let digits = split(tail.text, "")
+    let out = []
+    let carry = true
+    for ch in reverse(digits) {
+        if carry && ch == "9" {
+            out = out | push("0")
+        } else if carry {
+            out = out | push(str(int(ch) + 1))
+            carry = false
+        } else {
+            out = out | push(ch)
+        }
+    }
+    `${slice(t, 0, tail.start)}${carry ? "1" : ""}${join(reverse(out), "")}`
+}
+
+// The props' lines as rows of text, one empty row when there are none.
+fn invoice_builder_rows(lines, rate) -> list {
+    let given = type_of(lines) == "list" ? take(lines, 100) | filter((l) => type_of(l) == "map") : []
+    let text = (x) => x == null ? "" : str(x)
+    let rows = given | enumerate() | map((row) => {
+        let l = row[1]
+        { id: row[0] + 1, description: text(l.description), quantity: text(l.quantity), unit_price: text(l.unit_price), discount: text(l.discount), tax_rate: l.tax_rate == null ? text(rate) : text(l.tax_rate) }
+    })
+    len(rows) > 0 ? rows : [{ id: 1, description: "", quantity: "", unit_price: "", discount: "", tax_rate: text(rate) }]
+}
+
+// True for a row nothing has been typed in.
+fn invoice_builder_blank(r: map) -> bool = trim(r.description) == "" && trim(r.quantity) == "" && trim(r.unit_price) == ""
+
+// All the figures from the rows as typed: { errors: [{ field, text }], lines (each with
+// the text it came from), totals }; totals is null with errors.
+fn invoice_builder_work(rows: list, order_text, inclusive: bool, code: str) -> map {
+    let errors = []
+    let used = rows | filter((r) => !invoice_builder_blank(r))
+    let lines = []
+    for r in used {
+        let place = (rows | enumerate() | find((x) => x[1].id == r.id))[0] + 1
+        let label = filled(trim(r.description)) ?? `line ${place}`
+        let quantity = invoice_builder_read(r.quantity, 1000000m, 1m)
+        let unit_price = invoice_builder_read(r.unit_price, 100000000m, 0m)
+        let discount = invoice_builder_discount(r.discount)
+        let tax_rate = invoice_builder_read(r.tax_rate, 100m, 0m)
+        if quantity == null { errors = errors | push({ field: `quantity-${r.id}`, text: `The quantity of ${label} must be a number from 0 to 1,000,000.` }) }
+        if unit_price == null { errors = errors | push({ field: `price-${r.id}`, text: `The price of ${label} must be a number from 0 to 100,000,000.` }) }
+        if discount == null { errors = errors | push({ field: `discount-${r.id}`, text: `The discount of ${label} must be an amount or a percent like 10%.` }) }
+        if tax_rate == null { errors = errors | push({ field: `rate-${r.id}`, text: `The tax rate of ${label} must be a percent from 0 to 100.` }) }
+        lines = lines | push({ id: r.id, label, description: r.description, quantity, unit_price, discount, tax_rate })
+    }
+    let order = invoice_builder_discount(order_text)
+    if order == null { errors = errors | push({ field: "discount", text: "The order discount must be an amount or a percent like 5%." }) }
+    if len(errors) > 0 { return { errors, lines: [], totals: null } }
+    // Past this the browser's whole numbers stop being exact, and the totals could not reconcile.
+    for l in lines {
+        if l.unit_price * l.quantity > 100000000000m { errors = errors | push({ field: `quantity-${l.id}`, text: `The amount of ${l.label} is too large, past 100,000,000,000.` }) }
+    }
+    if len(errors) > 0 { return { errors, lines: [], totals: null } }
+    for l in lines {
+        let gross = money.to_minor(money.mul(money.of(l.unit_price, code, "half_up"), l.quantity, "half_up"))
+        if invoice_builder_off(gross, l.discount, code) > gross {
+            errors = errors | push({ field: `discount-${l.id}`, text: `The discount of ${l.label} is more than the line comes to.` })
+        }
+    }
+    if len(errors) > 0 { return { errors, lines: [], totals: null } }
+    let totals = invoice_builder_totals(lines, order, inclusive, code)
+    if totals == null { return { errors: [{ field: "discount", text: "The order discount is more than the lines come to." }], lines: [], totals: null } }
+    { errors, lines, totals }
+}
+
+// What must be there before saving: [{ field, text }].
+fn invoice_builder_missing(number, bill_to, issued, used: list, work: map, rows: list) -> list {
+    let out = []
+    let n = trim(str(number ?? ""))
+    if n == "" { out = out | push({ field: "number", text: "Give the invoice a number." }) }
+    if contains(used, n) { out = out | push({ field: "number", text: `${n} is already used.` }) }
+    if trim(str(bill_to ?? "")) == "" { out = out | push({ field: "bill_to", text: "Say who the invoice is for." }) }
+    if !invoice_builder_date_ok(issued) { out = out | push({ field: "issued", text: "Give the issue date as a real date." }) }
+    if len(work.lines) == 0 && len(work.errors) == 0 { out = out | push({ field: "lines", text: "Add at least one line." }) }
+    for l in work.lines {
+        if trim(l.description) == "" { out = out | push({ field: `description-${l.id}`, text: `Describe ${l.label}.` }) }
+    }
+    out
+}
+
+component InvoiceBuilder(today: str? = null, number: str = "INV-0001", used = null, bill_to: str = "", terms: str = "net30", lines = null, discount = null,
+                         tax_inclusive: bool = false, tax_rate = 0, currency: str = "USD", locale: str? = null, title: str = "New invoice",
+                         id: str = "invoice-builder", name: str = "invoice", on_save = null, on_change = null, class: str? = null) {
+    style global invoice_builder_css
+    state serial = 1000
+    state rows = invoice_builder_rows(lines, tax_rate)
+    state order_text = discount == null ? "" : str(discount)
+    state inclusive = tax_inclusive
+    state seq = number
+    state customer = bill_to
+    state issued = today ?? ""
+    state term = (invoice_builder_terms() | any((t) => t.id == terms)) ? terms : "net30"
+    state taken = type_of(used) == "list" ? used | map((u) => str(u)) : []
+    state tried = false
+    state saved = ""
+    let code = invoice_builder_code(currency)
+    let work = invoice_builder_work(rows, order_text, inclusive, code)
+    let missing = tried ? invoice_builder_missing(seq, customer, issued, taken, work, rows) : []
+    let shown_errors = work.errors + missing
+    let due = invoice_builder_due(issued, term)
+    let ok = work.totals != null
+    let shown = (minor: int) => locale != null ? money.format(money.from_minor(minor, code), locale) : money.format(money.from_minor(minor, code))
+    let bad = (field: str) => shown_errors | any((e) => e.field == field)
+    let field_id = (part: str) => `${id}-${part}`
+    let named = (part: str) => `${name}_${part}`
+    let amount_of = (minor: int) => money.from_minor(minor, code).amount
+    let line_amount = (rid) => {
+        let at = work.lines | enumerate() | find((row) => row[1].id == rid)
+        if at == null || !ok { return "" }
+        shown(work.totals.lines[at[0]].net)
+    }
+    let tell = () => {
+        if on_change != null && ok {
+            let t = work.totals
+            on_change({ subtotal: amount_of(t.subtotal), line_discounts: amount_of(t.line_discounts), order_discount: amount_of(t.order_discount), tax: amount_of(t.tax), total: amount_of(t.total) })
+        }
+    }
+    let change = (rid, field: str, value) => {
+        rows = rows | map((r) => r.id == rid ? set(r, field, value) : r)
+        saved = ""
+        tell()
+    }
+    let add_line = () => {
+        if len(rows) < 100 {
+            serial += 1
+            rows = rows | push({ id: serial, description: "", quantity: "", unit_price: "", discount: "", tax_rate: str(tax_rate ?? "") })
+        }
+    }
+    let drop_line = (rid) => {
+        let left = rows | filter((r) => r.id != rid)
+        serial += 1
+        rows = len(left) > 0 ? left : [{ id: serial, description: "", quantity: "", unit_price: "", discount: "", tax_rate: str(tax_rate ?? "") }]
+        tell()
+    }
+    let save = () => {
+        tried = true
+        if len(work.errors) == 0 && len(invoice_builder_missing(seq, customer, issued, taken, work, rows)) == 0 && ok {
+            let t = work.totals
+            let invoice = { number: trim(seq), bill_to: trim(customer), issued, due, terms: term, currency: code, tax_inclusive: inclusive,
+                            lines: work.lines | enumerate() | map((row) => {
+                                let l = row[1]
+                                let d = l.discount
+                                { description: trim(l.description), quantity: l.quantity, unit_price: amount_of(money.to_minor(money.of(l.unit_price, code, "half_up"))),
+                                  discount: d.percent ? `${d.value}%` : str(d.value), tax_rate: l.tax_rate, amount: amount_of(t.lines[row[0]].net) }
+                            }),
+                            subtotal: amount_of(t.subtotal), line_discounts: amount_of(t.line_discounts), order_discount: amount_of(t.order_discount),
+                            tax: amount_of(t.tax), total: amount_of(t.total),
+                            tax_summary: t.summary | map((s) => ({ rate: s.rate, base: amount_of(s.base), tax: amount_of(s.tax) })) }
+            taken = taken | push(trim(seq))
+            saved = `Saved ${trim(seq)} for ${shown(t.total)}, due ${due}.`
+            seq = invoice_builder_next(seq)
+            serial += 1
+            rows = [{ id: serial, description: "", quantity: "", unit_price: "", discount: "", tax_rate: str(tax_rate ?? "") }]
+            customer = ""
+            order_text = ""
+            tried = false
+            if on_save != null { on_save(invoice) }
+        }
+    }
+    <section class={ui_cls(["ui-invoice-builder", class])} aria-labelledby={field_id("title")}>
+        <h3.ui-invoice-builder-title id={field_id("title")}>{title}</h3>
+        <div.ui-invoice-builder-head>
+            <div.ui-invoice-builder-field>
+                <label for={field_id("number")}>Invoice number</label>
+                <input type="text" autocomplete="off" maxlength="40" id={field_id("number")} name={named("number")} value={seq} aria-invalid={bad("number") ? "true" : null}
+                       @input={(e) => { seq = e.value; saved = "" }}/>
+            </div>
+            <div.ui-invoice-builder-field>
+                <label for={field_id("bill-to")}>Bill to</label>
+                <input type="text" autocomplete="off" maxlength="120" id={field_id("bill-to")} name={named("bill_to")} value={customer} aria-invalid={bad("bill_to") ? "true" : null}
+                       @input={(e) => { customer = e.value; saved = "" }}/>
+            </div>
+            <div.ui-invoice-builder-field>
+                <label for={field_id("issued")}>Issue date</label>
+                <input type="date" id={field_id("issued")} name={named("issued")} value={issued} aria-invalid={bad("issued") ? "true" : null} @input={(e) => { issued = e.value; saved = "" }}/>
+            </div>
+            <div.ui-invoice-builder-field>
+                <label for={field_id("terms")}>Terms</label>
+                <select id={field_id("terms")} name={named("terms")} @change={(e) => { term = e.value }}>
+                    {for t in invoice_builder_terms() => <option key={t.id} value={t.id} selected={t.id == term}>{t.label}</option>}
+                </select>
+            </div>
+            <div.ui-invoice-builder-field>
+                <span>Due</span>
+                <output.ui-invoice-builder-due id={field_id("due")}>{due ?? "No date yet"}</output>
+            </div>
+        </div>
+        <div.ui-invoice-builder-labels aria-hidden="true">
+            <span>Description</span><span>Quantity</span><span>Price</span><span>Discount</span><span>Tax %</span><span.ui-invoice-builder-end>Amount</span><span></span>
+        </div>
+        <ul.ui-invoice-builder-lines>
+            {for r in rows => <li.ui-invoice-builder-row key={r.id}>
+                <div.ui-invoice-builder-cell>
+                    <label for={field_id(`description-${r.id}`)}>Description</label>
+                    <input type="text" autocomplete="off" maxlength="200" id={field_id(`description-${r.id}`)} name={named("description")} value={r.description}
+                           aria-invalid={bad(`description-${r.id}`) ? "true" : null} @input={(e) => { change(r.id, "description", e.value) }}/>
+                </div>
+                <div.ui-invoice-builder-cell>
+                    <label for={field_id(`quantity-${r.id}`)}>Quantity</label>
+                    <input type="text" inputmode="decimal" autocomplete="off" id={field_id(`quantity-${r.id}`)} name={named("quantity")} value={r.quantity} placeholder="1"
+                           aria-invalid={bad(`quantity-${r.id}`) ? "true" : null} @input={(e) => { change(r.id, "quantity", e.value) }}/>
+                </div>
+                <div.ui-invoice-builder-cell>
+                    <label for={field_id(`price-${r.id}`)}>Price</label>
+                    <input type="text" inputmode="decimal" autocomplete="off" id={field_id(`price-${r.id}`)} name={named("unit_price")} value={r.unit_price} placeholder="0.00"
+                           aria-invalid={bad(`price-${r.id}`) ? "true" : null} @input={(e) => { change(r.id, "unit_price", e.value) }}/>
+                </div>
+                <div.ui-invoice-builder-cell>
+                    <label for={field_id(`discount-${r.id}`)}>Discount</label>
+                    <input type="text" autocomplete="off" id={field_id(`discount-${r.id}`)} name={named("line_discount")} value={r.discount} placeholder="10%"
+                           aria-invalid={bad(`discount-${r.id}`) ? "true" : null} @input={(e) => { change(r.id, "discount", e.value) }}/>
+                </div>
+                <div.ui-invoice-builder-cell>
+                    <label for={field_id(`rate-${r.id}`)}>Tax rate in percent</label>
+                    <input type="text" inputmode="decimal" autocomplete="off" id={field_id(`rate-${r.id}`)} name={named("tax_rate")} value={r.tax_rate} placeholder="0"
+                           aria-invalid={bad(`rate-${r.id}`) ? "true" : null} @input={(e) => { change(r.id, "tax_rate", e.value) }}/>
+                </div>
+                <div.ui-invoice-builder-amount data-amount="">{line_amount(r.id)}</div>
+                <button.ui-invoice-builder-drop type="button" aria-label={`Remove ${filled(r.description) ?? "this line"}`} @click={() => { drop_line(r.id) }}>×</button>
+            </li>}
+        </ul>
+        <div.ui-invoice-builder-bar>
+            <button.ui-invoice-builder-btn type="button" disabled={len(rows) >= 100} @click={add_line}>Add a line</button>
+            <label.ui-invoice-builder-check><input type="checkbox" name={named("tax_inclusive")} checked={inclusive} @change={(e) => { inclusive = e.checked; tell() }}/> Prices include tax</label>
+            <div.ui-invoice-builder-order>
+                <label for={field_id("discount")}>Order discount</label>
+                <input type="text" autocomplete="off" id={field_id("discount")} name={named("discount")} value={order_text} placeholder="5%" aria-invalid={bad("discount") ? "true" : null}
+                       @input={(e) => { order_text = e.value; tell() }}/>
+            </div>
+        </div>
+        {len(shown_errors) > 0 && <ul.ui-invoice-builder-errors role="alert">{for e in shown_errors => <li key={e.field}>{e.text}</li>}</ul>}
+        {ok && <div.ui-invoice-builder-out aria-live="polite">
+            <table.ui-invoice-builder-rates>
+                <caption>Tax by rate</caption>
+                <thead><tr><th scope="col">Rate</th><th scope="col">Before tax</th><th scope="col">Tax</th></tr></thead>
+                <tbody>
+                    {for s in work.totals.summary => <tr key={str(s.rate)}><td>{s.rate}%</td><td>{shown(s.base)}</td><td>{shown(s.tax)}</td></tr>}
+                </tbody>
+            </table>
+            <dl.ui-invoice-builder-sums>
+                <dt>Subtotal</dt><dd data-key="subtotal">{shown(work.totals.subtotal)}</dd>
+                <dt>Line discounts</dt><dd data-key="line_discounts">{shown(work.totals.line_discounts)}</dd>
+                <dt>Order discount</dt><dd data-key="order_discount">{shown(work.totals.order_discount)}</dd>
+                <dt>{inclusive ? "Tax included" : "Tax"}</dt><dd data-key="tax">{shown(work.totals.tax)}</dd>
+                <dt.ui-invoice-builder-total>Total</dt><dd.ui-invoice-builder-total data-key="total">{shown(work.totals.total)}</dd>
+            </dl>
+        </div>}
+        <div.ui-invoice-builder-bar>
+            <button.ui-invoice-builder-btn.ui-invoice-builder-save type="button" @click={save}>Save invoice</button>
+            <p.ui-invoice-builder-saved role="status">{saved}</p>
+        </div>
+    </section>
+}

@@ -1,0 +1,319 @@
+// QrPayCard: a code for someone else's phone to read, so they can pay you: who is being paid,
+// how much, how long the code lasts, a way to send it to them instead, and what became of it.
+// When the time is up the code leaves the screen, as an old code must not be paid. On a tablet
+// the code stands beside the details.
+//
+//   import ui/qr_pay_card.qwe use QrPayCard
+//
+//   component Request() {
+//       state paid = "waiting"
+//       <QrPayCard payee="Cafe Luz" to="cafe@luz" amount={12.50m} reference="R-1042" seconds={300} status={paid}
+//                  on_renew={() => new_reference()}/>
+//   }
+//
+// payee: the name shown. to: who is paid, as your payment scheme writes it. amount: a decimal,
+// an int or numeric text; left out, or not a number, the payer enters it. currency ("USD"),
+// locale. reference: what ties a payment to this request. scheme: what the code's text starts
+// with ("pay"), which reads `pay:cafe@luz?amount=12.50&cur=USD&ref=R-1042`. link: an address to
+// use instead (`https://pay.example/r`, the same query added). seconds: how long a code lasts
+// (300; 0 for no limit). status: "waiting", "paid" or "failed", from your own state, which your
+// server sets. on_renew(): gives the new reference after the time runs out, and may wait for a
+// server fn; an error value or false says so; left out, the same one starts again. on_cancel():
+// the person gave up. on_share(share): { text, url } was sent on, or copied.
+//
+// The clock starts in the browser, from `now()`, and is read each second rather than counted,
+// because `every` stands still while the phone sleeps. Sharing goes to the app's share sheet,
+// then the browser's, then the clipboard, and failing all three shows the text to copy. While
+// a code waits the screen stays on where that can be done, and says so where it cannot.
+//
+// qr_pay_card_text(...), qr_pay_card_clock(seconds) are the working.
+
+import ui/theme.qwe use ui_cls
+import ui/price.qwe use price_text
+import ui/button.qwe use Button
+import ui/qr_code.qwe use QrCode
+
+let qr_pay_card_css = css`
+.ui-qrpay { display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 14px/1.4 var(--ui-font); text-align: center; }
+.ui-qrpay-cols { display: grid; gap: 12px; justify-items: center; min-width: 0; }
+.ui-qrpay-side { display: grid; gap: 10px; justify-items: center; width: 100%; min-width: 0; }
+.ui-qrpay-sum { margin: 0; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-qrpay-sum strong { display: block; color: var(--ui-fg); font-size: min(32px, 9cqw); font-variant-numeric: tabular-nums; line-height: 1.2; }
+.ui-qrpay-code { box-sizing: border-box; display: grid; place-items: center; width: min(100%, 300px); aspect-ratio: 1; padding: 8px; border-radius: var(--ui-radius); background: #fff; color: #000; }
+.ui-qrpay-code figure { display: block; width: 100%; margin: 0; }
+.ui-qrpay-code svg { display: block; width: 100%; height: auto; }
+.ui-qrpay-off { border: 1px dashed var(--ui-border); background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-qrpay-off p { margin: 0; padding: 12px; font-size: 15px; }
+.ui-qrpay-paid { background: var(--ui-success-soft); color: var(--ui-success); border: 0; }
+.ui-qrpay-paid p { font-size: 22px; font-weight: 700; }
+.ui-qrpay-bad { background: var(--ui-danger-soft); color: var(--ui-danger); border: 0; }
+.ui-qrpay-ref { margin: 0; color: var(--ui-muted); font: 13px/1.3 var(--ui-mono); overflow-wrap: anywhere; }
+.ui-qrpay-clock { position: relative; width: min(100%, 300px); }
+.ui-qrpay-clock p { margin: 0 0 4px; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-qrpay-left { height: 6px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-qrpay-left span { display: block; height: 100%; background: var(--ui-accent); transition: width .9s linear; }
+.ui-qrpay-soon p { color: var(--ui-warning); font-weight: 600; }
+.ui-qrpay-soon .ui-qrpay-left span { background: var(--ui-warning); }
+.ui-qrpay-status { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-weight: 600; }
+.ui-qrpay-status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.ui-qrpay-st-waiting { color: var(--ui-info); }
+.ui-qrpay-st-paid { color: var(--ui-success); }
+.ui-qrpay-st-failed, .ui-qrpay-st-expired { color: var(--ui-danger); }
+.ui-qrpay-st-cancelled { color: var(--ui-muted); }
+.ui-qrpay-acts { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.ui-qrpay-note { margin: 0; max-width: 34em; color: var(--ui-muted); font-size: 13px; }
+.ui-qrpay-err { color: var(--ui-danger); }
+.ui-qrpay-copy { box-sizing: border-box; width: 100%; min-height: 44px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px/1.3 var(--ui-font); }
+.ui-qrpay-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+@container (min-width: 560px) {
+  .ui-qrpay-cols { grid-template-columns: minmax(0, 300px) minmax(0, 1fr); align-items: center; gap: 28px; text-align: left; }
+  .ui-qrpay-side { justify-items: start; }
+  .ui-qrpay-acts { justify-content: flex-start; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-qrpay-left span { transition: none; } }
+`
+
+// The amount as a decimal, or null: none given, or not a number or not above zero, so the payer enters it.
+fn qr_pay_card_amount(v) {
+    let kind = type_of(v)
+    if kind != "dec" && kind != "int" && kind != "float" && kind != "str" { return null }
+    let d = dec(v)
+    if is_err(d) || d <= 0m { return null }
+    d
+}
+
+// What the code says: every value is encoded, so a name with a space or an & stays one value.
+fn qr_pay_card_text(scheme: str, to: str, amount, currency: str, reference: str, link: str = "") -> str {
+    let d = qr_pay_card_amount(amount)
+    let m = d == null ? null : money.of(d, currency, "half_up")
+    let parts = [
+        m != null && !is_err(m) ? `amount=${str(m.amount)}` : null,
+        m != null && !is_err(m) ? `cur=${url_encode(currency)}` : null,
+        reference != "" ? `ref=${url_encode(reference)}` : null,
+    ] | filter((p) => p != null)
+    let query = parts | join("&")
+    let start = link != "" ? link : `${scheme}:${to}`
+    if query == "" { return start }
+    `${start}${contains(start, "?") ? "&" : "?"}${query}`
+}
+
+// Seconds as m:ss, as a timer reads.
+fn qr_pay_card_clock(seconds: int) -> str {
+    let s = max([0, seconds])
+    let rest = s % 60
+    `${int(floor(s / 60))}:${rest < 10 ? "0" : ""}${rest}`
+}
+
+// What a person is told about the request now. Paid and failed come from outside, and win over the clock.
+fn qr_pay_card_phase(status: str, expired: bool, cancelled: bool) -> str {
+    if status == "paid" { return "paid" }
+    if status == "failed" { return "failed" }
+    if cancelled { return "cancelled" }
+    expired ? "expired" : "waiting"
+}
+
+// Whether the app's sheet sent it: iOS answers { shared }, Android only true, as it cannot tell.
+fn qr_pay_card_shared(r) -> bool = type_of(r) != "map" || r.shared != false
+
+// Whether what a share or a copy gave back is the person changing their mind.
+fn qr_pay_card_declined(r) -> bool = re.test(lower(str(r)), "abort|cancel")
+
+component QrPayCard(payee: str = "", to: str = "", amount = null, currency: str = "USD", locale: str? = null, reference: str = "", scheme: str = "pay",
+                    link: str = "", seconds: int = 300, status: str = "waiting", label: str = "Payment request", on_renew = null, on_cancel = null, on_share = null) {
+    style global qr_pay_card_css
+    state ref_now = reference
+    state ref_seen = reference
+    state ends = 0           // when it runs out, in ms; 0 until the browser has started
+    state left = seconds
+    state expired = false
+    state cancelled = false
+    state renewing = false
+    state renew_failed = false
+    state said = ""          // how a share went
+    state typed_out = ""     // the text to copy by hand, when nothing else could send it
+    state win = null
+    state wake = null
+    state awake = false      // what was last asked of the screen
+    state no_stay = false    // nothing here can keep the screen on
+    state buzzed = false
+    let d = qr_pay_card_amount(amount)
+    let sum_text = d == null ? "Any amount" : price_text(d, currency, locale)
+    let code = qr_pay_card_text(scheme, to, amount, currency, ref_now, link)
+    let phase = qr_pay_card_phase(status, expired, cancelled)
+    let share_url = re.test(code, "^https?:") ? code : ""
+    let share_text = `Pay ${payee != "" ? payee + " " : ""}${sum_text}${ref_now != "" ? ` (${ref_now})` : ""}${share_url == "" ? `: ${code}` : ""}`
+    let start_clock = () => {
+        expired = false
+        left = seconds
+        ends = seconds > 0 ? now() + seconds * 1000 : 0
+    }
+    let tick = () => {
+        if ends > 0 && phase == "waiting" {
+            let rest = int(ceil((ends - now()) / 1000))
+            left = max([0, rest])
+            if rest <= 0 { expired = true }
+        }
+    }
+    let stay = (on: bool) => {
+        if win != null {
+            if win.quilloNative != null {
+                win.quilloNative.keepAwake(on).then((_v = null) => { no_stay = false }, (_e = null) => { no_stay = true })
+            } else {
+                let locks = win.navigator.wakeLock
+                if !on {
+                    if wake != null {
+                        wake.release()
+                        wake = null
+                    }
+                } else if locks == null {
+                    no_stay = true
+                } else {
+                    locks.request("screen").then((s) => { wake = s }, (_e = null) => { no_stay = true })
+                }
+            }
+        }
+    }
+    let renew = () => {
+        if !renewing {
+            renew_failed = false
+            said = ""
+            typed_out = ""
+            cancelled = false
+            if on_renew == null {
+                start_clock()
+            } else {
+                renewing = true
+                let r = js("Promise.resolve", on_renew())
+                renewing = false
+                if r == false || r == null && reference == "" || is_err(r) {
+                    renew_failed = true
+                } else {
+                    if type_of(r) == "str" { ref_now = r }
+                    start_clock()
+                }
+            }
+        }
+    }
+    let told = (text: str) => { said = text }
+    let hand_out = () => {
+        said = "Nothing here can send it. Copy this and send it yourself."
+        typed_out = share_url == "" ? share_text : `${share_text}: ${share_url}`
+    }
+    let copy_it = () => {
+        let nav = win.navigator
+        let text = share_url == "" ? share_text : `${share_text}: ${share_url}`
+        if nav.clipboard == null {
+            hand_out()
+        } else {
+            let r = js("Promise.resolve", nav.clipboard.writeText(text))
+            if is_err(r) {
+                hand_out()
+            } else {
+                told("Copied. Paste it wherever you like.")
+                on_share && on_share({ text: share_text, url: share_url })
+            }
+        }
+    }
+    let share_it = () => {
+        said = ""
+        typed_out = ""
+        // Nothing waits before the share, as a browser allows it only straight after a tap.
+        if win.quilloNative != null {
+            let r = share_url != "" ? js("quilloNative.share", share_text, share_url) : js("quilloNative.share", share_text)
+            if is_err(r) {
+                copy_it()
+            } else if qr_pay_card_shared(r) {
+                on_share && on_share({ text: share_text, url: share_url })
+            }
+        } else {
+            let nav = win.navigator
+            if nav.share == null {
+                copy_it()
+            } else {
+                let sent = share_url != "" ? { title: label, text: share_text, url: share_url } : { title: label, text: share_text }
+                let r = js("Promise.resolve", nav.share(sent))
+                if !is_err(r) {
+                    on_share && on_share({ text: share_text, url: share_url })
+                } else if !qr_pay_card_declined(r) {
+                    copy_it()
+                }
+            }
+        }
+    }
+    // A new reference from your page is a new code, and a new clock.
+    if reference != ref_seen {
+        ref_seen = reference
+        ref_now = reference
+        if win != null { start_clock() }
+    }
+    if ends > 0 && phase == "waiting" { every(1000, tick) }
+    // The screen stays on while a code is up, and no longer.
+    if win != null && (phase == "waiting") != awake {
+        awake = phase == "waiting"
+        stay(awake)
+    }
+    if win != null && phase == "paid" && !buzzed {
+        buzzed = true
+        if win.quilloNative != null { win.quilloNative.haptic("success").then((_v = null) => { buzzed = true }, (_e = null) => { buzzed = true }) }
+    }
+    <section.ui-qrpay aria-label={label}
+             @mount={(_el) => {
+                 let w = js("window")
+                 let doc = js("document")
+                 let back = (_e = null) => {
+                     if doc.visibilityState == "visible" {
+                         tick()
+                         // The browser lets go of a Wake Lock when the page is hidden.
+                         if phase == "waiting" && w.quilloNative == null { stay(true) }
+                     }
+                 }
+                 doc.addEventListener("visibilitychange", back)
+                 win = w
+                 start_clock()
+                 () => {
+                     doc.removeEventListener("visibilitychange", back)
+                     stay(false)
+                 }
+             }}>
+        <div.ui-qrpay-cols>
+            <div class={ui_cls(["ui-qrpay-code", phase != "waiting" && "ui-qrpay-off", phase == "paid" && "ui-qrpay-paid", (phase == "failed" || phase == "expired") && "ui-qrpay-bad"])}>
+                {phase == "waiting" && <QrCode text={code} size={280} label={`QR code to pay ${sum_text}`}/>}
+                {phase == "paid" && <p>Paid</p>}
+                {phase == "failed" && <p>The payment failed</p>}
+                {phase == "expired" && <p>This code has run out</p>}
+                {phase == "cancelled" && <p>Cancelled</p>}
+            </div>
+            <div.ui-qrpay-side>
+                <p.ui-qrpay-sum>{payee != "" ? `Pay ${payee}` : "Pay"}<strong>{sum_text}</strong></p>
+                {ref_now != "" && <p.ui-qrpay-ref>Ref {ref_now}</p>}
+                <p class={ui_cls(["ui-qrpay-status", `ui-qrpay-st-${phase}`])} role="status">
+                    {match phase {
+                        "paid" => "Paid"
+                        "failed" => "Failed"
+                        "expired" => "Expired"
+                        "cancelled" => "Cancelled"
+                        _ => "Waiting for payment"
+                    }}
+                </p>
+                {phase == "waiting" && seconds > 0 && <div class={ui_cls(["ui-qrpay-clock", left <= 30 && "ui-qrpay-soon"])}>
+                    <p role="timer">Runs out in {qr_pay_card_clock(left)}</p>
+                    <div.ui-qrpay-left aria-hidden="true"><span style={`width: ${round(left * 100 / seconds)}%`}></span></div>
+                    <span.ui-qrpay-sr aria-live="polite">{left <= 60 ? "Under a minute left" : ""}</span>
+                </div>}
+                {phase == "waiting" && seconds == 0 && <p.ui-qrpay-note>This code has no time limit.</p>}
+                {phase == "waiting" && no_stay && <p.ui-qrpay-note>This screen may go dark by itself: touch it now and then until you are paid.</p>}
+                {renew_failed && <p class="ui-qrpay-note ui-qrpay-err" role="alert">A new code could not be made. Try again.</p>}
+                {said != "" && <p.ui-qrpay-note role="status">{said}</p>}
+                {typed_out != "" && <input.ui-qrpay-copy type="text" readonly aria-label="Text to copy" value={typed_out}/>}
+                <div.ui-qrpay-acts>
+                    {phase == "waiting" && <Button size="lg" on_click={share_it}>Share</Button>}
+                    {(phase == "expired" || phase == "failed" || phase == "cancelled") && <Button size="lg" loading={renewing} on_click={renew}>New code</Button>}
+                    {phase == "waiting" && <Button size="lg" variant="ghost" on_click={() => {
+                        cancelled = true
+                        on_cancel && on_cancel()
+                    }}>Cancel</Button>}
+                </div>
+            </div>
+        </div>
+    </section>
+}

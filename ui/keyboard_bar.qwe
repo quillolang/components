@@ -1,0 +1,197 @@
+// KeyboardBar: a bar that sits on top of the on-screen keyboard while a field is being
+// filled in, with previous, next and done. Put a form's fields inside it. The bar follows the
+// visual viewport, the one part of the page the keyboard leaves visible, so it rides
+// the keyboard on both systems: on iOS and in Android's Chrome the page stays and the visual
+// viewport shrinks; in an Android web view the page itself shrinks, and it needs no lift.
+//
+//   <KeyboardBar on_done={() => { save() }}>
+//       <TextField name="name" label="Name"/>
+//       <TextField name="email" label="Email" type="email"/>
+//       <TextArea name="note" label="Note"/>
+//   </KeyboardBar>
+//
+// children: the fields; every input, select and textarea in them that can be typed in counts.
+// done_label ("Done"), previous_label ("Previous"), next_label ("Next"). always: true shows it
+// on a screen with a mouse too; by default only a touch screen has it. on_done(): the Done
+// button was pressed; the keyboard goes. class: more classes on the box around the fields.
+//
+// Its buttons do not take the focus from the field, so the keyboard stays up. Enter
+// in a one-line field goes to the next one and on the last is Done, and the keyboard's own
+// key says "next" or "done" to match. A field the bar or keyboard would cover is scrolled into
+// view, with room made at the end for it. On a wide bar (a tablet's, 440 px and up) it says which field this is, as
+// there the keyboard leaves room. Keys and screen readers reach its buttons by Tab; Escape
+// in a field is Done.
+//
+// Safari in a browser has a Previous, Next and Done bar of its own on an iPhone: this one sits
+// above it. An app's web view shows the system's too, unless the app turns it off.
+//
+// keyboard_bar_lift(layout, height, top) is how far the keyboard covers the page.
+
+import ui/theme.qwe use ui_cls
+
+let keyboard_bar_css = css`
+.ui-keyboard-bar-host { min-width: 0; }
+.ui-keyboard-bar {
+  position: fixed; inset: auto 0 0 0; z-index: 40; container-type: inline-size; visibility: hidden; box-sizing: border-box;
+  border-top: 1px solid var(--ui-border); background: var(--ui-subtle); color: var(--ui-fg); font: 15px/1.3 var(--ui-font);
+  padding-inline: max(4px, env(safe-area-inset-left)) max(4px, env(safe-area-inset-right)); will-change: transform; touch-action: manipulation;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ui-keyboard-bar-on { visibility: visible; }
+/* With the keyboard down the bar reaches the screen's edge, and clears the home indicator. */
+.ui-keyboard-bar-low { padding-bottom: env(safe-area-inset-bottom); }
+.ui-keyboard-bar-row { display: flex; align-items: center; gap: 4px; }
+.ui-keyboard-bar-btn {
+  display: grid; place-items: center; min-width: 48px; height: 46px; margin: 0; padding: 0 6px; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-accent); font: 500 16px var(--ui-font); cursor: pointer; touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+.ui-keyboard-bar-btn svg { width: 24px; height: 24px; }
+.ui-keyboard-bar-btn[aria-disabled="true"] { color: var(--ui-muted); opacity: .45; cursor: default; }
+.ui-keyboard-bar-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-keyboard-bar-where { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: center; color: var(--ui-muted); visibility: hidden; }
+.ui-keyboard-bar-done { padding: 0 12px; font-weight: 600; }
+@media (hover: hover) { .ui-keyboard-bar-btn:hover:not([aria-disabled="true"]) { background: var(--ui-bg); } }
+@container (min-width: 440px) {
+  .ui-keyboard-bar-where { visibility: visible; }
+}
+`
+
+// How far the keyboard covers the bottom of the page: what the layout has below the
+// bottom of the part that can be seen. 0 where the layout itself shrank.
+fn keyboard_bar_lift(layout: num, height: num, top: num) -> int = max([0, round(layout - height - top)])
+
+// What the bar says of a field: the start of its label (a label around a select holds its
+// options too), else what it says of itself.
+fn keyboard_bar_name(el) -> str {
+    let by_label = el.labels != null && el.labels.length > 0 ? trim(el.labels[0].childNodes[0].textContent) : ""
+    by_label != "" ? by_label : el.getAttribute("aria-label") ?? el.placeholder ?? el.name ?? "Field"
+}
+
+// The place of an element in a list. `==` and `index_of` take any two elements as equal.
+fn keyboard_bar_index(list: list, el) {
+    let hits = enumerate(list) | filter((p) => p[1].isSameNode(el))
+    len(hits) > 0 ? hits[0][0] : null
+}
+
+let keyboard_bar_fields = "input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([disabled]):not([readonly]), select:not([disabled]), textarea:not([disabled]):not([readonly])"
+
+component KeyboardBar(done_label: str = "Done", previous_label: str = "Previous", next_label: str = "Next", always: bool = false, on_done = null,
+                      class: str? = null, children) {
+    style global keyboard_bar_css
+    state host = null
+    state bar = null
+    state now = null            // the field in use
+    state at = 0
+    state count = 0
+    state where = ""
+    state raised = false
+    state unfollow = null
+    let fields = () => js("Array.from", host.querySelectorAll(keyboard_bar_fields))
+    // Into view, above the bar: a field's own scrolling box first, then the page.
+    let reveal = () => {
+        if now != null {
+            let vv = js("window").visualViewport
+            let bottom = vv == null ? js("window.innerHeight") - bar.offsetHeight - 8 : vv.height + vv.offsetTop - bar.offsetHeight - 8
+            if now.getBoundingClientRect().bottom > bottom {
+                now.scrollIntoView({ block: "center" })
+                let over = now.getBoundingClientRect().bottom - bottom
+                if over > 0 { js("window.scrollBy", 0, over) }
+            }
+        }
+    }
+    let lift = () => {
+        let win = js("window")
+        let vv = win.visualViewport
+        let up = vv == null ? 0 : keyboard_bar_lift(win.innerHeight, vv.height, vv.offsetTop)
+        bar.style.transform = up > 0 ? `translateY(${-up}px)` : ""
+        raised = up > 0
+        // Room to scroll the last field clear: the page's end is under the keyboard.
+        host.style.paddingBottom = up > 0 ? `${up + bar.offsetHeight}px` : ""
+        reveal()
+    }
+    let release = () => {
+        now = null
+        raised = false
+        host.style.paddingBottom = ""
+        bar.style.transform = ""
+        unfollow && unfollow()
+        unfollow = null
+    }
+    let enter = (el) => {
+        let list = fields()
+        let i = keyboard_bar_index(list, el)
+        if i != null {
+            now = el
+            at = i
+            count = len(list)
+            where = `${keyboard_bar_name(el)}, ${i + 1} of ${len(list)}`
+            if unfollow == null {
+                // Asked for only now, and given up on leaving: nothing runs while no field is in use.
+                let vv = js("window").visualViewport
+                if vv != null {
+                    vv.addEventListener("resize", lift)
+                    vv.addEventListener("scroll", lift)
+                    unfollow = () => {
+                        vv.removeEventListener("resize", lift)
+                        vv.removeEventListener("scroll", lift)
+                    }
+                }
+            }
+            // The keyboard's own key says what Enter will do.
+            if el.tagName != "TEXTAREA" && el.tagName != "SELECT" && el.getAttribute("enterkeyhint") == null {
+                el.enterKeyHint = i + 1 < len(list) ? "next" : "done"
+            }
+            lift()
+        }
+    }
+    let move = (by: int) => {
+        let list = fields()
+        let i = at + by
+        if i >= 0 && i < len(list) { list[i].focus() }
+    }
+    let finish = () => {
+        if now != null { now.blur() }
+        release()
+        on_done && on_done()
+    }
+    let shows = always || js("window.matchMedia", "(pointer: coarse)").matches
+    <div class={ui_cls(["ui-keyboard-bar-host", class])}
+         @mount={(el) => {
+             host = el
+             () => { unfollow && unfollow() }
+         }}
+         @focusin={(e) => {
+             if e.target.closest(".ui-keyboard-bar") == null { enter(e.target) }
+         }}
+         @focusout={(e) => {
+             let to = e.relatedTarget
+             if to == null || !host.contains(to) { release() }
+         }}
+         @keydown={(e) => {
+             if e.key == "Escape" && now != null {
+                 e.preventDefault()
+                 finish()
+             }
+             if e.key == "Enter" && e.target.tagName == "INPUT" && e.target.closest(".ui-keyboard-bar") == null && now != null {
+                 e.preventDefault()
+                 if at + 1 < count { move(1) } else { finish() }
+             }
+         }}>
+        {children}
+        <div class={ui_cls(["ui-keyboard-bar", now != null && shows && "ui-keyboard-bar-on", !raised && "ui-keyboard-bar-low"])} role="toolbar" aria-label="Form fields"
+             @mount={(el) => { bar = el }}
+             @pointerdown={(e) => { e.preventDefault() }} @mousedown={(e) => { e.preventDefault() }}>
+            <div.ui-keyboard-bar-row>
+                <button.ui-keyboard-bar-btn type="button" aria-label={previous_label} aria-disabled={at <= 0 ? "true" : null} @click={() => { move(-1) }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 15 6-6 6 6"/></svg>
+                </button>
+                <button.ui-keyboard-bar-btn type="button" aria-label={next_label} aria-disabled={at + 1 >= count ? "true" : null} @click={() => { move(1) }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+                </button>
+                <span.ui-keyboard-bar-where aria-live="polite">{where}</span>
+                <button class="ui-keyboard-bar-btn ui-keyboard-bar-done" type="button" @click={finish}>{done_label}</button>
+            </div>
+        </div>
+    </div>
+}

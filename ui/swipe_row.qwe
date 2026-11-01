@@ -1,0 +1,306 @@
+// SwipeRow: a list row with actions behind it, shown by swiping it sideways, as a mail
+// app's rows are. A swipe past the actions' middle leaves them open, a flick does it
+// from less, and a swipe most of the way across runs the action marked full. One row of
+// a group is open at a time, and a touch anywhere else closes it. Everything a swipe
+// reaches has another way in: a More button lists the same actions, the arrow keys open
+// a focused row, and in a wide container the actions stand on the row itself.
+//
+//   component Inbox() {
+//       state rows = load_rows()
+//       <div role="list">
+//           {for m in rows => <SwipeRow key={m.id} label={m.subject} group="inbox"
+//                   leading={[{ id: "read", label: "Read", tone: "accent" }]}
+//                   trailing={[{ id: "archive", label: "Archive", full: true }, { id: "delete", label: "Delete", tone: "danger" }]}
+//                   on_action={(id) => { act(m, id) }}><b>{m.subject}</b></SwipeRow>}
+//       </div>
+//   }
+//
+// leading: the actions a swipe to the right shows, at the row's start. trailing: those a
+// swipe to the left shows. Each is { id, label, tone?, full? }: tone is "accent", "danger",
+// "success" or "neutral" (the default); full: true on one action of a side runs it on a
+// full swipe. on_action(id): inside one of your components, which action was chosen.
+// group: rows with the same group close each other ("swipe-row"). label: the row's name
+// for screen readers, used for its More button. action_width: pixels each action takes
+// (76, and 44 at the least). class. children: the row.
+
+import ui/theme.qwe use ui_cls
+
+let swipe_row_css = css`
+.ui-swipe-row { position: relative; overflow: hidden; container-type: inline-size; background: var(--ui-surface); color: var(--ui-fg);
+  font: 15px/1.4 var(--ui-font); border-bottom: 1px solid var(--ui-border); overscroll-behavior-x: contain; }
+.ui-swipe-row-top { position: relative; min-height: 60px; overflow: hidden; }
+.ui-swipe-row-pane { position: absolute; inset: 0 auto 0 auto; display: flex; visibility: hidden; max-width: 100%; }
+.ui-swipe-row-leading { left: 0; }
+.ui-swipe-row-trailing { right: 0; flex-direction: row; }
+.ui-swipe-row-showing .ui-swipe-row-pane { visibility: visible; }
+.ui-swipe-row-act { flex: 1 1 var(--w); display: grid; place-items: center; min-width: 44px; min-height: 44px; padding: 0 6px; border: 0;
+  background: var(--t, var(--ui-muted)); color: var(--tf, #fff); font: 600 13px/1.2 var(--ui-font); cursor: pointer;
+  overflow: hidden; white-space: nowrap; transition: flex-grow .16s; }
+.ui-swipe-row-act:focus-visible { outline: 2px solid var(--ui-fg); outline-offset: -3px; }
+.ui-swipe-row-tone-accent { --t: var(--ui-accent); --tf: var(--ui-accent-fg); }
+.ui-swipe-row-tone-danger { --t: var(--ui-danger); --tf: #fff; }
+.ui-swipe-row-tone-success { --t: var(--ui-success); --tf: #fff; }
+/* Past the full swipe, the action that will run takes the whole width of what is shown. */
+.ui-swipe-row-armed .ui-swipe-row-act-full { flex-grow: 60; }
+.ui-swipe-row-front { position: relative; display: flex; align-items: center; gap: 8px; min-height: 60px; padding: 6px 4px 6px 16px; background: var(--ui-surface);
+  touch-action: pan-y; transition: transform .24s cubic-bezier(.2, .8, .2, 1); outline: none; }
+.ui-swipe-row-front:focus-visible { box-shadow: inset var(--ui-focus); }
+.ui-swipe-row-moving .ui-swipe-row-front { transition: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-swipe-row-body { flex: 1; min-width: 0; }
+.ui-swipe-row-more-btn { display: grid; flex: none; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); cursor: pointer; }
+.ui-swipe-row-more-btn svg { width: 20px; height: 20px; }
+.ui-swipe-row-more-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-swipe-row-inline { display: none; flex: none; gap: 6px; }
+.ui-swipe-row-chip { min-width: 44px; min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--t, var(--ui-fg)); font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-swipe-row-chip:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-swipe-row-sheet { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--ui-border); background: var(--ui-subtle); }
+@media (hover: hover) {
+  .ui-swipe-row-more-btn:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+  .ui-swipe-row-chip:hover { background: var(--ui-subtle); }
+}
+@container (min-width: 520px) {
+  .ui-swipe-row-more-btn { display: none; }
+  .ui-swipe-row-inline { display: flex; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-swipe-row-front, .ui-swipe-row-act { transition: none; } }
+`
+
+// Actions with something to show: an entry without a label is left out, and an id falls
+// back on the label.
+fn swipe_row_clean(actions) {
+    if type_of(actions) != "list" { return [] }
+    actions | filter((a) => type_of(a) == "map" && get(a, "label") != null)
+            | map((a) => { ...a, id: get(a, "id") ?? a.label })
+}
+
+fn swipe_row_axis(dx: num, dy: num, slop: num) -> str {
+    if abs(dx) < slop && abs(dy) < slop { return "" }
+    abs(dx) > abs(dy) ? "x" : "y"
+}
+
+// Where the row goes for a finger at d (positive to the right): it follows up to the width
+// of what is behind it and on if a full swipe waits there; past that it drags, and with
+// nothing on that side it barely moves.
+fn swipe_row_offset(d: num, left: num, right: num, full_left: bool, full_right: bool) -> num {
+    let side = d >= 0 ? left : right
+    let way = d >= 0 ? 1 : -1
+    let far = abs(d)
+    let full = d >= 0 ? full_left : full_right
+    if side == 0 { return way * min([far * 0.15, 24]) }
+    if far <= side || full { return d }
+    way * (side + (far - side) * 0.3)
+}
+
+// What a release at x with speed v (pixels a millisecond, signed) comes to: "", "leading",
+// "trailing", "full-leading" or "full-trailing".
+fn swipe_row_settle(x: num, v: num, width: num, left: num, right: num, full_left: bool, full_right: bool) -> str {
+    let way = x >= 0 ? 1 : -1
+    let side = x >= 0 ? left : right
+    let name = x >= 0 ? "leading" : "trailing"
+    if side == 0 { return "" }
+    if (x >= 0 ? full_left : full_right) && abs(x) >= width * 0.6 { return `full-${name}` }
+    if abs(v) >= 0.5 { return v * way > 0 ? name : "" }
+    abs(x) >= side / 2 ? name : ""
+}
+
+fn swipe_row_sample(s, pos: num, now: num) {
+    let dt = now - s.at
+    dt < 32 ? s : { pos, at: now, v: (pos - s.pos) / dt }
+}
+
+// The speed at release, signed: none if the finger stopped before it lifted.
+fn swipe_row_speed(s, pos: num, now: num, moved: num) -> num {
+    if now - moved > 80 { return 0 }
+    let dt = now - s.at
+    let since = dt >= 8 ? (pos - s.pos) / dt : 0
+    abs(since) > abs(s.v) ? since : s.v
+}
+
+// A tap felt: the app's haptics, else the web's, which Chrome refuses, with a warning, until
+// the page has been tapped once. iOS's browser has neither.
+fn swipe_row_buzz(kind: str, ms: int) {
+    if is_err(js("quilloNative.haptic", kind)) && js("navigator.userActivation.hasBeenActive") == true {
+        js("navigator.vibrate", ms)
+    }
+}
+
+component SwipeRow(leading = [], trailing = [], on_action = null, group: str = "swipe-row", label: str = "Row", action_width: int = 76,
+                   class: str? = null, children) {
+    style global swipe_row_css
+    let lefts = swipe_row_clean(leading)
+    let rights = swipe_row_clean(trailing)
+    let each = max([44, action_width])
+    let left_w = len(lefts) * each
+    let right_w = len(rights) * each
+    let full_left = find(lefts, (a) => get(a, "full") == true)
+    let full_right = find(rights, (a) => get(a, "full") == true)
+    state wrap = null
+    state front = null
+    state side = ""          // "", "leading" or "trailing": what stands open
+    state moving = false
+    state armed = false      // past the full swipe, in a drag
+    state more = false       // the list of actions under the row
+    state dragged = false    // a mouse's drag ends in a click, which is not a tap on the row
+    state g = null
+    let rest = (s: str) => s == "leading" ? left_w : s == "trailing" ? -right_w : 0
+    let place = (x: num) => {
+        front.style.transform = x != 0 ? `translateX(${x}px)` : ""
+        // What is behind grows with the row past its own width, for a full swipe.
+        let pane = wrap.querySelector(x > 0 ? ".ui-swipe-row-leading" : ".ui-swipe-row-trailing")
+        if pane != null { pane.style.width = abs(x) > (x > 0 ? left_w : right_w) ? `${abs(x)}px` : "" }
+    }
+    let close_others = () => {
+        let all = js("document").querySelectorAll(".ui-swipe-row-open")
+        for i in range(0, all.length) {
+            if !all[i].isSameNode(wrap) && all[i].dataset.group == group { all[i].dispatchEvent(js_new("CustomEvent", "ui-swipe-row-close")) }
+        }
+    }
+    let open_to = (s: str) => {
+        if s != "" { close_others() }
+        side = s
+        moving = false
+        armed = false
+        place(rest(s))
+    }
+    let pick = (a) => {
+        open_to("")
+        more = false
+        on_action && on_action(a.id)
+    }
+    state firing = null      // the action of a full swipe, while the row leaves
+    if firing != null {
+        every(200, () => {
+            let a = firing
+            firing = null
+            front.style.transition = "none"
+            open_to("")
+            on_action && on_action(a.id)
+            js("requestAnimationFrame", (_t = null) => { front.style.transition = "" })
+        })
+    }
+    <div class={ui_cls(["ui-swipe-row", side != "" && "ui-swipe-row-open", (side != "" || moving || firing != null) && "ui-swipe-row-showing",
+                        moving && "ui-swipe-row-moving", armed && "ui-swipe-row-armed", class])} role="listitem" data-group={group} style={`--w: ${each}px`}
+         @mount={(me) => {
+             let d = js("document")
+             wrap = me
+             let shut = () => { open_to("") }
+             let outside = (e) => { if side != "" && !me.contains(e.target) { shut() } }
+             me.addEventListener("ui-swipe-row-close", shut)
+             d.addEventListener("pointerdown", outside, true)
+             () => { d.removeEventListener("pointerdown", outside, true) }
+         }}>
+        <div.ui-swipe-row-top>
+            {len(lefts) > 0 && <div.ui-swipe-row-pane.ui-swipe-row-leading>
+                {for a in lefts => <button key={a.id} type="button"
+                    class={ui_cls(["ui-swipe-row-act", get(a, "tone") != null && `ui-swipe-row-tone-${a.tone}`, get(a, "full") == true && "ui-swipe-row-act-full"])}
+                    @click={() => pick(a)}>{a.label}</button>}
+            </div>}
+            {len(rights) > 0 && <div.ui-swipe-row-pane.ui-swipe-row-trailing>
+                {for a in rights => <button key={a.id} type="button"
+                    class={ui_cls(["ui-swipe-row-act", get(a, "tone") != null && `ui-swipe-row-tone-${a.tone}`, get(a, "full") == true && "ui-swipe-row-act-full"])}
+                    @click={() => pick(a)}>{a.label}</button>}
+            </div>}
+            <div.ui-swipe-row-front tabindex="0"
+                 @mount={(me) => { front = me }}
+                 @keydown={(e) => {
+                     if e.target.isSameNode(front) {
+                         if e.key == "ArrowLeft" && len(rights) > 0 { e.preventDefault(); open_to(side == "leading" ? "" : "trailing") }
+                         if e.key == "ArrowRight" && len(lefts) > 0 { e.preventDefault(); open_to(side == "trailing" ? "" : "leading") }
+                         if e.key == "Escape" && side != "" { open_to("") }
+                     }
+                 }}
+                 @click={(e) => {
+                     if dragged { dragged = false } else {
+                         if side != "" && e.target.closest("button") == null { open_to("") }
+                     }
+                 }}
+                 @pointerdown={(e) => {
+                     dragged = false
+                     let free = e.isPrimary && e.button == 0 && firing == null && e.target.closest("button, a, input, select, textarea") == null
+                     g = free ? { id: e.pointerId, x: e.clientX, y: e.clientY, on: false, base: rest(side), at: 0, moved: e.timeStamp,
+                                  s: { pos: e.clientX, at: e.timeStamp, v: 0 } } : null
+                 }}
+                 @pointermove={(e) => {
+                     if g != null && e.pointerId == g.id {
+                         let dx = e.clientX - g.x
+                         if !g.on {
+                             let way = swipe_row_axis(dx, e.clientY - g.y, 8)
+                             if way == "y" { g = null }
+                             if way == "x" {
+                                 front.setPointerCapture(e.pointerId)
+                                 close_others()
+                                 moving = true
+                                 g = { ...g, on: true, shift: dx > 0 ? 8 : -8 }
+                             }
+                         }
+                         if g != null && g.on {
+                             let x = swipe_row_offset(g.base + dx - g.shift, left_w, right_w, full_left != null, full_right != null)
+                             place(x)
+                             let past = swipe_row_settle(x, 0, front.offsetWidth, left_w, right_w, full_left != null, full_right != null)
+                             let now_armed = starts_with(past, "full-")
+                             if now_armed && !armed { swipe_row_buzz("medium", 12) }
+                             armed = now_armed
+                             g = { ...g, at: x, moved: e.timeStamp, s: swipe_row_sample(g.s, e.clientX, e.timeStamp) }
+                         }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     if g != null && e.pointerId == g.id {
+                         let was = g
+                         g = null
+                         if was.on {
+                             dragged = e.pointerType == "mouse"
+                             let v = swipe_row_speed(was.s, e.clientX, e.timeStamp, was.moved)
+                             let end = swipe_row_settle(was.at, v, front.offsetWidth, left_w, right_w, full_left != null, full_right != null)
+                             if starts_with(end, "full-") {
+                                 moving = false
+                                 armed = true
+                                 side = ""
+                                 firing = end == "full-leading" ? full_left : full_right
+                                 let w = wrap.offsetWidth
+                                 place(end == "full-leading" ? w : -w)
+                             } else {
+                                 open_to(end)
+                             }
+                         }
+                     }
+                 }}
+                 @pointercancel={(e) => {
+                     if g != null && e.pointerId == g.id {
+                         let was = g
+                         g = null
+                         if was.on { open_to("") }
+                     }
+                 }}>
+                <div.ui-swipe-row-body>{children}</div>
+                <div.ui-swipe-row-inline>
+                    {for a in lefts + rights => <button.ui-swipe-row-chip key={a.id} type="button"
+                        class={get(a, "tone") != null ? `ui-swipe-row-tone-${a.tone}` : null} @click={() => pick(a)}>{a.label}</button>}
+                </div>
+                <button.ui-swipe-row-more-btn type="button" aria-label={`More actions for ${label}`} aria-expanded={more ? "true" : "false"}
+                        @click={(e) => {
+                            more = !more
+                            let row = wrap
+                            if more { js("requestAnimationFrame", (_t = null) => {
+                                let first = row.querySelector(".ui-swipe-row-sheet button")
+                                first && first.focus()
+                            }) }
+                        }}>
+                    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+                </button>
+            </div>
+        </div>
+        {more && <div.ui-swipe-row-sheet role="group" aria-label={`Actions for ${label}`}
+                      @keydown={(e) => {
+                          if e.key == "Escape" {
+                              more = false
+                              wrap.querySelector(".ui-swipe-row-more-btn").focus()
+                          }
+                      }}>
+            {for a in lefts + rights => <button.ui-swipe-row-chip key={a.id} type="button"
+                class={get(a, "tone") != null ? `ui-swipe-row-tone-${a.tone}` : null} @click={() => pick(a)}>{a.label}</button>}
+        </div>}
+    </div>
+}

@@ -1,0 +1,145 @@
+// SizeClassView: says whether the room it has is compact, medium or expanded, and
+// shows the slots meant for that. It measures its own box, not the screen, so an iPad
+// in Split View, a Slide Over, a pane or a turn are all the same thing to it: a new
+// width. Every slot stays on the page and only the shown one is drawn, so what is in
+// the others keeps its state, its text and its scroll while it is away.
+//
+//   import ui/size_class_view.qwe use SizeClassView, SizeClassSlot
+//
+//   <SizeClassView on_change={(c) => { size = c }}>
+//       <SizeClassSlot when="compact"><Stacked/></SizeClassSlot>
+//       <SizeClassSlot when="medium expanded"><Columns/></SizeClassSlot>
+//   </SizeClassView>
+//
+// compact is under 600 px wide, medium under 840, expanded the rest: a phone, an iPad
+// upright, an iPad turned. They are fixed, as CSS has to know them before any script
+// runs and a custom property cannot reach a container query; that is why the right
+// slot shows on the first paint, with no flash.
+//
+// children: SizeClassSlots, or anything else, which shows at every size.
+// on_change(size): inside one of your components, called with "compact", "medium" or
+// "expanded" when the browser first measures and each time that changes.
+// fill: take the height of the box around it (false: as tall as what is in it).
+// class: added to its root. data-size-class on the root says the size, for your CSS.
+//
+// SizeClassSlot(when): shown at the sizes in `when`, separated by spaces.
+//
+// data-keep="name" on an element in two slots makes them one thing to a person: when
+// the size changes, the one coming into view takes the other's text, scroll and
+// caret, and the focus if it had it, so someone typing goes on typing. Nothing else
+// moves between slots: for a value both must show, hold it in your own state.
+
+import ui/theme.qwe use ui_cls
+
+let size_class_view_css = css`
+.ui-size-class { position: relative; container: ui-size-class / inline-size; min-width: 0; width: 100%; }
+.ui-size-class-fill { height: 100%; }
+/* Hidden with visibility, not display: an element that is not laid out forgets its
+   scroll, and these must come back as they were. Neither focus nor a screen reader
+   reaches it. */
+.ui-size-class-slot { position: absolute; inset: 0 0 auto 0; height: 0; overflow: hidden; visibility: hidden; pointer-events: none; }
+/* Chrome's scroll anchoring moves a list as its slot leaves, by the height it lost. */
+.ui-size-class-slot * { overflow-anchor: none; }
+@container ui-size-class (max-width: 599.98px) {
+  .ui-size-class-slot[data-when~="compact"] { position: relative; inset: auto; height: auto; overflow: visible; visibility: visible; pointer-events: auto; }
+}
+@container ui-size-class (min-width: 600px) and (max-width: 839.98px) {
+  .ui-size-class-slot[data-when~="medium"] { position: relative; inset: auto; height: auto; overflow: visible; visibility: visible; pointer-events: auto; }
+}
+@container ui-size-class (min-width: 840px) {
+  .ui-size-class-slot[data-when~="expanded"] { position: relative; inset: auto; height: auto; overflow: visible; visibility: visible; pointer-events: auto; }
+}
+.ui-size-class-fill > .ui-size-class-slot { min-height: 0; }
+@container ui-size-class (max-width: 599.98px) { .ui-size-class-fill > .ui-size-class-slot[data-when~="compact"] { height: 100%; } }
+@container ui-size-class (min-width: 600px) and (max-width: 839.98px) { .ui-size-class-fill > .ui-size-class-slot[data-when~="medium"] { height: 100%; } }
+@container ui-size-class (min-width: 840px) { .ui-size-class-fill > .ui-size-class-slot[data-when~="expanded"] { height: 100%; } }
+`
+
+// The one place that names the sizes, as the CSS above does. A width that is not a
+// number is the widest, where nothing is hidden for want of room.
+fn size_class_view_of(width) -> str {
+    let w = type_of(width) == "int" || type_of(width) == "float" ? width : 10000
+    w < 600 ? "compact" : w < 840 ? "medium" : "expanded"
+}
+
+// Whether a slot's `when` names a size: whole words, so "compact" never matches "not-compact".
+fn size_class_view_in(when, size: str) -> bool = contains(split(str(when ?? ""), " "), size)
+
+// Every element with a data-keep of that name, in whichever slots.
+fn size_class_view_twins(root, name: str) {
+    let found = root.querySelectorAll("[data-keep]")
+    range(found.length) | map((i) => found[i]) | filter((e) => e.dataset.keep == name)
+}
+
+view SizeClassSlot(when: str = "compact medium expanded", class: str? = null, children) {
+    style global size_class_view_css
+    <div class={ui_cls(["ui-size-class-slot", class])} data-when={when}>{children}</div>
+}
+
+component SizeClassView(on_change = null, fill: bool = false, class: str? = null, children) {
+    style global size_class_view_css
+    state size = ""            // "" until measured: the server cannot know, and the CSS does not need to
+    state kept = ""            // the data-keep of what holds the focus
+    state tops = {}            // each data-keep's scroll, noted as it scrolls: a slot leaving is laid out anew before anyone can ask it
+    // What came into view takes over from what left. Each pair is looked at once, by
+    // name, so three slots sharing a name still give the text of the one that left.
+    let carry = (root, left: str, came: str) => {
+        let inside = (e, s: str) => {
+            let slot = e.closest(".ui-size-class-slot")
+            slot != null && size_class_view_in(slot.dataset.when, s)
+        }
+        let all = root.querySelectorAll("[data-keep]")
+        let names = range(all.length) | map((i) => all[i].dataset.keep) | unique()
+        for name in names {
+            let twins = size_class_view_twins(root, name)
+            let from = twins | filter((e) => inside(e, left) && !inside(e, came))
+            let to = twins | filter((e) => inside(e, came) && !inside(e, left))
+            if len(from) > 0 && len(to) > 0 {
+                let a = from[0]
+                let b = to[0]
+                if a.value != null && a.value != b.value {
+                    b.value = a.value
+                    b.dispatchEvent(js_new("Event", "input", { bubbles: true }))
+                }
+                let top = get(tops, name, 0)
+                a.scrollTop = top
+                b.scrollTop = top
+                if kept == name {
+                    b.focus({ preventScroll: true })
+                    if a.selectionStart != null && b.setSelectionRange != null { b.setSelectionRange(a.selectionStart, a.selectionEnd) }
+                }
+            }
+        }
+    }
+    <div class={ui_cls(["ui-size-class", fill && "ui-size-class-fill", class])} data-size-class={size == "" ? null : size}
+         @focusin={(e) => {
+             let holder = e.target.closest("[data-keep]")
+             kept = holder != null ? holder.dataset.keep : ""
+         }}
+         @mount={(el) => {
+             let look = (_e = null) => {
+                 let next = size_class_view_of(el.clientWidth)
+                 if next != size {
+                     let was = size
+                     size = next
+                     if was != "" { carry(el, was, next) }
+                     on_change && on_change(next)
+                 }
+             }
+             let scrolled = (e) => {
+                 let t = e.target
+                 if t.closest != null && t.dataset.keep != null && size_class_view_in(t.closest(".ui-size-class-slot").dataset.when, size) {
+                     tops = set(tops, t.dataset.keep, t.scrollTop)
+                 }
+             }
+             let seen = js_new("ResizeObserver", look)
+             seen.observe(el)
+             el.addEventListener("scroll", scrolled, { capture: true, passive: true })
+             () => {
+                 seen.disconnect()
+                 el.removeEventListener("scroll", scrolled, { capture: true })
+             }
+         }}>
+        {children}
+    </div>
+}

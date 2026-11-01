@@ -1,0 +1,316 @@
+// DraftKeeper: a form that keeps what was typed on this device, written down on every
+// change so that a crash or the system closing the app loses nothing, and offers it back
+// next time, with how old it is and how it starts. Until the person chooses, nothing
+// overwrites it. Sending clears it; a send that fails keeps it. (AutosaveForm is the
+// desktop cousin: it writes every half second, so it can lose the last moments.)
+//
+//   import ui/draft_keeper.qwe use DraftKeeper
+//
+//   <DraftKeeper id="report" fields={[
+//       { name: "title", label: "Title", required: true },
+//       { name: "body", label: "What happened", multiline: true, required: true },
+//   ]} on_send={(v) => { send_report(v) }}/>
+//
+//   // What lasts. In a browser it needs nothing: it keeps the draft in localStorage. In a
+//   // phone app that comes back empty each launch, because the app's port changes, so give
+//   // `saved`, and keep what on_save gives in SQLite, which the app's own server holds:
+//   server fn keep_draft(d) { db.exec("insert or replace into drafts (id, body) values ('report', ?)", json.stringify(d ?? {})) }
+//   component Report(saved = {}) {
+//       <DraftKeeper id="report" saved={saved} on_save={(d) => { keep_draft(d) }} on_send={(v) => { send_report(v) }}/>
+//   }
+//   route GET / { <Report saved={load_draft()}/> }
+//
+// fields: each { name, label, multiline (true: a text area), type ("text", "email", ...),
+// placeholder, required, inputmode, autocomplete, value (where it starts), secret (true: never
+// written down) }; a "password" field is never written down either. Left out, it is one
+// text area called `text`, with `label` and `placeholder`.
+// saved: the draft on_save last gave, or an empty map or null when there is none; a map
+// given (even empty) leaves localStorage alone. on_save(draft): called as typing goes, at
+// most every every_ms (400) and when the page is hidden, with { v, at, values }, or
+// null when there is nothing to keep; false or an error value says it was not kept.
+// on_send(values): the Send button, and it may wait; false, { ok: false, error } or an error
+// value keeps the draft and says so. action, method ("post"): a plain form instead. The page
+// cannot know that went well, so the draft stays until a page gives clear={true}.
+// clear: true removes the draft on start. submit: the button's words. max_days: an older
+// draft is dropped (30). wait_ms: how long a send may take (30000). id: for its elements, and
+// the name it is stored under, with store in its place if given. class: more classes.
+//
+// What a person sees says where the draft is, so nobody trusts more than there is.
+//
+// draft_keeper_encode(fields, values, at) and draft_keeper_decode(kept, fields, now_ms, max_days)
+// are the format; decode takes the text or the map and gives { values, at }, { gone: "old" } or
+// { gone: "bad" }, or null when there is none.
+
+import ui/theme.qwe use ui_cls
+
+let draft_keeper_css = css`
+.ui-dkeep { container-type: inline-size; display: grid; gap: 14px; min-width: 0; color: var(--ui-fg); font: 15px/1.45 var(--ui-font); }
+.ui-dkeep-offer { display: grid; gap: 8px; padding: 12px; border-radius: var(--ui-radius-sm); background: var(--ui-info-soft); }
+.ui-dkeep-offer-title { margin: 0; font-weight: 600; }
+.ui-dkeep-preview { margin: 0; overflow-wrap: anywhere; color: var(--ui-muted); font-size: 14px; }
+.ui-dkeep-offer-acts, .ui-dkeep-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.ui-dkeep-fields { display: grid; gap: 12px; min-width: 0; }
+.ui-dkeep-field { display: grid; gap: 5px; min-width: 0; }
+.ui-dkeep-label { font-size: 14px; font-weight: 500; }
+.ui-dkeep-req { margin-left: 2px; color: var(--ui-danger); }
+/* 16 px: below that, iOS zooms the page on focus and leaves it zoomed. */
+.ui-dkeep-input { box-sizing: border-box; width: 100%; min-height: 46px; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px/1.4 var(--ui-font); }
+textarea.ui-dkeep-input { min-height: 132px; resize: vertical; field-sizing: content; }
+.ui-dkeep-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-dkeep-input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-dkeep-btn { min-width: 96px; min-height: 46px; padding: 0 16px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 15px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-dkeep-go { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); font-weight: 600; }
+.ui-dkeep-btn:disabled { opacity: .6; cursor: default; }
+.ui-dkeep-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-dkeep-note { flex: 1 1 200px; margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-dkeep-note:focus { outline: none; }
+.ui-dkeep-note[data-bad] { color: var(--ui-danger); }
+.ui-dkeep-lasts { margin: 0; color: var(--ui-muted); font-size: 13px; }
+@media (hover: hover) { .ui-dkeep-btn:hover:enabled { border-color: var(--ui-strong); background: var(--ui-subtle); } .ui-dkeep-go:hover:enabled { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); } }
+@container (min-width: 560px) {
+  .ui-dkeep-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ui-dkeep-field[data-wide] { grid-column: 1 / -1; }
+  .ui-dkeep-offer { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+  .ui-dkeep-preview { grid-column: 1; }
+  .ui-dkeep-offer-acts { grid-column: 2; grid-row: 1 / 3; }
+}
+`
+
+// Whether a field may be written down.
+fn draft_keeper_keeps(f: map) -> bool = f.type != "password" && f.secret != true
+
+// The fields, or the one text area.
+fn draft_keeper_fields(fields, label: str, placeholder) -> list {
+    let good = (type_of(fields) == "list" ? fields : []) | filter((f) => type_of(f) == "map" && type_of(f.name) == "str" && f.name != "")
+    len(good) > 0 ? good : [{ name: "text", label, placeholder, multiline: true, required: true }]
+}
+
+fn draft_keeper_blank(fields: list) -> map = reduce(fields, {}, (m, f) => set(m, f.name, type_of(f.value) == "str" ? f.value : ""))
+
+// A draft to keep.
+fn draft_keeper_encode(fields: list, values: map, at: int) -> map {
+    let kept = reduce(fields | filter(draft_keeper_keeps), {}, (m, f) => set(m, f.name, get(values, f.name, "")))
+    { v: 1, at, values: kept }
+}
+
+// A draft from storage: text or a map. Only what fits today's fields comes back.
+fn draft_keeper_decode(kept, fields: list, now_ms: int, max_days: int) {
+    if kept == null { return null }
+    let d = type_of(kept) == "str" ? json.parse(kept) : kept
+    if is_err(d) || type_of(d) != "map" { return { gone: "bad" } }
+    if len(keys(d)) == 0 { return null }
+    if d.v != 1 || type_of(d.values) != "map" { return { gone: "bad" } }
+    let at = type_of(d.at) == "int" ? d.at : null
+    if at != null && now_ms - at > max_days * 86400000 { return { gone: "old" } }
+    let values = reduce(fields | filter(draft_keeper_keeps), {}, (m, f) => {
+        let v = get(d.values, f.name)
+        type_of(v) == "str" ? set(m, f.name, v) : m
+    })
+    { values, at }
+}
+
+// Whether there is anything worth keeping.
+fn draft_keeper_empty(fields: list, values: map) -> bool =
+    all(fields | filter(draft_keeper_keeps), (f) => {
+        let start = type_of(f.value) == "str" ? f.value : ""
+        trim(get(values, f.name, "")) == trim(start)
+    })
+
+// Whether a draft says anything the form does not already.
+fn draft_keeper_differs(draft: map, values: map) -> bool = any(keys(draft), (k) => get(draft, k, "") != get(values, k, ""))
+
+// What the offer shows of it: its first words, cut at 80 characters.
+fn draft_keeper_preview(fields: list, values: map) -> str {
+    let first = fields | filter(draft_keeper_keeps) | map((f) => trim(get(values, f.name, ""))) | find((t) => t != "")
+    if first == null { return "" }
+    len(first) > 80 ? `${trim(slice(first, 0, 80))}…` : first
+}
+
+fn draft_keeper_ago(ms: int) -> str {
+    if ms < 60000 { return "a moment ago" }
+    if ms < 3600000 { return `${floor(ms / 60000)} min ago` }
+    if ms < 86400000 { return `${floor(ms / 3600000)} h ago` }
+    let days = floor(ms / 86400000)
+    days == 1 ? "yesterday" : `${days} days ago`
+}
+
+fn draft_keeper_missing(fields: list, values: map) -> list =
+    fields | filter((f) => f.required == true && trim(get(values, f.name, "")) == "")
+
+// Whether a send came to nothing, and the words for it.
+fn draft_keeper_failure(r) {
+    if is_err(r) { return "Not sent: it could not reach the server. Your draft is kept." }
+    if r == false { return "Not sent. Your draft is kept." }
+    if type_of(r) == "map" && r.ok == false { return type_of(r.error) == "str" && r.error != "" ? `Not sent: ${r.error} Your draft is kept.` : "Not sent. Your draft is kept." }
+    null
+}
+
+// What it can promise, in the words a person would use.
+fn draft_keeper_lasts(place, keeper: bool) -> str {
+    if place == null { return "" }
+    if keeper { return place == "app" ? "Your draft stays on this phone, even if the app closes." : "Your draft is kept by this program." }
+    match place {
+        "app" => "Your draft lasts until the app closes."
+        "blocked" => "This browser is blocking storage, so your draft lasts only while this page is open."
+        _ => "Your draft stays in this browser, on this device only."
+    }
+}
+
+component DraftKeeper(id: str = "draft-keeper", store: str? = null, fields = [], label: str = "Your message", placeholder: str? = null, saved = null, on_save = null,
+                      on_send = null, action: str? = null, method: str = "post", submit: str = "Send", clear: bool = false, every_ms: int = 400, max_days: int = 30,
+                      wait_ms: int = 30000, class: str? = null) {
+    style global draft_keeper_css
+    let clean = draft_keeper_fields(fields, label, placeholder)
+    let slot = `ui-draft-keeper:${store ?? id}`
+    let keeper = type_of(saved) == "map"
+    state vals = draft_keeper_blank(draft_keeper_fields(fields, label, placeholder))
+    state offer = null
+    state place = null
+    state dirty = false
+    state sending = false
+    state tried = false
+    state note = ""
+    state bad = false
+    let wanting = tried ? (draft_keeper_missing(clean, vals) | map((f) => f.name)) : []
+    let say = (words: str, wrong: bool) => {
+        note = words
+        bad = wrong
+    }
+    let write = () => {
+        let quiet = draft_keeper_empty(clean, vals)
+        let text = json.stringify(draft_keeper_encode(clean, vals, now()))
+        if !keeper {
+            let wrote = js("Promise.resolve", js_new("Promise", (done) => { done((quiet ? js("localStorage.removeItem", slot) : js("localStorage.setItem", slot, text)) ?? true) }))
+            if is_err(wrote) { place = "blocked" }
+        }
+        dirty = true
+    }
+    let tell = () => {
+        if dirty {
+            dirty = false
+            if on_save != null {
+                let r = js("Promise.resolve", js_new("Promise", (done) => {
+                    js("AbortSignal.timeout", wait_ms).addEventListener("abort", (_e = null) => { done(err("no answer")) })
+                    js("Promise.resolve", on_save(draft_keeper_empty(clean, vals) ? null : draft_keeper_encode(clean, vals, now()))).then(done, (_e = null) => { done(err("failed")) })
+                }))
+                if is_err(r) || r == false { say("Your draft could not be kept. It is safe on this page until you leave it.", true) }
+            }
+        }
+    }
+    if dirty { every(every_ms, tell) }
+    let forget = () => {
+        offer = null
+        dirty = true
+        if !keeper { js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.removeItem", slot) ?? true) })) }
+    }
+    let begin = (el) => {
+        let w = js("window")
+        let d = js("document")
+        let text = keeper ? saved : js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.getItem", slot)) }))
+        let blocked = !keeper && is_err(text)
+        place = w.quilloNative != null ? "app" : (blocked ? "blocked" : "browser")
+        if clear {
+            forget()
+            tell()
+        } else if !blocked {
+            let found = draft_keeper_decode(text, clean, now(), max_days)
+            if found != null && found.gone != null {
+                forget()
+                say(found.gone == "old" ? "An old draft was past keeping, so it was cleared." : "A saved draft could not be read, so it was cleared.", true)
+            } else if found != null && draft_keeper_differs(found.values, vals) {
+                offer = { ...found, ago: found.at != null ? draft_keeper_ago(now() - found.at) : null, preview: draft_keeper_preview(clean, found.values) }
+            }
+        }
+        // A phone closes a page in the background with no warning, so what on_save has
+        // not had yet goes the moment the page stops showing.
+        let away = (_e = null) => { if d.hidden { tell() } }
+        let gone = (_e = null) => { tell() }
+        d.addEventListener("visibilitychange", away)
+        w.addEventListener("pagehide", gone)
+        () => {
+            d.removeEventListener("visibilitychange", away)
+            w.removeEventListener("pagehide", gone)
+        }
+    }
+    let send = (e) => {
+        e.preventDefault()
+        let form = e.target
+        if !sending {
+            tried = true
+            let lacking = draft_keeper_missing(clean, vals)
+            if len(lacking) > 0 {
+                say(`${lacking[0].label ?? lacking[0].name} is needed before this can go.`, true)
+                form.querySelector(`[name="${lacking[0].name}"]`).focus()
+            } else if on_send == null {
+                if action != null { form.submit() }
+            } else {
+                sending = true
+                say("Sending…", false)
+                let r = js("Promise.resolve", js_new("Promise", (done) => {
+                    js("AbortSignal.timeout", wait_ms).addEventListener("abort", (_e = null) => { done(err("no answer")) })
+                    js("Promise.resolve", on_send(vals)).then(done, (_e = null) => { done(err("failed")) })
+                }))
+                sending = false
+                let why = draft_keeper_failure(r)
+                if why != null {
+                    say(why, true)
+                } else {
+                    vals = draft_keeper_blank(clean)
+                    tried = false
+                    forget()
+                    tell()
+                    say("Sent. Your draft is cleared.", false)
+                }
+            }
+        }
+    }
+    <form class={ui_cls(["ui-dkeep", class])} id={id} action={action} method={method} novalidate="true" @mount={begin} @submit={send}>
+        {offer != null && <div.ui-dkeep-offer role="group" aria-label="An unsent draft">
+            <p.ui-dkeep-offer-title>{offer.ago != null ? `You have an unsent draft from ${offer.ago}.` : "You have an unsent draft."}</p>
+            <p.ui-dkeep-preview>{offer.preview}</p>
+            <div.ui-dkeep-offer-acts>
+                <button.ui-dkeep-btn.ui-dkeep-go type="button" @click={(e) => {
+                    let box = e.target.closest(".ui-dkeep")
+                    vals = { ...vals, ...offer.values }
+                    offer = null
+                    write()
+                    say("Your draft is back.", false)
+                    // The button is about to go: focus stays near, and no keyboard comes up.
+                    box.querySelector(".ui-dkeep-note").focus()
+                }}>Put it back</button>
+                <button.ui-dkeep-btn type="button" @click={(e) => {
+                    let box = e.target.closest(".ui-dkeep")
+                    forget()
+                    if !draft_keeper_empty(clean, vals) { write() }
+                    tell()
+                    say("Draft discarded.", false)
+                    box.querySelector(".ui-dkeep-note").focus()
+                }}>Discard</button>
+            </div>
+        </div>}
+        <div.ui-dkeep-fields>
+            {for f in clean => <div.ui-dkeep-field key={f.name} data-wide={f.multiline == true ? "" : null}>
+                <label.ui-dkeep-label for={`${id}-${f.name}`}>{f.label ?? f.name}{f.required == true && <span.ui-dkeep-req aria-hidden="true">*</span>}</label>
+                {f.multiline == true
+                    ? <textarea.ui-dkeep-input id={`${id}-${f.name}`} name={f.name} placeholder={f.placeholder} required={f.required == true} autocapitalize="sentences"
+                                value={get(vals, f.name, "")} aria-invalid={contains(wanting, f.name) ? "true" : null}
+                                @input={(e) => {
+                                    vals = set(vals, f.name, e.value)
+                                    if offer == null { write() }
+                                }}></textarea>
+                    : <input.ui-dkeep-input id={`${id}-${f.name}`} name={f.name} type={f.type ?? "text"} placeholder={f.placeholder} required={f.required == true}
+                             inputmode={f.inputmode} autocomplete={f.autocomplete ?? (draft_keeper_keeps(f) ? null : "off")}
+                             value={get(vals, f.name, "")} aria-invalid={contains(wanting, f.name) ? "true" : null}
+                             @input={(e) => {
+                                 vals = set(vals, f.name, e.value)
+                                 if offer == null { write() }
+                             }}/>}
+            </div>}
+        </div>
+        <div.ui-dkeep-foot>
+            <button.ui-dkeep-btn.ui-dkeep-go type="submit" disabled={sending}>{submit}</button>
+            <p.ui-dkeep-note tabindex="-1" role="status" data-bad={bad ? "" : null}>{note}</p>
+        </div>
+        <p.ui-dkeep-lasts>{draft_keeper_lasts(place, keeper)}</p>
+    </form>
+}

@@ -1,0 +1,421 @@
+// StoryViewer: stories as phones show them, full screen, one person after another, with
+// a bar of segments along the top. Each runs for its time and goes on by itself. Hold a
+// finger down to pause, tap the right of the screen to go on and the left to go back,
+// swipe sideways for the next or last person, and swipe down to leave. Short of the
+// distance, it springs back. What comes next is fetched before it is needed, so that it
+// shows at once, and the clock waits for a picture still on its way.
+// The tap zones are real buttons, with Pause and Close beside them, so keys and screen
+// readers can do all of it: arrow keys go on and back, Space pauses, Escape leaves.
+//
+//   <StoryViewer trigger="Stories" stories={[
+//       { id: "ana", name: "Ana Silva", time: "2 h", items: [
+//           { src: "/s/1.jpg", alt: "The new bridge at dawn" },
+//           { src: "/s/2.mp4", type: "video", alt: "Crossing it" },
+//           { text: "Open on Monday", bg: "#5b4bdb" } ] }
+//   ]} on_seen={(story, item) => { mark(story, item) }}/>
+//
+// stories: a list of { id, name, avatar?, time?, items }, and each of items { src, type?
+// ("image", or "video", which is played muted and runs for its own length), alt?, text?
+// (words, alone or over the picture), bg? (a colour behind words), seconds? }. A story
+// with nothing to show is left out. seconds: how long each lasts unless it says (5).
+// start: which story to open on (0). trigger: the text of a button that opens it. Inside
+// one of your components, open it from your own state instead: open={...} and on_close().
+// modal: true is the browser's <dialog> over the whole page, which holds the focus; false
+// keeps it inside the nearest element with a transform, for a frame or a pane.
+// label: what screen readers call it ("Stories"). id, class: for the <dialog>.
+// on_seen(story_id, item_index): each time one is shown. on_close(): it was left.
+// Both work inside one of your components.
+
+import ui/theme.qwe use ui_cls
+
+let story_viewer_css = css`
+.ui-story-viewer-host { display: contents; }
+.ui-story-viewer-open {
+  min-height: 46px; padding: 0 18px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 15px var(--ui-font); cursor: pointer;
+}
+.ui-story-viewer-open:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-story-viewer-open:disabled { opacity: .55; cursor: default; }
+.ui-story-viewer {
+  position: fixed; inset: 0; z-index: 40; box-sizing: border-box; width: 100%; height: 100%; max-width: none; max-height: none; margin: 0; padding: 0; overflow: hidden; border: 0;
+  background: rgba(0, 0, 0, var(--ui-story-viewer-dim, 1)); color: #fff; font: 15px/1.4 var(--ui-font); container-type: size; overscroll-behavior: contain;
+}
+.ui-story-viewer::backdrop { background: #000; }
+.ui-story-viewer[open] { display: grid; grid-template-columns: 1fr; place-items: center; }
+.ui-story-viewer-stage {
+  position: relative; display: block; width: 100%; height: 100%; overflow: hidden; touch-action: none; background: #111; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  transition: transform .26s cubic-bezier(.2, .9, .3, 1);
+}
+.ui-story-viewer-dragging { transition: none; }
+.ui-story-viewer-media { position: absolute; inset: 0; display: grid; place-items: center; background: var(--ui-story-viewer-bg, #111); }
+.ui-story-viewer-media img, .ui-story-viewer-media video { width: 100%; height: 100%; object-fit: contain; -webkit-user-drag: none; pointer-events: none; }
+.ui-story-viewer-words { position: absolute; left: 20px; right: 20px; top: 50%; transform: translateY(-50%); margin: 0; font-size: 24px; font-weight: 600; line-height: 1.3; text-align: center; text-shadow: 0 1px 6px rgba(0, 0, 0, .6); overflow-wrap: anywhere; }
+.ui-story-viewer-broken { padding: 20px; text-align: center; }
+.ui-story-viewer-top {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 3; padding: max(10px, env(safe-area-inset-top)) 10px 18px; pointer-events: none;
+  background: linear-gradient(rgba(0, 0, 0, .55), transparent); transition: opacity .15s .22s;
+}
+.ui-story-viewer-held .ui-story-viewer-top { opacity: 0; }
+.ui-story-viewer-bars { display: flex; gap: 3px; }
+.ui-story-viewer-seg { flex: 1; height: 3px; overflow: hidden; border-radius: 2px; background: rgba(255, 255, 255, .38); }
+.ui-story-viewer-seg i { display: block; height: 100%; background: #fff; transform: scaleX(0); transform-origin: 0 50%; }
+:dir(rtl).ui-story-viewer-seg i { transform-origin: 100% 50%; }
+.ui-story-viewer-seg-done i { transform: scaleX(1) !important; }
+.ui-story-viewer-seg-todo i { transform: scaleX(0) !important; }
+.ui-story-viewer-who { display: flex; align-items: center; gap: 8px; min-height: 44px; margin-top: 4px; }
+.ui-story-viewer-who img, .ui-story-viewer-who > i { flex: none; width: 34px; height: 34px; border-radius: 50%; object-fit: cover; background: rgba(255, 255, 255, .25); font: 600 13px/34px var(--ui-font); text-align: center; }
+.ui-story-viewer-who b { min-width: 0; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-story-viewer-who small { flex: none; opacity: .8; font-size: 13px; }
+.ui-story-viewer-who span { flex: 1; }
+.ui-story-viewer-btn {
+  flex: none; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: #fff; cursor: pointer; pointer-events: auto;
+}
+.ui-story-viewer-btn svg { width: 24px; height: 24px; }
+.ui-story-viewer-btn:focus-visible { outline: 2px solid #fff; }
+.ui-story-viewer-zone { position: absolute; top: 0; bottom: 0; z-index: 2; margin: 0; padding: 0; border: 0; background: transparent; color: transparent; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.ui-story-viewer-zone:focus-visible { outline: 2px solid rgba(255, 255, 255, .8); outline-offset: -4px; }
+.ui-story-viewer-back { inset-inline-start: 0; width: 33%; }
+.ui-story-viewer-next { inset-inline-end: 0; width: 67%; }
+.ui-story-viewer-ahead { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; }
+.ui-story-viewer-arrow { display: none; }
+/* A tablet shows a story at its own shape, with the next and last person's arrows in the room beside it. */
+@container (min-width: 600px) {
+  .ui-story-viewer-stage { width: min(100cqw - 140px, 56.25cqh); height: min(100cqh, (100cqw - 140px) * 1.778); border-radius: 12px; }
+  .ui-story-viewer-arrow { position: absolute; top: 50%; z-index: 4; display: grid; margin-top: -22px; }
+  .ui-story-viewer-arrow-back { inset-inline-start: 12px; }
+  .ui-story-viewer-arrow-next { inset-inline-end: 12px; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-story-viewer-stage, .ui-story-viewer-top { transition: none; } }
+`
+
+// The stories that have something to show, and of each only what can be shown.
+fn story_viewer_clean(stories) {
+    let list = (type_of(stories) == "list" ? stories : []) | filter((s) => type_of(s) == "map")
+    let made = list | map((s) => {
+        ...s,
+        items: (type_of(s.items) == "list" ? s.items : []) | filter((m) => type_of(m) == "map" && (str(m.src ?? "") != "" || str(m.text ?? "") != ""))
+    })
+    made | filter((s) => len(s.items) > 0)
+}
+
+// Which of the stories that can be shown `start` means: it counts the stories as given,
+// so a story with nothing to show before it does not move it, and one with nothing to
+// show gives way to the next that has something.
+fn story_viewer_first(stories, start: int) -> int {
+    let given = type_of(stories) == "list" ? stories : []
+    let before = len(story_viewer_clean(slice(given, 0, max([start, 0]))))
+    max([0, min([before, len(story_viewer_clean(given)) - 1])])
+}
+
+// Where going on leads: the next item, the next person's first, or null past the end.
+fn story_viewer_next(rows: list, p: int, i: int) {
+    if p >= len(rows) { return null }
+    if i + 1 < len(rows[p].items) { return { p, i: i + 1 } }
+    p + 1 < len(rows) ? { p: p + 1, i: 0 } : null
+}
+
+// Where going back leads: the last item, the last person's final one, or null at the very start.
+fn story_viewer_back(rows: list, p: int, i: int) {
+    if i > 0 { return { p, i: i - 1 } }
+    if p > 0 && p - 1 < len(rows) { return { p: p - 1, i: len(rows[p - 1].items) - 1 } }
+    null
+}
+
+// What should be fetched now: the next `count` items with a picture or a video.
+fn story_viewer_ahead(rows: list, p: int, i: int, count: int) {
+    let at = { p, i }
+    let found = []
+    let steps = 0
+    while len(found) < count && steps < 12 {
+        at = story_viewer_next(rows, at.p, at.i)
+        if at == null { return found }
+        let m = rows[at.p].items[at.i]
+        if str(m.src ?? "") != "" { found = push(found, { src: m.src, video: m.type == "video" }) }
+        steps += 1
+    }
+    found
+}
+
+// How long an item lasts, in milliseconds. Bad numbers fall back on the default.
+fn story_viewer_ms(item, seconds: num) -> num {
+    let own = type_of(item.seconds) == "int" || type_of(item.seconds) == "float" ? item.seconds : seconds
+    max([own, 1]) * 1000
+}
+
+// Whether a swipe down, of dy at a speed in pixels a millisecond, leaves.
+fn story_viewer_leaves(dy: num, speed: num, screen: num) -> bool =
+    dy >= min([140, screen * 0.2]) || (dy >= 40 && speed >= 0.4)
+
+// The step to another person for a swipe of dx: 1, -1 or 0 for too short.
+fn story_viewer_step(dx: num, speed: num, width: num, rtl: bool) -> int {
+    if abs(dx) < min([90, width * 0.25]) && !(abs(dx) >= 40 && abs(speed) >= 0.4) { return 0 }
+    let way = dx < 0 ? 1 : -1
+    rtl ? 0 - way : way
+}
+
+// Speed from the last tenth of a second or so, not from the last two events, which can be
+// a moment apart or several together. `m` holds two marks, { p0, t0, p1, t1 }, the older
+// being what speed is measured from, and where it began: { from, since }.
+fn story_viewer_marks(pos: num, at: num) = { from: pos, since: at, p0: pos, t0: at, p1: pos, t1: at }
+fn story_viewer_track(m, pos: num, at: num) =
+    at - m.t1 >= 40 ? { ...m, p0: m.p1, t0: m.t1, p1: pos, t1: at } : m
+
+// Pixels a millisecond: since the older mark, or over the whole gesture if that is quicker,
+// as a phone that is busy hands a flick over in few events.
+fn story_viewer_speed(m, pos: num, at: num) -> num {
+    let recent = (pos - m.p0) / max([at - m.t0, 1])
+    let whole = (pos - m.from) / max([at - m.since, 1])
+    abs(whole) > abs(recent) ? whole : recent
+}
+
+// Up to two letters for someone with no picture.
+fn story_viewer_initials(name) -> str =
+    upper(join(split(trim(str(name ?? "")), " ") | filter((w) => w != "") | map((w) => slice(w, 0, 1)) | slice(0, 2), ""))
+
+component StoryViewer(stories: list = [], seconds: num = 5, start: int = 0, trigger: str? = null, open: bool = false, modal: bool = true,
+                      label: str = "Stories", on_seen = null, on_close = null, id: str? = null, class: str? = null) {
+    style global story_viewer_css
+    state dlg = null
+    state stage = null
+    state bars = null
+    state vid = null
+    state opener = null
+    state win = null
+    state was_open = false
+    state shown = false
+    state p = 0
+    state i = 0
+    state ready = false
+    state broken = false
+    state held = false
+    state paused = false
+    state away = false
+    state elapsed = 0
+    state last = 0
+    state grip = null        // { id, x, y, at, last_at, last, speed, axis }
+    state swallow = 0        // a click before this time ends a hold, and is not a tap
+    let rows = story_viewer_clean(stories)
+    let story = p < len(rows) ? rows[p] : null
+    let item = story != null && i < len(story.items) ? story.items[i] : null
+    let run = shown && ready && !held && !paused && !away
+    let count = story != null ? len(story.items) : 0
+    let ahead = shown ? story_viewer_ahead(rows, p, i, 3) : []
+    let paint = (part: num) => {
+        if bars != null && i < bars.children.length {
+            bars.children[i].firstElementChild.style.transform = `scaleX(${max([0, min([part, 1])])})`
+        }
+    }
+    let arrive = (to) => {
+        p = to.p
+        i = to.i
+        elapsed = 0
+        last = now()
+        let m = rows[to.p].items[to.i]
+        // Words need nothing to load.
+        ready = str(m.src ?? "") == ""
+        broken = false
+        paint(0)
+        on_seen && on_seen(rows[to.p].id, to.i)
+    }
+    let leave = () => { if dlg.open { dlg.close() } }
+    let onward = () => {
+        let to = story_viewer_next(rows, p, i)
+        if to != null { arrive(to) } else { leave() }
+    }
+    let backward = () => {
+        let to = story_viewer_back(rows, p, i)
+        if to != null { arrive(to) } else {
+            elapsed = 0
+            last = now()
+            paint(0)
+            if vid != null { vid.currentTime = 0 }
+        }
+    }
+    let person = (step: int) => {
+        let to = p + step
+        if to >= len(rows) { leave() } else if to >= 0 { arrive({ p: to, i: 0 }) }
+    }
+    let show = () => {
+        if dlg != null && !dlg.open && len(rows) > 0 {
+            let first = story_viewer_first(stories, start)
+            shown = true
+            paused = false
+            if modal { dlg.showModal() } else { dlg.show() }
+            arrive({ p: first, i: 0 })
+            stage.querySelector(".ui-story-viewer-next").focus({ preventScroll: true })
+        }
+    }
+    // On a change of `open` only: left open by a parent that has no on_close, it must not come straight back.
+    if dlg != null && stage != null && bars != null && open != was_open {
+        was_open = open
+        if open { show() } else if dlg.open { dlg.close() }
+    }
+    if run {
+        last = now()
+        every(50, () => {
+            if vid != null {
+                if vid.ended { onward() } else { paint(vid.duration > 0 ? vid.currentTime / vid.duration : 0) }
+            } else {
+                let t = now()
+                elapsed = elapsed + t - last
+                last = t
+                let full = story_viewer_ms(item, seconds)
+                paint(elapsed / full)
+                if elapsed >= full { onward() }
+            }
+        })
+    }
+    if vid != null {
+        if run { vid.play().then((_v = null) => null, (_e = null) => null) } else { vid.pause() }
+    }
+    let release = () => {
+        stage.classList.remove("ui-story-viewer-dragging")
+        stage.style.transform = ""
+        dlg.style.removeProperty("--ui-story-viewer-dim")
+    }
+    <div.ui-story-viewer-host>
+        {trigger != null && <button.ui-story-viewer-open type="button" aria-haspopup="dialog" disabled={len(rows) == 0}
+                                    @mount={(el) => { opener = el }} @click={show}>{trigger}</button>}
+        <dialog class={ui_cls(["ui-story-viewer", held && "ui-story-viewer-held", class])} id={id} aria-label={label}
+                @mount={(el) => {
+                    // js() first: until it has answered, what reads the next line would run ahead of this function.
+                    let w = js("window")
+                    let d = w.document
+                    win = w
+                    dlg = el
+                    let seen = (_e = null) => { away = d.visibilityState != "visible" }
+                    d.addEventListener("visibilitychange", seen)
+                    () => { d.removeEventListener("visibilitychange", seen) }
+                }}
+                @close={() => {
+                    shown = false
+                    held = false
+                    grip = null
+                    release()
+                    if opener != null { opener.focus({ preventScroll: true }) }
+                    on_close && on_close()
+                }}
+                @keydown={(e) => {
+                    let forward = win.getComputedStyle(dlg).direction == "rtl" ? "ArrowLeft" : "ArrowRight"
+                    let behind = forward == "ArrowLeft" ? "ArrowRight" : "ArrowLeft"
+                    if e.key == forward { e.preventDefault(); onward() }
+                    if e.key == behind { e.preventDefault(); backward() }
+                    if e.key == "ArrowDown" { e.preventDefault(); person(1) }
+                    if e.key == "ArrowUp" { e.preventDefault(); person(-1) }
+                    if e.key == " " && e.target.closest("button") == null { e.preventDefault(); paused = !paused }
+                    if e.key == "Escape" {
+                        e.preventDefault()
+                        leave()
+                    }
+                }}>
+            <div.ui-story-viewer-stage
+                 @mount={(el) => { stage = el }}
+                 @pointerdown={(e) => {
+                     if shown && e.button == 0 && e.isPrimary && e.target.closest(".ui-story-viewer-btn") == null {
+                         held = true
+                         grip = { id: e.pointerId, x: e.clientX, y: e.clientY, at: now(), axis: null, marks: null }
+                     }
+                 }}
+                 @pointermove={(e) => {
+                     if grip != null && e.pointerId == grip.id {
+                         let dx = e.clientX - grip.x
+                         let dy = e.clientY - grip.y
+                         let axis = grip.axis ?? (abs(dx) < 10 && abs(dy) < 10 ? null : (abs(dx) > abs(dy) ? "x" : "y"))
+                         if axis != null {
+                             if grip.axis == null {
+                                 stage.setPointerCapture(e.pointerId)
+                                 stage.classList.add("ui-story-viewer-dragging")
+                             }
+                             let pos = axis == "y" ? e.clientY : e.clientX
+                             // The first step is taken to have been a frame: a hold before it is not part of the swipe.
+                             let marks = grip.marks ?? story_viewer_marks(axis == "y" ? grip.y : grip.x, e.timeStamp - 16)
+                             grip = { ...grip, axis, marks: story_viewer_track(marks, pos, e.timeStamp) }
+                             if axis == "y" {
+                                 let down = max([dy, 0])
+                                 stage.style.transform = `translateY(${down}px) scale(${max([1 - down / 1600, 0.8])})`
+                                 dlg.style.setProperty("--ui-story-viewer-dim", str(max([1 - down / 500, 0.3])))
+                             } else {
+                                 stage.style.transform = `translateX(${dx}px)`
+                             }
+                         }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     if grip != null && e.pointerId == grip.id {
+                         let g = grip
+                         let dx = e.clientX - g.x
+                         let dy = e.clientY - g.y
+                         grip = null
+                         held = false
+                         release()
+                         if g.axis == "y" {
+                             if story_viewer_leaves(dy, story_viewer_speed(g.marks, e.clientY, e.timeStamp), stage.clientHeight) { leave() }
+                         } else if g.axis == "x" {
+                             let rtl = win.getComputedStyle(dlg).direction == "rtl"
+                             let step = story_viewer_step(dx, story_viewer_speed(g.marks, e.clientX, e.timeStamp), stage.clientWidth, rtl)
+                             if step != 0 { person(step) }
+                         } else if now() - g.at > 260 {
+                             swallow = now() + 100
+                         }
+                     }
+                 }}
+                 @pointercancel={() => {
+                     grip = null
+                     held = false
+                     release()
+                 }}
+                 @contextmenu={(e) => { e.preventDefault() }}>
+                {for m in (shown && item != null ? [item] : []) =>
+                    <div.ui-story-viewer-media key={`${p}-${i}`} style={m.bg != null ? `--ui-story-viewer-bg: ${m.bg}` : null}>
+                        {str(m.src ?? "") != "" && !broken && (m.type == "video"
+                            ? <video src={m.src} muted playsinline preload="auto" aria-label={m.alt}
+                                     @mount={(el) => {
+                                         vid = el
+                                         () => { vid = null }
+                                     }}
+                                     @loadeddata={() => { ready = true }}
+                                     @error={() => { broken = true; ready = true }}></video>
+                            : <img src={m.src} alt={m.alt ?? ""} draggable="false" @load={() => { ready = true }} @error={() => { broken = true; ready = true }}/>)}
+                        {broken && <p.ui-story-viewer-broken>This one could not be loaded.{m.alt != null ? ` ${m.alt}` : ""}</p>}
+                        {m.text != null && <p.ui-story-viewer-words>{m.text}</p>}
+                    </div>}
+                <div.ui-story-viewer-ahead aria-hidden="true">
+                    {for a in ahead => <span key={a.src}>{a.video
+                        ? <video src={a.src} muted preload="auto" tabindex="-1"></video>
+                        : <img src={a.src} alt=""/>}</span>}
+                </div>
+                <button.ui-story-viewer-zone.ui-story-viewer-back type="button" aria-label="Back"
+                        @click={() => { if now() >= swallow { backward() } }}></button>
+                <button.ui-story-viewer-zone.ui-story-viewer-next type="button" aria-label="Next"
+                        @click={() => { if now() >= swallow { onward() } }}></button>
+                <div.ui-story-viewer-top>
+                    <div.ui-story-viewer-bars role="progressbar" aria-label="Stories of this person" aria-valuemin="1" aria-valuemax={count} aria-valuenow={i + 1}
+                         @mount={(el) => { bars = el }}>
+                        {for k in range(count) => <span key={k} class={ui_cls(["ui-story-viewer-seg", k < i && "ui-story-viewer-seg-done", k > i && "ui-story-viewer-seg-todo"])}><i></i></span>}
+                    </div>
+                    {story != null && <div.ui-story-viewer-who>
+                        {story.avatar != null ? <img src={story.avatar} alt=""/> : <i>{story_viewer_initials(story.name)}</i>}
+                        <b>{story.name}</b>
+                        {story.time != null && <small>{story.time}</small>}
+                        <span></span>
+                        <button.ui-story-viewer-btn type="button" aria-label={paused ? "Play" : "Pause"} aria-pressed={paused ? "true" : "false"} @click={() => { paused = !paused }}>
+                            {paused
+                                ? <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l11-6.5a1 1 0 0 0 0-1.72l-11-6.5A1 1 0 0 0 8 5.5z"/></svg>
+                                : <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>}
+                        </button>
+                        <button.ui-story-viewer-btn type="button" aria-label="Close" @click={leave}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                        </button>
+                    </div>}
+                </div>
+                <p.ui-sr role="status">{story != null ? `${story.name}, ${i + 1} of ${count}` : ""}</p>
+            </div>
+            <button.ui-story-viewer-btn.ui-story-viewer-arrow.ui-story-viewer-arrow-back type="button" aria-label="Last person" @click={() => { person(-1) }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
+            </button>
+            <button.ui-story-viewer-btn.ui-story-viewer-arrow.ui-story-viewer-arrow-next type="button" aria-label="Next person" @click={() => { person(1) }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+            </button>
+        </dialog>
+    </div>
+}

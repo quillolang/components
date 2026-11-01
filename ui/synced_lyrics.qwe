@@ -1,0 +1,255 @@
+// SyncedLyrics: the words of a song, lit line by line with the music and kept in the
+// middle of the box by a smooth scroll that never jumps. Only one thing moves the
+// lines: the box's scroll. The lit line grows by a transform, so nothing below it shifts.
+// A tap on a line goes there in the song. A finger scrolling the words takes
+// over; following comes back by itself after a few quiet seconds, or by a button.
+//
+//   import ui/synced_lyrics.qwe use SyncedLyrics
+//
+//   <SyncedLyrics media="player" lyrics={lrc_text}/>
+//   <SyncedLyrics time={position} lyrics={[{ at: 12.5, text: "First line" }]} on_seek={(t) => { audio.currentTime = t }}/>
+//
+// lyrics: LRC text ("[00:12.50]First line", with several stamps on a line, [ti:], [ar:] and
+// [offset:] understood, and an empty line for a pause), or a list of { at, text }, with at
+// in seconds. Text with no stamps shows as plain words. media: the id of the <audio> or
+// <video> it follows and seeks. time: the position in seconds instead, from your own player.
+// offset: seconds added to the time, for words a little early or late (0). rest: quiet
+// seconds until following comes back (5); 0 waits for the button. title, artist: shown beside the
+// words on a wide box, and read from [ti:] and [ar:] when left out. label: what screen readers
+// call it. on_seek(seconds): inside one of your components, on a tap on a line.
+//
+// The box needs a height: it is 100% of `--ui-lyrics-height`, 60dvh unless set. The arrow keys
+// walk the lines, Enter goes to one, Home and End go to the ends.
+
+import ui/theme.qwe use ui_cls
+
+let synced_lyrics_css = css`
+.ui-lyrics { position: relative; min-width: 0; height: var(--ui-lyrics-height, 60dvh); container: ui-lyrics / inline-size; color: var(--ui-fg); font: 16px/1.4 var(--ui-font); }
+.ui-lyrics-in { display: grid; grid-template-rows: auto minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); height: 100%; }
+.ui-lyrics-side { display: flex; align-items: baseline; gap: 8px; min-width: 0; padding: 6px 12px; color: var(--ui-muted); font-size: 13px; }
+.ui-lyrics-side:empty { display: none; }
+.ui-lyrics-side strong { overflow: hidden; color: var(--ui-fg); text-overflow: ellipsis; white-space: nowrap; }
+.ui-lyrics-wrap { position: relative; min-width: 0; min-height: 0; }
+.ui-lyrics-scroll {
+  position: relative; height: 100%; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; container-type: size; outline: none; touch-action: pan-y;
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 12%, #000 88%, transparent); mask-image: linear-gradient(to bottom, transparent, #000 12%, #000 88%, transparent);
+}
+.ui-lyrics-scroll::-webkit-scrollbar { display: none; }
+/* Half a box of room at each end, so the first and last lines can stand in the middle too. */
+.ui-lyrics-list { display: grid; gap: 2px; margin: 0; padding: 50cqh 12px; list-style: none; }
+.ui-lyrics-line {
+  display: block; width: 100%; min-height: 44px; padding: 8px 6px; border: 0; border-radius: 10px; background: none; color: var(--ui-muted); text-align: center;
+  font: 650 22px/1.3 var(--ui-font); cursor: pointer; touch-action: pan-y; transition: color .25s, transform .25s; -webkit-tap-highlight-color: transparent;
+}
+.ui-lyrics-line[aria-current="true"] { color: var(--ui-fg); transform: scale(1.06); }
+.ui-lyrics-gap { color: var(--ui-strong); letter-spacing: .3em; }
+.ui-lyrics-line:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: -2px; }
+.ui-lyrics-back {
+  position: absolute; left: 50%; bottom: calc(10px + env(safe-area-inset-bottom, 0px)); min-height: 44px; padding: 0 16px; border: 0; border-radius: 999px; background: var(--ui-accent); color: var(--ui-accent-fg);
+  font: 600 14px var(--ui-font); cursor: pointer; transform: translateX(-50%); box-shadow: var(--ui-shadow); touch-action: manipulation; z-index: 1;
+}
+.ui-lyrics-back:focus-visible { outline: 2px solid var(--ui-fg); outline-offset: 2px; }
+.ui-lyrics-empty, .ui-lyrics-plain { margin: 0; padding: 16px; color: var(--ui-muted); text-align: center; }
+.ui-lyrics-plain { overflow-y: auto; color: var(--ui-fg); white-space: pre-line; }
+@media (hover: hover) { .ui-lyrics-line:hover { color: var(--ui-fg); } }
+/* A wide box: the song beside the words, which get larger and start from the left. */
+@container ui-lyrics (min-width: 640px) {
+  .ui-lyrics-both { grid-template-rows: minmax(0, 1fr); grid-template-columns: minmax(180px, 240px) minmax(0, 1fr); gap: 20px; }
+  .ui-lyrics-side { flex-direction: column; justify-content: center; gap: 4px; padding: 16px; font-size: 15px; }
+  .ui-lyrics-side strong { white-space: normal; font-size: 22px; }
+  .ui-lyrics-line { padding: 10px 12px; text-align: left; font-size: 32px; transform-origin: 0 50%; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-lyrics-line { transition: none; } }
+`
+
+// A stamp's seconds: "01:02.50" or "01:02:50"; null for anything else.
+fn synced_lyrics_stamp(tag: str) {
+    let parts = split(tag, ":")
+    if len(parts) < 2 || len(parts) > 3 { return null }
+    let m = int(parts[0])
+    let s = float(len(parts) == 3 ? `${parts[1]}.${parts[2]}` : parts[1])
+    if is_err(m) || is_err(s) || m < 0 || s < 0 { return null }
+    m * 60 + s
+}
+
+// A line of LRC: its stamps, what is left, and a tag such as "ti:Song" if that is what it is.
+fn synced_lyrics_tags(line: str) -> map {
+    let rest = trim(line)
+    let stamps = []
+    let tag = null
+    let going = true
+    while going && starts_with(rest, "[") {
+        let close = index_of(rest, "]")
+        if close == null {
+            going = false
+        } else {
+            let inner = slice(rest, 1, close)
+            let at = synced_lyrics_stamp(inner)
+            if at != null {
+                stamps = stamps | push(at)
+            } else {
+                tag = inner
+            }
+            rest = trim(slice(rest, close + 1, len(rest)))
+        }
+    }
+    { stamps: stamps, text: rest, tag: tag }
+}
+
+// What [ti:Song] says, or null.
+fn synced_lyrics_meta(parsed: list, name: str) {
+    let hit = find(parsed, (p) => p.tag != null && starts_with(lower(p.tag), `${name}:`))
+    hit == null ? null : trim(slice(hit.tag, len(name) + 1, len(hit.tag)))
+}
+
+// Any lyrics as { lines, plain, title, artist }: lines are { at, text } in time order.
+fn synced_lyrics_parse(lyrics) -> map {
+    if type_of(lyrics) == "list" {
+        let kept = lyrics | filter((x) => type_of(x) == "map" && (type_of(get(x, "at")) == "int" || type_of(get(x, "at")) == "float") && math.isfinite(x.at))
+        return { lines: sort_by(kept | map((x) => { at: x.at, text: str(get(x, "text") ?? "") }), (x) => x.at), plain: "", title: null, artist: null }
+    }
+    if type_of(lyrics) != "str" { return { lines: [], plain: "", title: null, artist: null } }
+    let parsed = split(lyrics, "\n") | map((l) => synced_lyrics_tags(l))
+    let shift = synced_lyrics_meta(parsed, "offset")
+    let ms = shift == null ? 0 : float(shift)
+    let early = is_err(ms) ? 0 : ms / 1000
+    let stamped = flatten(parsed | filter((p) => len(p.stamps) > 0) | map((p) => p.stamps | map((t) => { at: max([0, t - early]), text: p.text })))
+    let plain = parsed | filter((p) => len(p.stamps) == 0 && p.tag == null) | map((p) => p.text)
+    { lines: sort_by(stamped, (x) => x.at), plain: trim(join(plain, "\n")), title: synced_lyrics_meta(parsed, "ti"), artist: synced_lyrics_meta(parsed, "ar") }
+}
+
+// Which line is lit at a time: the last that has begun, -1 before the first. Halves the
+// list, as this runs on every update of the time and a song may have hundreds of lines.
+fn synced_lyrics_at(ats: list, t) -> int {
+    let lo = 0
+    let hi = len(ats) - 1
+    let found = -1
+    while lo <= hi {
+        let mid = floor((lo + hi) / 2)
+        if ats[mid] <= t {
+            found = mid
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    found
+}
+
+component SyncedLyrics(lyrics = [], media: str = "", time = null, offset = 0, rest = 5, title: str? = null, artist: str? = null,
+                       label: str = "Lyrics", on_seek = null, class: str? = null) {
+    style global synced_lyrics_css
+    let song = synced_lyrics_parse(lyrics)
+    let lines = song.lines
+    let ats = lines | map((l) => l.at)
+    let name = title ?? song.title
+    let by = artist ?? song.artist
+    state box = null
+    state doc = null
+    state still = false
+    state live_t = 0
+    state follow = true
+    state down = false        // a finger is on the words
+    state quiet = 0           // when the words were last moved by hand
+    state cursor = -1         // the line a key went to, while the keys are in use
+    let time_now = (media != "" ? live_t : (time ?? 0)) + offset
+    let at = synced_lyrics_at(ats, time_now)
+    let tab_i = cursor >= 0 ? cursor : max([at, 0])
+    let centre = (i, smooth) => {
+        let el = box.querySelector(`[data-i="${i}"]`)
+        if el != null {
+            box.scrollTo({ top: el.offsetTop + el.offsetHeight / 2 - box.clientHeight / 2, behavior: smooth && !still ? "smooth" : "instant" })
+        }
+    }
+    let take_over = () => {
+        follow = false
+        quiet = js("Date.now")
+    }
+    let resume = () => {
+        follow = true
+        cursor = -1
+        centre(max([at, 0]), true)
+    }
+    let seek = (t) => {
+        let m = media == "" || doc == null ? null : doc.getElementById(media)
+        if m != null {
+            m.currentTime = t
+            live_t = t
+        }
+        on_seek && on_seek(t)
+    }
+    let walk = (i) => {
+        let to = max([0, min([i, len(lines) - 1])])
+        cursor = to
+        take_over()
+        box.querySelector(`[data-i="${to}"]`).focus()
+    }
+    if follow && box != null && (at >= 0 || len(lines) > 0) { centre(max([at, 0]), true) }
+    if !follow && type_of(rest) == "int" && rest > 0 {
+        every(500, () => {
+            let clock = js("Date.now")
+            if !follow && !down && clock - quiet >= rest * 1000 { resume() }
+        })
+    }
+    {len(lines) == 0
+        ? <div class={ui_cls(["ui-lyrics", class])} role="region" aria-label={label}>
+            {song.plain != "" ? <p.ui-lyrics-plain>{song.plain}</p> : <p.ui-lyrics-empty>No lyrics for this one.</p>}
+          </div>
+        : <div class={ui_cls(["ui-lyrics", class])} role="region" aria-label={label}><div class={ui_cls(["ui-lyrics-in", (name != null || by != null) && "ui-lyrics-both"])}>
+            {(name != null || by != null) && <div.ui-lyrics-side><strong>{name}</strong><span>{by}</span></div>}
+            <div.ui-lyrics-wrap>
+                <div.ui-lyrics-scroll
+                     @mount={(el) => {
+                         box = el
+                         doc = js("document")
+                         still = js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+                         centre(max([at, 0]), false)
+                         let heard = (e) => { if e.target.id == media { live_t = e.target.currentTime } }
+                         let names = ["timeupdate", "seeked"]
+                         if media != "" {
+                             for n in names { doc.addEventListener(n, heard, true) }
+                             let m = doc.getElementById(media)
+                             if m != null { live_t = m.currentTime }
+                         }
+                         // A turn of the phone rewraps the words: the same line stays in the middle, at once.
+                         let grown = js_new("ResizeObserver", (_x) => { if follow { centre(max([at, 0]), false) } })
+                         grown.observe(el)
+                         () => {
+                             grown.disconnect()
+                             if media != "" { for n in names { doc.removeEventListener(n, heard, true) } }
+                         }
+                     }}
+                     @pointerdown={() => { down = true }}
+                     @pointerup={() => { down = false }}
+                     // The browser sends this when a finger on the words turns into a scroll.
+                     @pointercancel={() => {
+                         down = false
+                         take_over()
+                     }}
+                     @wheel={() => { take_over() }}
+                     @scroll={() => { if !follow { quiet = js("Date.now") } }}
+                     @keydown={(e) => {
+                         let k = e.key
+                         let i = cursor >= 0 ? cursor : max([at, 0])
+                         if k == "ArrowDown" { e.preventDefault(); walk(i + 1) }
+                         if k == "ArrowUp" { e.preventDefault(); walk(i - 1) }
+                         if k == "Home" { e.preventDefault(); walk(0) }
+                         if k == "End" { e.preventDefault(); walk(len(lines) - 1) }
+                     }}>
+                    <ol.ui-lyrics-list>
+                        {for [i, l] in enumerate(lines) => <li key={i}>
+                            <button class={ui_cls(["ui-lyrics-line", l.text == "" && "ui-lyrics-gap"])} type="button" data-i={i} tabindex={tab_i == i ? "0" : "-1"}
+                                    aria-current={at == i ? "true" : "false"} aria-label={l.text == "" ? "A pause in the words" : null}
+                                    @click={() => {
+                                        seek(l.at)
+                                        cursor = -1
+                                        follow = true
+                                        centre(i, true)
+                                    }}>{l.text == "" ? "..." : l.text}</button>
+                        </li>}
+                    </ol>
+                </div>
+                {!follow && <button.ui-lyrics-back type="button" @click={() => { resume() }}>Back to the song</button>}
+            </div>
+          </div></div>}
+}

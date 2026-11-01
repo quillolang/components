@@ -1,0 +1,270 @@
+// BusinessDaysCalc: how many working days lie between two dates, or which date falls
+// N working days from a date, either way along the calendar. Weekends are a set of
+// weekdays (Saturday and Sunday, Friday and Saturday, Sunday alone) and holidays are
+// data, one date a line, so it fits any country. It lists every day it skipped and why.
+// Dates are worked out as calendar dates, never as hours, so a clock change cannot
+// lose or gain a day.
+//
+//   <BusinessDaysCalc start="2026-11-02" end="2026-12-24" holidays={["2026-11-26 Thanksgiving"]}/>
+//   <BusinessDaysCalc mode="add" start="2026-12-23" count={5} weekend={[5, 6]}
+//                     holidays={[{ date: "12-25", name: "Christmas Day" }]}
+//                     on_change={(r) => { due = r.date }}/>
+//
+// mode: "between" (the default) or "add". start, end: where the fields start
+// ("YYYY-MM-DD"). count: the working days to add; negative goes back. weekend: the days
+// off each week, 1 for Monday to 7 for Sunday ([6, 7]). holidays: a list, each
+// "YYYY-MM-DD Name" text or { date, name? }, where a date may be "MM-DD" for every year.
+// count_first: whether the first day counts ("between" only; false, so Monday to Friday
+// is 4 days, as a deadline is reckoned; true makes it 5, as Excel's NETWORKDAYS).
+// title: the heading. id: a prefix for its fields' ids, unique on the page. The fields
+// are named mode, start, end, count, count_first, weekend and holidays; name: a prefix
+// for those names. on_change(result): inside one of your components, after each
+// change that gives a result; see business_days_calc_between and _add.
+//
+// A program can use the logic alone: business_days_calc_calendar(holidays) reads
+// holidays into { days, yearly, bad }; business_days_calc_between(start, end, weekend,
+// calendar, count_first) gives { count, weekends, holidays, skipped, calendar_days };
+// business_days_calc_add(start, n, weekend, calendar) gives the same with `date`.
+// Each gives { error } for what it cannot do. It walks at most 36,600 days (100 years).
+
+import ui/theme.qwe use ui_cls
+
+let business_days_calc_css = css`
+.ui-business-days { display: grid; gap: 16px; min-width: 0; max-width: 640px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-business-days .ui-business-days-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-business-days-modes, .ui-business-days-weekend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-business-days-modes legend, .ui-business-days-weekend legend { float: left; margin-right: 8px; padding: 0; font-size: 13px; font-weight: 500; }
+.ui-business-days-modes label, .ui-business-days-weekend label, .ui-business-days-first { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ui-business-days input[type=radio], .ui-business-days input[type=checkbox] { margin: 0; accent-color: var(--ui-accent); }
+.ui-business-days-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px 14px; }
+.ui-business-days-field { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 500; }
+.ui-business-days-field input, .ui-business-days-field textarea { box-sizing: border-box; width: 100%; min-width: 0; padding: 8px 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.4 var(--ui-font); }
+.ui-business-days-field textarea { font: 13px/1.5 var(--ui-mono); resize: vertical; }
+.ui-business-days-field input:focus-visible, .ui-business-days-field textarea:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-business-days-field [aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-business-days-error { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-business-days-out { display: grid; gap: 8px; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-business-days-answer { margin: 0; font-size: 22px; font-weight: 700; color: var(--ui-accent); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-business-days-sum { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-business-days-skipped { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 2px 14px; max-height: 220px; overflow: auto; margin: 0; padding: 0; list-style: none; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-business-days-holiday { color: var(--ui-warning); font-weight: 600; }
+`
+
+let business_days_calc_limit = 36600
+let business_days_calc_most = 10000
+let business_days_calc_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+// A date the walk can leave safely: `date.add_days` fails past the years 1 and 9999.
+fn business_days_calc_date_ok(d) -> bool =
+    type_of(d) == "str" && date.valid(d, "date") && d >= "1000-01-01" && d <= "9000-12-31"
+
+// "MM-DD", a day of every year (02-29 stands, for leap years).
+fn business_days_calc_month_day_ok(d: str) -> bool =
+    re.test(d, "^\\d{2}-\\d{2}$") && date.valid(`2024-${d}`, "date")
+
+// Holidays as maps: { days: date -> name, yearly: "MM-DD" -> name, bad: what was not
+// understood }. `list` is what the prop takes, or the lines of the text box.
+fn business_days_calc_calendar(list) -> map {
+    let days = {}
+    let yearly = {}
+    let bad = []
+    let items = type_of(list) == "list" ? list : []
+    if len(items) > 2000 { bad = bad | push("Only the first 2,000 holidays are read.") }
+    for [i, item] in enumerate(take(items, 2000)) {
+        let text = type_of(item) == "map" ? trim(`${item.date ?? ""} ${item.name ?? ""}`) : trim(str(item ?? ""))
+        if text != "" {
+            let cut = re.find(text, "^(\\S+)\\s*(.*)$")
+            let when = cut.groups[0]
+            let name = filled(cut.groups[1]) ?? "Holiday"
+            if business_days_calc_date_ok(when) {
+                days = set(days, when, name)
+            } else if business_days_calc_month_day_ok(when) {
+                yearly = set(yearly, when, name)
+            } else {
+                bad = bad | push(`Holiday ${i + 1}: "${slice(when, 0, 30)}" is not a date. Write 2026-12-25 or, for every year, 12-25.`)
+            }
+        }
+    }
+    { days, yearly, bad }
+}
+
+// The name of the holiday on `d`, or null.
+fn business_days_calc_holiday(d: str, cal: map) = get(cal.days, d) ?? get(cal.yearly, slice(d, 5, 10))
+
+// Why `d` is not a working day: { date, why: "weekend" | "holiday", name }, or null. A
+// holiday on a weekend is one day off, not two, and says it is both.
+fn business_days_calc_off(d: str, weekend: list, cal: map) {
+    let h = business_days_calc_holiday(d, cal)
+    if contains(weekend, date.weekday(d)) {
+        return { date: d, why: "weekend", name: h }
+    }
+    h != null ? { date: d, why: "holiday", name: h } : null
+}
+
+// What every result shares: the skipped days counted.
+fn business_days_calc_tally(skipped: list) -> map {
+    let weekends = skipped | filter((s) => s.why == "weekend") | len
+    { weekends, holidays: len(skipped) - weekends }
+}
+
+// What cannot be walked at all, or null.
+fn business_days_calc_refuse(weekend: list) {
+    if len(unique(weekend | filter((w) => type_of(w) == "int" && w >= 1 && w <= 7))) >= 7 {
+        return "Every day of the week is marked as a weekend, so there are no working days."
+    }
+    null
+}
+
+// The working days from `start` to `end`: negative when `end` comes first. The day
+// walked from counts only with `count_first`, and the day reached always does.
+fn business_days_calc_between(start, end, weekend: list, cal: map, count_first: bool = false) -> map {
+    if !business_days_calc_date_ok(start) { return { error: "The first date is not a date from 1000 to 9000." } }
+    if !business_days_calc_date_ok(end) { return { error: "The second date is not a date from 1000 to 9000." } }
+    let refused = business_days_calc_refuse(weekend)
+    if refused != null { return { error: refused } }
+    let span = date.days_between(start, end)
+    if abs(span) > business_days_calc_limit {
+        return { error: `These dates are ${format_number(abs(span), "en-US", 0)} days apart, and the limit is ${format_number(business_days_calc_limit, "en-US", 0)} days (about 100 years).` }
+    }
+    let step = span < 0 ? -1 : 1
+    let count = 0
+    let skipped = []
+    let i = count_first ? 0 : 1
+    while i <= abs(span) {
+        let d = date.add_days(start, i * step)
+        let off = business_days_calc_off(d, weekend, cal)
+        if off == null { count += 1 } else { skipped = skipped | push(off) }
+        i += 1
+    }
+    { count: count * step, calendar_days: abs(span), skipped } + business_days_calc_tally(skipped)
+}
+
+// The date `n` working days from `start`, later or earlier. The first day walked to
+// is the day after `start`, so a Friday plus 1 is Monday. Plus 0 stays on `start`.
+fn business_days_calc_add(start, n, weekend: list, cal: map) -> map {
+    if !business_days_calc_date_ok(start) { return { error: "The first date is not a date from 1000 to 9000." } }
+    if type_of(n) != "int" { return { error: "The number of working days must be a whole number." } }
+    if abs(n) > business_days_calc_most {
+        return { error: `That is more than ${format_number(business_days_calc_most, "en-US", 0)} working days, the most this adds.` }
+    }
+    let refused = business_days_calc_refuse(weekend)
+    if refused != null { return { error: refused } }
+    let step = n < 0 ? -1 : 1
+    let left = abs(n)
+    let d = start
+    let skipped = []
+    let walked = 0
+    while left > 0 {
+        if walked >= business_days_calc_limit {
+            return { error: "No date was found within 100 years: the calendar has too few working days." }
+        }
+        d = date.add_days(d, step)
+        walked += 1
+        let off = business_days_calc_off(d, weekend, cal)
+        if off == null { left -= 1 } else { skipped = skipped | push(off) }
+    }
+    { date: d, count: n, calendar_days: walked, skipped } + business_days_calc_tally(skipped)
+}
+
+// A count as typed: an int, or null. The minus may be the typographic one.
+fn business_days_calc_read(text) {
+    let t = replace(trim(str(text ?? "")), "−", "-")
+    if !re.test(t, "^[+-]?\\d{1,12}$") { return null }
+    let n = int(replace(t, "+", ""))
+    is_err(n) ? null : n
+}
+
+// A day as it reads in the results: "Sat 7 Nov 2026".
+fn business_days_calc_show(d: str) -> str = date.format(d, "ddd D MMM YYYY")
+
+fn business_days_calc_plural(n: int, one: str) -> str = `${format_number(n, "en-US", 0)} ${one}${abs(n) == 1 ? "" : "s"}`
+
+component BusinessDaysCalc(mode: str = "between", start: str = "", end: str = "", count: int = 0, weekend: list = [6, 7], holidays: list = [],
+                           count_first: bool = false, title: str = "Working days", id: str = "business-days-calc", name: str? = null,
+                           on_change = null, class: str? = null) {
+    style global business_days_calc_css
+    let line = (h) => type_of(h) == "map" ? trim(`${h.date ?? ""} ${h.name ?? ""}`) : str(h)
+    state how = mode == "add" ? "add" : "between"
+    state from = start
+    state to = end
+    state n_text = str(count)
+    state off = sort(unique(weekend | filter((w) => type_of(w) == "int" && w >= 1 && w <= 7)))
+    state text = holidays | map(line) | join("\n")
+    state first_too = count_first
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let lines = split(text, "\n")
+    let cal = business_days_calc_calendar(lines)
+    let wanted = business_days_calc_read(n_text)
+    let work = (w, c, kind, a, b, k, f) => {
+        if a == "" { return { error: "Choose the first date." } }
+        if kind == "add" {
+            if k == null { return { error: `"${slice(trim(n_text), 0, 30)}" is not a whole number of working days.` } }
+            return business_days_calc_add(a, k, w, c)
+        }
+        if b == "" { return { error: "Choose the second date." } }
+        business_days_calc_between(a, b, w, c, f)
+    }
+    let r = work(off, cal, how, from, to, wanted, first_too)
+    let tell = () => {
+        let g = work(off, business_days_calc_calendar(split(text, "\n")), how, from, to, business_days_calc_read(n_text), first_too)
+        if on_change != null && g.error == null { on_change(g) }
+    }
+    let shown = (r.skipped ?? []) | take(100)
+    let answer = r.error != null ? "" : (how == "add" ? business_days_calc_show(r.date) : business_days_calc_plural(r.count, "working day"))
+    let sum = r.error != null ? "" : `${business_days_calc_plural(r.calendar_days, "calendar day")}, skipping ${business_days_calc_plural(r.weekends, "weekend day")} and ${business_days_calc_plural(r.holidays, "holiday")}.`
+    let note = r.error == null && how == "add" && r.count == 0 && business_days_calc_off(from, off, cal) != null ? `${business_days_calc_show(from)} is not itself a working day.` : null
+    <section class={ui_cls(["ui-business-days", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-business-days-title id={`${id}-title`}>{title}</h3>
+        <fieldset.ui-business-days-modes>
+            <legend>Work out</legend>
+            <label><input type="radio" name={named("mode")} value="between" checked={how == "between"} @change={(e) => { how = "between"; tell() }}/> Days between two dates</label>
+            <label><input type="radio" name={named("mode")} value="add" checked={how == "add"} @change={(e) => { how = "add"; tell() }}/> A date plus working days</label>
+        </fieldset>
+        <div.ui-business-days-grid>
+            <label.ui-business-days-field>{how == "add" ? "From" : "First date"}
+                <input type="date" id={`${id}-start`} name={named("start")} value={from} @input={(e) => { from = e.value; tell() }}/>
+            </label>
+            {how == "between"
+                ? <label.ui-business-days-field>Second date
+                    <input type="date" id={`${id}-end`} name={named("end")} value={to} @input={(e) => { to = e.value; tell() }}/>
+                  </label>
+                : <label.ui-business-days-field>Working days (negative goes back)
+                    <input type="text" inputmode="numeric" id={`${id}-count`} name={named("count")} value={n_text} autocomplete="off"
+                           aria-invalid={wanted == null ? "true" : null} @input={(e) => { n_text = e.value; tell() }}/>
+                  </label>}
+        </div>
+        {how == "between" && <label.ui-business-days-first>
+            <input type="checkbox" id={`${id}-first`} name={named("count_first")} checked={first_too} @change={(e) => { first_too = e.checked; tell() }}/>
+            Count the first date too
+        </label>}
+        <fieldset.ui-business-days-weekend>
+            <legend>Weekend</legend>
+            {for [i, day] in enumerate(business_days_calc_days) => <label key={day}>
+                <input type="checkbox" name={named("weekend")} value={i + 1} checked={contains(off, i + 1)} aria-label={day}
+                       @change={(e) => { off = e.checked ? sort(off | push(i + 1)) : remove(off, i + 1); tell() }}/>
+                <span aria-hidden="true">{slice(day, 0, 3)}</span>
+            </label>}
+        </fieldset>
+        <label.ui-business-days-field>Holidays, one a line: a date and a name; 12-25 means every year
+            <textarea id={`${id}-holidays`} name={named("holidays")} rows="3" spellcheck="false" aria-invalid={len(cal.bad) > 0 ? "true" : null}
+                      @input={(e) => { text = e.value; tell() }}>{text}</textarea>
+        </label>
+        {len(cal.bad) > 0 && <ul.ui-business-days-error role="alert">{for b in take(cal.bad, 5) => <li key={b}>{b}</li>}</ul>}
+        <div aria-live="polite">
+            {r.error != null
+                ? <p.ui-business-days-error role="alert">{r.error}</p>
+                : <div.ui-business-days-out>
+                    <p.ui-business-days-answer>{answer}</p>
+                    <p.ui-business-days-sum>{sum}{note != null ? ` ${note}` : ""}</p>
+                    {len(shown) > 0 && <ul.ui-business-days-skipped aria-label="Days skipped">
+                        {for s in shown => <li key={s.date} class={s.name != null ? "ui-business-days-holiday" : null}>
+                            {business_days_calc_show(s.date)}: {s.name != null ? s.name : "weekend"}
+                        </li>}
+                    </ul>}
+                    {len(r.skipped) > 100 && <p.ui-business-days-sum>The first 100 of {len(r.skipped)} are listed.</p>}
+                  </div>}
+        </div>
+    </section>
+}

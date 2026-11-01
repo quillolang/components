@@ -1,0 +1,202 @@
+// PageDots: the row of dots under pages that swipe. It follows a scroller by itself,
+// or a place you give it, fractions and all, so its marker moves with the finger.
+// With many pages only a window of them shows full size, those beyond it shrinking
+// and then gone, as in a photo app, and the window moves only when the marker reaches
+// its end. Screen readers hear "Page 3 of 9" when a page settles, not on the way.
+//
+//   import ui/page_dots.qwe use PageDots
+//
+//   <div id="photos" style="display: flex; overflow-x: auto; scroll-snap-type: x mandatory"> ... </div>
+//   <PageDots count={12} target="photos"/>
+//
+//   <PageDots count={3} at={place} on_change={(i) => { place = i }}/>
+//
+// count: how many pages. target: the id of a scroller to follow, sideways; tapping and
+// keys then scroll it. at: the place to show when there is no target, 0 for the first
+// page, and may be 2.4 during a swipe. on_change(i): called with the page tapped or
+// keyed to, inside one of your components. visible: how many dots show full size on a
+// phone (5); a pane 600 px wide has room for 4 more. label: what a page is called
+// ("Page"). With a target or on_change the dots are a slider, so keys work, and a tap
+// on either half steps once; the dots alone are too small to press. Without them they
+// are only a picture of where things are. A scroller that is not there yet is looked
+// for during the first few seconds, and then the dots stay as they are.
+
+import ui/theme.qwe use ui_cls
+
+let page_dots_step = 16
+
+let page_dots_css = css`
+.ui-pagedots { position: relative; display: block; width: 100%; container-type: inline-size; color: var(--ui-fg); font: 13px/1.4 var(--ui-font); }
+.ui-pagedots-row {
+  position: relative; display: block; box-sizing: content-box; height: 8px; margin: 0 auto; padding: 18px 0; overflow: hidden; border-radius: var(--ui-radius-sm);
+  outline: none; touch-action: manipulation;
+}
+.ui-pagedots-row[role="slider"] { cursor: pointer; }
+.ui-pagedots-row:focus-visible { box-shadow: var(--ui-focus); }
+.ui-pagedots-strip { position: absolute; top: 18px; left: 0; height: 8px; transition: transform .22s cubic-bezier(.2, .8, .2, 1); }
+.ui-pagedots-dot {
+  position: absolute; top: 0; width: 8px; height: 8px; border-radius: 50%; background: var(--ui-strong); transition: transform .22s cubic-bezier(.2, .8, .2, 1), opacity .22s;
+}
+.ui-pagedots-dot[data-size="mid"] { transform: scale(.66); }
+.ui-pagedots-dot[data-size="far"] { transform: scale(.4); }
+.ui-pagedots-dot[data-size="gone"] { transform: scale(0); opacity: 0; }
+.ui-pagedots-mark { position: absolute; top: 0; left: 0; width: 8px; height: 8px; border-radius: 50%; background: var(--ui-accent); will-change: transform; }
+.ui-pagedots-mark-off { display: none; }
+@media (prefers-reduced-motion: reduce) { .ui-pagedots-strip, .ui-pagedots-dot { transition: none; } }
+`
+
+// A page count that can be drawn: a whole number, none for anything else, and a limit
+// so a mistaken million does not make a million elements.
+fn page_dots_count(count) -> int {
+    if type_of(count) != "int" && type_of(count) != "float" { return 0 }
+    let n = floor(count)
+    n < 0 ? 0 : n > 500 ? 500 : n
+}
+
+// A place inside the pages, for any input.
+fn page_dots_place(at, count: int) -> num {
+    if type_of(at) != "int" && type_of(at) != "float" { return 0 }
+    if at != at || count <= 1 || at <= 0 { return 0 }
+    at >= count - 1 ? count - 1 : at
+}
+
+// The first page of the window of full-size dots, kept unless the page is outside it.
+fn page_dots_window(start: int, page: int, count: int, room: int) -> int {
+    if count <= room { return 0 }
+    let from = page < start ? page : page > start + room - 1 ? page - room + 1 : start
+    from < 0 ? 0 : from > count - room ? count - room : from
+}
+
+// The size of one dot: full in the window, then two steps smaller, then none.
+fn page_dots_size(i: int, start: int, room: int) -> str {
+    let off = i < start ? start - i : i > start + room - 1 ? i - (start + room - 1) : 0
+    off == 0 ? "full" : off == 1 ? "mid" : off == 2 ? "far" : "gone"
+}
+
+// Near enough to a page to call it settled.
+fn page_dots_settled(place: num) -> bool = abs(place - round(place)) < 0.02
+
+// A dot's place in the strip: it is 8 px wide, in the middle of its step.
+fn page_dots_left(place: num) -> num = place * page_dots_step + (page_dots_step - 8) / 2
+
+fn page_dots_paint(mark, place: num) {
+    mark.style.transform = `translate3d(${page_dots_left(place)}px, 0, 0)`
+}
+
+// Where a scroller stands, as a page. Works for snap points of any width, and for a
+// page written right to left, where its offsets are negative.
+fn page_dots_of_scroller(left: num, room: num, count: int) -> num {
+    if room <= 0 || count <= 1 { return 0 }
+    abs(left) / room * (count - 1)
+}
+
+component PageDots(count = 0, at = 0, target: str? = null, on_change = null, visible: int = 5, label: str = "Page", class: str? = null) {
+    style global page_dots_css
+    let total = page_dots_count(count)
+    state page = round(page_dots_place(at, page_dots_count(count)))
+    state said = page                     // what screen readers were last told
+    state first_place = page_dots_place(at, page_dots_count(count))  // never changes: the server's place for the marker
+    state wide = false
+    state start = page_dots_window(0, page, total, visible)
+    state win = null
+    state mark = null
+    state box = null
+    state scroller = null
+    state tries = 0
+    let room = visible > 0 ? (wide ? visible + 4 : visible) : 1
+    let shrunk = total > room
+    let live = target != null || on_change != null
+    // The row is the window and two steps each side; a short list only its dots.
+    let row_w = shrunk ? (room + 4) * page_dots_step : total * page_dots_step
+    let shift = shrunk ? (2 - start) * page_dots_step : 0
+    let follow = () => {
+        if scroller != null {
+            let place = page_dots_of_scroller(scroller.scrollLeft, scroller.scrollWidth - scroller.clientWidth, total)
+            page_dots_paint(mark, place)
+            page = round(place)
+            start = page_dots_window(start, page, total, room)
+            if page_dots_settled(place) { said = page }
+        }
+    }
+    // Looked for by a clock: a scroller may be made after this component.
+    let find = () => {
+        tries += 1
+        if win != null {
+            let el = win.document.getElementById(target)
+            if el != null {
+                scroller = el
+                el.addEventListener("scroll", follow, { passive: true })
+                follow()
+            }
+        }
+    }
+    if target != null && scroller == null && tries < 50 { every(100, find) }
+    // The place given, when there is no scroller.
+    if target == null && mark != null {
+        let place = page_dots_place(at, total)
+        page_dots_paint(mark, place)
+        page = round(place)
+        start = page_dots_window(start, page, total, room)
+        if page_dots_settled(place) { said = page }
+    }
+    let go = (i: int) => {
+        let to = i < 0 ? 0 : i > total - 1 ? total - 1 : i
+        if to != page {
+            if scroller != null {
+                let still = win.matchMedia("(prefers-reduced-motion: reduce)").matches
+                let end = total > 1 ? to / (total - 1) * (scroller.scrollWidth - scroller.clientWidth) : 0
+                scroller.scrollTo({ left: end, behavior: still ? "auto" : "smooth" })
+            }
+            on_change && on_change(to)
+        }
+    }
+    <div class={ui_cls(["ui-pagedots", class])}
+         @mount={(el) => {
+             win = js("window")
+             box = el
+             let ro = js_new("ResizeObserver", () => {
+                 wide = el.clientWidth >= 600
+                 start = page_dots_window(start, page, total, room)
+             })
+             ro.observe(el)
+             () => {
+                 ro.disconnect()
+                 if scroller != null { scroller.removeEventListener("scroll", follow) }
+             }
+         }}>
+        {total > 0 && <div.ui-pagedots-row style={`width: ${row_w}px`}
+                role={live ? "slider" : "img"} tabindex={live ? "0" : null}
+                aria-label={live ? label : `${label} ${page + 1} of ${total}`}
+                aria-valuemin={live ? "1" : null} aria-valuemax={live ? str(total) : null} aria-valuenow={live ? str(page + 1) : null}
+                aria-valuetext={live ? `${label} ${page + 1} of ${total}` : null}
+                @click={(e) => {
+                    if live {
+                        let r = e.target.closest(".ui-pagedots-row").getBoundingClientRect()
+                        go(e.clientX < r.left + r.width / 2 ? page - 1 : page + 1)
+                    }
+                }}
+                @keydown={(e) => {
+                    let to = match e.key {
+                        "ArrowLeft" => page - 1
+                        "ArrowDown" => page - 1
+                        "ArrowRight" => page + 1
+                        "ArrowUp" => page + 1
+                        "Home" => 0
+                        "End" => total - 1
+                        _ => null
+                    }
+                    if live && to != null {
+                        e.preventDefault()
+                        go(to)
+                    }
+                }}>
+            <div.ui-pagedots-strip style={`transform: translate3d(${shift}px, 0, 0)`}>
+                {for i in range(0, total) => <span.ui-pagedots-dot key={i} aria-hidden="true" data-size={shrunk ? page_dots_size(i, start, room) : "full"}
+                        style={`left: ${page_dots_left(i)}px`}></span>}
+                <span.ui-pagedots-mark aria-hidden="true" style={`transform: translate3d(${page_dots_left(first_place)}px, 0, 0)`}
+                      @mount={(el) => { mark = el }}></span>
+            </div>
+        </div>}
+        <div.ui-sr aria-live="polite" aria-atomic="true">{total > 0 ? `${label} ${said + 1} of ${total}` : ""}</div>
+    </div>
+}

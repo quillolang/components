@@ -1,0 +1,387 @@
+// ConflictSheet: when a record was changed in two places, this device's version against the
+// server's, chosen field by field, each difference said in plain words. Given the version
+// both started from, what only one side changed is merged without asking, and listed. A
+// sheet from below on a phone, pulled down to put it away; a dialog with the two versions
+// side by side on a tablet. Nothing is lost by closing it: the choices stay.
+//
+//   import ui/conflict_sheet.qwe use ConflictSheet
+//
+//   <ConflictSheet trigger="Review the changes" local={mine} remote={theirs} base={before}
+//                  fields={[{ name: "phone", label: "Phone" }, { name: "note", label: "Note" }]}
+//                  local_at={edited} remote_at={stamp} now={date.now()} remote_name="Ana's phone"
+//                  on_resolve={(merged, picks) => { save(merged) }}/>
+//
+// local, remote: the two versions, as maps. base: the version both came from: without it every
+// difference must be chosen, as nothing says who changed what. fields: each { name, label },
+// in the order to show; left out, every key of the two, labelled by its name.
+// open: shows it, for a program that opens it itself. trigger: the words of a button that
+// opens it. on_close(): it was closed without saving. on_resolve(merged, picks): Save, once all
+// is chosen, and it may wait: merged is the record to keep, picks a map from field to "mine"
+// or "theirs", for those chosen. false, { ok: false, error } or an error value keeps the
+// sheet open and says so.
+// local_name ("this device"), remote_name ("the server"): written in sentences. local_at,
+// remote_at, now: milliseconds or date-times; with them each side says how long ago. title:
+// the heading. wait_ms: how long a save may take (30000). id: names its radio buttons, so give
+// each one its own. class.
+//
+// conflict_sheet_compare(fields, local, remote, base) sorts the fields into kinds ("same",
+// "mine", "theirs", "both"), conflict_sheet_merge(rows, picks) makes the record, and
+// conflict_sheet_explain(row, local_name, remote_name, has_base) says it.
+
+import ui/theme.qwe use ui_cls
+
+let conflict_sheet_css = css`
+.ui-cflct-open { min-height: 46px; padding: 0 16px; border: 1px solid var(--ui-warning); border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-fg); font: 600 15px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-cflct-open:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+/* The page behind stays where it is: a modal dialog does not stop it scrolling on a phone. */
+html:has(.ui-cflct[open]) { overflow: hidden; }
+.ui-cflct { position: fixed; inset: auto 0 0 0; box-sizing: border-box; width: 100%; max-width: none; max-height: 92dvh; margin: 0; padding: 0 0 env(safe-area-inset-bottom); border: 0; border-radius: 16px 16px 0 0; background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 15px/1.4 var(--ui-font); transition: transform .2s ease; }
+.ui-cflct[open] { display: flex; flex-direction: column; animation: ui-cflct-in .22s ease-out; }
+.ui-cflct::backdrop { background: var(--ui-overlay); }
+@keyframes ui-cflct-in { from { transform: translateY(100%); } }
+.ui-cflct-grab { flex: none; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: grab; border-bottom: 1px solid var(--ui-border); }
+.ui-cflct-grip { display: block; width: 40px; height: 5px; margin: 8px auto 2px; border-radius: 999px; background: var(--ui-strong); }
+.ui-cflct-head { display: flex; align-items: center; gap: 8px; padding: 2px 8px 4px 16px; }
+.ui-cflct-head h2 { flex: 1; margin: 0; font-size: 17px; }
+.ui-cflct-x { display: grid; place-items: center; width: 44px; height: 44px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: pointer; }
+.ui-cflct-x svg { width: 22px; height: 22px; }
+.ui-cflct-x:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-cflct-body { flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; display: grid; gap: 14px; align-content: start; padding: 14px 16px; container-type: inline-size; }
+.ui-cflct-intro { margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-cflct-row { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-cflct-row legend { padding: 0; font-weight: 600; }
+.ui-cflct-why { margin: 2px 0 0; color: var(--ui-muted); font-size: 14px; }
+.ui-cflct-opts { display: grid; gap: 8px; min-width: 0; }
+.ui-cflct-opt { position: relative; display: grid; gap: 2px; min-height: 48px; padding: 10px 12px 10px 42px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); cursor: pointer; touch-action: manipulation; }
+.ui-cflct-opt:has(input:checked) { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-cflct-opt:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-cflct-opt input { position: absolute; left: 12px; top: 13px; width: 20px; height: 20px; margin: 0; accent-color: var(--ui-accent); }
+.ui-cflct-side { color: var(--ui-muted); font-size: 13px; }
+.ui-cflct-value { overflow-wrap: anywhere; white-space: pre-wrap; }
+.ui-cflct-value mark { border-radius: 2px; background: var(--ui-warning-soft); color: inherit; }
+.ui-cflct-none { color: var(--ui-muted); font-style: italic; }
+.ui-cflct-auto { color: var(--ui-muted); font-size: 14px; }
+/* A list item, or it loses the arrow that says it opens. */
+.ui-cflct-auto summary { box-sizing: border-box; min-height: 44px; padding: 12px 0; cursor: pointer; }
+.ui-cflct-auto ul { margin: 0; padding: 0 0 0 18px; }
+.ui-cflct-foot { flex: none; display: grid; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--ui-border); }
+.ui-cflct-all { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.ui-cflct-btn { min-height: 46px; padding: 4px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1.2 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-cflct-save { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); font-size: 15px; font-weight: 600; }
+.ui-cflct-save[aria-disabled="true"] { opacity: .6; }
+.ui-cflct-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-cflct-note { margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-cflct-note[data-bad] { color: var(--ui-danger); }
+@media (hover: hover) { .ui-cflct-btn:hover, .ui-cflct-x:hover { background: var(--ui-subtle); } .ui-cflct-save:hover { background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); } }
+@container (min-width: 520px) {
+  .ui-cflct-opts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 700px) {
+  .ui-cflct { inset: 0; width: min(760px, 92vw); max-height: 86dvh; margin: auto; padding: 0; border-radius: var(--ui-radius); }
+  .ui-cflct[open] { animation: none; }
+  .ui-cflct-grab { touch-action: auto; cursor: auto; }
+  .ui-cflct-grip { display: none; }
+  .ui-cflct-head { padding-top: 6px; }
+  .ui-cflct-foot { grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; }
+  .ui-cflct-all { grid-template-columns: repeat(2, auto); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-cflct { transition: none; } .ui-cflct[open] { animation: none; } }
+`
+
+// A value as a person reads it. Empty is null, for any way of being empty.
+fn conflict_sheet_text(v) {
+    match type_of(v) {
+        "null" => null
+        "str" => trim(v) == "" ? null : v
+        "bool" => v ? "Yes" : "No"
+        "list" => len(v) == 0 ? null : join(v | map((x) => str(x)), ", ")
+        "map" => len(keys(v)) == 0 ? null : json.stringify(v)
+        "error" => null
+        _ => str(v)
+    }
+}
+
+// Two values that read the same are the same: a person could not tell them apart.
+fn conflict_sheet_same(a, b) -> bool = conflict_sheet_text(a) == conflict_sheet_text(b)
+
+fn conflict_sheet_map(m) -> map = type_of(m) == "map" ? m : {}
+
+// The fields to go through: those given, or every key of the two.
+fn conflict_sheet_fields(fields, local, remote) -> list {
+    let given = (type_of(fields) == "list" ? fields : []) | filter((f) => type_of(f) == "map" && type_of(f.name) == "str" && f.name != "")
+    if len(given) > 0 { return given | map((f) => { name: f.name, label: str(f.label ?? f.name) }) }
+    unique(keys(conflict_sheet_map(local)) + keys(conflict_sheet_map(remote))) | map((k) => { name: k, label: k })
+}
+
+// Each field with its two values and its kind: "same", "mine" (only this side changed it),
+// "theirs" (only the other did) or "both", which a person must choose.
+fn conflict_sheet_compare(fields, local, remote, base) -> list {
+    let l = conflict_sheet_map(local)
+    let r = conflict_sheet_map(remote)
+    let has_base = type_of(base) == "map"
+    let b = conflict_sheet_map(base)
+    conflict_sheet_fields(fields, local, remote) | map((f) => {
+        let mine = get(l, f.name)
+        let theirs = get(r, f.name)
+        let start = get(b, f.name)
+        let kind = conflict_sheet_same(mine, theirs) ? "same"
+            : (!has_base ? "both"
+            : (conflict_sheet_same(mine, start) ? "theirs"
+            : (conflict_sheet_same(theirs, start) ? "mine" : "both")))
+        { name: f.name, label: f.label, mine, theirs, kind }
+    })
+}
+
+// The difference in plain words.
+fn conflict_sheet_explain(row: map, local_name: str, remote_name: str, has_base: bool) -> str {
+    if !has_base { return `The two versions differ, and nothing says which came first.` }
+    if conflict_sheet_text(row.mine) == null { return `You cleared this on ${local_name}, but it was changed on ${remote_name}.` }
+    if conflict_sheet_text(row.theirs) == null { return `You changed this on ${local_name}, but it was cleared on ${remote_name}.` }
+    `This was changed on ${local_name} and on ${remote_name}, in different ways.`
+}
+
+// The record to keep.
+fn conflict_sheet_merge(rows: list, picks: map) -> map =
+    reduce(rows, {}, (m, r) => {
+        let side = r.kind == "both" ? get(picks, r.name) : (r.kind == "theirs" ? "theirs" : "mine")
+        set(m, r.name, side == "theirs" ? r.theirs : r.mine)
+    })
+
+// Those still to choose.
+fn conflict_sheet_left(rows: list, picks: map) -> list =
+    rows | filter((r) => r.kind == "both" && get(picks, r.name) == null)
+
+fn conflict_sheet_fields_word(n: int) -> str = n == 1 ? "1 field" : `${n} fields`
+
+fn conflict_sheet_intro(rows: list) -> str {
+    let asked = len(rows | filter((r) => r.kind == "both"))
+    let auto = len(rows | filter((r) => r.kind == "mine" || r.kind == "theirs"))
+    if asked == 0 && auto == 0 { return "Both versions say the same." }
+    let first = asked == 0 ? "Nothing needs your choice." : `${conflict_sheet_fields_word(asked)} ${asked == 1 ? "needs" : "need"} your choice.`
+    auto == 0 ? first : `${first} ${conflict_sheet_fields_word(auto)} changed on one side only, so ${auto == 1 ? "it was" : "they were"} merged. Nothing is saved until you press Save.`
+}
+
+// A heading: the first letter up.
+fn conflict_sheet_cap(s: str) -> str = len(s) == 0 ? s : upper(slice(s, 0, 1)) + slice(s, 1, len(s))
+
+fn conflict_sheet_ms(t) {
+    if type_of(t) == "int" { return t }
+    if type_of(t) == "str" && date.valid(t) { return date.ms(t) }
+    null
+}
+
+fn conflict_sheet_ago(at, now_at) {
+    let a = conflict_sheet_ms(at)
+    let n = conflict_sheet_ms(now_at)
+    if a == null || n == null { return null }
+    let ms = n - a
+    if ms < 60000 { return "just now" }
+    if ms < 3600000 { return `${floor(ms / 60000)} min ago` }
+    if ms < 86400000 { return `${floor(ms / 3600000)} h ago` }
+    `${floor(ms / 86400000)} days ago`
+}
+
+// What the two have in common at each end, so only what differs is marked: { head, mid, tail }
+// for each of a and b, by characters. Nothing is marked when they share nothing.
+fn conflict_sheet_diff(a: str, b: str) -> map {
+    let x = split(a, "")
+    let y = split(b, "")
+    let most = min([len(x), len(y)])
+    let i = 0
+    while i < most && x[i] == y[i] { i += 1 }
+    let j = 0
+    while j < most - i && x[len(x) - 1 - j] == y[len(y) - 1 - j] { j += 1 }
+    { head: join(slice(x, 0, i)), a: join(slice(x, i, len(x) - j)), b: join(slice(y, i, len(y) - j)), tail: join(slice(y, len(y) - j, len(y))) }
+}
+
+// A value in a choice: empty says so, and what differs from the other side is marked.
+view ConflictSheetValue(value, other) {
+    let text = conflict_sheet_text(value)
+    let against = conflict_sheet_text(other)
+    let d = text != null && against != null ? conflict_sheet_diff(text, against) : null
+    let shows = d != null && (d.head != "" || d.tail != "")
+    <span.ui-cflct-value>
+        {text == null ? <span.ui-cflct-none>Empty</span> : (shows ? <span>{d.head}<mark>{d.a}</mark>{d.tail}</span> : <span>{text}</span>)}
+    </span>
+}
+
+// One side of a choice.
+view ConflictSheetOption(group: str, side: str, name: str, when, value, other, picked: bool, on_pick = null) =
+    <label.ui-cflct-opt>
+        <input type="radio" name={group} value={side} checked={picked} @change={() => { on_pick && on_pick() }}/>
+        <span.ui-cflct-side>{when != null ? `${conflict_sheet_cap(name)}, ${when}` : conflict_sheet_cap(name)}</span>
+        <ConflictSheetValue value={value} other={other}/>
+    </label>
+
+// True when a pull at release closes the sheet: past a third of its height, or a flick down.
+fn conflict_sheet_closes(dy: num, speed: num, height: num) -> bool = dy > height / 3 || (dy > 24 && speed > 0.5)
+
+// Pulling up gives way only a little, so the sheet stays on the edge of the screen.
+fn conflict_sheet_pull(dy: num) -> num = dy >= 0 ? dy : -sqrt(-dy) * 2
+
+component ConflictSheet(local = null, remote = null, base = null, fields = [], open: bool = false, trigger: str? = null, title: str = "Two versions of this",
+                        local_name: str = "this device", remote_name: str = "the server", local_at = null, remote_at = null, now = null, on_resolve = null,
+                        on_close = null, wait_ms: int = 30000, id: str = "conflict-sheet", class: str? = null) {
+    style global conflict_sheet_css
+    let has_base = type_of(base) == "map"
+    let rows = conflict_sheet_compare(fields, local, remote, base)
+    let asked = rows | filter((r) => r.kind == "both")
+    let auto = rows | filter((r) => r.kind == "mine" || r.kind == "theirs")
+    let local_when = conflict_sheet_ago(local_at, now)
+    let remote_when = conflict_sheet_ago(remote_at, now)
+    state own = false
+    state box = null
+    state picks = {}
+    state saving = false
+    state note = ""
+    state bad = false
+    state grab = null       // where a pull began: { x, y }
+    state axis = null       // "y" once it is a pull, "x" when it went sideways and is not one
+    state mark = null       // a point of it from a moment ago, for its speed at the end
+    state going = false     // sliding away, until the dialog closes
+    state done_ = false     // closed by saving, so on_close stays quiet
+    let left = conflict_sheet_left(rows, picks)
+    if (open || own) && box != null && !box.open { box.showModal() }
+    if !open && !own && box != null && box.open { box.close() }
+    if going {
+        every(200, () => {
+            going = false
+            box.close()
+        })
+    }
+    // The dialog moves by box.style alone, so it has no `style` in the markup: one there
+    // would be rewritten on any change of state and send a pull back home.
+    let spring = () => {
+        box.style.transition = ""
+        box.style.transform = ""
+    }
+    let let_go = (e) => {
+        if grab != null {
+            let dy = e.clientY - grab.y
+            let was = axis
+            let dt = e.timeStamp - mark.at
+            let speed = dt > 0 ? (e.clientY - mark.y) / dt : 0
+            grab = null
+            axis = null
+            if was == "y" && e.type == "pointerup" && conflict_sheet_closes(dy, speed, box.offsetHeight) {
+                box.style.transition = ""
+                box.style.transform = "translateY(100%)"
+                going = true
+            } else {
+                spring()
+            }
+        }
+    }
+    let save = (e) => {
+        e.preventDefault()
+        if !saving {
+            let lacking = conflict_sheet_left(rows, picks)
+            if len(lacking) > 0 {
+                note = `Choose a version of ${join(lacking | map((r) => r.label), ", ")} first.`
+                bad = true
+                let first = box.querySelector(`.ui-cflct-row[data-field="${lacking[0].name}"]`)
+                first.scrollIntoView({ block: "nearest" })
+            } else if on_resolve == null {
+                box.close()
+            } else {
+                saving = true
+                bad = false
+                note = "Saving…"
+                let merged = conflict_sheet_merge(rows, picks)
+                let r = js("Promise.resolve", js_new("Promise", (done) => {
+                    js("AbortSignal.timeout", wait_ms).addEventListener("abort", (_e = null) => { done(err("no answer")) })
+                    js("Promise.resolve", on_resolve(merged, picks)).then(done, (_e = null) => { done(err("failed")) })
+                }))
+                saving = false
+                if is_err(r) || r == false || (type_of(r) == "map" && r.ok == false) {
+                    note = type_of(r) == "map" && type_of(r.error) == "str" ? `Not saved: ${r.error}` : "Not saved. Your choices are kept."
+                    bad = true
+                } else {
+                    note = ""
+                    done_ = true
+                    own = false
+                    box.close()
+                }
+            }
+        }
+    }
+    let all = (side: str) => {
+        picks = reduce(asked, picks, (m, r) => set(m, r.name, side))
+        bad = false
+        note = ""
+    }
+    <div>
+        {trigger != null && <button.ui-cflct-open type="button" aria-haspopup="dialog" @click={() => { own = true }}>{trigger}</button>}
+        <dialog class={ui_cls(["ui-cflct", class])} id={id} aria-label={title}
+                @mount={(el) => {
+                    box = el
+                    if open { el.showModal() }
+                }}
+                @close={() => {
+                    box.style.transform = ""
+                    own = false
+                    if !done_ { on_close && on_close() }
+                    done_ = false
+                }}
+                @click={(e) => { if e.target.isSameNode(box) && !going { box.close() } }}>
+            <div.ui-cflct-grab
+                 @pointerdown={(e) => {
+                     // On a phone only: from 700 px it is not a sheet. A press on the close button is a press.
+                     if e.button == 0 && e.target.closest(".ui-cflct-x") == null && !js("matchMedia", "(min-width: 700px)").matches {
+                         e.target.closest(".ui-cflct-grab").setPointerCapture(e.pointerId)
+                         grab = { x: e.clientX, y: e.clientY }
+                         mark = { y: e.clientY, at: e.timeStamp }
+                         axis = null
+                     }
+                 }}
+                 @pointermove={(e) => {
+                     if grab != null {
+                         let dy = e.clientY - grab.y
+                         let dx = e.clientX - grab.x
+                         if axis == null && (abs(dy) > 8 || abs(dx) > 8) { axis = abs(dy) >= abs(dx) ? "y" : "x" }
+                         if axis == "y" {
+                             box.style.transition = "none"
+                             box.style.transform = `translateY(${conflict_sheet_pull(dy)}px)`
+                         }
+                         // A point at least 60 ms old, so a last move does not read as a stop.
+                         if e.timeStamp - mark.at > 120 { mark = { y: e.clientY, at: e.timeStamp - 60 } }
+                     }
+                 }}
+                 @pointerup={let_go}
+                 @pointercancel={let_go}>
+                <span.ui-cflct-grip aria-hidden="true"></span>
+                <div.ui-cflct-head>
+                    <h2>{title}</h2>
+                    <button.ui-cflct-x type="button" aria-label="Close" @click={() => { box.close() }}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                    </button>
+                </div>
+            </div>
+            <div.ui-cflct-body>
+                <p.ui-cflct-intro>{conflict_sheet_intro(rows)}</p>
+                {for r in asked => <fieldset.ui-cflct-row key={r.name} data-field={r.name}>
+                    <legend>{r.label}</legend>
+                    <p.ui-cflct-why>{conflict_sheet_explain(r, local_name, remote_name, has_base)}</p>
+                    <div.ui-cflct-opts>
+                        <ConflictSheetOption group={`${id}-${r.name}`} side="mine" name={local_name} when={local_when} value={r.mine} other={r.theirs}
+                                             picked={get(picks, r.name) == "mine"} on_pick={() => { picks = set(picks, r.name, "mine") }}/>
+                        <ConflictSheetOption group={`${id}-${r.name}`} side="theirs" name={remote_name} when={remote_when} value={r.theirs} other={r.mine}
+                                             picked={get(picks, r.name) == "theirs"} on_pick={() => { picks = set(picks, r.name, "theirs") }}/>
+                    </div>
+                </fieldset>}
+                {len(auto) > 0 && <details.ui-cflct-auto>
+                    <summary>{`${conflict_sheet_fields_word(len(auto))} merged without asking`}</summary>
+                    <ul>{for r in auto => <li key={r.name}>{r.kind == "mine" ? `${r.label}: your change, from ${local_name}, is kept.` : `${r.label}: the change from ${remote_name} is taken.`}</li>}</ul>
+                </details>}
+            </div>
+            <div.ui-cflct-foot>
+                {len(asked) > 0 && <div.ui-cflct-all>
+                    <button.ui-cflct-btn type="button" @click={() => { all("mine") }}>{`All from ${local_name}`}</button>
+                    <button.ui-cflct-btn type="button" @click={() => { all("theirs") }}>{`All from ${remote_name}`}</button>
+                </div>}
+                <p.ui-cflct-note role="status" data-bad={bad ? "" : null}>{note != "" ? note : (len(left) > 0 ? `Choose ${len(left)} more.` : "")}</p>
+                <button.ui-cflct-btn.ui-cflct-save type="button" aria-disabled={len(left) > 0 || saving ? "true" : "false"} @click={save}>Save</button>
+            </div>
+        </dialog>
+    </div>
+}

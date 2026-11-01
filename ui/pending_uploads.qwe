@@ -1,0 +1,563 @@
+// PendingUploads: a queue of files going up in parts, one file at a time, each with its
+// progress, a Pause, a Retry and a Remove, and a wifi-only rule. A file stopped by a pause, a
+// lost connection or a reload goes on from the last part that arrived, not from the start.
+//
+//   import ui/pending_uploads.qwe use PendingUploads
+//
+//   // In parts to a route of yours, each a multipart POST:
+//   <PendingUploads url="/upload"/>
+//
+//   route POST /upload {
+//       // Fields: upload (the file's id), name, type, size, offset, end, last ("true" or "false"),
+//       // and the file field `part`. Saved by id and offset, as a part may be sent again.
+//       save_upload(request.files.part, `uploads/${request.form.upload}/${request.form.offset}`)
+//       { ok: true }
+//   }
+//
+//   // What lasts. It needs nothing in a browser. In a phone app localStorage and IndexedDB
+//   // come back empty each launch, because the app's port changes, so give `saved`, and keep
+//   // what on_change gives in SQLite. The files themselves cannot be kept there: the list
+//   // comes back, and the person chooses each file again to go on.
+//   server fn keep_uploads(state) { db.exec("insert or replace into uploads (id, body) values (1, ?)", json.stringify(state)) }
+//   component Sender(saved = {}) {
+//       <PendingUploads url="/upload" saved={saved} on_change={(s) => { keep_uploads(s) }}/>
+//   }
+//
+// url: where parts go, by POST. send_part(part): does it yourself instead, and may wait, with
+// { id, name, type, size, offset, end, last, part (a Blob) }; anything but false,
+// { ok: false, error } or an error value counts as arrived. chunk: bytes in a part (1 MiB,
+// which must fit Quillo's --max-body); 0 sends each file whole, so a stop means starting
+// it again. wifi_only: where the rule starts (false); the person can flip it, and it is kept.
+// on_rule(on) tells you. network: "wifi" or "cellular" to say for yourself, as iOS and
+// desktop browsers do not tell; null reads navigator.connection. saved: what on_change last
+// gave, { rule, items }; a map given (even empty) leaves localStorage alone. on_change(state):
+// after every change. on_done(item). accept, max_size, max_files: as a file field's. keep_limit: the
+// largest file held in IndexedDB for a reload (100 MiB). label: the add button's words.
+// wait_ms: how long one part may take (60000). id: for its elements and the name it is stored
+// under, with store in its place if given. class.
+//
+// What a browser allows: the list goes in localStorage, and each file in IndexedDB, which
+// keeps it through a reload and a crash, up to keep_limit and as far as there is room.
+// Uploads run only while the page does: a phone stops them in the background, and they go
+// on when it comes back. A wifi rule can only be as good as what the system says: where it
+// does not say (iOS, and most desktops), files wait for the person to say go.
+//
+// pending_uploads_gate(rule, network, allowed, online) says whether files may go, and why not;
+// pending_uploads_restore(list) is what a kept list becomes after a restart.
+
+import ui/theme.qwe use ui_cls
+
+let pending_uploads_css = css`
+.ui-pendup { position: relative; container-type: inline-size; display: grid; gap: 10px; min-width: 0; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-pendup-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.ui-pendup-sum { flex: 1 1 180px; margin: 0; font-weight: 600; }
+.ui-pendup-rule { position: relative; display: inline-flex; align-items: center; gap: 10px; min-height: 44px; cursor: pointer; touch-action: manipulation; }
+.ui-pendup-rule input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.ui-pendup-track { position: relative; width: 44px; height: 26px; border-radius: 999px; background: var(--ui-strong); transition: background .15s; }
+.ui-pendup-track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .25); transition: transform .15s; }
+.ui-pendup-rule input:checked + .ui-pendup-track { background: var(--ui-accent); }
+.ui-pendup-rule input:checked + .ui-pendup-track::after { transform: translateX(18px); }
+.ui-pendup-rule input:focus-visible + .ui-pendup-track { box-shadow: var(--ui-focus); }
+.ui-pendup-gate { display: grid; gap: 8px; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); }
+.ui-pendup-gate p { margin: 0; }
+.ui-pendup-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-pendup-row { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); min-width: 0; }
+.ui-pendup-row[data-status="failed"], .ui-pendup-row[data-status="lost"] { border-color: color-mix(in srgb, var(--ui-danger) 45%, var(--ui-border)); }
+.ui-pendup-name { overflow-wrap: anywhere; font-weight: 500; }
+.ui-pendup-line { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 10px; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-pendup-row[data-status="failed"] .ui-pendup-word, .ui-pendup-row[data-status="lost"] .ui-pendup-word { color: var(--ui-danger); }
+.ui-pendup-row[data-status="done"] .ui-pendup-word { color: var(--ui-success); }
+.ui-pendup-track2 { height: 6px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-pendup-fill { height: 100%; border-radius: inherit; background: var(--ui-accent); transition: width .2s ease; }
+.ui-pendup-row[data-status="done"] .ui-pendup-fill { background: var(--ui-success); }
+.ui-pendup-row[data-status="failed"] .ui-pendup-fill { background: var(--ui-danger); }
+.ui-pendup-row[data-status="paused"] .ui-pendup-fill { background: var(--ui-strong); }
+.ui-pendup-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-pendup-btn { position: relative; overflow: hidden; display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; min-width: 78px; min-height: 46px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-pendup-go { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+/* The real field lies over its label, so a finger presses the field itself. */
+.ui-pendup-btn input[type="file"] { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; font-size: 0; }
+.ui-pendup-btn:focus-visible, .ui-pendup-btn:focus-within { outline: none; box-shadow: var(--ui-focus); }
+.ui-pendup-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.ui-pendup-said { flex: 1 1 200px; margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-pendup-said[data-bad] { color: var(--ui-danger); }
+.ui-pendup-lasts { margin: 0; color: var(--ui-muted); font-size: 13px; }
+@media (hover: hover) { .ui-pendup-btn:hover { border-color: var(--ui-strong); background: var(--ui-subtle); } .ui-pendup-go:hover { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); } }
+@media (prefers-reduced-motion: reduce) { .ui-pendup-fill, .ui-pendup-track, .ui-pendup-track::after { transition: none; } }
+@container (min-width: 560px) {
+  .ui-pendup-row { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+  .ui-pendup-name, .ui-pendup-line, .ui-pendup-track2 { grid-column: 1; }
+  .ui-pendup-acts { grid-column: 2; grid-row: 1 / 4; }
+  .ui-pendup-gate { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+}
+`
+
+// Bytes as text: "840 B", "2.1 MB".
+fn pending_uploads_size(n: num) -> str {
+    if n < 1024 { return `${round(n)} B` }
+    let unit = n < 1048576 ? 1024 : (n < 1073741824 ? 1048576 : 1073741824)
+    let tenths = round(n * 10 / unit)
+    `${floor(tenths / 10)}${tenths % 10 == 0 ? "" : `.${tenths % 10}`} ${unit == 1024 ? "KB" : (unit == 1048576 ? "MB" : "GB")}`
+}
+
+// A file's id: the same file picked again has the same one, so a server can go on with it.
+fn pending_uploads_key(name: str, size: int, modified) -> str = `${name}:${size}:${modified}`
+
+fn pending_uploads_item(id: str, name: str, size: int, kind: str, modified, kept: bool) -> map =
+    { id, name, size, type: kind, modified, sent: 0, status: "queued", why: null, kept }
+
+// A kept list after a restart: what went is gone, what was going is queued again, and
+// nothing is sent past what the server has.
+fn pending_uploads_restore(list) -> list {
+    if type_of(list) != "list" { return [] }
+    list | filter((a) => type_of(a) == "map" && type_of(a.id) == "str" && type_of(a.name) == "str" && type_of(a.size) == "int" && a.status != "done")
+         | map((a) => {
+             let sent = type_of(a.sent) == "int" && a.sent >= 0 && a.sent <= a.size ? a.sent : 0
+             { id: a.id, name: a.name, size: a.size, type: type_of(a.type) == "str" ? a.type : "", modified: a.modified, sent,
+               status: a.status == "paused" ? "paused" : "queued", why: null, kept: a.kept == true }
+         })
+}
+
+// Whether files may go now: "go", "offline", "wifi" (on mobile data, waiting for wifi) or
+// "unknown" (the rule is on and nothing says what the network is). allowed: the person
+// said go, whatever it is.
+fn pending_uploads_gate(rule: bool, network, allowed: bool, online: bool) -> str {
+    if !online { return "offline" }
+    if !rule || allowed { return "go" }
+    match network {
+        "wifi" => "go"
+        "cellular" => "wifi"
+        _ => "unknown"
+    }
+}
+
+// What navigator.connection.type comes to, with the program's word first.
+fn pending_uploads_network(given, kind) {
+    if given == "wifi" || given == "cellular" { return given }
+    if kind == "wifi" || kind == "ethernet" { return "wifi" }
+    if kind == "cellular" || kind == "wimax" || kind == "bluetooth" { return "cellular" }
+    null
+}
+
+fn pending_uploads_next(items: list) = items | find((a) => a.status == "queued")
+
+fn pending_uploads_patch(items: list, id: str, change: map) -> list =
+    items | map((a) => a.id == id ? { ...a, ...change } : a)
+
+fn pending_uploads_percent(sent: int, size: int) -> int = size <= 0 ? 100 : floor(min([sent, size]) * 100 / size)
+
+// A row's word.
+fn pending_uploads_word(a: map, sent: int, gate: str) -> str = match a.status {
+    "sending" => `Sending ${pending_uploads_percent(sent, a.size)}%`
+    "paused" => "Paused"
+    "failed" => a.why ?? "It did not go."
+    "done" => "Sent"
+    "lost" => sent > 0 ? `Choose it again to go on from ${pending_uploads_percent(sent, a.size)}%` : "Choose it again to send it"
+    _ => match gate {
+        "offline" => "Waiting for a connection"
+        "wifi" => "Waiting for wifi"
+        "unknown" => "Waiting for you to say"
+        _ => "Next"
+    }
+}
+
+fn pending_uploads_rows(items: list, moving, gate: str) -> list =
+    items | map((a) => {
+        let sent = moving != null && moving.id == a.id ? moving.bytes : a.sent
+        { ...a, shown: sent, percent: a.status == "done" ? 100 : pending_uploads_percent(sent, a.size), word: pending_uploads_word(a, sent, gate) }
+    })
+
+fn pending_uploads_summary(items: list) -> str {
+    let left = items | filter((a) => a.status != "done")
+    if len(items) == 0 { return "No uploads" }
+    if len(left) == 0 { return "All sent" }
+    let bytes = sum(left | map((a) => a.size - a.sent))
+    `${len(left) == 1 ? "1 file" : `${len(left)} files`}, ${pending_uploads_size(bytes)} to go`
+}
+
+fn pending_uploads_gate_words(gate: str) -> str = match gate {
+    "offline" => "You are offline. Uploads go on when you are back."
+    "wifi" => "On mobile data, so uploads are waiting for wifi."
+    "unknown" => "This device does not say what network it is on, so wifi only cannot be checked. Files wait until you say."
+    _ => ""
+}
+
+// What was given as an answer, as words if it is a failure.
+fn pending_uploads_failure(r) {
+    if is_err(r) { return "Could not reach the server." }
+    if r == false { return "The server refused this part." }
+    if type_of(r) == "map" && r.ok == false { return type_of(r.error) == "str" && r.error != "" ? r.error : "The server refused this part." }
+    null
+}
+
+// What it can promise.
+fn pending_uploads_lasts(place, keeper: bool, limit: int) -> str {
+    let runs = "Uploads run only while this page is open."
+    match place {
+        null => ""
+        "app" => keeper ? `${runs} If the app closes, this list comes back and you choose each file again.` : `${runs} This list lasts until the app closes.`
+        "blocked" => `${runs} This browser is not keeping files, so they last only while this page is open.`
+        _ => keeper ? `${runs} Files stay in this browser through a reload, up to ${pending_uploads_size(limit)} each.` : `${runs} This list and its files stay in this browser through a reload, up to ${pending_uploads_size(limit)} each.`
+    }
+}
+
+component PendingUploads(id: str = "pending-uploads", store: str? = null, url: str? = null, send_part = null, chunk: int = 1048576, wifi_only: bool = false, on_rule = null,
+                         network: str? = null, saved = null, on_change = null, on_done = null, accept: str? = null, max_size: int? = null, max_files: int? = null,
+                         keep_limit: int = 104857600, label: str = "Add files", wait_ms: int = 60000, class: str? = null) {
+    style global pending_uploads_css
+    let name_ = store ?? id
+    let slot = `ui-pending-uploads:${name_}`
+    let keeper = type_of(saved) == "map"
+    state items = keeper ? pending_uploads_restore(saved.items) : []
+    state rule = keeper && type_of(saved.rule) == "bool" ? saved.rule : wifi_only
+    state held = null       // file by id, from when it starts
+    state base = null       // the IndexedDB, or null
+    state place = null
+    state net = true
+    state kind = null       // what navigator.connection says
+    state allowed = false
+    state pumping = false
+    state moving = null     // the part on its way: { id, bytes }
+    state xhr = null
+    state wake = false
+    state was_go = false
+    state said = ""
+    state bad = false
+    let gate = pending_uploads_gate(rule, pending_uploads_network(network, kind), allowed, net)
+    let rows = pending_uploads_rows(items, moving, gate)
+    let done_ = len(items | filter((a) => a.status == "done"))
+    let say = (words: str, wrong: bool) => {
+        said = words
+        bad = wrong
+    }
+    if gate == "go" && !was_go && place != null { wake = true }
+    if (gate == "go") != was_go { was_go = gate == "go" }
+    let keep = () => {
+        let list = items | filter((a) => a.status != "done")
+        let kept = { rule, items: list }
+        if !keeper && place != null {
+            let text = json.stringify(kept)
+            let wrote = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.setItem", slot, text) ?? true) }))
+            if is_err(wrote) { place = "blocked" }
+        }
+        on_change && on_change(kept)
+    }
+    // The files themselves, in IndexedDB. Each answers true, the file, null or an error value.
+    let db_open = () => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            // A database being deleted elsewhere makes this wait, which must not stop the queue.
+            js("AbortSignal.timeout", 3000).addEventListener("abort", (_e = null) => { done(err("no database")) })
+            let r = js("window").indexedDB.open("ui-pending-uploads", 1)
+            r.addEventListener("upgradeneeded", (_e) => { r.result.createObjectStore("files") })
+            r.addEventListener("success", (_e) => {
+                // Lets go when something wants it gone, as StorageMeter's Clear may: held open,
+                // the database could not be deleted, and every other page would wait on it.
+                let b = r.result
+                b.addEventListener("versionchange", (_v) => {
+                    b.close()
+                    base = null
+                })
+                done(b)
+            })
+            r.addEventListener("error", (_e = null) => { done(err("no database")) })
+        }))
+    }
+    let db_ready = () => {
+        if base == null {
+            let opened = db_open()
+            base = is_err(opened) ? null : opened
+        }
+        base != null
+    }
+    let db_put = (k: str, file) => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            let tx = base.transaction("files", "readwrite")
+            tx.objectStore("files").put(file, `${name_}/${k}`)
+            tx.addEventListener("complete", (_e) => { done(true) })
+            tx.addEventListener("error", (_e = null) => { done(err("not kept")) })
+            tx.addEventListener("abort", (_e = null) => { done(err("not kept")) })
+        }))
+    }
+    let db_get = (k: str) => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            let r = base.transaction("files").objectStore("files").get(`${name_}/${k}`)
+            r.addEventListener("success", (_e) => { done(r.result) })
+            r.addEventListener("error", (_e) => { done(null) })
+        }))
+    }
+    let db_drop = (k: str) => {
+        if db_ready() {
+            js("Promise.resolve", js_new("Promise", (done) => {
+                let tx = base.transaction("files", "readwrite")
+                tx.objectStore("files").delete(`${name_}/${k}`)
+                tx.addEventListener("complete", (_e) => { done(true) })
+                tx.addEventListener("error", (_e) => { done(null) })
+            }))
+        }
+    }
+    // One part to the url, with its own progress. Answers true, a refusal, "stopped" or an error value.
+    let post = (it: map, part, from: int, end: int) => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            let x = js_new("XMLHttpRequest")
+            let form = js_new("FormData")
+            form.append("upload", it.id)
+            form.append("name", it.name)
+            form.append("type", it.type)
+            form.append("size", str(it.size))
+            form.append("offset", str(from))
+            form.append("end", str(end))
+            form.append("last", end >= it.size ? "true" : "false")
+            form.append("part", part, it.name)
+            x.open("POST", url)
+            x.timeout = wait_ms
+            x.upload.addEventListener("progress", (e) => { moving = { id: it.id, bytes: from + min([e.loaded, end - from]) } })
+            x.addEventListener("load", (_e) => { done(x.status >= 200 && x.status < 300 ? true : { ok: false, error: `The server answered ${x.status}.` }) })
+            x.addEventListener("error", (_e = null) => { done(err("no answer")) })
+            x.addEventListener("timeout", (_e = null) => { done(err("no answer")) })
+            x.addEventListener("abort", (_e) => { done("stopped") })
+            xhr = x
+            x.send(form)
+        }))
+    }
+    let give = (it: map, part, from: int, end: int) => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            js("AbortSignal.timeout", wait_ms).addEventListener("abort", (_e = null) => { done(err("no answer")) })
+            js("Promise.resolve", send_part({ id: it.id, name: it.name, type: it.type, size: it.size, offset: from, end, last: end >= it.size, part })).then(done, (_e = null) => { done(err("failed")) })
+        }))
+    }
+    let now_status = (k: str) => (items | find((a) => a.id == k)).status
+    // A file, part by part from where it had got to, until it ends or something stops it.
+    let carry = (it: map, file) => {
+        let from = it.sent
+        let going = true
+        while going {
+            let whole = chunk <= 0
+            let start = whole ? 0 : from
+            let end = whole ? it.size : min([from + chunk, it.size])
+            let part = file.slice(start, end)
+            moving = { id: it.id, bytes: start }
+            let r = url != null ? post(it, part, start, end) : give(it, part, start, end)
+            xhr = null
+            let why = r == "stopped" ? null : pending_uploads_failure(r)
+            if r == "stopped" {
+                going = false
+            } else if why != null {
+                let gone = js("navigator.onLine") == false
+                if gone { net = false }
+                let st = items | find((a) => a.id == it.id)
+                if st != null && st.status == "sending" {
+                    // The connection went: not this file's fault, so it waits its turn.
+                    items = pending_uploads_patch(items, it.id, gone ? { status: "queued" } : { status: "failed", why })
+                }
+                going = false
+            } else {
+                from = end
+                let st = items | find((a) => a.id == it.id)
+                if st != null {
+                    items = pending_uploads_patch(items, it.id, { sent: from })
+                    if from >= it.size {
+                        items = pending_uploads_patch(items, it.id, { status: "done" })
+                        db_drop(it.id)
+                        held.delete(it.id)
+                        on_done && on_done({ id: it.id, name: it.name, size: it.size })
+                        going = false
+                    } else if now_status(it.id) != "sending" {
+                        going = false
+                    } else if pending_uploads_gate(rule, pending_uploads_network(network, kind), allowed, net) != "go" {
+                        // The rule or the network changed: the file goes back in line, kept where it got to.
+                        items = pending_uploads_patch(items, it.id, { status: "queued" })
+                        going = false
+                    }
+                } else {
+                    going = false
+                }
+                keep()
+            }
+        }
+        moving = null
+        keep()
+    }
+    let pump = () => {
+        if !pumping && (url != null || send_part != null) && held != null {
+            pumping = true
+            let go = true
+            while go {
+                let next = pending_uploads_next(items)
+                if next == null || pending_uploads_gate(rule, pending_uploads_network(network, kind), allowed, net) != "go" {
+                    go = false
+                } else {
+                    let file = held.get(next.id)
+                    if file == null {
+                        items = pending_uploads_patch(items, next.id, { status: "lost" })
+                    } else {
+                        items = pending_uploads_patch(items, next.id, { status: "sending", why: null })
+                        carry(next, file)
+                    }
+                }
+            }
+            pumping = false
+        }
+    }
+    if wake {
+        every(40, () => {
+            wake = false
+            pump()
+        })
+    }
+    let add = (list) => {
+        let have = items | map((a) => a.id)
+        let picked = max_files != null ? take(list, max_files - len(items | filter((a) => a.status != "done"))) : list
+        let notes = []
+        for f in picked {
+            let k = pending_uploads_key(f.name, f.size, f.lastModified)
+            if max_size != null && f.size > max_size {
+                notes = notes | push(`${f.name} is larger than ${pending_uploads_size(max_size)}.`)
+            } else if contains(have, k) {
+                notes = notes | push(`${f.name} is already in the list.`)
+            } else {
+                held.set(k, f)
+                let room = f.size <= keep_limit && db_ready() ? db_put(k, f) : false
+                items = items | push(pending_uploads_item(k, f.name, f.size, f.type, f.lastModified, room == true))
+            }
+        }
+        if max_files != null && len(picked) < len(list) { notes = notes | push(`Only ${max_files} files can wait at once.`) }
+        say(join(notes, " "), len(notes) > 0)
+        keep()
+        wake = true
+    }
+    let again = (a: map, file) => {
+        let k = pending_uploads_key(file.name, file.size, file.lastModified)
+        if k != a.id {
+            say(`That is not the same file as ${a.name}.`, true)
+        } else {
+            held.set(k, file)
+            let room = file.size <= keep_limit && db_ready() ? db_put(k, file) : false
+            items = pending_uploads_patch(items, a.id, { status: "queued", why: null, kept: room == true })
+            say("", false)
+            keep()
+            wake = true
+        }
+    }
+    let begin = (_el) => {
+        let w = js("window")
+        let map_ = js_new("Map")
+        let opened = db_open()
+        let text = keeper ? null : js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.getItem", slot)) }))
+        let conn = js("navigator").connection
+        let app = w.quilloNative != null
+        base = is_err(opened) ? null : opened
+        let found = keeper || is_err(text) || text == null ? null : json.parse(text)
+        if type_of(found) == "map" {
+            items = pending_uploads_restore(found.items)
+            if type_of(found.rule) == "bool" { rule = found.rule }
+        }
+        for a in items {
+            let file = base != null ? db_get(a.id) : null
+            if file != null {
+                map_.set(a.id, file)
+            } else {
+                items = pending_uploads_patch(items, a.id, { status: "lost" })
+            }
+        }
+        held = map_
+        place = app ? "app" : (base == null || is_err(text) ? "blocked" : "browser")
+        net = js("navigator.onLine") != false
+        kind = conn != null ? conn.type : null
+        let went = (_e = null) => { net = false }
+        let came = (_e = null) => { net = true }
+        let turned = (_e = null) => {
+            kind = conn.type
+            allowed = false
+        }
+        w.addEventListener("offline", went)
+        w.addEventListener("online", came)
+        if conn != null && conn.addEventListener != null { conn.addEventListener("change", turned) }
+        wake = true
+        () => {
+            w.removeEventListener("offline", went)
+            w.removeEventListener("online", came)
+            if conn != null && conn.removeEventListener != null { conn.removeEventListener("change", turned) }
+            if xhr != null { xhr.abort() }
+        }
+    }
+    <section class={ui_cls(["ui-pendup", class])} id={id} aria-label="Uploads" @mount={begin}>
+        <div.ui-pendup-head>
+            <p.ui-pendup-sum role="status">{pending_uploads_summary(items)}</p>
+            <label.ui-pendup-rule>
+                <input type="checkbox" role="switch" checked={rule} @change={(e) => {
+                    rule = e.checked
+                    allowed = false
+                    on_rule && on_rule(rule)
+                    keep()
+                }}/>
+                <span.ui-pendup-track aria-hidden="true"></span>
+                Wifi only
+            </label>
+        </div>
+        {gate != "go" && <div.ui-pendup-gate role="status">
+            <p.ui-pendup-gate-words>{pending_uploads_gate_words(gate)}</p>
+            {gate != "offline" && <button.ui-pendup-btn type="button" @click={() => { allowed = true }}>{gate == "wifi" ? "Send on mobile data" : "Send anyway"}</button>}
+        </div>}
+        <ul.ui-pendup-list>
+            {for r in rows => <li.ui-pendup-row key={r.id} data-id={r.id} data-name={r.name} data-status={r.status}>
+                <span.ui-pendup-name>{r.name}</span>
+                <span.ui-pendup-line><span.ui-pendup-word>{r.word}</span><span>{`${pending_uploads_size(r.shown)} of ${pending_uploads_size(r.size)}`}</span></span>
+                <div.ui-pendup-track2 role="progressbar" aria-label={r.name} aria-valuemin="0" aria-valuemax="100" aria-valuenow={r.percent}>
+                    <div.ui-pendup-fill style={`width: ${r.percent}%`}></div>
+                </div>
+                {r.status != "done" && <div.ui-pendup-acts>
+                    {r.status == "sending" || r.status == "queued"
+                        ? <button.ui-pendup-btn type="button" aria-label={`Pause ${r.name}`} @click={() => {
+                              items = pending_uploads_patch(items, r.id, { status: "paused" })
+                              if r.status == "sending" && xhr != null { xhr.abort() }
+                              keep()
+                          }}>Pause</button>
+                        : null}
+                    {r.status == "paused" && <button.ui-pendup-btn.ui-pendup-go type="button" aria-label={`Resume ${r.name}`} @click={() => {
+                        items = pending_uploads_patch(items, r.id, { status: "queued" })
+                        keep()
+                        wake = true
+                    }}>Resume</button>}
+                    {r.status == "failed" && <button.ui-pendup-btn.ui-pendup-go type="button" aria-label={`Retry ${r.name}`} @click={() => {
+                        items = pending_uploads_patch(items, r.id, { status: "queued", why: null })
+                        keep()
+                        wake = true
+                    }}>Retry</button>}
+                    {r.status == "lost" && <label.ui-pendup-btn.ui-pendup-go>
+                        Choose again
+                        <input type="file" accept={accept} aria-label={`Choose ${r.name} again`} @change={(e) => {
+                            let input = e.target
+                            let file = input.files[0]
+                            input.value = ""
+                            if file != null { again(r, file) }
+                        }}/>
+                    </label>}
+                    <button.ui-pendup-btn type="button" aria-label={`Remove ${r.name}`} @click={() => {
+                        if r.status == "sending" && xhr != null { xhr.abort() }
+                        items = items | filter((a) => a.id != r.id)
+                        held.delete(r.id)
+                        db_drop(r.id)
+                        keep()
+                    }}>Remove</button>
+                </div>}
+            </li>}
+        </ul>
+        <div.ui-pendup-foot>
+            <label.ui-pendup-btn.ui-pendup-go>
+                {label}
+                <input type="file" multiple="true" accept={accept} aria-label={label} @change={(e) => {
+                    let input = e.target
+                    let list = js("Array.from", input.files)
+                    input.value = ""
+                    add(list)
+                }}/>
+            </label>
+            {done_ > 0 && <button.ui-pendup-btn type="button" @click={() => {
+                items = items | filter((a) => a.status != "done")
+                say("", false)
+            }}>Clear sent</button>}
+            <p.ui-pendup-said role="status" data-bad={bad ? "" : null}>{said}</p>
+        </div>
+        <p.ui-pendup-lasts>{pending_uploads_lasts(place, keeper, keep_limit)}</p>
+    </section>
+}

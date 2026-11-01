@@ -1,0 +1,349 @@
+// CriticalPath: a project's tasks with their durations and what each waits for. It runs
+// the forward and backward passes, so each task gets its earliest and latest start and
+// finish and its slack, finds the critical path (every one, when there are several), and
+// turns working days into calendar dates, weekends and holidays off. Cycles, missing
+// tasks, duplicates and bad durations are named line by line, and nothing is scheduled
+// until they are put right. The list can be edited as text, so pasting a plan works.
+//
+//   <CriticalPath start="2026-11-02" tasks={[
+//       { id: "A", name: "Design", days: 3 },
+//       { id: "B", name: "Build", days: 5, deps: ["A"] },
+//       { id: "C", name: "Docs", days: 2, deps: ["A"] },
+//       { id: "D", name: "Launch", days: 1, deps: ["B", "C"] }]}/>
+//
+// tasks: a list of { id, name?, days, deps? }, where id is text or a number, days a
+// whole number of working days (0 is a milestone) and deps the ids it waits for. start:
+// the first day of work ("YYYY-MM-DD"; a day off moves to the next working day).
+// weekends: true works weekends too (false). holidays: dates with no work ("YYYY-MM-DD").
+// title: the heading. id: a prefix for its fields' ids, unique on the page. name: what
+// a form calls the text box ("tasks"). on_change(result): inside one of your components,
+// after each edit that gives a schedule; see critical_path_plan.
+//
+// The text box takes a line per task: id, name, days, what it waits for, with commas
+// between and spaces between the ids: "C, Docs, 2, A B". A line starting with # is a note.
+//
+// critical_path_plan(tasks, start, weekends, holidays) is the logic, for a program's
+// own use: { rows, total, finish, paths, problems }, where a row is { id, name, days,
+// deps, es, ef, ls, lf, slack, free, critical, start, end }. es and the rest count working
+// days from 0; a task with es 0 and 3 days has ef 3, and works days 0, 1 and 2.
+// critical_path_read(text) reads the text box into tasks, with their line numbers.
+// It takes at most 500 tasks and 100,000 working days a task.
+
+import ui/theme.qwe use ui_cls
+
+let critical_path_css = css`
+.ui-critical-path { display: grid; gap: 14px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-critical-path .ui-critical-path-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-critical-path-bar { display: flex; flex-wrap: wrap; align-items: end; gap: 10px 18px; }
+.ui-critical-path-field { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 500; }
+.ui-critical-path-field input, .ui-critical-path-field textarea { box-sizing: border-box; width: 100%; min-width: 0; padding: 8px 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.4 var(--ui-font); }
+.ui-critical-path-field textarea { font: 13px/1.5 var(--ui-mono); resize: vertical; }
+.ui-critical-path-field input:focus-visible, .ui-critical-path-field textarea:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-critical-path-field [aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-critical-path-check { display: inline-flex; align-items: center; gap: 6px; padding-bottom: 8px; cursor: pointer; }
+.ui-critical-path-check input { margin: 0; accent-color: var(--ui-accent); }
+.ui-critical-path-problems { display: grid; gap: 3px; margin: 0; padding: 10px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); color: var(--ui-danger); font-size: 13px; list-style: none; }
+.ui-critical-path-sum { display: grid; gap: 4px; padding: 10px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-critical-path-finish { margin: 0; font-size: 18px; font-weight: 700; color: var(--ui-accent); overflow-wrap: anywhere; }
+.ui-critical-path-route { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
+.ui-critical-path-wrap { position: relative; overflow-x: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-critical-path-wrap:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-critical-path-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-critical-path-table th, .ui-critical-path-table td { padding: 6px 10px; border-bottom: 1px solid var(--ui-border); text-align: right; white-space: nowrap; }
+.ui-critical-path-table th:nth-child(-n+2), .ui-critical-path-table td:nth-child(-n+2) { text-align: left; }
+.ui-critical-path-table thead th { background: var(--ui-subtle); font-weight: 600; }
+.ui-critical-path-table tbody tr:last-child th, .ui-critical-path-table tbody tr:last-child td { border-bottom: 0; }
+.ui-critical-path-hot th, .ui-critical-path-hot td { background: var(--ui-danger-soft); }
+.ui-critical-path-hot .ui-critical-path-slack { color: var(--ui-danger); font-weight: 700; }
+.ui-critical-path-slack { font-weight: 600; }
+.ui-critical-path-more { margin: 0; color: var(--ui-muted); font-size: 12px; }
+`
+
+let critical_path_most_tasks = 500
+let critical_path_most_days = 100000
+let critical_path_most_paths = 8
+
+// Reads the text box: one task a line, with `line` kept so a problem can name it.
+fn critical_path_read(text) -> list {
+    let out = []
+    for [i, raw] in enumerate(take(split(str(text ?? ""), "\n"), critical_path_most_tasks * 2)) {
+        let t = trim(raw)
+        if t != "" && !starts_with(t, "#") {
+            let cut = split(t, ",") | map(trim)
+            let deps = trim(cut[3] ?? "")
+            out = out | push({ id: cut[0], name: cut[1] ?? "", days: cut[2] ?? "", deps: deps == "" ? [] : re.split(deps, "\\s+"), line: i + 1 })
+        }
+    }
+    out
+}
+
+// How a task is named in a problem: by its line where it has one.
+fn critical_path_where(t: map, i: int) -> str = t.line != null ? `Line ${t.line}` : `Task ${i + 1}`
+
+// A task's days as an int, or null.
+fn critical_path_days(v) {
+    if type_of(v) == "int" { return v >= 0 && v <= critical_path_most_days ? v : null }
+    if type_of(v) == "float" { return v == floor(v) && v >= 0 && v <= critical_path_most_days ? int(v) : null }
+    if type_of(v) == "str" && re.test(trim(v), "^\\d{1,9}$") {
+        let n = int(trim(v))
+        return n <= critical_path_most_days ? n : null
+    }
+    null
+}
+
+// One cycle among the tasks a sort could not place, as ids in order, first again at the
+// end: from any of them, following what it waits for must come round.
+fn critical_path_cycle(left: list, index: map) -> list {
+    let at = left[0]
+    let seen = []
+    let turns = 0
+    while !contains(seen, at) && turns <= len(left) {
+        seen = seen | push(at)
+        at = get(index, at).deps | find((d) => contains(left, d))
+        turns += 1
+    }
+    let from = index_of(seen, at)
+    reverse(slice(seen, from, len(seen)) | push(at))
+}
+
+// Whether a day is worked.
+fn critical_path_worked(d: str, weekends: bool, off: map) -> bool =
+    !has(off, d) && (weekends || date.weekday(d) < 6)
+
+// The first `count` working days from `start`, as a list. Stops at the last year dates
+// reach, and the caller is told by a shorter list.
+fn critical_path_calendar(start: str, count: int, weekends: bool, off: map) -> list {
+    let out = []
+    let d = start
+    let walked = 0
+    while len(out) < count && walked < 400000 && d < "9999-01-01" {
+        if critical_path_worked(d, weekends, off) { out = out | push(d) }
+        d = date.add_days(d, 1)
+        walked += 1
+    }
+    out
+}
+
+// `found` and the paths on from `id`. (A `let` function cannot call itself.)
+fn critical_path_walk(id: str, so_far: list, next: map, index: map, total: int, found: list) -> list {
+    if len(found) >= critical_path_most_paths { return found }
+    let path = so_far | push(id)
+    let onward = get(next, id) ?? []
+    if len(onward) == 0 { return get(index, id).ef == total ? found | push(path) : found }
+    let out = found
+    for n in onward { out = critical_path_walk(n, path, next, index, total, out) }
+    out
+}
+
+// Every critical path, as lists of ids, from what starts one to what ends one. Stops at
+// `critical_path_most_paths`: a plan of many ties has very many.
+fn critical_path_routes(rows: list, total: int) -> list {
+    let hot = rows | filter((r) => r.critical)
+    let index = {}
+    for r in hot { index = set(index, r.id, r) }
+    let next = {}
+    for r in hot {
+        for d in r.deps {
+            let from = get(index, d)
+            if from != null && from.ef == r.es { next = set(next, d, (get(next, d) ?? []) | push(r.id)) }
+        }
+    }
+    let starts = hot | filter((r) => r.es == 0)
+    let found = []
+    for s in starts {
+        let leads_in = any(s.deps, (d) => { let f = get(index, d); f != null && f.ef == s.es })
+        if !leads_in { found = critical_path_walk(s.id, [], next, index, total, found) }
+    }
+    found
+}
+
+// The schedule. { problems } alone when the plan cannot be worked out.
+fn critical_path_plan(tasks, start, weekends: bool = false, holidays = []) -> map {
+    let problems = []
+    let given = type_of(tasks) == "list" ? tasks : []
+    if type_of(tasks) != "list" { problems = problems | push("The tasks are not a list.") }
+    if len(given) > critical_path_most_tasks {
+        return { rows: [], problems: [`That is more than ${critical_path_most_tasks} tasks, the limit.`] }
+    }
+    let index = {}
+    let order = []
+    for [i, t] in enumerate(given) {
+        let where = type_of(t) == "map" ? critical_path_where(t, i) : `Task ${i + 1}`
+        if type_of(t) != "map" {
+            problems = problems | push(`${where}: this is not a task.`)
+        } else {
+            let id = trim(str(t.id ?? ""))
+            let days = critical_path_days(t.days)
+            if id == "" {
+                problems = problems | push(`${where}: it has no id.`)
+            } else if has(index, id) {
+                problems = problems | push(`${where}: the id ${id} is used twice.`)
+            } else {
+                if days == null {
+                    problems = problems | push(`${where}: "${slice(str(t.days ?? ""), 0, 20)}" is not a whole number of days from 0 to ${critical_path_most_days}.`)
+                }
+                let deps = (type_of(t.deps) == "list" ? t.deps : []) | map((d) => trim(str(d))) | filter((d) => d != "") | unique
+                index = set(index, id, { id, name: filled(trim(str(t.name ?? ""))) ?? id, days: days ?? 0, deps, where })
+                order = order | push(id)
+            }
+        }
+    }
+    for id in order {
+        let t = get(index, id)
+        for d in t.deps {
+            if d == id {
+                problems = problems | push(`${t.where}: ${id} waits for itself.`)
+            } else if !has(index, d) {
+                problems = problems | push(`${t.where}: ${id} waits for ${slice(d, 0, 30)}, which is not in the list.`)
+            }
+        }
+    }
+    // Kahn's sort: what waits for nothing goes first, and what is left is in or behind a cycle.
+    let waiting = {}
+    let after = {}
+    for id in order {
+        let t = get(index, id)
+        let known = t.deps | filter((d) => has(index, d) && d != id)
+        waiting = set(waiting, id, len(known))
+        for d in known { after = set(after, d, (get(after, d) ?? []) | push(id)) }
+    }
+    let ready = order | filter((id) => get(waiting, id) == 0)
+    let sorted = []
+    let at = 0
+    while at < len(ready) {
+        let id = ready[at]
+        at += 1
+        sorted = sorted | push(id)
+        for n in get(after, id) ?? [] {
+            let w = get(waiting, n) - 1
+            waiting = set(waiting, n, w)
+            if w == 0 { ready = ready | push(n) }
+        }
+    }
+    if len(sorted) < len(order) {
+        let left = order | filter((id) => !contains(sorted, id))
+        let tied = {}
+        for id in left { tied = set(tied, id, { deps: get(index, id).deps | filter((d) => contains(left, d)) }) }
+        // Tasks that only sit behind a cycle have a way back into it, so any start finds one.
+        problems = problems | push(`A cycle: ${critical_path_cycle(left, tied) | join(" → ")}. Each waits for the next to finish.`)
+    }
+    if type_of(start) != "str" || !date.valid(start, "date") {
+        problems = problems | push(`"${slice(str(start ?? ""), 0, 30)}" is not a start date.`)
+    }
+    let off = {}
+    for h in type_of(holidays) == "list" ? holidays : [] {
+        if type_of(h) == "str" && date.valid(h, "date") {
+            off = set(off, h, true)
+        } else {
+            problems = problems | push(`"${slice(str(h), 0, 30)}" is not a holiday date.`)
+        }
+    }
+    if len(problems) > 0 { return { rows: [], problems } }
+    if len(order) == 0 { return { rows: [], problems: ["Add a task to start."] } }
+    // Forward: a task starts when the last thing it waits for ends.
+    let es = {}
+    let ef = {}
+    for id in sorted {
+        let t = get(index, id)
+        let s = t.deps | map((d) => get(ef, d)) | max
+        es = set(es, id, s ?? 0)
+        ef = set(ef, id, (s ?? 0) + t.days)
+    }
+    let total = values(ef) | max
+    // Backward: a task must end when the first thing waiting for it has to start.
+    let ls = {}
+    let lf = {}
+    for id in reverse(sorted) {
+        let t = get(index, id)
+        let f = (get(after, id) ?? []) | map((n) => get(ls, n)) | min
+        lf = set(lf, id, f ?? total)
+        ls = set(ls, id, (f ?? total) - t.days)
+    }
+    let days = critical_path_calendar(start, total + 1, weekends, off)
+    if len(days) < total + 1 {
+        return { rows: [], problems: ["The plan runs past the last date there is."] }
+    }
+    let rows = order | map((id) => {
+        let t = get(index, id)
+        let e = get(es, id)
+        let f = get(ef, id)
+        let next = (get(after, id) ?? []) | map((n) => get(es, n)) | min
+        { id, name: t.name, days: t.days, deps: t.deps, es: e, ef: f, ls: get(ls, id), lf: get(lf, id), slack: get(ls, id) - e,
+          free: (next ?? total) - f, critical: get(ls, id) == e, start: days[e], end: days[t.days == 0 ? e : f - 1] }
+    })
+    let finish = total == 0 ? days[0] : days[total - 1]
+    { rows, total, finish, start: days[0], paths: critical_path_routes(rows, total), problems: [] }
+}
+
+fn critical_path_show(d: str) -> str = date.format(d, "ddd D MMM YYYY")
+
+// The tasks as the text box writes them.
+fn critical_path_write(tasks) -> str =
+    (type_of(tasks) == "list" ? tasks : []) | map((t) => {
+        let deps = type_of(t) == "map" && type_of(t.deps) == "list" ? join(t.deps, " ") : ""
+        type_of(t) == "map" ? `${t.id ?? ""}, ${t.name ?? ""}, ${t.days ?? ""}, ${deps}` : str(t)
+    }) | join("\n")
+
+// How tall the text box is: as many lines as it has, within reason.
+fn critical_path_rows(text: str) -> int = min([12, max([4, len(split(text, "\n")) + 1])])
+
+component CriticalPath(tasks: list = [], start: str = "", weekends: bool = false, holidays: list = [], title: str = "Critical path",
+                       id: str = "critical-path", name: str = "tasks", on_change = null, class: str? = null) {
+    style global critical_path_css
+    state text = critical_path_write(tasks)
+    state from = start
+    state work_weekends = weekends
+    let plan = critical_path_plan(critical_path_read(text), from, work_weekends, holidays)
+    let tell = () => {
+        let p = critical_path_plan(critical_path_read(text), from, work_weekends, holidays)
+        if on_change != null && len(p.problems) == 0 { on_change(p) }
+    }
+    let ok = len(plan.problems) == 0
+    <section class={ui_cls(["ui-critical-path", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-critical-path-title id={`${id}-title`}>{title}</h3>
+        <div.ui-critical-path-bar>
+            <label.ui-critical-path-field>Work starts
+                <input type="date" id={`${id}-start`} name={`${name}_start`} value={from} @input={(e) => { from = e.value; tell() }}/>
+            </label>
+            <label.ui-critical-path-check>
+                <input type="checkbox" id={`${id}-weekends`} name={`${name}_weekends`} checked={work_weekends} @change={(e) => { work_weekends = e.checked; tell() }}/>
+                Work weekends too
+            </label>
+        </div>
+        <label.ui-critical-path-field>Tasks, one a line: id, name, working days, what it waits for
+            <textarea id={`${id}-tasks`} name={name} rows={critical_path_rows(text)} spellcheck="false" aria-invalid={!ok ? "true" : null}
+                      @input={(e) => { text = e.value; tell() }}>{text}</textarea>
+        </label>
+        <div aria-live="polite">
+            {!ok
+                ? <ul.ui-critical-path-problems role="alert">
+                    {for p in take(plan.problems, 12) => <li key={p}>{p}</li>}
+                    {len(plan.problems) > 12 && <li>And {len(plan.problems) - 12} more.</li>}
+                  </ul>
+                : <div.ui-critical-path-sum>
+                    <p.ui-critical-path-finish>Finishes {critical_path_show(plan.finish)}, {plan.total} working {plan.total == 1 ? "day" : "days"}</p>
+                    {for r in plan.paths => <p.ui-critical-path-route key={join(r, ">")}>Critical path: {join(r, " → ")}</p>}
+                    {len(plan.paths) >= critical_path_most_paths && <p.ui-critical-path-more>There may be more; the first {critical_path_most_paths} are shown.</p>}
+                  </div>}
+        </div>
+        {ok && <div.ui-critical-path-wrap tabindex="0" role="region" aria-label="Schedule">
+            <table.ui-critical-path-table>
+                <thead><tr>
+                    <th scope="col">Task</th><th scope="col">Waits for</th><th scope="col">Days</th>
+                    <th scope="col"><abbr title="Earliest start">ES</abbr></th><th scope="col"><abbr title="Earliest finish">EF</abbr></th>
+                    <th scope="col"><abbr title="Latest start">LS</abbr></th><th scope="col"><abbr title="Latest finish">LF</abbr></th>
+                    <th scope="col">Slack</th><th scope="col">Free</th><th scope="col">Start</th><th scope="col">End</th>
+                </tr></thead>
+                <tbody>
+                    {for r in plan.rows => <tr key={r.id} class={r.critical ? "ui-critical-path-hot" : null}>
+                        <th scope="row">{r.id} {r.name != r.id ? r.name : ""}{r.critical ? <span.ui-sr> (critical)</span> : ""}</th>
+                        <td>{len(r.deps) > 0 ? join(r.deps, " ") : "–"}</td><td>{r.days}</td><td>{r.es}</td><td>{r.ef}</td><td>{r.ls}</td><td>{r.lf}</td>
+                        <td.ui-critical-path-slack>{r.slack}</td><td>{r.free}</td><td>{date.format(r.start, "ddd D MMM")}</td><td>{date.format(r.end, "ddd D MMM")}</td>
+                    </tr>}
+                </tbody>
+            </table>
+        </div>}
+    </section>
+}

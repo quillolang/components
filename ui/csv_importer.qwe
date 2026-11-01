@@ -1,0 +1,521 @@
+// CsvImporter: takes CSV someone pasted or dropped and turns it into checked rows.
+// It works out the delimiter, the quoting and whether the first row is a header,
+// guesses which column feeds which of your fields by their names (the person can
+// change each), checks every row by its field's type, lists the bad rows with the
+// line and the reason, and hands the good ones to on_import.
+//
+//   <CsvImporter id="people" fields={[
+//       { key: "name", label: "Name", required: true },
+//       { key: "email", label: "Email", type: "email", required: true },
+//       { key: "joined", label: "Joined", type: "date" },
+//       { key: "balance", label: "Balance", type: "money" },
+//       { key: "plan", label: "Plan", type: "enum", options: ["free", "pro"] },
+//   ]} on_import={(rows) => { added = rows }}/>
+//
+// id: a prefix for its ids, unique on the page. fields: what to fill, each a key
+// or { key, label?, type?, required?, aliases?, options?, format? }. type: text
+// (the default), integer, decimal, money (a symbol and thousands commas allowed, at
+// most two decimals), date, boolean (yes/no, true/false, y/n, 1/0), email, url, or
+// enum (one of options, whatever the case). aliases: other headers that mean this
+// field. format: a date's pattern besides ISO ("DD/MM/YYYY"). With no fields, each
+// column is a text field named by its header. text: the CSV it starts with. title:
+// the heading ("Import CSV"). max_rows: the most rows read (5,000); max_chars: the
+// most text read (500,000); past either it says so and works on what it read.
+// name: the box's field name, so a plain <form> sends the text; `<name>_rows` goes
+// with it, the good rows as JSON. on_import(rows): inside one of your components,
+// given the good rows as maps by field key: integer an int, decimal and money a
+// decimal, date ISO text, boolean true or false, empty cells null. class: more
+// classes for its outer element.
+//
+// csv_importer_read(text, fields) does the same work for a program: { rows, bad,
+// delimiter, quote, header, mapping }, each of bad { line, reasons }.
+
+import ui/theme.qwe use ui_cls
+
+let csv_importer_css = css`
+.ui-csv-imp { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; padding: 18px 20px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-csv-imp .ui-csv-imp-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-csv-imp-drop { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; min-width: 0; padding: 10px; border: 1px dashed var(--ui-strong); border-radius: var(--ui-radius-sm); }
+.ui-csv-imp-over { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-csv-imp-drop label, .ui-csv-imp-opt label { font-size: 13px; font-weight: 500; }
+.ui-csv-imp-text { box-sizing: border-box; width: 100%; min-height: 120px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 12.5px/1.5 var(--ui-mono); resize: vertical; white-space: pre; overflow: auto; }
+.ui-csv-imp-text:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-csv-imp-hint { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-csv-imp-hint input { max-width: 100%; font: inherit; color: inherit; }
+.ui-csv-imp-hint input:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 4px; }
+.ui-csv-imp-opts { display: flex; flex-wrap: wrap; gap: 10px 14px; }
+.ui-csv-imp-opt { display: grid; gap: 4px; min-width: 0; }
+.ui-csv-imp select { box-sizing: border-box; max-width: 100%; height: 32px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); }
+.ui-csv-imp select:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-csv-imp-found { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-csv-imp-note { margin: 0; color: var(--ui-warning); font-size: 13px; }
+.ui-csv-imp-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-csv-imp-scroll { overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-csv-imp-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-csv-imp table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-csv-imp caption { padding: 8px 10px 4px; text-align: left; font-weight: 600; }
+.ui-csv-imp th, .ui-csv-imp td { padding: 6px 10px; text-align: left; border-top: 1px solid var(--ui-border); vertical-align: middle; }
+.ui-csv-imp thead th { background: var(--ui-subtle); font-weight: 600; white-space: nowrap; }
+.ui-csv-imp-kind { color: var(--ui-muted); font-size: 12px; }
+.ui-csv-imp-req { color: var(--ui-danger); }
+.ui-csv-imp-sample { color: var(--ui-muted); font-family: var(--ui-mono); font-size: 12px; overflow-wrap: anywhere; }
+.ui-csv-imp-sum { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0; font-weight: 600; }
+.ui-csv-imp-good { color: var(--ui-success); }
+.ui-csv-imp-badcount { color: var(--ui-danger); }
+.ui-csv-imp-bad { display: grid; gap: 4px; max-height: 200px; margin: 0; padding: 8px 10px 8px 12px; overflow: auto; border-left: 3px solid var(--ui-danger);
+  background: var(--ui-danger-soft); list-style: none; font-size: 13px; }
+.ui-csv-imp-bad:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-csv-imp-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.ui-csv-imp-go { height: 36px; padding: 0 16px; border: 1px solid var(--ui-accent); border-radius: var(--ui-radius-sm); background: var(--ui-accent);
+  color: var(--ui-accent-fg); font: 600 14px var(--ui-font); cursor: pointer; }
+.ui-csv-imp-go:hover:not(:disabled) { background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-csv-imp-go:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-csv-imp-go:disabled { opacity: .5; cursor: not-allowed; }
+.ui-csv-imp-said { color: var(--ui-muted); font-size: 13px; }
+`
+
+let csv_importer_seps = [
+    { id: "comma", char: ",", name: "Comma" },
+    { id: "semicolon", char: ";", name: "Semicolon" },
+    { id: "tab", char: "\t", name: "Tab" },
+    { id: "pipe", char: "|", name: "Pipe" },
+]
+
+let csv_importer_kinds = { text: "text", integer: "whole number", decimal: "number", money: "amount", date: "date", boolean: "yes or no",
+                           email: "email", url: "link", enum: "one of a list" }
+
+// Fields as maps, from keys or maps; with none, a text field for each header.
+fn csv_importer_fields(fields, headers: list) -> list {
+    let given = type_of(fields) == "list" ? fields | filter((f) => type_of(f) == "str" || (type_of(f) == "map" && f.key != null)) : []
+    if len(given) == 0 { return filter(headers, (h) => trim(h) != "") | unique() | map((h) => csv_importer_fields_one({ key: trim(h) })) }
+    given | map((f) => csv_importer_fields_one(type_of(f) == "str" ? { key: f } : f))
+}
+
+fn csv_importer_fields_one(f: map) -> map {
+    let key = str(f.key)
+    { ...f, key, label: f.label ?? key, type: f.type ?? "text", required: f.required == true, aliases: f.aliases ?? [], options: f.options ?? [] }
+}
+
+// The rows of the text, each { line, cells }: RFC 4180, and what people paste
+// besides. A quote opens a field only at its start (spaces before it are dropped),
+// so 5" stays as it is; "" inside is one quote; CR, LF and CR LF end a row; a line
+// with nothing on it is no row. `line` is where the row starts, for the messages.
+// Gives { rows, more (stopped at cap), open (the line of a quote never closed) }.
+// `chars` is indexed, not the text: `text[i]` walks the string each time in the
+// browser, and would take over a minute on a long paste.
+fn csv_importer_parse(text: str, sep: str, quote: str, cap: int) -> map {
+    let chars = split(text, "")
+    let n = len(chars)
+    let rows = []
+    let row = []
+    let field = ""
+    let quoted = false
+    let started = false
+    let line = 1
+    let from = 1
+    let opened = null
+    let i = 0
+    while i < n {
+        let c = chars[i]
+        if quoted {
+            if c == quote {
+                if chars[i + 1] == quote {
+                    field += quote
+                    i += 1
+                } else {
+                    quoted = false
+                    opened = null
+                }
+            } else {
+                if c == "\n" || (c == "\r" && chars[i + 1] != "\n") { line += 1 }
+                field += c
+            }
+        } else if c == quote && !started {
+            quoted = true
+            started = true
+            opened = line
+            field = ""
+        } else if c == sep {
+            row = push(row, field)
+            field = ""
+            started = false
+        } else if c == "\n" || c == "\r" {
+            if c == "\r" && chars[i + 1] == "\n" { i += 1 }
+            row = push(row, field)
+            if len(row) > 1 || trim(row[0]) != "" { rows = push(rows, { line: from, cells: row }) }
+            row = []
+            field = ""
+            started = false
+            line += 1
+            from = line
+            if len(rows) >= cap { return { rows, more: i + 1 < n, open: null } }
+        } else {
+            field += c
+            if c != " " { started = true }
+        }
+        i += 1
+    }
+    row = push(row, field)
+    if len(row) > 1 || trim(row[0]) != "" { rows = push(rows, { line: from, cells: row }) }
+    { rows, more: false, open: opened }
+}
+
+// The start of a text, cut at a line's end so no row is left half read.
+fn csv_importer_sample(text: str) -> str {
+    let head = replace(slice(text, 0, 8000), "\r\n", "\n")
+    if len(text) <= 8000 { return head }
+    let lines = split(head, "\n")
+    join(take(lines, max([1, len(lines) - 1])), "\n")
+}
+
+// Which quote the text uses: the one around most whole fields, "" when neither is.
+fn csv_importer_quote(sample: str) -> str {
+    let around = (q: str) => len(re.find_all(sample, `(?:^|[,;\t|]) *${q}[^${q}\n]*${q} *(?:[,;\t|]|$)`, "m"))
+    let dq = around("\"")
+    let sq = around("'")
+    sq > dq ? "'" : (dq > 0 ? "\"" : "")
+}
+
+// The delimiter: the one that splits the sample into the same number of fields on
+// most lines. A delimiter that never splits a line scores nothing.
+fn csv_importer_sep(sample: str, quote: str) -> map {
+    let scored = csv_importer_seps | map((s) => {
+        let sizes = csv_importer_parse(sample, s.char, quote == "" ? "\"" : quote, 20).rows | map((r) => len(r.cells))
+        let tally = group_by(sizes, (x) => x)
+        let width = reduce(keys(tally), 1, (b, k) => len(get(tally, k)) > len(get(tally, b) ?? []) ? int(k) : b)
+        let agree = len(sizes) == 0 ? 0 : floor(1000 * len(get(tally, width) ?? []) / len(sizes))
+        { sep: s, score: width < 2 ? 0 : agree + min([width, 20]) }
+    })
+    let best = reduce(scored, scored[0], (b, x) => x.score > b.score ? x : b)
+    best.sep
+}
+
+// A cell's shape, for telling a header from data.
+fn csv_importer_shape(cell: str) -> str {
+    let s = trim(cell)
+    if s == "" { return "empty" }
+    if csv_importer_number(s) != null { return "number" }
+    if re.test(s, "^\\d{4}-\\d{2}-\\d{2}") || re.test(s, "^\\d{1,2}/\\d{1,2}/\\d{2,4}$") { return "date" }
+    if re.test(s, "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") || re.test(s, "^https?://", "i") { return "address" }
+    "text"
+}
+
+// Whether the first row names the columns: a field's name in it says so; a number, a
+// date or an address in it, a blank, or the same name twice says it is data. Words
+// over numbers or dates are a header. All text is a header only with no fields to
+// compare it to: with fields, a row that names none of them is data.
+fn csv_importer_has_header(rows: list, fields: list) -> bool {
+    if len(rows) == 0 { return false }
+    let top = rows[0].cells
+    let body = take(drop(rows, 1), 20)
+    if any(top, (c) => any(fields, (f) => csv_importer_score(c, f) >= 80)) { return true }
+    let shapes = top | map(csv_importer_shape)
+    if any(shapes, (s) => s != "text") { return false }
+    if len(unique(top | map((c) => lower(trim(c))))) < len(top) { return false }
+    let typed = any(enumerate(top), (p) => len(body) > 0 && all(body, (r) => csv_importer_shape(r.cells[p[0]] ?? "") != "text"))
+    typed || len(fields) == 0
+}
+
+// A header or field name with case, spaces and punctuation gone.
+fn csv_importer_norm(s: str) -> str = re.replace(lower(trim(s)), "[\\s_.:/()#-]+", "")
+
+// Levenshtein distance, for short names.
+fn csv_importer_edits(a: str, b: str) -> int {
+    let x = split(a, "")
+    let y = split(b, "")
+    let prev = for j in 0..(len(y) + 1) => j
+    for [i, c] in enumerate(x) {
+        let cur = [i + 1]
+        for [j, d] in enumerate(y) {
+            cur = push(cur, min([prev[j] + (c == d ? 0 : 1), prev[j + 1] + 1, cur[j] + 1]))
+        }
+        prev = cur
+    }
+    prev[len(y)]
+}
+
+// How well a header names a field, 0 to 100: its key, label or an alias, the same,
+// nearly the same, or one inside the other.
+fn csv_importer_score(header: str, f: map) -> int {
+    let h = slice(csv_importer_norm(header), 0, 64)
+    if h == "" { return 0 }
+    let names = [f.key, f.label, ...f.aliases] | map((n) => slice(csv_importer_norm(str(n)), 0, 64)) | filter((n) => n != "")
+    reduce(names, 0, (best, n) => {
+        let d = abs(len(h) - len(n)) > 2 ? 3 : csv_importer_edits(h, n)
+        let s = h == n ? 100
+            : (d == 1 && len(n) >= 4 ? 90
+            : (d == 2 && len(n) >= 6 ? 80
+            : (min([len(h), len(n)]) >= 3 && (contains(h, n) || contains(n, h)) ? 70 : 0)))
+        max([best, s])
+    })
+}
+
+// Which column feeds each field: { key: column or null }. The best matches go first,
+// and a column feeds one field.
+fn csv_importer_guess(headers: list, fields: list) -> map {
+    let pairs = flatten(for f in fields => for [c, h] in enumerate(headers) => { key: f.key, col: c, score: csv_importer_score(h, f) })
+    let ranked = reverse(sort_by(reverse(pairs | filter((p) => p.score >= 70)), (p) => p.score))
+    let taken = reduce(ranked, { map: {}, cols: [] }, (acc, p) =>
+        has(acc.map, p.key) || contains(acc.cols, p.col) ? acc : { map: set(acc.map, p.key, p.col), cols: push(acc.cols, p.col) })
+    reduce(fields, {}, (m, f) => set(m, f.key, get(taken.map, f.key)))
+}
+
+// A number as people write one, with thousands commas: a decimal, or null.
+fn csv_importer_number(s: str) {
+    if !re.test(s, "^[-+]?(\\d{1,3}(,\\d{3})+|\\d+)?(\\.\\d+)?$") || !re.test(s, "\\d") { return null }
+    let digits = replace(s, ",", "")
+    if len(digits) > 24 { return null }
+    let d = dec(digits)
+    is_err(d) ? null : d
+}
+
+// One cell by its field: { value } or { why }.
+fn csv_importer_check(cell: str, f: map) -> map {
+    let s = trim(cell)
+    let shown = `"${len(s) > 40 ? slice(s, 0, 40) + "…" : s}"`
+    if s == "" { return f.required ? { why: "is required" } : { value: null } }
+    match f.type {
+        "integer" => {
+            let d = csv_importer_number(s)
+            if d == null || d != floor(d) {
+                return { why: `${shown} is not a whole number` }
+            }
+            abs(d) >= 1000000000000000 ? { why: `${shown} is too large` } : { value: int(d) }
+        }
+        "decimal" => {
+            let d = csv_importer_number(s)
+            d != null ? { value: d } : { why: re.test(s, "^[-+]?\\d+,\\d+$") ? `${shown} is not a number: write decimals with a point` : `${shown} is not a number` }
+        }
+        "money" => {
+            let d = csv_importer_number(re.replace(s, "^([-+]?)\\s*[$€£¥]\\s*", "$1"))
+            if d == null { return { why: `${shown} is not an amount` } }
+            d != round(d, 2) ? { why: `${shown} has more than two decimals` } : { value: d }
+        }
+        "date" => {
+            let v = re.test(s, "^\\d{4}-\\d{2}-\\d{2}$") && date.valid(s, "date") ? s : (f.format != null ? date.parse(s, f.format) : null)
+            v == null || is_err(v) ? { why: `${shown} is not a date${f.format != null ? ` (${f.format})` : " (YYYY-MM-DD)"}` } : { value: v }
+        }
+        "boolean" => {
+            let w = lower(s)
+            contains(["yes", "y", "true", "1"], w) ? { value: true }
+                : (contains(["no", "n", "false", "0"], w) ? { value: false } : { why: `${shown} is not yes or no` })
+        }
+        "email" => re.test(s, "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$") ? { value: s } : { why: `${shown} is not an email address` }
+        "url" => re.test(s, "^https?://[^\\s/]+\\S*$", "i") ? { value: s } : { why: `${shown} is not a link` }
+        "enum" => {
+            let hit = find(f.options, (o) => lower(str(o)) == lower(s))
+            hit != null ? { value: hit } : { why: `${shown} is not one of ${join(f.options, ", ")}` }
+        }
+        _ => { value: s }
+    }
+}
+
+// Every row by the fields: { good: [maps], bad: [{ line, reasons }] }. A row with
+// more cells than columns has lost its place (a comma out of quotes, usually), so
+// nothing in it can be trusted; with too few, what is missing is empty.
+fn csv_importer_validate(body: list, fields: list, mapping: map, width: int) -> map {
+    let checked = body | map((r) => {
+        let extra = len(r.cells) > width ? [`has ${len(r.cells)} values where there are ${width} columns`] : []
+        let cells = fields | map((f) => {
+            let c = get(mapping, f.key)
+            { key: f.key, label: f.label, got: csv_importer_check(c == null ? "" : r.cells[c] ?? "", f) }
+        })
+        let wrong = cells | filter((x) => x.got.why != null) | map((x) => `${x.label} ${x.got.why}`)
+        { line: r.line, reasons: extra + wrong, row: reduce(cells, {}, (m, x) => set(m, x.key, x.got.value)) }
+    })
+    { good: checked | filter((x) => len(x.reasons) == 0) | map((x) => x.row),
+      bad: checked | filter((x) => len(x.reasons) > 0) | map((x) => { line: x.line, reasons: x.reasons }) }
+}
+
+// All of it at once, for a program: delimiter, quote and header worked out unless given.
+fn csv_importer_read(text: str, fields, sep: str? = null, quote: str? = null, header: bool? = null, cap: int = 5000) -> map {
+    let clean = starts_with(text, "\u{FEFF}") ? slice(text, 1, len(text)) : text
+    let sample = csv_importer_sample(clean)
+    let q = quote ?? csv_importer_quote(sample)
+    let d = sep ?? csv_importer_sep(sample, q).char
+    let read = csv_importer_parse(clean, d, q == "" ? "\"" : q, cap + 1)
+    let probe = csv_importer_fields(fields, [])
+    let head = header ?? csv_importer_has_header(read.rows, probe)
+    let width = max(read.rows | map((r) => len(r.cells))) ?? 0
+    let top = len(read.rows) > 0 ? read.rows[0].cells : []
+    let headers = head ? top : for i in 0..width => `Column ${i + 1}`
+    let body = head ? drop(read.rows, 1) : read.rows
+    let f = csv_importer_fields(fields, headers)
+    let mapping = len(probe) == 0 ? reduce(f, {}, (m, x) => set(m, x.key, index_of(headers | map((h) => trim(h)), x.key))) : csv_importer_guess(headers, f)
+    let checked = csv_importer_validate(take(body, cap), f, mapping, len(headers))
+    { rows: checked.good, bad: checked.bad, delimiter: d, quote: q, header: head, headers, mapping, fields: f,
+      body: take(body, cap), more: read.more || len(body) > cap, open: read.open }
+}
+
+// The first few non-empty values of a column, to tell columns apart.
+fn csv_importer_peek(body: list, col: int?) -> str {
+    if col == null { return "" }
+    let seen = take(body, 20) | map((r) => trim(r.cells[col] ?? "")) | filter((v) => v != "")
+    let shown = take(seen, 2) | map((v) => len(v) > 24 ? slice(v, 0, 24) + "…" : v)
+    join(shown, ", ")
+}
+
+// A value as a preview shows it.
+fn csv_importer_show(v) -> str = match type_of(v) {
+    "null" => ""
+    "bool" => v ? "yes" : "no"
+    _ => str(v)
+}
+
+component CsvImporter(id: str, fields = [], text: str = "", title: str = "Import CSV", max_rows: int = 5000, max_chars: int = 500000,
+                      name: str? = null, on_import = null, class: str? = null) {
+    style global csv_importer_css
+    state body_text = text
+    state sep_pick = "auto"
+    state quote_pick = "auto"
+    state head_pick = "auto"
+    state picks = {}
+    state over = false
+    state said = ""
+    let clean = len(body_text) > max_chars ? slice(body_text, 0, max_chars) : body_text
+    let blank = trim(clean) == ""
+    let chosen_sep = find(csv_importer_seps, (s) => s.id == sep_pick)
+    let chosen_quote = quote_pick == "double" ? "\"" : (quote_pick == "single" ? "'" : null)
+    let chosen_head = head_pick == "yes" ? true : (head_pick == "no" ? false : null)
+    let read = csv_importer_read(clean, fields, chosen_sep != null ? chosen_sep.char : null, chosen_quote, chosen_head, max_rows)
+    let sep_name = (find(csv_importer_seps, (s) => s.char == read.delimiter) ?? csv_importer_seps[0]).name
+    let quote_name = read.quote == "\"" ? "double quotes" : (read.quote == "'" ? "single quotes" : "no quotes")
+    // What the person picked wins over the guess; a column gone from the data is unmapped.
+    let mapping = reduce(read.fields, {}, (m, f) => {
+        let p = get(picks, f.key)
+        let c = has(picks, f.key) ? (p != null && p < len(read.headers) ? p : null) : get(read.mapping, f.key)
+        set(m, f.key, c)
+    })
+    let checked = csv_importer_validate(read.body, read.fields, mapping, len(read.headers))
+    let good = checked.good
+    let bad = checked.bad
+    let total = len(read.body)
+    let missing = read.fields | filter((f) => f.required && get(mapping, f.key) == null)
+    let doubled = read.fields | filter((f) => {
+        let c = get(mapping, f.key)
+        c != null && len(read.fields | filter((g) => get(mapping, g.key) == c)) > 1
+    })
+    let ready = !blank && len(good) > 0 && len(missing) == 0
+    let shown_bad = take(bad, 50)
+    let preview = take(good, 5)
+    let load = (s: str) => {
+        body_text = s
+        picks = {}
+        said = ""
+    }
+    let take_file = (f) => {
+        if f.size > max_chars * 4 {
+            said = `${f.name} is too large to read here.`
+        } else {
+            f.text().then((s) => { load(s); said = `Read ${f.name}.` }, (_ = null) => { said = `Could not read ${f.name}.` })
+        }
+    }
+    let run = () => {
+        if ready {
+            on_import && on_import(good)
+            said = `Imported ${len(good)} row${len(good) == 1 ? "" : "s"}${len(bad) > 0 ? `, left out ${len(bad)} bad` : ""}.`
+        }
+    }
+    <section class={ui_cls(["ui-csv-imp", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-csv-imp-title id={`${id}-title`}>{title}</h3>
+        <div class={ui_cls(["ui-csv-imp-drop", over && "ui-csv-imp-over"])}
+             @dragover={(e) => { e.preventDefault(); over = true }} @dragleave={() => { over = false }}
+             @drop={(e) => {
+                 e.preventDefault()
+                 over = false
+                 let f = e.dataTransfer.files[0]
+                 if f != null { take_file(f) } else { load(e.dataTransfer.getData("text") ?? "") }
+             }}>
+            <label for={`${id}-text`}>CSV text</label>
+            <textarea.ui-csv-imp-text id={`${id}-text`} name={name} rows="6" spellcheck="false" autocomplete="off" wrap="off"
+                      aria-describedby={`${id}-hint`} @input={(e) => { load(e.value) }}>{body_text}</textarea>
+            <p.ui-csv-imp-hint id={`${id}-hint`}>
+                <span>Paste CSV above, drop a file or text on this box, or pick a file:</span>
+                <input type="file" accept=".csv,.tsv,.txt,text/csv,text/plain" aria-label="CSV file"
+                       @change={(e) => { let f = e.target.files[0]; if f != null { take_file(f) } }}/>
+            </p>
+        </div>
+        {!blank && <div.ui-csv-imp-opts>
+            <div.ui-csv-imp-opt>
+                <label for={`${id}-sep`}>Delimiter</label>
+                <select id={`${id}-sep`} @change={(e) => { sep_pick = e.value }}>
+                    <option value="auto" selected={sep_pick == "auto"}>{`Detect (${lower(sep_name)})`}</option>
+                    {for s in csv_importer_seps => <option key={s.id} value={s.id} selected={sep_pick == s.id}>{s.name}</option>}
+                </select>
+            </div>
+            <div.ui-csv-imp-opt>
+                <label for={`${id}-quote`}>Quotes</label>
+                <select id={`${id}-quote`} @change={(e) => { quote_pick = e.value }}>
+                    <option value="auto" selected={quote_pick == "auto"}>{`Detect (${quote_name})`}</option>
+                    <option value="double" selected={quote_pick == "double"}>Double</option>
+                    <option value="single" selected={quote_pick == "single"}>Single</option>
+                </select>
+            </div>
+            <div.ui-csv-imp-opt>
+                <label for={`${id}-head`}>First row</label>
+                <select id={`${id}-head`} @change={(e) => { head_pick = e.value; picks = {} }}>
+                    <option value="auto" selected={head_pick == "auto"}>{`Detect (${read.header ? "header" : "data"})`}</option>
+                    <option value="yes" selected={head_pick == "yes"}>Header</option>
+                    <option value="no" selected={head_pick == "no"}>Data</option>
+                </select>
+            </div>
+        </div>}
+        {!blank && <p.ui-csv-imp-found>
+            {`${sep_name}-separated, ${quote_name}, ${read.header ? "a header row" : "no header row"}: ${len(read.headers)} column${len(read.headers) == 1 ? "" : "s"}, ${total} row${total == 1 ? "" : "s"}.`}
+        </p>}
+        {len(body_text) > max_chars && <p.ui-csv-imp-note>{`Only the first ${format_number(max_chars, "en-US", 0)} characters are read.`}</p>}
+        {read.more && <p.ui-csv-imp-note>{`Only the first ${format_number(max_rows, "en-US", 0)} rows are read.`}</p>}
+        {read.open != null && <p.ui-csv-imp-error role="alert">{`The quote opened on line ${read.open} is never closed, so all that follows is one field.`}</p>}
+        {!blank && len(read.headers) > 0 && <div.ui-csv-imp-scroll tabindex="0" role="region" aria-label="Which column feeds each field">
+            <table>
+                <caption>Columns</caption>
+                <thead><tr><th scope="col">Field</th><th scope="col">Column</th><th scope="col">Sample</th></tr></thead>
+                <tbody>
+                    {for f in read.fields => {
+                        let c = get(mapping, f.key)
+                        <tr key={f.key} data-key={f.key}>
+                            <th scope="row">
+                                <label for={`${id}-map-${f.key}`}>{f.label}{f.required && <span.ui-csv-imp-req aria-label=" (required)"> *</span>}</label>
+                                {" "}<span.ui-csv-imp-kind>{get(csv_importer_kinds, f.type) ?? f.type}</span>
+                            </th>
+                            <td>
+                                <select id={`${id}-map-${f.key}`} @change={(e) => { picks = set(picks, f.key, e.value == "" ? null : int(e.value)) }}>
+                                    <option value="" selected={c == null}>Not imported</option>
+                                    {for [i, h] in enumerate(read.headers) => <option key={i} value={str(i)} selected={c == i}>{filled(trim(h)) ?? `Column ${i + 1}`}</option>}
+                                </select>
+                            </td>
+                            <td.ui-csv-imp-sample>{csv_importer_peek(read.body, c)}</td>
+                        </tr>
+                    }}
+                </tbody>
+            </table>
+        </div>}
+        {len(missing) > 0 && !blank && <p.ui-csv-imp-error role="alert">{`Pick a column for ${join(missing | map((f) => f.label), ", ")}.`}</p>}
+        {len(doubled) > 0 && <p.ui-csv-imp-note>{`${join(doubled | map((f) => f.label), " and ")} read the same column.`}</p>}
+        {!blank && <p.ui-csv-imp-sum aria-live="polite">
+            <span.ui-csv-imp-good>{`${len(good)} good row${len(good) == 1 ? "" : "s"}`}</span>
+            <span.ui-csv-imp-badcount>{`${len(bad)} bad row${len(bad) == 1 ? "" : "s"}`}</span>
+        </p>}
+        {len(bad) > 0 && <ul.ui-csv-imp-bad tabindex="0" aria-label="Bad rows">
+            {for b in shown_bad => <li key={b.line}><b>{`Line ${b.line}: `}</b>{join(b.reasons, "; ")}</li>}
+            {len(bad) > len(shown_bad) && <li>{`and ${len(bad) - len(shown_bad)} more`}</li>}
+        </ul>}
+        {len(preview) > 0 && <div.ui-csv-imp-scroll tabindex="0" role="region" aria-label="Rows to import">
+            <table>
+                <caption>{len(good) > len(preview) ? `The first ${len(preview)} rows to import` : "Rows to import"}</caption>
+                <thead><tr>{for f in read.fields => <th key={f.key} scope="col">{f.label}</th>}</tr></thead>
+                <tbody>
+                    {for [i, r] in enumerate(preview) => <tr key={i}>{for f in read.fields => <td key={f.key}>{csv_importer_show(get(r, f.key))}</td>}</tr>}
+                </tbody>
+            </table>
+        </div>}
+        <div.ui-csv-imp-bar>
+            <button.ui-csv-imp-go type="button" disabled={!ready} @click={run}>{`Import ${len(good)} row${len(good) == 1 ? "" : "s"}`}</button>
+            <span.ui-csv-imp-said role="status">{said}</span>
+        </div>
+        {name != null && <input type="hidden" name={`${name}_rows`} value={json.stringify(good)}/>}
+    </section>
+}

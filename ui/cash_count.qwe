@@ -1,0 +1,276 @@
+// CashCount: counting a till. A count for each note and coin of the currency gives the
+// total, and against what the drawer should hold, whether it is over, short or balanced.
+// It also makes change with the fewest pieces from what is actually in the drawer. Taking the
+// largest piece first fails with a limited stock (0.25 cannot start 0.30 with no nickels)
+// and with some sets of coins (0.40 + 0.10 + 0.10 where 0.30 + 0.30 will do), so it searches
+// them all, cutting off what cannot beat the best so far, what the rest of the drawer cannot
+// reach and what no remaining piece divides. A search capped at 40,000 steps says so in
+// the rare case it stops early. When change cannot be made it says why.
+//
+//   <CashCount currency="USD" counts={[0, 1, 3, 5, 4, 20, 12, 10, 8, 30]} expected="205.00"/>
+//   <CashCount currency="EUR" expected="150" change="12.35" on_change={(c) => { over = c.variance }}/>
+//   <CashCount denominations={[100, 20, 5, 1, 0.25]} name="till"/>
+//
+// currency: ISO code ("USD"), which picks its notes and coins for USD, EUR, GBP, JPY, CAD, AUD and
+// PHP; another gets a general set, and one Quillo does not know falls back to USD. denominations:
+// the pieces instead, as amounts. counts: how many of each to start with, in the order
+// shown, largest first. expected: what the drawer should hold; left empty, no variance is
+// shown. change: the amount of change to make. locale: how to write amounts (the
+// program's). title: the heading ("Cash count"). id: a prefix for its ids ("cash-count"), unique on
+// the page. name: a prefix for the names of its fields ("cash": cash_expected, cash_change, and a field
+// for each piece named by its value in minor units, cash_2000 for a 20.00 note). In a count,
+// the up and down arrows add or take one. on_change(c): inside one of your components,
+// after each change, given { total, expected, variance, status, pieces: [{ value, count }] }
+// as decimals when the figures are good: status is "over", "short", "balanced" or null with no
+// expected amount, and pieces the change, null when it cannot be made.
+// class: more classes for its outer element.
+//
+// cash_count_variance(total, expected) and cash_count_change(amount, pieces, counts) are the
+// logic, in whole minor units, for a program's own use.
+
+import ui/theme.qwe use ui_cls
+
+let cash_count_css = css`
+.ui-cash-count { container-type: inline-size; display: grid; gap: 16px; min-width: 0; max-width: 620px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-cash-count .ui-cash-count-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-cash-count-rows { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 6px 20px; margin: 0; padding: 0; list-style: none; }
+.ui-cash-count-row { display: grid; grid-template-columns: minmax(60px, 1fr) 70px minmax(70px, 1fr); gap: 8px; align-items: center; min-width: 0; }
+.ui-cash-count-row label { font-weight: 500; font-variant-numeric: tabular-nums; }
+.ui-cash-count-line { text-align: right; color: var(--ui-muted); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-cash-count input { box-sizing: border-box; width: 100%; min-width: 0; height: 34px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-cash-count-row input { text-align: right; }
+.ui-cash-count input:hover { border-color: var(--ui-strong); }
+.ui-cash-count input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-cash-count input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-cash-count-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px 14px; }
+.ui-cash-count-field { display: grid; gap: 5px; min-width: 0; align-content: start; }
+.ui-cash-count-field label { font-size: 13px; font-weight: 500; }
+.ui-cash-count-errors { margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-cash-count-out { display: grid; gap: 10px; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-cash-count-sums { display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; margin: 0; }
+.ui-cash-count-sums dt { color: var(--ui-muted); }
+.ui-cash-count-sums dd { margin: 0; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-cash-count-total { color: var(--ui-fg) !important; font-size: 16px; font-weight: 700; }
+.ui-cash-count-status { margin: 0; padding: 6px 10px; border-radius: var(--ui-radius-sm); font-weight: 600; }
+.ui-cash-count-balanced { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-cash-count-over { background: var(--ui-info-soft); color: var(--ui-info); }
+.ui-cash-count-short { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-cash-count-change { margin: 0; }
+.ui-cash-count-pieces { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 4px 0 0; padding: 0; list-style: none; font-variant-numeric: tabular-nums; }
+.ui-cash-count-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+`
+
+// The currency's code, USD when Quillo does not know it.
+fn cash_count_code(currency) -> str {
+    let c = upper(trim(str(currency ?? "")))
+    type_of(money.minor_units(c)) == "error" ? "USD" : c
+}
+
+// The notes and coins of a currency in minor units, largest first; others get a plain series.
+fn cash_count_preset(code: str) -> list {
+    if code == "USD" { return [10000, 5000, 2000, 1000, 500, 100, 25, 10, 5, 1] }
+    if code == "EUR" { return [50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50, 20, 10, 5, 2, 1] }
+    if code == "GBP" { return [5000, 2000, 1000, 500, 200, 100, 50, 20, 10, 5, 2, 1] }
+    if code == "JPY" { return [10000, 5000, 1000, 500, 100, 50, 10, 5, 1] }
+    if code == "CAD" { return [10000, 5000, 2000, 1000, 500, 200, 100, 25, 10, 5] }
+    if code == "AUD" { return [10000, 5000, 2000, 1000, 500, 200, 100, 50, 20, 10, 5] }
+    if code == "PHP" { return [100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 100, 25] }
+    let scale = int(pow(10, money.minor_units(code)))
+    [100, 50, 20, 10, 5, 2, 1] | map((x) => x * scale)
+}
+
+// The pieces to count: the prop's amounts in minor units, largest first, or the preset
+// when the prop gives none that can be used.
+fn cash_count_pieces(denominations, code: str) -> list {
+    if type_of(denominations) != "list" { return cash_count_preset(code) }
+    let read = denominations | map((x) => {
+        let d = dec(x)
+        if is_err(d) || d <= 0m || d > 1000000m { return 0 }
+        money.to_minor(money.of(d, code, "half_up"))
+    }) | filter((x) => x > 0)
+    len(read) == 0 ? cash_count_preset(code) : reverse(sort(unique(read)))
+}
+
+// A count as typed: 0 when empty, null when it is not a whole number from 0 to 1,000,000.
+fn cash_count_whole(text) {
+    let t = trim(str(text ?? ""))
+    if t == "" { return 0 }
+    if !re.test(t, "^[0-9]{1,7}$") { return null }
+    let n = int(t)
+    n > 1000000 ? null : n
+}
+
+// What was typed as an amount: `blank` when empty, null when it is not a plain number from 0 up.
+fn cash_count_read(text, blank) {
+    let t = trim(str(text ?? ""))
+    if t == "" { return blank }
+    if len(t) > 40 { return null }
+    let plain = re.test(t, "^[0-9]{1,3}(,[0-9]{3})+(\\.[0-9]*)?$") ? replace(t, ",", "") : t
+    if !re.test(plain, "^([0-9]+\\.?[0-9]*|\\.[0-9]+)$") { return null }
+    let d = dec(plain)
+    is_err(d) || d > 10000000000m ? null : d
+}
+
+// Over, short or balanced: { variance, status }, minor units, what is there less what should be.
+fn cash_count_variance(total: int, expected: int) -> map {
+    let variance = total - expected
+    { variance, status: variance > 0 ? "over" : (variance < 0 ? "short" : "balanced") }
+}
+
+fn cash_count_gcd(a: int, b: int) -> int = b == 0 ? a : cash_count_gcd(b, a % b)
+
+// One step of the search for the fewest pieces: at piece i with `left` to make, `n` pieces
+// used. `found` is { used, n, steps }, the best so far, and comes back improved. Each try takes
+// as many of this piece as it can first, so that a good answer comes early and cuts the rest.
+fn cash_count_walk(s: map, i: int, left: int, used: list, n: int, found: map) -> map {
+    let at = found.steps + 1
+    if left == 0 { return n < found.n ? { used, n, steps: at } : set(found, "steps", at) }
+    if i >= len(s.values) || at > 40000 || left > s.below[i] || left % s.steps[i] != 0 { return set(found, "steps", at) }
+    let d = s.values[i]
+    if n + int(ceil(dec(left) / d)) >= found.n { return set(found, "steps", at) }
+    let best = set(found, "steps", at)
+    let k = min([s.counts[i], int(floor(dec(left) / d))])
+    let going = true
+    while going && k >= 0 && best.steps <= 40000 {
+        let rest = left - k * d
+        // Fewer of this piece only leaves more for smaller ones: once that cannot be
+        // done, or cannot beat the best, no smaller k can, however many there are.
+        let more_than_held = i + 1 < len(s.values) ? rest > s.below[i + 1] : rest > 0
+        let at_least = i + 1 < len(s.values) ? n + k + int(ceil(dec(rest) / s.values[i + 1])) : n + k
+        if more_than_held || at_least >= best.n {
+            going = false
+        } else {
+            best = cash_count_walk(s, i + 1, rest, k > 0 ? used | push({ value: d, count: k }) : used, n + k, best)
+            k -= 1
+        }
+    }
+    best
+}
+
+// Change for `amount` from what is in the drawer, all in minor units: pieces and counts in
+// the same order, largest first. Gives { pieces: [{ value, count }], total, proven } or
+// { pieces: null, why }, why being "drawer", "step" or "mix": the drawer holds too little, no
+// piece there divides the amount, or no mix makes it exactly.
+fn cash_count_change(amount: int, pieces: list, counts: list) -> map {
+    if amount <= 0 { return { pieces: [], total: 0, proven: true } }
+    let held = range(len(pieces)) | filter((i) => counts[i] > 0)
+    let values = held | map((i) => pieces[i])
+    let stock = held | map((i) => counts[i])
+    let holds = sum(range(len(values)) | map((i) => values[i] * stock[i]))
+    if amount > holds { return { pieces: null, why: "drawer", holds } }
+    let places = range(len(values))
+    let below = places | map((i) => sum(slice(places, i, len(values)) | map((j) => values[j] * stock[j])))
+    let steps = places | map((i) => reduce(slice(values, i, len(values)), 0, (a, b) => cash_count_gcd(a, b)))
+    if amount % steps[0] != 0 { return { pieces: null, why: "step", step: steps[0] } }
+    let found = cash_count_walk({ values, counts: stock, below, steps }, 0, amount, [], 0, { used: null, n: 100000000, steps: 0 })
+    if found.used == null { return { pieces: null, why: found.steps > 40000 ? "limit" : "mix" } }
+    { pieces: found.used, total: found.n, proven: found.steps <= 40000 }
+}
+
+// All the figures from the fields as typed: { errors, counts, lines, total, expected,
+// variance, change }; total is null with errors.
+fn cash_count_work(pieces: list, count_texts: list, expected_text, change_text, code: str) -> map {
+    let errors = []
+    let counts = count_texts | map((t) => cash_count_whole(t))
+    let label = (d: int) => money.format(money.from_minor(d, code))
+    for [i, n] in enumerate(counts) {
+        if n == null { errors = errors | push({ field: `count-${pieces[i]}`, text: `The count of ${label(pieces[i])} must be a whole number from 0 to 1,000,000.` }) }
+    }
+    let expected = cash_count_read(expected_text, null)
+    let wanted = cash_count_read(change_text, 0m)
+    if expected == null && trim(str(expected_text ?? "")) != "" { errors = errors | push({ field: "expected", text: "The expected amount must be a number of 0 or more." }) }
+    if wanted == null { errors = errors | push({ field: "change", text: "The change to make must be a number of 0 or more." }) }
+    if len(errors) > 0 { return { errors, counts: [], total: null, expected: null, variance: null, change: null, wanted: 0 } }
+    let minor = (d: dec) => money.to_minor(money.of(d, code, "half_up"))
+    let lines = range(len(pieces)) | map((i) => pieces[i] * counts[i])
+    let total = sum(lines)
+    let due = expected == null ? null : minor(expected)
+    let want = minor(wanted)
+    { errors, counts, lines, total, expected: due, variance: due == null ? null : cash_count_variance(total, due), change: want > 0 ? cash_count_change(want, pieces, counts) : null, wanted: want }
+}
+
+component CashCount(currency: str = "USD", denominations = null, counts = null, expected = null, change = null, locale: str? = null, title: str = "Cash count", id: str = "cash-count",
+                    name: str = "cash", on_change = null, class: str? = null) {
+    style global cash_count_css
+    let code = cash_count_code(currency)
+    let pieces = cash_count_pieces(denominations, code)
+    state texts = cash_count_pieces(denominations, cash_count_code(currency)) | enumerate() | map((row) => type_of(counts) == "list" && row[0] < len(counts) && counts[row[0]] != null ? str(counts[row[0]]) : "")
+    state expected_text = expected == null ? "" : str(expected)
+    state change_text = change == null ? "" : str(change)
+    let work = cash_count_work(pieces, texts, expected_text, change_text, code)
+    let ok = work.total != null
+    let shown = (minor: int) => locale != null ? money.format(money.from_minor(minor, code), locale) : money.format(money.from_minor(minor, code))
+    let bad = (field: str) => work.errors | any((e) => e.field == field)
+    let field_id = (part: str) => `${id}-${part}`
+    let named = (part: str) => `${name}_${part}`
+    let tell = () => {
+        if on_change != null && ok {
+            let amount = (minor: int) => money.from_minor(minor, code).amount
+            let c = work.change
+            on_change({ total: amount(work.total), expected: work.expected == null ? null : amount(work.expected), variance: work.variance == null ? null : amount(work.variance.variance),
+                        status: work.variance == null ? null : work.variance.status,
+                        pieces: c == null || c.pieces == null ? null : c.pieces | map((p) => ({ value: amount(p.value), count: p.count })) })
+        }
+    }
+    let put = (i: int, text: str) => {
+        texts = texts | enumerate() | map((row) => row[0] == i ? text : row[1])
+        tell()
+    }
+    let nudge = (e, i: int) => {
+        if e.key == "ArrowUp" || e.key == "ArrowDown" {
+            e.preventDefault()
+            let n = cash_count_whole(texts[i])
+            if n != null {
+                let next = e.key == "ArrowUp" ? min([n + 1, 1000000]) : max([n - 1, 0])
+                put(i, str(next))
+            }
+        }
+    }
+    <section class={ui_cls(["ui-cash-count", class])} aria-labelledby={field_id("title")}>
+        <h3.ui-cash-count-title id={field_id("title")}>{title}</h3>
+        <ul.ui-cash-count-rows>
+            {for row in enumerate(pieces) => <li.ui-cash-count-row key={row[1]}>
+                <label for={field_id(`count-${row[1]}`)}><span.ui-sr>Count of </span>{shown(row[1])}</label>
+                <input type="text" inputmode="numeric" autocomplete="off" id={field_id(`count-${row[1]}`)} name={named(str(row[1]))} value={texts[row[0]]} placeholder="0"
+                       aria-invalid={bad(`count-${row[1]}`) ? "true" : null} @input={(e) => { put(row[0], e.value) }} @keydown={(e) => { nudge(e, row[0]) }}/>
+                <span.ui-cash-count-line data-line="">{ok ? shown(work.lines[row[0]]) : ""}</span>
+            </li>}
+        </ul>
+        <div.ui-cash-count-grid>
+            <div.ui-cash-count-field>
+                <label for={field_id("expected")}>Expected in the drawer ({code})</label>
+                <input type="text" inputmode="decimal" autocomplete="off" id={field_id("expected")} name={named("expected")} value={expected_text} placeholder="0.00" aria-invalid={bad("expected") ? "true" : null}
+                       @input={(e) => { expected_text = e.value; tell() }}/>
+            </div>
+            <div.ui-cash-count-field>
+                <label for={field_id("change")}>Change to make ({code})</label>
+                <input type="text" inputmode="decimal" autocomplete="off" id={field_id("change")} name={named("change")} value={change_text} placeholder="0.00" aria-invalid={bad("change") ? "true" : null}
+                       @input={(e) => { change_text = e.value; tell() }}/>
+            </div>
+        </div>
+        {len(work.errors) > 0 && <ul.ui-cash-count-errors role="alert">{for e in work.errors => <li key={e.field}>{e.text}</li>}</ul>}
+        {ok && <div.ui-cash-count-out aria-live="polite">
+            <dl.ui-cash-count-sums>
+                <dt.ui-cash-count-total>Total</dt><dd.ui-cash-count-total data-key="total">{shown(work.total)}</dd>
+                {work.expected != null && <dt>Expected</dt>}
+                {work.expected != null && <dd data-key="expected">{shown(work.expected)}</dd>}
+            </dl>
+            {work.variance != null && <p class={ui_cls(["ui-cash-count-status", `ui-cash-count-${work.variance.status}`])} data-key="status">
+                {work.variance.status == "balanced" ? "Balanced" : (work.variance.status == "over" ? `Over by ${shown(work.variance.variance)}` : `Short by ${shown(0 - work.variance.variance)}`)}
+            </p>}
+            {work.change != null && work.change.pieces != null && <div.ui-cash-count-change data-key="change">
+                {`Change of ${shown(work.wanted)} in ${work.change.total} ${work.change.total == 1 ? "piece" : "pieces"}:`}
+                <ul.ui-cash-count-pieces>{for p in work.change.pieces => <li key={p.value}>{p.count} × {shown(p.value)}</li>}</ul>
+            </div>}
+            {work.change != null && work.change.pieces != null && !work.change.proven && <p.ui-cash-count-note data-key="unproven">The search stopped at its limit, so a mix with fewer pieces may exist.</p>}
+            {work.change != null && work.change.pieces == null && <p.ui-cash-count-note data-key="cannot">
+                {work.change.why == "drawer" ? `Cannot make ${shown(work.wanted)}: the drawer holds only ${shown(work.change.holds)}.`
+                    : (work.change.why == "step" ? `Cannot make ${shown(work.wanted)}: what is in the drawer only comes in steps of ${shown(work.change.step)}.`
+                    : (work.change.why == "mix" ? `Cannot make ${shown(work.wanted)}: no mix of what is in the drawer comes to it exactly.`
+                    : `Could not find a way to make ${shown(work.wanted)} within the search limit.`))}
+            </p>}
+        </div>}
+    </section>
+}

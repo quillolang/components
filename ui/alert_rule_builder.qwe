@@ -1,0 +1,445 @@
+// AlertRuleBuilder: tries an alert rule on a sample of a metric before it wakes anyone.
+// Set the threshold, the comparison, how long a value must stay past it ("for") and how
+// long to stay quiet after an alert clears (cooldown), and it replays the sample as an
+// alerting system would: a run of bad values starts pending, fires once it has lasted
+// "for", holds until a value is back to normal, and cannot fire again in the cooldown.
+// It draws each firing on a chart, lists them, gives the firings per day, and warns of
+// a rule that flaps or one that never fires, saying why, with the settings that would
+// help, found by replaying the sample with them.
+//
+//   <AlertRuleBuilder series={values} start="2026-10-01T00:00:00Z" step_minutes={5}
+//                     threshold={90} comparison=">" for_minutes={10} cooldown_minutes={30}/>
+//   <AlertRuleBuilder series={[{ t: "2026-10-01T00:00:00Z", v: 12.5 }, { t: "2026-10-01T00:05:00Z", v: null }]}
+//                     unit="ms" on_change={(r) => { per_day = r.per_day }}/>
+//
+// series: the sample, a list of numbers at even steps, or of { t, v } with t a date-time
+// or milliseconds; a null value is a gap, which ends a pending run but not a firing.
+// start, step_minutes: where a list of numbers starts ("2026-01-01T00:00:00Z") and its
+// step (5). threshold: where the rule starts (90), comparison: ">", ">=", "<" or "<="
+// (">"), for_minutes (5), cooldown_minutes (0). unit: shown after values. metric: what
+// is measured, for the chart ("Value"). flap_minutes: firings closer than this count
+// as flapping (30, or three steps if longer). editable: shows the sample as text to
+// change (true), a value or `time,value` to a line, whose bad lines are skipped and
+// named. title: its heading. id: a prefix for its ids, unique on the page. The fields
+// are named threshold, comparison, for_minutes, cooldown_minutes and series. on_change(
+// result): inside one of your components, given { firings, per_day, flapping, never }
+// after each change, firings being a count and per_day a decimal, or null. class:
+// more classes for its outer element.
+//
+// alert_rule_builder_backtest(points, rule) is the replay, for a program's own use:
+// points are { ms, v } in time order, rule is { threshold, comparison, for_minutes,
+// cooldown_minutes }, and it gives { firings: [{ start, end, open, peak }], held,
+// longest, hits, ... }. Only the first 5,000 points of a sample are read, and it says so.
+
+import ui/theme.qwe use ui_cls
+
+let alert_rule_builder_css = css`
+.ui-alert-rule { display: grid; gap: 14px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-alert-rule .ui-alert-rule-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-alert-rule-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
+.ui-alert-rule-field { display: grid; gap: 5px; min-width: 0; }
+.ui-alert-rule-field label { font-size: 13px; font-weight: 500; }
+.ui-alert-rule-field input, .ui-alert-rule-field select { box-sizing: border-box; width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-alert-rule-field input:focus-visible, .ui-alert-rule-field select:focus-visible, .ui-alert-rule-data textarea:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-alert-rule-field input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-alert-rule-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-alert-rule-chart { display: block; width: 100%; height: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-alert-rule-chart text { fill: var(--ui-muted); font: 22px var(--ui-font); }
+.ui-alert-rule-line { fill: none; stroke: var(--ui-accent); stroke-width: 2.5; vector-effect: non-scaling-stroke; }
+.ui-alert-rule-limit { stroke: var(--ui-danger); stroke-width: 1.5; stroke-dasharray: 6 5; vector-effect: non-scaling-stroke; }
+.ui-alert-rule-band { fill: var(--ui-danger); opacity: .16; }
+.ui-alert-rule-mark { fill: var(--ui-danger); }
+.ui-alert-rule-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 0; }
+.ui-alert-rule-stats > div { padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-alert-rule-stats dt { color: var(--ui-muted); font-size: 12px; }
+.ui-alert-rule-stats dd { margin: 2px 0 0; font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-alert-rule-warns { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-alert-rule-warns li { padding: 8px 12px; border-left: 4px solid var(--ui-warning); border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); }
+.ui-alert-rule-warns li.ui-alert-rule-tip { border-left-color: var(--ui-info); background: var(--ui-info-soft); }
+.ui-alert-rule-scroll { overflow-x: auto; }
+.ui-alert-rule-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-alert-rule table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-alert-rule caption { padding: 0 0 6px; text-align: left; font-weight: 600; }
+.ui-alert-rule th, .ui-alert-rule td { padding: 5px 8px; border-bottom: 1px solid var(--ui-border); text-align: left; white-space: nowrap; }
+.ui-alert-rule thead th { color: var(--ui-muted); font-weight: 500; }
+.ui-alert-rule-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-alert-rule-data summary { font-weight: 600; cursor: pointer; }
+.ui-alert-rule-data summary:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 4px; }
+.ui-alert-rule-data textarea { box-sizing: border-box; width: 100%; margin-top: 8px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.5 var(--ui-mono); resize: vertical; }
+`
+
+let alert_rule_builder_most = 5000
+
+// A finite number from text, or null. `float` is not used alone: it reads "nan" and
+// "inf" on the server and not in the browser.
+fn alert_rule_builder_number(t: str) {
+    let s = trim(replace(t, ",", ""))
+    re.test(s, "^[-+]?\\d{1,15}(\\.\\d{1,12})?$") ? float(dec(s)) : null
+}
+
+// Whole minutes or fractions of 0 or more, or null.
+fn alert_rule_builder_minutes(t: str) {
+    let s = trim(t)
+    if s == "" { return 0.0 }
+    let n = alert_rule_builder_number(s)
+    n == null || n < 0 || n > 525600 ? null : n
+}
+
+// A number as people write it: 1,234.5, 90.
+fn alert_rule_builder_show(v) -> str {
+    let t = format_number(dec(round(v, 2)), "en-US", 2)
+    re.replace(t, "\\.?0+$", "") == "" ? "0" : (contains(t, ".") ? re.replace(t, "\\.?0+$", "") : t)
+}
+
+fn alert_rule_builder_num_text(v) -> str = type_of(v) == "float" && v == floor(v) ? str(int(v)) : str(v)
+
+// The sample as lines of text.
+fn alert_rule_builder_text(series) -> str {
+    if type_of(series) != "list" { return "" }
+    join(take(series, alert_rule_builder_most) | map((p) => {
+        if type_of(p) != "map" { return p == null ? "" : alert_rule_builder_num_text(p) }
+        let t = type_of(p.t) == "str" ? p.t : (type_of(p.t) == "int" ? date.from_ms(p.t, "UTC") : "")
+        `${t},${p.v == null ? "" : alert_rule_builder_num_text(p.v)}`
+    }), "\n")
+}
+
+// Lines of text as points in time order: { points: [{ ms, v }], bad: [line numbers],
+// more: lines past the limit, step: the usual minutes between points }.
+fn alert_rule_builder_parse(text: str, start_ms: int, step_minutes) -> map {
+    let lines = split(replace(text, "\r", ""), "\n")
+    let more = max([0, len(lines) - alert_rule_builder_most])
+    let bad = []
+    let points = []
+    let i = 0
+    for line in take(lines, alert_rule_builder_most) {
+        i += 1
+        let s = trim(line)
+        if s != "" {
+            let at = index_of(s, ",")
+            let looks_timed = at != null && re.test(s, "^[0-9]{4}-")
+            let t = looks_timed ? trim(slice(s, 0, at)) : null
+            let vt = lower(looks_timed ? trim(slice(s, at + 1, len(s))) : s)
+            let gap = vt == "" || vt == "null" || vt == "nan" || vt == "-"
+            let v = gap ? null : alert_rule_builder_number(vt)
+            let when = t == null ? start_ms + int(round((len(points) * step_minutes) * 60000)) : (date.valid(t) ? date.ms(t) : null)
+            if when == null || (v == null && !gap) { bad = push(bad, i) } else { points = push(points, { ms: when, v }) }
+        }
+    }
+    let sorted = sort_by(points, (p) => p.ms)
+    let gaps = len(sorted) < 2 ? [] : sort(zip(sorted, drop(sorted, 1)) | map((p) => p[1].ms - p[0].ms))
+    { points: sorted, bad, more, step: len(gaps) == 0 ? step_minutes : gaps[floor(len(gaps) / 2)] / 60000 }
+}
+
+fn alert_rule_builder_past(v, comparison: str, threshold) -> bool = match comparison {
+    ">" => v > threshold
+    ">=" => v >= threshold
+    "<" => v < threshold
+    _ => v <= threshold
+}
+
+// The replay. A firing is { start, end, open (still firing when the sample ends), peak
+// (the worst value) }. held counts runs the cooldown kept back, hits the points past
+// the threshold, longest the longest run in milliseconds.
+fn alert_rule_builder_backtest(points: list, rule: map) -> map {
+    let for_ms = rule.for_minutes * 60000
+    let cool_ms = rule.cooldown_minutes * 60000
+    let low = rule.comparison == "<" || rule.comparison == "<="
+    let firings = []
+    let since = null
+    let firing = null
+    let quiet_until = null
+    let held = 0
+    let held_run = false
+    let hits = 0
+    let longest = 0
+    let read = 0
+    for p in points {
+        if p.v == null {
+            since = null
+            held_run = false
+        } else {
+            read += 1
+            if alert_rule_builder_past(p.v, rule.comparison, rule.threshold) {
+                hits += 1
+                if since == null { since = p.ms }
+                let run = p.ms - since
+                if run > longest { longest = run }
+                if firing == null && run >= for_ms {
+                    if quiet_until != null && p.ms < quiet_until {
+                        if !held_run { held += 1; held_run = true }
+                    } else {
+                        firing = { start: p.ms, end: p.ms, open: true, peak: p.v }
+                    }
+                }
+                if firing != null {
+                    let worse = low ? p.v < firing.peak : p.v > firing.peak
+                    firing = { ...firing, end: p.ms, peak: worse ? p.v : firing.peak }
+                }
+            } else {
+                since = null
+                held_run = false
+                if firing != null {
+                    firings = push(firings, { ...firing, end: p.ms, open: false })
+                    quiet_until = p.ms + cool_ms
+                    firing = null
+                }
+            }
+        }
+    }
+    if firing != null { firings = push(firings, firing) }
+    { firings, held, hits, longest, read }
+}
+
+// Whether firings come close together: at least three, and half of the quiet spells
+// between them shorter than `flap_ms`.
+fn alert_rule_builder_flapping(firings: list, flap_ms) -> bool {
+    if len(firings) < 3 { return false }
+    let quiet = zip(firings, drop(firings, 1)) | map((p) => p[1].start - p[0].end)
+    count(quiet, (g) => g < flap_ms) * 2 >= len(quiet)
+}
+
+// Firings a day as a decimal, or null with less than a moment of data.
+fn alert_rule_builder_per_day(n: int, span_ms) {
+    span_ms <= 0 ? null : round(dec(n) * 86400000 / dec(span_ms), 2, "half_up")
+}
+
+// Words for minutes: "1 h 5 min", "3 days 2 h".
+fn alert_rule_builder_span(minutes) -> str {
+    let total = int(round(minutes))
+    if total == 0 { return minutes > 0 ? "under a minute" : "0 min" }
+    let d = floor(total / 1440)
+    let h = floor((total % 1440) / 60)
+    let m = total % 60
+    join([d > 0 ? `${d} ${d == 1 ? "day" : "days"}` : null, h > 0 ? `${h} h` : null, m > 0 ? `${m} min` : null] | filter((x) => x != null), " ")
+}
+
+fn alert_rule_builder_when(ms) -> str = date.format(date.from_ms(ms, "UTC"), "MMM D HH:mm")
+
+// Replays the sample with longer "for"s and cooldowns; what stops the flapping and
+// still fires. Each is { field, value, firings }, the smallest that works.
+fn alert_rule_builder_suggest(points: list, rule: map, flap_ms, step) -> list {
+    let works = (r) => {
+        let f = alert_rule_builder_backtest(points, r).firings
+        len(f) > 0 && !alert_rule_builder_flapping(f, flap_ms) ? len(f) : null
+    }
+    let out = []
+    let pick = (field: str, values: list, make) => {
+        let found = find(values, (v) => works(make(v)) != null)
+        if found != null { out = push(out, { field, value: found, firings: works(make(found)) }) }
+    }
+    // A "for" shorter than a step acts as a step, so the words would mislead.
+    pick("for", [1, 2, 5, 10, 15, 30, 60, 120] | filter((v) => v > rule.for_minutes && v >= step), (v) => { ...rule, for_minutes: v })
+    pick("cooldown", [15, 30, 60, 120, 240] | filter((v) => v > rule.cooldown_minutes), (v) => { ...rule, cooldown_minutes: v })
+    out
+}
+
+// The whole result for a sample and a rule: { firings, per_day, days, flapping, never,
+// warnings: [text], tips: [text], chart facts... }.
+fn alert_rule_builder_review(parsed: map, rule: map, flap_minutes, unit: str) -> map {
+    let points = parsed.points
+    let r = alert_rule_builder_backtest(points, rule)
+    let n = len(r.firings)
+    let span = len(points) < 2 ? 0 : points[-1].ms - points[0].ms
+    let values = points | map((p) => p.v) | filter((v) => v != null)
+    let flap_ms = max([flap_minutes, parsed.step * 3]) * 60000
+    let flapping = alert_rule_builder_flapping(r.firings, flap_ms)
+    let never = n == 0 && len(values) > 0
+    let warnings = []
+    let tips = []
+    let show = (v) => `${alert_rule_builder_show(v)}${unit}`
+    if never {
+        let low = rule.comparison == "<" || rule.comparison == "<="
+        if r.held > 0 {
+            warnings = push(warnings, "Never fires: the cooldown holds every firing back.")
+        } else if r.hits == 0 {
+            warnings = push(warnings, low
+                ? `Never fires: the lowest value is ${show(min(values))}, which does not reach ${rule.comparison} ${show(rule.threshold)}.`
+                : `Never fires: the highest value is ${show(max(values))}, which does not reach ${rule.comparison} ${show(rule.threshold)}.`)
+        } else {
+            warnings = push(warnings, `Never fires: ${r.hits} ${r.hits == 1 ? "value is" : "values are"} past the threshold, but the longest run lasts ${alert_rule_builder_span(r.longest / 60000)}, short of the ${alert_rule_builder_span(rule.for_minutes)} "for".`)
+        }
+    }
+    if flapping {
+        warnings = push(warnings, `Flapping: ${n} firings, most within ${alert_rule_builder_span(flap_ms / 60000)} of the one before.`)
+        for s in alert_rule_builder_suggest(points, rule, flap_ms, parsed.step) {
+            tips = push(tips, s.field == "for"
+                ? `A "for" of ${alert_rule_builder_span(s.value)} would fire ${s.firings} ${s.firings == 1 ? "time" : "times"} and not flap.`
+                : `A cooldown of ${alert_rule_builder_span(s.value)} would fire ${s.firings} ${s.firings == 1 ? "time" : "times"} and not flap.`)
+        }
+    }
+    if len(values) > 0 && r.hits * 10 >= len(values) * 9 {
+        warnings = push(warnings, `Past the threshold ${str(round(dec(r.hits) * 100 / dec(len(values)), 0, "half_up"))}% of the time: this would be firing nearly always.`)
+    }
+    if n > 0 && r.firings[-1].open { tips = push(tips, "The last firing is still open where the sample ends.") }
+    if rule.for_minutes > 0 && parsed.step > 0 && rule.for_minutes < parsed.step {
+        tips = push(tips, `The "for" is shorter than the ${alert_rule_builder_span(parsed.step)} between samples, so it takes two samples in a row.`)
+    }
+    { firings: r.firings, held: r.held, hits: r.hits, count: n, per_day: alert_rule_builder_per_day(n, span), span, flapping, never, warnings, tips, values,
+      firing_ms: sum(r.firings | map((f) => f.end - f.start)) }
+}
+
+// The chart's shapes, in whole units of a 960 by 280 box, so the server and the
+// browser write the same numbers. Over 900 points each column keeps its low and high.
+fn alert_rule_builder_chart(points: list, threshold, firings: list) -> map {
+    let w = 960
+    let h = 280
+    let pad = 44
+    let vals = (points | map((p) => p.v) | filter((v) => v != null)) + [threshold]
+    let lo = min(vals)
+    let hi = max(vals)
+    let room = hi == lo ? 1.0 : (hi - lo) * 0.08
+    let top = hi + room
+    let bottom = lo - room
+    let t0 = points[0].ms
+    let t1 = points[-1].ms
+    let dt = t1 == t0 ? 1 : t1 - t0
+    let x = (ms) => pad + round((ms - t0) * (w - pad - 10) / dt)
+    let y = (v) => 12 + round((top - v) * (h - 44) / (top - bottom))
+    let thin = len(points) > 900
+    let pieces = []
+    let pen = false
+    let column = null
+    let col_lo = 0.0
+    let col_hi = 0.0
+    let flush = () => {
+        if column != null {
+            pieces = push(pieces, `${pen ? "L" : "M"}${column} ${y(col_hi)}L${column} ${y(col_lo)}`)
+            pen = true
+            column = null
+        }
+    }
+    for p in points {
+        if p.v == null {
+            flush()
+            pen = false
+        } else if thin {
+            let c = x(p.ms)
+            if c != column { flush(); column = c; col_lo = p.v; col_hi = p.v }
+            else {
+                if p.v < col_lo { col_lo = p.v }
+                if p.v > col_hi { col_hi = p.v }
+            }
+        } else {
+            pieces = push(pieces, `${pen ? "L" : "M"}${x(p.ms)} ${y(p.v)}`)
+            pen = true
+        }
+    }
+    flush()
+    let bands = firings | map((f) => { x: x(f.start), w: max([2, x(f.end) - x(f.start)]), label: alert_rule_builder_when(f.start) })
+    { w, h, pad, path: join(pieces, ""), limit: y(threshold), limit_label: alert_rule_builder_show(threshold), hi: alert_rule_builder_show(hi), lo: alert_rule_builder_show(lo),
+      top: y(hi), low: y(lo), bands, from: alert_rule_builder_when(t0), to: alert_rule_builder_when(t1) }
+}
+
+component AlertRuleBuilder(series = [], start: str = "2026-01-01T00:00:00Z", step_minutes = 5, threshold = 90, comparison: str = ">", for_minutes = 5,
+                           cooldown_minutes = 0, unit: str = "", metric: str = "Value", flap_minutes = 30, editable: bool = true,
+                           title: str = "Alert rule backtest", id: str = "alert-rule-builder", on_change = null, class: str? = null) {
+    style global alert_rule_builder_css
+    state limit_text = str(threshold)
+    state op = comparison
+    state for_text = str(for_minutes)
+    state cool_text = str(cooldown_minutes)
+    state text = alert_rule_builder_text(series)
+    let start_ms = date.valid(start) ? date.ms(start) : 0
+    let parsed = alert_rule_builder_parse(text, start_ms, step_minutes)
+    let limit = alert_rule_builder_number(limit_text)
+    let wait_for = alert_rule_builder_minutes(for_text)
+    let cool = alert_rule_builder_minutes(cool_text)
+    let ok = limit != null && wait_for != null && cool != null
+    let some = len(parsed.points) > 0 && any(parsed.points, (p) => p.v != null)
+    let rule = ok ? { threshold: limit, comparison: op, for_minutes: wait_for, cooldown_minutes: cool } : null
+    let r = ok && some ? alert_rule_builder_review(parsed, rule, flap_minutes, unit) : null
+    let chart = ok && some ? alert_rule_builder_chart(parsed.points, limit, r.firings) : null
+    let tell = () => {
+        if on_change != null {
+            let l = alert_rule_builder_number(limit_text)
+            let w = alert_rule_builder_minutes(for_text)
+            let c = alert_rule_builder_minutes(cool_text)
+            let p = alert_rule_builder_parse(text, start_ms, step_minutes)
+            if l != null && w != null && c != null && any(p.points, (x) => x.v != null) {
+                let x = alert_rule_builder_review(p, { threshold: l, comparison: op, for_minutes: w, cooldown_minutes: c }, flap_minutes, unit)
+                on_change({ firings: x.count, per_day: x.per_day, flapping: x.flapping, never: x.never })
+            }
+        }
+    }
+    let bad_lines = take(parsed.bad, 5)
+    <section class={ui_cls(["ui-alert-rule", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-alert-rule-title id={`${id}-title`}>{title}</h3>
+        <div.ui-alert-rule-grid>
+            <div.ui-alert-rule-field>
+                <label for={`${id}-comparison`}>Fires when {metric} is</label>
+                <select id={`${id}-comparison`} name="comparison" @change={(e) => { op = e.value; tell() }}>
+                    <option value=">" selected={op == ">"}>above</option>
+                    <option value=">=" selected={op == ">="}>at or above</option>
+                    <option value="<" selected={op == "<"}>below</option>
+                    <option value="<=" selected={op == "<="}>at or below</option>
+                </select>
+            </div>
+            <div.ui-alert-rule-field>
+                <label for={`${id}-threshold`}>Threshold{unit != "" ? ` (${unit})` : ""}</label>
+                <input type="text" inputmode="decimal" id={`${id}-threshold`} name="threshold" value={limit_text} autocomplete="off"
+                       aria-invalid={limit == null ? "true" : null} @input={(e) => { limit_text = e.value; tell() }}/>
+            </div>
+            <div.ui-alert-rule-field>
+                <label for={`${id}-for`}>For (minutes)</label>
+                <input type="text" inputmode="decimal" id={`${id}-for`} name="for_minutes" value={for_text} autocomplete="off"
+                       aria-invalid={wait_for == null ? "true" : null} @input={(e) => { for_text = e.value; tell() }}/>
+            </div>
+            <div.ui-alert-rule-field>
+                <label for={`${id}-cooldown`}>Cooldown (minutes)</label>
+                <input type="text" inputmode="decimal" id={`${id}-cooldown`} name="cooldown_minutes" value={cool_text} autocomplete="off"
+                       aria-invalid={cool == null ? "true" : null} @input={(e) => { cool_text = e.value; tell() }}/>
+            </div>
+        </div>
+        {limit == null && <p.ui-alert-rule-error role="alert">The threshold must be a number.</p>}
+        {(wait_for == null || cool == null) && <p.ui-alert-rule-error role="alert">{wait_for == null ? `"For"` : "Cooldown"} must be a number of minutes, from 0 to a year.</p>}
+        {!some && <p.ui-alert-rule-note>No values to test yet.</p>}
+        {r != null && <svg.ui-alert-rule-chart viewBox={`0 0 ${chart.w} ${chart.h}`} role="img"
+                aria-label={`${metric} over the sample, with the threshold at ${chart.limit_label} and ${r.count} ${r.count == 1 ? "firing" : "firings"} marked`}>
+            {for b in chart.bands => <g key={`${b.x}`}>
+                <rect.ui-alert-rule-band x={b.x} y="12" width={b.w} height={chart.h - 44}><title>{`Fired ${b.label}`}</title></rect>
+                <circle.ui-alert-rule-mark cx={b.x} cy="12" r="5"></circle>
+            </g>}
+            <line.ui-alert-rule-limit x1={chart.pad} x2={chart.w - 10} y1={chart.limit} y2={chart.limit}></line>
+            <path.ui-alert-rule-line d={chart.path}></path>
+            <text x="4" y={chart.top + 8}>{chart.hi}</text>
+            <text x="4" y={chart.low}>{chart.lo}</text>
+            <text x={chart.pad} y={chart.h - 8}>{chart.from}</text>
+            <text x={chart.w - 10} y={chart.h - 8} text-anchor="end">{chart.to}</text>
+        </svg>}
+        {r != null && <dl.ui-alert-rule-stats aria-live="polite">
+            <div data-stat="firings"><dt>Firings</dt><dd>{r.count}</dd></div>
+            <div data-stat="per-day"><dt>Firings per day</dt><dd>{r.per_day == null ? "—" : str(r.per_day)}</dd></div>
+            <div data-stat="time"><dt>Time firing</dt><dd>{alert_rule_builder_span(r.firing_ms / 60000)}</dd></div>
+            <div data-stat="held"><dt>Held by cooldown</dt><dd>{r.held}</dd></div>
+        </dl>}
+        {r != null && (len(r.warnings) > 0 || len(r.tips) > 0) && <ul.ui-alert-rule-warns aria-live="polite">
+            {for w in r.warnings => <li key={w}>{w}</li>}
+            {for t in r.tips => <li.ui-alert-rule-tip key={t}>{t}</li>}
+        </ul>}
+        {r != null && r.count > 0 && <div.ui-alert-rule-scroll tabindex="0" role="region" aria-label="Firings">
+            <table>
+                <caption>Each firing (times in UTC)</caption>
+                <thead><tr><th scope="col">Fired</th><th scope="col">Cleared</th><th scope="col">Lasted</th><th scope="col">Worst</th></tr></thead>
+                <tbody>
+                    {for f in take(r.firings, 50) => <tr key={str(f.start)}>
+                        <td>{alert_rule_builder_when(f.start)}</td>
+                        <td>{f.open ? "still firing" : alert_rule_builder_when(f.end)}</td>
+                        <td>{alert_rule_builder_span((f.end - f.start) / 60000)}</td>
+                        <td>{alert_rule_builder_show(f.peak)}{unit}</td>
+                    </tr>}
+                </tbody>
+            </table>
+        </div>}
+        {r != null && r.count > 50 && <p.ui-alert-rule-note>{`The first 50 of ${r.count} firings are listed.`}</p>}
+        {len(parsed.bad) > 0 && <p.ui-alert-rule-note>{`Skipped ${len(parsed.bad)} bad ${len(parsed.bad) == 1 ? "line" : "lines"}: ${join(bad_lines, ", ")}${len(parsed.bad) > 5 ? " and more" : ""}.`}</p>}
+        {parsed.more > 0 && <p.ui-alert-rule-note>{`Only the first ${alert_rule_builder_most} lines are read; ${parsed.more} more are left out.`}</p>}
+        {editable && <details.ui-alert-rule-data>
+            <summary>Sample data</summary>
+            <label.ui-sr for={`${id}-series`}>Sample data: a value, or time and value, to a line</label>
+            <textarea id={`${id}-series`} name="series" rows="8" spellcheck="false" @input={(e) => { text = e.value; tell() }}>{text}</textarea>
+        </details>}
+    </section>
+}

@@ -1,0 +1,549 @@
+// PhotoEditor: edits a photo on the phone, in a canvas: rotate by quarter turns, crop with
+// handles, change the light, and straighten by a finger along a ruler. Every step can be
+// undone. Done gives back the image as a real file in a file field, so a plain multipart
+// <form> sends it, and to on_done. Nothing is sent anywhere to do any of this.
+//
+//   <form method="post" action="/avatar" enctype="multipart/form-data">
+//       <PhotoEditor name="photo" src="/uploads/me.jpg" alt="Your photo"/>
+//       <Button size="lg" type="submit">Save</Button>
+//   </form>
+//   <PhotoEditor on_done={(p) => { photo = p }}/>
+//
+// src: the picture to start with; none starts empty, with a button to choose one. Another
+// site's picture must allow it (CORS), or it says it cannot be edited. name: the file
+// field's name ("photo"). alt: what the picture is, for screen readers ("The photo").
+// max_side: the longest side of the result in pixels (2048). quality: the JPEG's quality, 0
+// to 1 (0.9). on_done(photo): inside one of your components, given { name, size, type, width,
+// height } when Done is pressed, and null when the photo is changed afterwards.
+//
+// The handles have their equals: four sliders give the crop's edges, and the ruler is a
+// slider too, with buttons beside it and arrow keys on it. Dragging the ruler up or down
+// is left to the page. A drag follows the finger on the page and is kept when it ends;
+// one the system takes back changes nothing. On a tablet the tools stand beside the picture.
+//
+// Needs Button: `import ui/button.qwe use Button`.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let photo_editor_css = css`
+.ui-photo-editor { container-type: inline-size; width: 100%; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-photo-editor-body { display: grid; gap: 12px; }
+.ui-photo-editor-stage { display: grid; place-items: center; min-height: 160px; padding: 24px; border-radius: var(--ui-radius-sm); background: #1b1b1f; color: #eee; overscroll-behavior: contain; }
+.ui-photo-editor-sheet { --x: 0; --y: 0; --w: 1; --h: 1; position: relative; width: 100%; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-photo-editor-clip { position: absolute; inset: 0; overflow: hidden; }
+.ui-photo-editor-sheet[hidden] { display: none; }
+.ui-photo-editor-sheet canvas { display: block; width: 100%; height: 100%; transform-origin: 50% 50%; }
+.ui-photo-editor-empty { margin: 0; color: #ccc; text-align: center; }
+.ui-photo-editor-box {
+  position: absolute; left: calc(var(--x) * 100%); top: calc(var(--y) * 100%); width: calc(var(--w) * 100%); height: calc(var(--h) * 100%);
+  box-shadow: 0 0 0 999px rgba(0, 0, 0, .5); outline: 1.5px solid #fff; touch-action: none; cursor: move;
+}
+/* With another tool the crop still shows, but a finger goes through it. */
+.ui-photo-editor-box-off { outline: none; pointer-events: none; }
+/* The dimming stays on the picture; the handles are outside that clip, so they stay whole. */
+.ui-photo-editor-handles { position: absolute; left: calc(var(--x) * 100%); top: calc(var(--y) * 100%); width: calc(var(--w) * 100%); height: calc(var(--h) * 100%); pointer-events: none; }
+.ui-photo-editor-handle {
+  position: absolute; width: 44px; height: 44px; margin: -22px 0 0 -22px; padding: 0; border: 0; border-radius: 50%; background: transparent; touch-action: none; pointer-events: auto;
+  -webkit-tap-highlight-color: transparent; outline: none;
+}
+.ui-photo-editor-handle::after { content: ""; position: absolute; inset: 13px; border-radius: 3px; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, .5); }
+.ui-photo-editor-handle:focus-visible { box-shadow: var(--ui-focus); }
+.ui-photo-editor-nw { left: 0; top: 0; }
+.ui-photo-editor-ne { left: 100%; top: 0; }
+.ui-photo-editor-se { left: 100%; top: 100%; }
+.ui-photo-editor-sw { left: 0; top: 100%; }
+.ui-photo-editor-side { display: grid; gap: 10px; align-content: start; min-width: 0; }
+.ui-photo-editor-tools { display: flex; gap: 6px; }
+.ui-photo-editor-tool {
+  flex: 1 1 0; min-width: 44px; height: 46px; padding: 0 6px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 14px/1 var(--ui-font); cursor: pointer;
+}
+.ui-photo-editor-tool[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-photo-editor-tool:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-photo-editor-panel { display: grid; gap: 6px; }
+.ui-photo-editor-field { display: grid; grid-template-columns: 76px minmax(0, 1fr) 40px; align-items: center; gap: 6px; font-size: 13px; }
+.ui-photo-editor-field output { color: var(--ui-muted); font-variant-numeric: tabular-nums; text-align: right; }
+.ui-photo-editor-field input[type=range] { width: 100%; min-width: 44px; height: 44px; margin: 0; accent-color: var(--ui-accent); }
+.ui-photo-editor-ruler-row { display: grid; grid-template-columns: 46px minmax(0, 1fr) 46px; gap: 6px; align-items: center; }
+.ui-photo-editor-ruler-row button { width: 46px; height: 46px; padding: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 18px/1 var(--ui-font); cursor: pointer; }
+.ui-photo-editor-ruler {
+  position: relative; height: 54px; overflow: hidden; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); touch-action: pan-y; cursor: ew-resize; outline: none;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; background: var(--ui-surface);
+}
+/* Its place is set by hand, on an element with no bound style, which would be rewritten in mid-drag. */
+.ui-photo-editor-ticks { position: absolute; left: 0; right: 0; top: 0; height: 12px; pointer-events: none;
+  background: linear-gradient(90deg, var(--ui-muted) 1px, transparent 1px) var(--ui-ruler-at, 0px) 0 / 10px 12px repeat-x; }
+.ui-photo-editor-ruler:focus-visible { box-shadow: var(--ui-focus); }
+.ui-photo-editor-ruler::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--ui-accent); }
+.ui-photo-editor-degrees { position: absolute; left: 0; right: 0; bottom: 6px; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; text-align: center; pointer-events: none; }
+.ui-photo-editor-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-photo-editor-bar > * { flex: 1 1 auto; }
+.ui-photo-editor-open {
+  position: relative; display: flex; align-items: center; justify-content: center; min-height: 46px; padding: 0 16px; overflow: hidden; border: 1px solid var(--ui-border); flex: 1 1 auto;
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 15px/1 var(--ui-font); cursor: pointer;
+}
+.ui-photo-editor-open input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; font-size: 16px; cursor: pointer; }
+.ui-photo-editor-open:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-photo-editor-note { margin: 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-photo-editor-why { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-photo-editor input[type=file][hidden] { display: none; }
+/* A tablet, or a wide pane: the tools beside the picture, as there is room for both. */
+@container (min-width: 440px) {
+  .ui-photo-editor-body { grid-template-columns: minmax(0, 1fr) 210px; align-items: start; }
+}
+`
+
+let photo_editor_most_angle = 15          // degrees of straightening each way
+let photo_editor_ruler_rate = 0.1         // degrees for each pixel along the ruler
+let photo_editor_view = 900               // the longest side the picture is drawn at to look at
+
+fn photo_editor_clamp(v: num, lo: num, hi: num) -> num = v < lo ? lo : v > hi ? hi : v
+
+// What nothing has changed yet looks like. A crop is in fractions of the frame, the picture
+// turned by quarter turns, so it survives the size being anything.
+fn photo_editor_start() -> map = { turns: 0, angle: 0, light: 0, crop: { x: 0, y: 0, w: 1, h: 1 } }
+
+// The frame of a picture of w by h after some quarter turns.
+fn photo_editor_frame(w: num, h: num, turns: int) -> map = turns % 2 == 1 ? { w: h, h: w } : { w, h }
+
+// A quarter turn to the right, and the crop goes with the picture: a point at x, y goes to
+// 1 - y, x, so the box's left edge is 1 less its bottom. Left is three of these.
+fn photo_editor_turn(e: map) -> map {
+    let c = e.crop
+    { ...e, turns: (e.turns + 1) % 4, crop: { x: round(1 - c.y - c.h, 6), y: c.x, w: c.h, h: c.w } }
+}
+
+// How much a picture of w by h must grow, turned by `deg`, to fill its own frame with no
+// corner showing: its turned width and height over the frame's.
+fn photo_editor_zoom(w: num, h: num, deg: num) -> num {
+    let a = abs(deg) * math.pi / 180
+    let across = math.cos(a) + h / w * math.sin(a)
+    let down = math.cos(a) + w / h * math.sin(a)
+    across > down ? across : down
+}
+
+// The crop after a drag: mode "move" or a corner ("nw", "ne", "se", "sw"), dx and dy in
+// fractions of the frame, and no side under `least`.
+fn photo_editor_drag(s: map, mode: str, dx: num, dy: num, least: num) -> map {
+    if mode == "move" {
+        return { x: photo_editor_clamp(s.x + dx, 0, 1 - s.w), y: photo_editor_clamp(s.y + dy, 0, 1 - s.h), w: s.w, h: s.h }
+    }
+    let west = contains(mode, "w")
+    let north = contains(mode, "n")
+    let x1 = west ? photo_editor_clamp(s.x + dx, 0, s.x + s.w - least) : s.x
+    let x2 = west ? s.x + s.w : photo_editor_clamp(s.x + s.w + dx, s.x + least, 1)
+    let y1 = north ? photo_editor_clamp(s.y + dy, 0, s.y + s.h - least) : s.y
+    let y2 = north ? s.y + s.h : photo_editor_clamp(s.y + s.h + dy, s.y + least, 1)
+    { x: x1, y: y1, w: x2 - x1, h: y2 - y1 }
+}
+
+// The crop with one edge moved to a percentage across or down: "left", "top", "right" or "bottom".
+fn photo_editor_edge(c: map, edge: str, percent: num, least: num) -> map {
+    let v = percent / 100
+    match edge {
+        "left" => photo_editor_drag(c, "w", v - c.x, 0, least)
+        "right" => photo_editor_drag(c, "e", v - c.x - c.w, 0, least)
+        "top" => photo_editor_drag(c, "n", 0, v - c.y, least)
+        _ => photo_editor_drag(c, "s", 0, v - c.y - c.h, least)
+    }
+}
+
+// The size of the result in pixels: the frame's part in the crop, with its longer side at most limit.
+fn photo_editor_out(w: num, h: num, e: map, limit: num) -> map {
+    let f = photo_editor_frame(w, h, e.turns)
+    let cw = f.w * e.crop.w
+    let ch = f.h * e.crop.h
+    let longest = cw > ch ? cw : ch
+    let k = longest > limit ? limit / longest : 1
+    let ow = round(cw * k)
+    let oh = round(ch * k)
+    { w: ow < 1 ? 1 : ow, h: oh < 1 ? 1 : oh }
+}
+
+// A number of percent as a person reads a change: "+20", "0", "-5".
+fn photo_editor_signed(n: num) -> str = n > 0 ? `+${n}` : str(n)
+
+// Draws the picture at its edit on a canvas cw by ch: the whole frame, or only the crop. The
+// light is drawn the same way in both, by compositing, as Safari's canvas has no `filter`:
+// darker is black over it, brighter is the picture added to itself. Both multiply each
+// colour by 1 + light / 100, as CSS brightness() does.
+fn photo_editor_paint(ctx, img, w: num, h: num, e: map, cw: num, ch: num, cropped: bool) {
+    let f = photo_editor_frame(w, h, e.turns)
+    let c = cropped ? e.crop : { x: 0, y: 0, w: 1, h: 1 }
+    let s = cw / (f.w * c.w)
+    let k = photo_editor_zoom(f.w, f.h, e.angle)
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.globalCompositeOperation = "source-over"
+    ctx.globalAlpha = 1
+    ctx.imageSmoothingQuality = "high"
+    ctx.fillStyle = "#fff"
+    ctx.fillRect(0, 0, cw, ch)
+    ctx.translate((0.5 - c.x) * f.w * s, (0.5 - c.y) * f.h * s)
+    ctx.rotate((e.turns * 90 + e.angle) * math.pi / 180)
+    ctx.scale(s * k, s * k)
+    ctx.drawImage(img, -w / 2, -h / 2)
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    if e.light < 0 {
+        ctx.globalAlpha = -e.light / 100
+        ctx.fillStyle = "#000"
+        ctx.fillRect(0, 0, cw, ch)
+    }
+    if e.light > 0 {
+        ctx.globalCompositeOperation = "lighter"
+        ctx.globalAlpha = e.light / 100
+        ctx.drawImage(ctx.canvas, 0, 0)
+    }
+    ctx.globalCompositeOperation = "source-over"
+    ctx.globalAlpha = 1
+}
+
+// One corner's handle: a view, so that its handlers stay the component's.
+view PhotoEditorHandle(mode: str, words: str, on_down, on_move, on_end, on_key) =
+    <button class={`ui-photo-editor-handle ui-photo-editor-${mode}`} type="button" aria-label={`${words} corner of the crop. Arrow keys move it.`}
+            @contextmenu={(e) => { e.preventDefault() }}
+            @pointerdown={(e) => { on_down(e, mode) }} @pointermove={(e) => { on_move(e) }}
+            @pointerup={() => { on_end(true) }} @pointercancel={() => { on_end(false) }}
+            @keydown={(e) => { on_key(e, mode) }}></button>
+
+// One edge's slider: a view with live props, or a value that changes would remake the
+// input under the finger.
+view PhotoEditorEdge(edge: str, words: str, value: num, on_input, on_change) =
+    <label.ui-photo-editor-field>
+        <span>{words}</span>
+        <input type="range" min="0" max="100" step="1" value={str(round(value))} aria-label={`${words} edge of the crop, percent`}
+               @input={(e) => { on_input(edge, int(e.value)) }} @change={() => { on_change() }}/>
+        <output>{round(value)}%</output>
+    </label>
+
+component PhotoEditor(src: str? = null, name: str = "photo", alt: str = "The photo", max_side: int = 2048, quality: num = 0.9,
+                      on_done = null, class: str? = null) {
+    style global photo_editor_css
+    state status = "empty"      // empty, loading, ready, saving, bad
+    state picture = null
+    state w0 = 0
+    state h0 = 0
+    state edit = photo_editor_start()
+    state past = []             // the edits before this one, for Undo
+    state tool = "crop"
+    state trial = null          // an edit being tried by a slider, not yet in the history
+    state canvas = null
+    state ticks = null          // the ruler's marks
+    state sheet = null
+    state room = null           // the box whose --x --y --w --h place the crop
+    state carry = null
+    state grab = null           // a crop's drag: { mode, x, y, s, w, h, moved, at }
+    state rule = null           // the ruler's drag: { x, y, from, on, at, k }
+    state done = null           // { width, height, size }
+    state said = ""
+    let shown = trial ?? edit
+    let ready = status == "ready" || status == "saving"
+    let least = 0.05
+    let keep_crop = (c: map) => {
+        if room != null {
+            room.style.setProperty("--x", str(round(c.x, 5)))
+            room.style.setProperty("--y", str(round(c.y, 5)))
+            room.style.setProperty("--w", str(round(c.w, 5)))
+            room.style.setProperty("--h", str(round(c.h, 5)))
+        }
+    }
+    let keep_ruler = (deg: num) => {
+        if ticks != null { ticks.style.setProperty("--ui-ruler-at", `${round(deg * 10)}px`) }
+    }
+    // The picture as it stands, drawn once for each thing that changes: not on each pointer move.
+    let redraw = (e: map) => {
+        if picture != null && canvas != null {
+            let f = photo_editor_frame(w0, h0, e.turns)
+            let k = photo_editor_view / (f.w > f.h ? f.w : f.h)
+            canvas.width = round(f.w * k)
+            canvas.height = round(f.h * k)
+            canvas.style.transform = ""
+            sheet.style.aspectRatio = `${f.w} / ${f.h}`
+            sheet.style.maxWidth = `calc(56dvh * ${round(f.w / f.h, 4)})`
+            photo_editor_paint(canvas.getContext("2d"), picture, w0, h0, e, canvas.width, canvas.height, false)
+            keep_crop(e.crop)
+            keep_ruler(e.angle)
+        }
+    }
+    // One gesture at a time: a key or a second finger would redraw what the finger is moving.
+    let moving = () => grab != null || (rule != null && rule.on)
+    let unsaved = () => {
+        if done != null {
+            done = null
+            carry.value = ""
+            on_done && on_done(null)
+        }
+    }
+    let change = (next: map) => {
+        if moving() { return null }
+        past = slice(past, -49, len(past)) | push(edit)
+        edit = next
+        trial = null
+        unsaved()
+        redraw(next)
+    }
+    let undo = () => {
+        if len(past) > 0 && !moving() {
+            let back = last(past)
+            past = slice(past, 0, len(past) - 1)
+            edit = back
+            trial = null
+            unsaved()
+            redraw(back)
+        }
+    }
+    // Another tool takes the handles or the ruler away, so a drag cannot end by itself.
+    let pick_tool = (next: str) => {
+        grab = null
+        rule = null
+        if canvas != null { canvas.style.transform = "" }
+        keep_crop(edit.crop)
+        tool = next
+    }
+    let start = (url: str, foreign: bool) => {
+        status = "loading"
+        grab = null
+        rule = null
+        said = ""
+        let img = js_new("Image")
+        if foreign { img.crossOrigin = "anonymous" }
+        img.src = url
+        let opened = js("Promise.resolve", img.decode())
+        if is_err(opened) || img.naturalWidth == 0 {
+            status = picture != null ? "ready" : "bad"
+            said = "This picture could not be read. Choose a JPEG or PNG."
+            return null
+        }
+        // An <img> is upright by its EXIF already, and its natural size is that way round.
+        picture = img
+        w0 = img.naturalWidth
+        h0 = img.naturalHeight
+        edit = photo_editor_start()
+        past = []
+        trial = null
+        unsaved()
+        status = "ready"
+        redraw(edit)
+    }
+    let choose = (e) => {
+        let file = e.target.files[0]
+        if file == null { return null }
+        e.value = ""
+        if !starts_with(file.type ?? "image/", "image/") {
+            said = "That is not a picture."
+            return null
+        }
+        let url = js("URL.createObjectURL", file)
+        start(url, false)
+        js("URL.revokeObjectURL", url)
+    }
+    let finish = () => {
+        status = "saving"
+        said = ""
+        let size = photo_editor_out(w0, h0, edit, max_side)
+        let c = js("document.createElement", "canvas")
+        c.width = size.w
+        c.height = size.h
+        photo_editor_paint(c.getContext("2d"), picture, w0, h0, edit, size.w, size.h, true)
+        // Inside a Promise, a picture another site will not share is an error value, not a stop.
+        let blob = js("Promise.resolve", js_new("Promise", (ok) => { c.toBlob((b) => { ok(b) }, "image/jpeg", quality) }))
+        status = "ready"
+        if blob == null || is_err(blob) {
+            said = "This picture cannot be saved here: its site does not allow it."
+            return null
+        }
+        let file = js_new("File", [blob], "photo.jpg", { type: "image/jpeg" })
+        let dt = js_new("DataTransfer")
+        dt.items.add(file)
+        carry.files = dt.files
+        done = { width: size.w, height: size.h, size: file.size }
+        on_done && on_done({ name: "photo.jpg", size: file.size, type: "image/jpeg", width: size.w, height: size.h })
+    }
+    let crop_end = (keep: bool) => {
+        if grab != null {
+            let g = grab
+            grab = null
+            if keep && g.moved && g.at != g.s {
+                change({ ...edit, crop: g.at })
+            } else {
+                keep_crop(edit.crop)
+            }
+        }
+    }
+    let crop_down = (e, mode: str) => {
+        if e.button == 0 {
+            e.preventDefault()
+            e.stopPropagation()
+            e.target.setPointerCapture(e.pointerId)
+            let r = sheet.getBoundingClientRect()
+            grab = { mode, x: e.clientX, y: e.clientY, s: edit.crop, w: r.width, h: r.height, moved: false, at: edit.crop }
+        }
+    }
+    let crop_move = (e) => {
+        if grab != null {
+            let dx = e.clientX - grab.x
+            let dy = e.clientY - grab.y
+            if grab.moved || abs(dx) > 3 || abs(dy) > 3 {
+                let at = photo_editor_drag(grab.s, grab.mode, dx / grab.w, dy / grab.h, least)
+                grab = { ...grab, moved: true, at }
+                keep_crop(at)
+            }
+        }
+    }
+    let crop_key = (e, mode: str) => {
+        let by = e.shiftKey ? 0.05 : 0.01
+        let move = match e.key {
+            "ArrowLeft" => [-by, 0]
+            "ArrowRight" => [by, 0]
+            "ArrowUp" => [0, -by]
+            "ArrowDown" => [0, by]
+            _ => null
+        }
+        if move != null {
+            e.preventDefault()
+            change({ ...edit, crop: photo_editor_drag(edit.crop, mode, move[0], move[1], least) })
+        }
+    }
+    let lean = (deg: num) => {
+        let to = round(photo_editor_clamp(deg, -photo_editor_most_angle, photo_editor_most_angle), 1)
+        if to != edit.angle { change({ ...edit, angle: to }) }
+    }
+    let edges = shown.crop
+    let edge_input = (edge: str, value: int) => {
+        let next = { ...edit, crop: photo_editor_edge((trial ?? edit).crop, edge, value, least) }
+        trial = next
+        keep_crop(next.crop)
+    }
+    let edge_change = () => { if trial != null { change(trial) } }
+    <div class={ui_cls(["ui-photo-editor", class])} data-state={status} data-turns={str(edit.turns)} data-angle={str(edit.angle)} data-light={str(edit.light)} data-steps={str(len(past))}
+         @mount={(_el) => { if src != null { start(src, !starts_with(src, "data:") && !starts_with(src, "blob:") && !starts_with(src, "/")) } }}>
+        <div.ui-photo-editor-body>
+            <div.ui-photo-editor-stage>
+                {!ready && <p.ui-photo-editor-empty role="status">{status == "loading" ? "Opening the photo…" : status == "bad" ? "No photo open." : "Choose a photo to edit."}</p>}
+                <div.ui-photo-editor-sheet hidden={!ready} @mount={(el) => { sheet = el; room = el }}>
+                    <div.ui-photo-editor-clip>
+                        <canvas role="img" aria-label={alt} @mount={(el) => { canvas = el }}></canvas>
+                        <div class={ui_cls(["ui-photo-editor-box", tool != "crop" && "ui-photo-editor-box-off"])} role="group" tabindex={tool == "crop" ? "0" : null} aria-label="Crop box. Arrow keys move it."
+                             @contextmenu={(e) => { e.preventDefault() }}
+                             @pointerdown={(e) => { crop_down(e, "move") }} @pointermove={crop_move}
+                             @pointerup={() => { crop_end(true) }} @pointercancel={() => { crop_end(false) }}
+                             @keydown={(e) => { crop_key(e, "move") }}></div>
+                    </div>
+                    {tool == "crop" && <div.ui-photo-editor-handles>
+                        <PhotoEditorHandle mode="nw" words="Top left" on_down={crop_down} on_move={crop_move} on_end={crop_end} on_key={crop_key}/>
+                        <PhotoEditorHandle mode="ne" words="Top right" on_down={crop_down} on_move={crop_move} on_end={crop_end} on_key={crop_key}/>
+                        <PhotoEditorHandle mode="se" words="Bottom right" on_down={crop_down} on_move={crop_move} on_end={crop_end} on_key={crop_key}/>
+                        <PhotoEditorHandle mode="sw" words="Bottom left" on_down={crop_down} on_move={crop_move} on_end={crop_end} on_key={crop_key}/>
+                    </div>}
+                </div>
+            </div>
+            <div.ui-photo-editor-side>
+                {ready && <div.ui-photo-editor-tools role="group" aria-label="Tools">
+                    <button.ui-photo-editor-tool type="button" aria-pressed={tool == "crop" ? "true" : "false"} @click={() => { pick_tool("crop") }}>Crop</button>
+                    <button.ui-photo-editor-tool type="button" aria-pressed={tool == "light" ? "true" : "false"} @click={() => { pick_tool("light") }}>Light</button>
+                    <button.ui-photo-editor-tool type="button" aria-pressed={tool == "straighten" ? "true" : "false"} @click={() => { pick_tool("straighten") }}>Level</button>
+                </div>}
+                {ready && tool == "crop" && <div.ui-photo-editor-panel>
+                    <PhotoEditorEdge edge="left" words="Left" value={edges.x * 100} on_input={edge_input} on_change={edge_change}/>
+                    <PhotoEditorEdge edge="top" words="Top" value={edges.y * 100} on_input={edge_input} on_change={edge_change}/>
+                    <PhotoEditorEdge edge="right" words="Right" value={(edges.x + edges.w) * 100} on_input={edge_input} on_change={edge_change}/>
+                    <PhotoEditorEdge edge="bottom" words="Bottom" value={(edges.y + edges.h) * 100} on_input={edge_input} on_change={edge_change}/>
+                </div>}
+                {ready && tool == "light" && <div.ui-photo-editor-panel>
+                    <label.ui-photo-editor-field>
+                        <span>Light</span>
+                        <input type="range" min="-100" max="100" step="5" value={str(shown.light)} aria-label="Light, percent"
+                               @input={(e) => {
+                                   let next = { ...edit, light: int(e.value) }
+                                   trial = next
+                                   redraw(next)
+                               }}
+                               @change={() => { if trial != null { change(trial) } }}/>
+                        <output>{photo_editor_signed(shown.light)}</output>
+                    </label>
+                </div>}
+                {ready && tool == "straighten" && <div.ui-photo-editor-panel>
+                    <div.ui-photo-editor-ruler-row>
+                        <button type="button" aria-label="Lean left" @click={() => { lean(edit.angle - 0.5) }}>−</button>
+                        <div.ui-photo-editor-ruler role="slider" tabindex="0" aria-label="Straighten, degrees" aria-valuemin={str(-photo_editor_most_angle)} aria-valuemax={str(photo_editor_most_angle)}
+                             aria-valuenow={str(edit.angle)} aria-valuetext={`${edit.angle} degrees`}
+                             @contextmenu={(e) => { e.preventDefault() }}
+                             @pointerdown={(e) => { if e.button == 0 { rule = { x: e.clientX, y: e.clientY, from: edit.angle, on: false, at: edit.angle } } }}
+                             @pointermove={(e) => {
+                                 if rule != null {
+                                     let dx = e.clientX - rule.x
+                                     let dy = e.clientY - rule.y
+                                     if !rule.on && (abs(dx) >= 6 || abs(dy) >= 6) {
+                                         if abs(dy) > abs(dx) {
+                                             rule = null     // up or down is the page's
+                                         } else {
+                                             e.target.closest("[role=slider]").setPointerCapture(e.pointerId)
+                                             rule = { ...rule, on: true }
+                                         }
+                                     }
+                                     if rule != null && rule.on {
+                                         let at = round(photo_editor_clamp(rule.from + dx * photo_editor_ruler_rate, -photo_editor_most_angle, photo_editor_most_angle), 1)
+                                         rule = { ...rule, at }
+                                         // The picture turns by transform as the finger goes; it is drawn for real on release.
+                                         let f = photo_editor_frame(w0, h0, edit.turns)
+                                         let grow = photo_editor_zoom(f.w, f.h, at) / photo_editor_zoom(f.w, f.h, rule.from)
+                                         canvas.style.transform = `rotate(${at - rule.from}deg) scale(${round(grow, 4)})`
+                                         keep_ruler(at)
+                                     }
+                                 }
+                             }}
+                             @pointerup={() => {
+                                 if rule != null {
+                                     let r = rule
+                                     rule = null
+                                     if r.on {
+                                         canvas.style.transform = ""
+                                         lean(r.at)
+                                     }
+                                 }
+                             }}
+                             @pointercancel={() => {
+                                 rule = null
+                                 canvas.style.transform = ""
+                                 keep_ruler(edit.angle)
+                             }}
+                             @keydown={(e) => {
+                                 let to = match e.key {
+                                     "ArrowLeft" => edit.angle - 0.5
+                                     "ArrowDown" => edit.angle - 0.5
+                                     "ArrowRight" => edit.angle + 0.5
+                                     "ArrowUp" => edit.angle + 0.5
+                                     "Home" => 0
+                                     _ => null
+                                 }
+                                 if to != null {
+                                     e.preventDefault()
+                                     lean(to)
+                                 }
+                             }}>
+                            <div.ui-photo-editor-ticks aria-hidden="true" @mount={(el) => { ticks = el; keep_ruler(edit.angle) }}></div>
+                            <span.ui-photo-editor-degrees aria-hidden="true">{edit.angle}°</span>
+                        </div>
+                        <button type="button" aria-label="Lean right" @click={() => { lean(edit.angle + 0.5) }}>+</button>
+                    </div>
+                </div>}
+                {ready && <div.ui-photo-editor-bar>
+                    <Button size="lg" variant="outline" tone="neutral" label="Rotate left" on_click={() => { change(photo_editor_turn(photo_editor_turn(photo_editor_turn(edit)))) }}>Turn left</Button>
+                    <Button size="lg" variant="outline" tone="neutral" label="Rotate right" on_click={() => { change(photo_editor_turn(edit)) }}>Turn right</Button>
+                    <Button size="lg" variant="outline" tone="neutral" disabled={len(past) == 0} on_click={undo}>Undo</Button>
+                    <Button size="lg" variant="outline" tone="neutral" disabled={len(past) == 0} on_click={() => { change(photo_editor_start()) }}>Reset</Button>
+                </div>}
+                <div.ui-photo-editor-bar>
+                    {ready && <Button size="lg" loading={status == "saving"} on_click={finish}>Done</Button>}
+                    <label.ui-photo-editor-open>
+                        <span>{ready ? "Another photo" : "Choose a photo"}</span>
+                        <input type="file" accept="image/*" aria-label={ready ? "Another photo" : "Choose a photo"} @change={choose}/>
+                    </label>
+                </div>
+                {done != null && <p.ui-photo-editor-note role="status">Saved: {done.width} × {done.height}, {round(done.size / 1024)} KB.</p>}
+                {said != "" && <p.ui-photo-editor-why role="alert">{said}</p>}
+            </div>
+        </div>
+        <input type="file" name={name} hidden={true} tabindex="-1" aria-hidden="true" @mount={(el) => { carry = el }}/>
+    </div>
+}

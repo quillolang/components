@@ -1,0 +1,341 @@
+// CloudCostEstimator: what a set of cloud resources costs, from prices given as data.
+// Each resource has graduated tiers (the first 1,000 GB at one price, the next at
+// another), so a change of quantity moves units through the tiers rather than repricing
+// them all. It gives each line's monthly and yearly cost and a total that adds up to
+// the cent, compares reserved against on-demand where a resource can be reserved (a
+// reservation is paid for every hour, used or not, so it can lose), and says what
+// drives the bill most. Lines are rounded to the cent half up, once; yearly is twelve
+// of those months, so every column adds up. Amounts are decimals, never floats.
+//
+//   <CloudCostEstimator currency="USD" resources={[
+//       { id: "store", name: "Object storage", unit: "GB", quantity: 5000,
+//         tiers: [{ upto: 1000, price: "0.023" }, { upto: null, price: "0.022" }] },
+//       { id: "web", name: "Web servers", unit: "instance", quantity: 6, hours: 730,
+//         tiers: [{ upto: null, price: "0.0416" }], reserved: { price: "0.026", upfront: "0", term_months: 12 } },
+//   ]} on_change={(b) => { total = b.monthly }}/>
+//
+// resources: a list of maps. id: what its fields are named by (else its name or place).
+// name, unit: what shows. quantity: where its field starts. hours: for what is billed
+// by the hour, the hours a month each one runs, with a field of its own; the usage is
+// quantity times hours, left out it is the quantity. tiers: the graduated prices, in
+// order, each { upto: the usage this tier ends at, cumulative, null for no end; price:
+// for each unit, as text, a decimal or a number }. reserved: if it can be reserved,
+// { price: for each unit or hour, upfront: for each one, once (0), term_months: what
+// upfront is spread over (12), hours: what a reservation pays for each month (730) }.
+// reserve: true starts it reserved. currency: ISO code ("USD"). locale: how to write
+// amounts (the program's). title: its heading. id: a prefix for its ids, unique on the
+// page. The fields are named qty_<id>, hours_<id> and reserve_<id>, so a form around it
+// sends them. on_change(bill): inside one of your components, given { monthly, yearly,
+// on_demand, saving } as decimals after each change. class: more classes for its outer
+// element.
+//
+// cloud_cost_estimator_tiers(usage, tiers) prices a usage, unrounded;
+// cloud_cost_estimator_bill(resources, picks, currency) is the whole bill, for a
+// program's own use, where picks is { <id>: { quantity, hours, reserve } } and may be {}.
+
+import ui/theme.qwe use ui_cls
+
+let cloud_cost_estimator_css = css`
+.ui-cloud-cost { display: grid; gap: 16px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-cloud-cost .ui-cloud-cost-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-cloud-cost-scroll { overflow-x: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-cloud-cost-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-cloud-cost table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-cloud-cost th, .ui-cloud-cost td { padding: 8px 10px; border-bottom: 1px solid var(--ui-border); text-align: right; vertical-align: top; }
+.ui-cloud-cost th:first-child, .ui-cloud-cost td:first-child { min-width: 170px; text-align: left; }
+.ui-cloud-cost thead th { background: var(--ui-subtle); color: var(--ui-muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
+.ui-cloud-cost tfoot th, .ui-cloud-cost tfoot td { border-bottom: 0; font-size: 15px; font-weight: 700; }
+.ui-cloud-cost-input { box-sizing: border-box; width: 92px; height: 32px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; text-align: right; }
+.ui-cloud-cost-input:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-cloud-cost-input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-cloud-cost-check { width: 16px; height: 16px; margin: 8px 0 0; accent-color: var(--ui-accent); }
+.ui-cloud-cost-check:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-cloud-cost-unit { display: block; color: var(--ui-muted); font-size: 12px; }
+.ui-cloud-cost-parts summary { color: var(--ui-muted); font-size: 12px; cursor: pointer; }
+.ui-cloud-cost-parts summary:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 4px; }
+.ui-cloud-cost-parts ul { margin: 4px 0 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 12px; }
+.ui-cloud-cost-sum { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 0; }
+.ui-cloud-cost-sum > div { padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-cloud-cost-sum dt { color: var(--ui-muted); font-size: 12px; }
+.ui-cloud-cost-sum dd { margin: 2px 0 0; font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-cloud-cost-say { display: grid; gap: 6px; }
+.ui-cloud-cost-say h4 { margin: 0; font-size: 14px; }
+.ui-cloud-cost-say p { margin: 0; }
+.ui-cloud-cost-drivers { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-cloud-cost-driver { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; }
+.ui-cloud-cost-bar { grid-column: 1 / -1; height: 6px; overflow: hidden; border-radius: 999px; background: var(--ui-subtle); }
+.ui-cloud-cost-bar span { display: block; height: 100%; background: var(--ui-accent); }
+.ui-cloud-cost-advice { display: grid; gap: 4px; margin: 0; padding: 0 0 0 18px; font-size: 13px; }
+.ui-cloud-cost-error { margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-cloud-cost-warn { margin: 0; color: var(--ui-warning); font-size: 13px; }
+`
+
+// A price or a quantity as a decimal: null when it is not a number of 0 or more that
+// the sums can hold (15 digits before the point), which also keeps the multiplying
+// away from Quillo's `decimal overflow`, a runtime error.
+fn cloud_cost_estimator_num(x) {
+    if x == null { return null }
+    let t = trim(replace(str(x), ",", ""))
+    re.test(t, "^\\+?\\d{1,15}(\\.\\d{0,12})?$") || re.test(t, "^\\.\\d{1,12}$") ? dec(t) : null
+}
+
+// A usage priced through graduated tiers: { amount (exact, unrounded), parts: [{ from,
+// to, units, price, amount }], beyond (usage past the last tier's end, priced at its
+// price), problem (text, or null) }.
+fn cloud_cost_estimator_tiers(usage, tiers) -> map {
+    let none = (problem) => { amount: 0m, parts: [], beyond: 0m, problem }
+    if type_of(tiers) != "list" || len(tiers) == 0 { return none("has no prices") }
+    let parts = []
+    let total = 0m
+    let from = 0m
+    let left = usage
+    let n = len(tiers)
+    let i = 0
+    let problem = null
+    let beyond = 0m
+    while i < n && problem == null {
+        let t = tiers[i]
+        let price = type_of(t) == "map" ? cloud_cost_estimator_num(t.price) : null
+        let upto = type_of(t) == "map" ? cloud_cost_estimator_num(t.upto) : null
+        let open_ended = type_of(t) == "map" && t.upto == null
+        if price == null { problem = `tier ${i + 1} has no usable price` }
+        else if !open_ended && upto == null { problem = `tier ${i + 1} has a bad end` }
+        else if !open_ended && upto <= from { problem = `tier ${i + 1} ends at ${str(upto)}, not past ${str(from)}` }
+        else if open_ended && i < n - 1 { problem = `tier ${i + 1} has no end, yet another follows it` }
+        else {
+            let last_one = i == n - 1
+            let room = open_ended ? left : upto - from
+            let units = last_one ? left : (left < room ? left : room)
+            if last_one && !open_ended && left > room { beyond = left - room }
+            if units > 0 {
+                let amount = units * price
+                parts = push(parts, { from, to: from + units, units, price, amount })
+                total = total + amount
+                left = left - units
+            }
+            from = open_ended ? from : upto
+        }
+        i += 1
+    }
+    problem != null ? none(problem) : { amount: total, parts, beyond, problem: null }
+}
+
+// The resources with an id each, unique, kept to what can be shown.
+fn cloud_cost_estimator_resources(resources) -> list {
+    if type_of(resources) != "list" { return [] }
+    let seen = {}
+    let out = []
+    for pair in enumerate(take(resources, 200)) {
+        let r = pair[1]
+        if type_of(r) == "map" {
+            let base = str(r.id ?? r.name ?? `line-${pair[0] + 1}`)
+            let id = has(seen, base) ? `${base}-${pair[0] + 1}` : base
+            seen = set(seen, id, true)
+            out = push(out, { ...r, id, name: str(r.name ?? r.id ?? `Line ${pair[0] + 1}`), unit: r.unit ?? "unit" })
+        }
+    }
+    out
+}
+
+// What a reservation costs a month, exactly, or null if there is none or it is bad.
+fn cloud_cost_estimator_reserved(r: map, quantity) {
+    let rv = r.reserved
+    if type_of(rv) != "map" { return null }
+    let price = cloud_cost_estimator_num(rv.price)
+    let upfront = rv.upfront == null ? 0m : cloud_cost_estimator_num(rv.upfront)
+    let term = rv.term_months == null ? 12m : cloud_cost_estimator_num(rv.term_months)
+    let hours = r.hours == null ? 1m : (rv.hours == null ? 730m : cloud_cost_estimator_num(rv.hours))
+    if price == null || upfront == null || term == null || term == 0 || hours == null { return null }
+    quantity * hours * price + quantity * upfront / term
+}
+
+// An exact amount as money, rounded once; null if the currency cannot hold it.
+fn cloud_cost_estimator_money(amount, currency: str) {
+    let m = money.of(amount, currency, "half_up")
+    type_of(m) == "error" ? null : m
+}
+
+// One line: what a resource costs a month on demand and reserved, and billed.
+fn cloud_cost_estimator_line(r: map, pick: map, currency: str) -> map {
+    let qty_text = pick.quantity ?? r.quantity ?? 0
+    let hours_text = pick.hours ?? r.hours
+    let qty_empty = trim(str(qty_text)) == ""
+    let hours_empty = r.hours != null && trim(str(hours_text ?? "")) == ""
+    let quantity = qty_empty ? 0m : cloud_cost_estimator_num(qty_text)
+    let hours = r.hours == null ? 1m : (hours_empty ? 0m : cloud_cost_estimator_num(hours_text))
+    let base = { id: r.id, name: r.name, unit: r.unit, has_hours: r.hours != null, can_reserve: type_of(r.reserved) == "map", parts: [], beyond: 0m }
+    let zero = money.zero(currency)
+    let failed = (problem, field) => { ...base, problem, field, on_demand: zero, reserved: null, billed: zero, yearly: zero, reserve: false }
+    if quantity == null { return failed("the quantity must be a number of 0 or more", "quantity") }
+    if hours == null { return failed("the hours must be a number of 0 or more", "hours") }
+    if r.hours != null && hours > 744 { return failed("no month has more than 744 hours", "hours") }
+    let priced = cloud_cost_estimator_tiers(quantity * hours, r.tiers)
+    if priced.problem != null { return failed(priced.problem, null) }
+    let on_demand = cloud_cost_estimator_money(priced.amount, currency)
+    let held = cloud_cost_estimator_reserved(r, quantity)
+    let reserved = held == null ? null : cloud_cost_estimator_money(held, currency)
+    if on_demand == null || (held != null && reserved == null) { return failed("is too large to add up", "quantity") }
+    let reserve = reserved != null && (pick.reserve ?? r.reserve ?? false) == true
+    let billed = reserve ? reserved : on_demand
+    { ...base, problem: null, field: null, usage: quantity * hours, quantity, hours, parts: priced.parts, beyond: priced.beyond, on_demand, reserved, billed,
+      yearly: money.mul(billed, 12), reserve, flat: type_of(r.tiers) == "list" && len(r.tiers) == 1 ? cloud_cost_estimator_num(r.tiers[0].price) : null }
+}
+
+// Shares of a total in tenths of a percent, by largest remainder, so they add up to
+// 100.0 exactly when anything was spent.
+fn cloud_cost_estimator_shares(amounts: list, total) -> list {
+    if total == 0 { return amounts | map((a) => 0) }
+    let raw = amounts | map((a) => a * 1000 / total)
+    let floors = raw | map((x) => int(floor(x)))
+    let short = 1000 - sum(floors)
+    let order = sort_by(enumerate(raw), (p) => 0m - (p[1] - floor(p[1]))) | map((p) => p[0])
+    let lucky = take(order, short)
+    enumerate(floors) | map((p) => contains(lucky, p[0]) ? p[1] + 1 : p[1])
+}
+
+fn cloud_cost_estimator_tenths(n: int) -> str = `${floor(n / 10)}.${n % 10}%`
+
+// The percent `part` is of `whole`, one place, as text.
+fn cloud_cost_estimator_pct(part, whole) -> str = whole == 0 ? "0%" : `${re.replace(str(round(part * 100 / whole, 1, "half_up")), "\\.0$", "")}%`
+
+// The whole bill. See the top of the file.
+fn cloud_cost_estimator_bill(resources, picks: map, currency: str) -> map {
+    let rows = cloud_cost_estimator_resources(resources)
+    let lines = rows | map((r) => cloud_cost_estimator_line(r, get(picks, r.id) ?? {}, currency))
+    let zero = money.zero(currency)
+    let add = (xs) => reduce(xs, zero, (t, m) => money.add(t, m))
+    let monthly = add(lines | map((l) => l.billed))
+    let yearly = add(lines | map((l) => l.yearly))
+    let on_demand = add(lines | map((l) => l.on_demand))
+    let saving = money.sub(on_demand, monthly)
+    let shares = cloud_cost_estimator_shares(lines | map((l) => l.billed.amount), monthly.amount)
+    let drivers = reverse(sort_by(reverse(enumerate(lines)), (p) => p[1].billed.amount))
+        | map((p) => { id: p[1].id, name: p[1].name, billed: p[1].billed, tenths: shares[p[0]], line: p[1] })
+    { lines, monthly, yearly, on_demand, saving, drivers }
+}
+
+// "1,000" for a whole number, else up to 4 places: a usage or an hour count.
+fn cloud_cost_estimator_count(d) -> str {
+    let s = str(round(d, 4, "half_up"))
+    let t = contains(s, ".") ? re.replace(s, "\\.?0+$", "") : s
+    let at = index_of(t, ".")
+    format_number(dec(t), "en-US", at == null ? 0 : len(t) - at - 1)
+}
+
+// Advice on reservations, a line each, in order of what it is worth.
+fn cloud_cost_estimator_advice(lines: list, shown) -> list {
+    let tips = []
+    for l in lines {
+        if l.reserved != null && l.problem == null {
+            let gain = money.sub(l.on_demand, l.reserved)
+            let d = gain.amount
+            let per = l.has_hours ? `at ${cloud_cost_estimator_count(l.hours)} hours a month ` : ""
+            if d > 0 && !l.reserve {
+                tips = push(tips, { worth: d, text: `Reserving ${l.name} saves ${shown(gain)} a month (${cloud_cost_estimator_pct(d, l.on_demand.amount)}).` })
+            } else if d < 0 {
+                let even = l.has_hours && l.flat != null && l.flat > 0 && l.quantity > 0 ? l.reserved.amount / (l.quantity * l.flat) : null
+                let tail = even != null ? ` It pays from ${cloud_cost_estimator_count(even)} hours a month.` : ""
+                tips = push(tips, { worth: 0m - d, text: `${l.name} ${per}costs less on demand: reserving adds ${shown(money.neg(gain))} a month.${tail}` })
+            }
+        }
+    }
+    reverse(sort_by(tips, (t) => t.worth)) | map((t) => t.text)
+}
+
+// What drives the bill, in a sentence or two.
+fn cloud_cost_estimator_driver_text(bill: map, shown) -> str {
+    let d = bill.drivers
+    if len(d) == 0 || bill.monthly.amount == 0 { return "Nothing is being spent yet." }
+    let top = d[0]
+    let tied = len(d) > 1 && d[1].billed.amount == top.billed.amount
+    let first = tied ? `${top.name} and ${d[1].name} cost the same, the most on the bill, at ${shown(top.billed)} a month each.`
+        : `${top.name} drives the bill most: ${shown(top.billed)} a month, ${cloud_cost_estimator_tenths(top.tenths)} of it.`
+    let parts = top.line.parts
+    if tied || len(parts) < 2 { return first }
+    let biggest = reverse(sort_by(parts, (p) => p.amount))[0]
+    `${first} Most of that is the ${cloud_cost_estimator_count(biggest.units)} ${top.line.unit} at ${str(biggest.price)} each.`
+}
+
+component CloudCostEstimator(resources = [], currency: str = "USD", locale: str? = null, title: str = "Monthly cloud cost", id: str = "cloud-cost-estimator",
+                             on_change = null, class: str? = null) {
+    style global cloud_cost_estimator_css
+    state picks = {}
+    let code = upper(currency)
+    let bill = cloud_cost_estimator_bill(resources, picks, code)
+    let shown = (m) => locale != null ? money.format(m, locale) : money.format(m)
+    let problems = bill.lines | filter((l) => l.problem != null)
+    let advice = cloud_cost_estimator_advice(bill.lines, shown)
+    let beyond = bill.lines | filter((l) => l.beyond > 0)
+    let pick = (l, field: str, v) => {
+        picks = set(picks, l.id, set(get(picks, l.id) ?? {}, field, v))
+        if on_change != null {
+            let b = cloud_cost_estimator_bill(resources, picks, code)
+            on_change({ monthly: b.monthly.amount, yearly: b.yearly.amount, on_demand: b.on_demand.amount, saving: b.saving.amount })
+        }
+    }
+    let typed = (l, field: str, start) => {
+        let v = get(get(picks, l.id) ?? {}, field)
+        str(v ?? start ?? "")
+    }
+    let start_of = (l, field: str) => {
+        let r = find(cloud_cost_estimator_resources(resources), (x) => x.id == l.id)
+        get(r, field)
+    }
+    <section class={ui_cls(["ui-cloud-cost", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-cloud-cost-title id={`${id}-title`}>{title}</h3>
+        {len(bill.lines) == 0 ? <p.ui-cloud-cost-warn>No resources to price.</p> : <div.ui-cloud-cost-scroll tabindex="0" role="region" aria-label="Cost by resource">
+            <table>
+                <thead><tr><th scope="col">Resource</th><th scope="col">Quantity</th><th scope="col">Hours a month</th><th scope="col">Reserve</th><th scope="col">Monthly</th><th scope="col">Yearly</th></tr></thead>
+                <tbody>
+                    {for l in bill.lines => <tr key={l.id}>
+                        <td>
+                            {l.name}
+                            {len(l.parts) > 0 && <details.ui-cloud-cost-parts>
+                                <summary>{len(l.parts) == 1 ? "1 tier used" : `${len(l.parts)} tiers used`}</summary>
+                                <ul>{for p in l.parts => <li key={str(p.from)}>{`${cloud_cost_estimator_count(p.units)} ${l.unit} × ${str(p.price)} = ${str(p.amount)}`}</li>}</ul>
+                            </details>}
+                        </td>
+                        <td>
+                            <input.ui-cloud-cost-input type="text" inputmode="decimal" name={`qty_${l.id}`} aria-label={`${l.name} quantity`} autocomplete="off"
+                                   value={typed(l, "quantity", start_of(l, "quantity"))} aria-invalid={l.field == "quantity" ? "true" : null}
+                                   @input={(e) => { pick(l, "quantity", e.value) }}/>
+                            <span.ui-cloud-cost-unit>{l.unit}</span>
+                        </td>
+                        <td>{l.has_hours && <input.ui-cloud-cost-input type="text" inputmode="decimal" name={`hours_${l.id}`} aria-label={`${l.name} hours a month`} autocomplete="off"
+                                   value={typed(l, "hours", start_of(l, "hours"))} aria-invalid={l.field == "hours" ? "true" : null}
+                                   @input={(e) => { pick(l, "hours", e.value) }}/>}</td>
+                        <td>{l.can_reserve && <input.ui-cloud-cost-check type="checkbox" name={`reserve_${l.id}`} aria-label={`Reserve ${l.name}`} checked={l.reserve}
+                                   @change={(e) => { pick(l, "reserve", e.checked) }}/>}</td>
+                        <td data-cell="monthly">{shown(l.billed)}</td>
+                        <td data-cell="yearly">{shown(l.yearly)}</td>
+                    </tr>}
+                </tbody>
+                <tfoot><tr><th scope="row" colspan="4">Total</th><td data-cell="monthly">{shown(bill.monthly)}</td><td data-cell="yearly">{shown(bill.yearly)}</td></tr></tfoot>
+            </table>
+        </div>}
+        {len(problems) > 0 && <ul.ui-cloud-cost-error role="alert">
+            {for l in problems => <li key={l.id}>{`${l.name}: ${l.problem}. It is left out of the totals.`}</li>}
+        </ul>}
+        {for l in beyond => <p.ui-cloud-cost-warn key={l.id}>{`${l.name} goes ${cloud_cost_estimator_count(l.beyond)} ${l.unit} past its last tier, priced at that tier.`}</p>}
+        <dl.ui-cloud-cost-sum aria-live="polite">
+            <div data-stat="monthly"><dt>A month, as chosen</dt><dd>{shown(bill.monthly)}</dd></div>
+            <div data-stat="yearly"><dt>A year, as chosen</dt><dd>{shown(bill.yearly)}</dd></div>
+            <div data-stat="demand"><dt>A month, all on demand</dt><dd>{shown(bill.on_demand)}</dd></div>
+            <div data-stat="saving"><dt>{bill.saving.amount < 0 ? "Reserving costs more" : "Saved by reserving"}</dt>
+                <dd>{`${shown(bill.saving.amount < 0 ? money.neg(bill.saving) : bill.saving)} (${cloud_cost_estimator_pct(abs(bill.saving.amount), bill.on_demand.amount)})`}</dd></div>
+        </dl>
+        <div.ui-cloud-cost-say>
+            <h4>What drives the bill</h4>
+            <p data-say="driver">{cloud_cost_estimator_driver_text(bill, shown)}</p>
+            {bill.monthly.amount > 0 && <ul.ui-cloud-cost-drivers>
+                {for d in bill.drivers => <li.ui-cloud-cost-driver key={d.id}>
+                    <span>{d.name}</span><span>{cloud_cost_estimator_tenths(d.tenths)}</span>
+                    <div.ui-cloud-cost-bar aria-hidden="true"><span style={`width: ${cloud_cost_estimator_tenths(d.tenths)}`}></span></div>
+                </li>}
+            </ul>}
+            {len(advice) > 0 && <ul.ui-cloud-cost-advice>{for t in advice => <li key={t}>{t}</li>}</ul>}
+        </div>
+    </section>
+}

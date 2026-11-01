@@ -1,0 +1,319 @@
+// DataProfiler: what a list of rows holds, column by column, before anyone trusts
+// it: each column's type worked out from its values, how much is missing, how many
+// distinct values, the range (minimum, maximum and mean, or the shortest and longest
+// text), the commonest values, and warnings in plain words: mostly empty, one value
+// only, mixed types, likely an id, numbers kept as text, stray spaces, values that
+// differ only by case, and stand-ins such as "n/a". Means are exact, worked out in
+// decimals, so 0.1 and 0.2 average 0.15.
+//
+//   <DataProfiler id="orders" rows={orders}/>
+//   <DataProfiler id="import" rows={rows} columns={["sku", "price"]} top={5} mostly_empty={60}
+//                 on_select={(c) => { picked = c.key }}/>
+//
+// id: a prefix for its ids, unique on the page. rows: a list of maps; anything else
+// in the list is counted and left out. columns: which keys, in which order (left
+// out, every key the rows have, first seen first, up to 200). top: how many of the
+// commonest values each column shows (3). mostly_empty: the percentage missing at
+// which a column is called mostly empty (80). limit: the most rows read (20,000);
+// past it the report says so. title: the heading ("Data profile"). on_select(column):
+// inside one of your components, given a column's profile when its card is picked.
+// class: more classes for its outer element.
+//
+// A value is missing when it is null, empty or only spaces. Numbers may be text
+// ("12.50", "1,200"), though not with a leading zero ("007" is a code, and so is
+// every run of digits in its column). Dates are
+// ISO text, a date-time with T or a space, and with no offset taken as UTC. A list or
+// a map is nested data, compared as JSON.
+//
+// data_profiler_profile(rows, columns, top, mostly_empty, limit) is the analysis, for
+// a program: { total, read, skipped, columns }, each column { key, type, missing,
+// missing_pct, distinct, low, high, mean, shortest, longest, top, warnings }.
+
+import ui/theme.qwe use ui_cls
+
+let data_profiler_css = css`
+.ui-dprof { display: grid; gap: 12px; min-width: 0; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-dprof .ui-dprof-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-dprof-sum { margin: 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-dprof-note { margin: 0; color: var(--ui-warning); font-size: 13px; }
+.ui-dprof-empty { margin: 0; padding: 20px; border: 1px dashed var(--ui-strong); border-radius: var(--ui-radius-sm); color: var(--ui-muted); text-align: center; }
+.ui-dprof-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.ui-dprof-find { box-sizing: border-box; width: 200px; max-width: 100%; height: 32px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); }
+.ui-dprof-find:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-dprof-only { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.ui-dprof-only input { margin: 0; accent-color: var(--ui-accent); }
+.ui-dprof-only input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-dprof-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr)); gap: 10px; }
+.ui-dprof-card { display: grid; align-content: start; gap: 8px; min-width: 0; padding: 12px 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-dprof-warned { border-left: 3px solid var(--ui-warning); }
+.ui-dprof-picked { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-dprof-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; }
+.ui-dprof .ui-dprof-name { min-width: 0; margin: 0; padding: 0; border: 0; background: none; color: inherit; font: 600 14px var(--ui-font); overflow-wrap: anywhere; text-align: left; cursor: pointer; }
+.ui-dprof-name:hover { color: var(--ui-accent); }
+.ui-dprof-name:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 3px; }
+.ui-dprof-type { flex: none; padding: 1px 7px; border-radius: 999px; background: var(--ui-accent-soft); color: var(--ui-accent); font-size: 11px; font-weight: 600; }
+.ui-dprof-meter { height: 5px; overflow: hidden; border-radius: 3px; background: var(--ui-subtle); }
+.ui-dprof-meter span { display: block; height: 100%; background: var(--ui-accent); }
+.ui-dprof-stats { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 12px; margin: 0; font-size: 13px; }
+.ui-dprof-stats dt { color: var(--ui-muted); }
+.ui-dprof-stats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-dprof-top { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-dprof-top li { display: flex; justify-content: space-between; gap: 8px; }
+.ui-dprof-top span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.ui-dprof-top span:last-child { flex: none; color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+.ui-dprof-warn { display: grid; gap: 3px; margin: 0; padding: 0; list-style: none; color: var(--ui-warning); font-size: 13px; }
+`
+
+let data_profiler_names = { integer: "Integer", decimal: "Decimal", boolean: "Yes/no", date: "Date", datetime: "Date-time", text: "Text",
+                            nested: "Nested", mixed: "Mixed", empty: "Empty" }
+let data_profiler_said = { integer: "whole number", decimal: "decimal", boolean: "yes/no value", date: "date", datetime: "date-time", text: "text value", nested: "nested value" }
+
+// A value's kind: missing, integer, decimal, boolean, date, datetime, text or nested.
+fn data_profiler_kind(v) -> str {
+    let t = type_of(v)
+    if t == "null" { return "missing" }
+    if t == "bool" { return "boolean" }
+    if t == "int" { return "integer" }
+    if t == "float" || t == "dec" { return data_profiler_dec(v) == null || v == floor(v) ? "integer" : "decimal" }
+    if t != "str" { return "nested" }
+    let s = trim(v)
+    if s == "" { return "missing" }
+    if len(s) <= 40 && re.test(s, "^[-+]?(0|[1-9]\\d*|[1-9]\\d{0,2}(,\\d{3})+)(\\.\\d+)?$") && data_profiler_dec(s) != null {
+        return contains(s, ".") ? "decimal" : "integer"
+    }
+    if re.test(s, "^\\d{4}-\\d{2}-\\d{2}$") && date.valid(s, "date") { return "date" }
+    data_profiler_moment(s) != null ? "datetime" : "text"
+}
+
+// A date-time as text the date module takes: T or a space, and with no offset, UTC.
+// Databases write them so, and date.valid and date.ms take only the full form. Or null.
+fn data_profiler_moment(s: str) -> str? {
+    let m = re.find(s, "^(\\d{4}-\\d{2}-\\d{2})[T ](\\d{2}:\\d{2})(:\\d{2}(?:\\.\\d+)?)?(Z|[+-]\\d{2}:\\d{2})?$")
+    if m == null { return null }
+    let full = `${m.groups[0]}T${m.groups[1]}${m.groups[2] ?? ":00"}${m.groups[3] ?? "Z"}`
+    date.valid(full, "date-time") ? full : null
+}
+
+// A number (or numeric text) as a decimal: null when it will not fit. Past 24 digits
+// a sum of the row limit's worth could overflow, which stops the handler, so such
+// a value is counted apart.
+fn data_profiler_dec(v) {
+    let t = type_of(v)
+    if t == "float" && abs(v) >= 1000000000000000000000000.0 { return null }
+    let d = t == "str" ? dec(replace(trim(v), ",", "")) : dec(v)
+    if is_err(d) { return null }
+    len(str(floor(abs(d)))) > 24 ? null : d
+}
+
+// A decimal without zeros at the end: 12.50 stays as it came, a mean of 0.150000 does not.
+fn data_profiler_trim(d) -> str {
+    let s = str(d)
+    contains(s, ".") ? re.replace(s, "\\.?0+$", "") : s
+}
+
+// A value as text, the same on the server and in the browser.
+fn data_profiler_text(v) -> str = match type_of(v) {
+    "str" => v
+    "bool" => v ? "true" : "false"
+    "null" => ""
+    "int" | "float" | "dec" => {
+        let d = data_profiler_dec(v)
+        d == null ? str(v) : str(d)
+    }
+    _ => json.stringify(v)
+}
+
+fn data_profiler_short(s: str, n: int = 60) -> str = len(s) > n ? slice(s, 0, n) + "…" : s
+
+// n as a percentage of `whole`, to a tenth, without a trailing zero.
+fn data_profiler_pct(n: int, whole: int) -> str =
+    whole == 0 ? "0" : data_profiler_trim(round(dec(n) * 100 / dec(whole), 1, "half_up"))
+
+// The values with their counts, the commonest first; ties in the order first seen.
+// Values that are the same number count as one, whichever way they are written.
+fn data_profiler_tally(items: list) -> list {
+    let seen = {}
+    for [i, v] in enumerate(items) {
+        let k = data_profiler_text(v)
+        let was = get(seen, k)
+        seen = set(seen, k, was == null ? { value: k, n: 1, at: i } : { ...was, n: was.n + 1 })
+    }
+    sort_by(sort_by(values(seen), (x) => x.at), (x) => -x.n)
+}
+
+fn data_profiler_plural(n: int, one: str, many: str) -> str = `${n} ${n == 1 ? one : many}`
+
+// One column's profile.
+fn data_profiler_column(key: str, cells: list, top_n: int, mostly: int) -> map {
+    let total = len(cells)
+    // One value with a leading zero makes the column's digits codes, so 007 and 100
+    // are both text, not a mix.
+    let coded = any(cells, (v) => type_of(v) == "str" && re.test(trim(v), "^0\\d+$"))
+    let present = cells | map((v) => {
+        let k = data_profiler_kind(v)
+        { v, kind: coded && k == "integer" && type_of(v) == "str" ? "text" : k }
+    }) | filter((x) => x.kind != "missing")
+    let filled = len(present)
+    let missing = total - filled
+    let kinds = group_by(present, (x) => x.kind)
+    let kind_list = keys(kinds)
+    let only = (names: list) => all(kind_list, (k) => contains(names, k))
+    let words = present | map((x) => type_of(x.v) == "str" ? lower(trim(x.v)) : "?")
+    let type = filled == 0 ? "empty"
+        : (len(kind_list) == 1 && kind_list[0] == "text" && all(words, (w) => contains(["yes", "no", "true", "false"], w)) ? "boolean"
+        : (len(kind_list) == 1 ? kind_list[0]
+        : (only(["integer", "decimal"]) ? "decimal"
+        : (only(["date", "datetime"]) ? "datetime" : "mixed"))))
+    let items = present | map((x) => x.v)
+    let tally = data_profiler_tally(items)
+    let distinct = len(tally)
+    let numeric = type == "integer" || type == "decimal"
+    let nums = numeric ? items | map(data_profiler_dec) : []
+    let exact = nums | filter((d) => d != null)
+    let huge = len(nums) - len(exact)
+    let texts = numeric ? [] : items | map(data_profiler_text)
+    let by_len = sort_by(texts, (s) => len(s))
+    let dated = type == "date" || type == "datetime"
+    let times = type == "datetime" ? sort_by(texts, (s) => date.ms(data_profiler_moment(trim(s)) ?? `${trim(s)}T00:00:00Z`))
+        : (type == "date" ? sort(texts | map((s) => trim(s))) : [])
+    let warnings = data_profiler_warnings(key, cells, { total, filled, missing, type, kinds, items, tally, distinct, huge, mostly })
+    {
+        key, type, total, missing, missing_pct: data_profiler_pct(missing, total), distinct,
+        low: numeric && len(exact) > 0 ? str(min(exact)) : (dated ? times[0] : null),
+        high: numeric && len(exact) > 0 ? str(max(exact)) : (dated ? times[-1] : null),
+        mean: numeric && len(exact) > 0 ? data_profiler_trim(round(sum(exact) / len(exact), 6)) : null,
+        shortest: !numeric && !dated && len(by_len) > 0 ? by_len[0] : null,
+        longest: !numeric && !dated && len(by_len) > 0 ? reverse(sort_by(reverse(texts), (s) => len(s)))[0] : null,
+        top: take(tally, top_n) | map((x) => { value: x.value, n: x.n, pct: data_profiler_pct(x.n, filled) }),
+        warnings,
+    }
+}
+
+// The warnings of a column, most serious first.
+fn data_profiler_warnings(key: str, cells: list, p: map) -> list {
+    let out = []
+    let texts = p.items | filter((v) => type_of(v) == "str")
+    if p.filled == 0 && p.total > 0 { out = push(out, "Empty: no row has a value here.") }
+    if p.filled > 0 && p.missing * 100 >= p.mostly * p.total {
+        out = push(out, `Mostly empty: ${data_profiler_pct(p.missing, p.total)}% of rows have no value.`)
+    }
+    if p.distinct == 1 && p.filled > 1 {
+        out = push(out, `One value only: every filled row says "${data_profiler_short(p.tally[0].value, 30)}".`)
+    }
+    if p.type == "mixed" {
+        let parts = reverse(sort_by(reverse(keys(p.kinds)), (k) => len(get(p.kinds, k))))
+        let said = parts | map((k) => {
+            let n = len(get(p.kinds, k))
+            `${n} ${get(data_profiler_said, k) ?? k}${n == 1 ? "" : "s"}`
+        })
+        out = push(out, `Mixed types: ${join(said, ", ")}.`)
+    }
+    let unbroken = all(p.items, (v) => !contains(data_profiler_text(v), " "))
+    let named = re.test(key, "(^|[_\\s-])(id|uuid|guid|key|code|sku|ref)$", "i") || re.test(key, "[a-z](Id|ID|Uuid)$")
+    let whole = p.type == "integer" || p.type == "text"
+    if p.total >= 3 && p.missing == 0 && p.distinct == p.total && whole && unbroken && (named || p.type == "integer") {
+        out = push(out, "Likely an id: every row has its own value.")
+    }
+    if p.huge > 0 { out = push(out, `${data_profiler_plural(p.huge, "number is", "numbers are")} too large to add up, and left out of the range and mean.`) }
+    let as_text = texts | filter((v) => contains(["integer", "decimal"], data_profiler_kind(v)))
+    if (p.type == "integer" || p.type == "decimal") && len(as_text) > 0 { out = push(out, `Numbers kept as text in ${data_profiler_plural(len(as_text), "row", "rows")}.`) }
+    let spaced = texts | filter((v) => v != trim(v) && trim(v) != "")
+    if len(spaced) > 0 { out = push(out, `${data_profiler_plural(len(spaced), "value has", "values have")} spaces at the start or end.`) }
+    let cased = len(data_profiler_tally(texts | map((v) => lower(trim(v)))))
+    let plain = len(data_profiler_tally(texts | map((v) => trim(v))))
+    if cased < plain { out = push(out, "Some values differ only by case, such as Paris and paris.") }
+    let stand_ins = texts | filter((v) => contains(["n/a", "na", "none", "null", "unknown", "-", "--", "?", "tbd"], lower(trim(v))))
+    if len(stand_ins) > 0 { out = push(out, `${data_profiler_plural(len(stand_ins), "value looks", "values look")} like a stand-in for nothing, such as "${data_profiler_short(trim(stand_ins[0]), 12)}".`) }
+    out
+}
+
+// The keys of the rows, first seen first.
+fn data_profiler_keys(rows: list) -> list {
+    let seen = {}
+    let order = []
+    for r in rows {
+        for k in keys(r) {
+            if !has(seen, k) {
+                seen = set(seen, k, true)
+                order = push(order, k)
+            }
+        }
+    }
+    order
+}
+
+// The whole report: { total, read, skipped, columns, more_columns }.
+fn data_profiler_profile(rows, columns: list? = null, top_n: int = 3, mostly: int = 80, limit: int = 20000) -> map {
+    let given = type_of(rows) == "list" ? rows : []
+    let cut = take(given, limit)
+    let records = cut | filter((r) => type_of(r) == "map")
+    let found = columns != null ? columns | map((c) => str(c)) : data_profiler_keys(records)
+    let used = take(found, 200)
+    {
+        total: len(given), read: len(records), skipped: len(cut) - len(records), valid: type_of(rows) == "list",
+        more_columns: len(found) - len(used),
+        columns: used | map((k) => data_profiler_column(k, records | map((r) => get(r, k)), top_n, mostly)),
+    }
+}
+
+component DataProfiler(id: str, rows = [], columns: list? = null, top: int = 3, mostly_empty: int = 80, limit: int = 20000,
+                       title: str = "Data profile", on_select = null, class: str? = null) {
+    style global data_profiler_css
+    state only_warned = false
+    state search = ""
+    state picked = null
+    let report = data_profiler_profile(rows, columns, top, mostly_empty, limit)
+    let warned = report.columns | filter((c) => len(c.warnings) > 0)
+    let needle = lower(trim(search))
+    let shown = report.columns | filter((c) => (!only_warned || len(c.warnings) > 0) && (needle == "" || contains(lower(c.key), needle)))
+    let warning_count = sum(warned | map((c) => len(c.warnings)))
+    <section class={ui_cls(["ui-dprof", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-dprof-title id={`${id}-title`}>{title}</h3>
+        {!report.valid && <p.ui-dprof-note role="alert">These rows are not a list, so there is nothing to profile.</p>}
+        {report.valid && <p.ui-dprof-sum aria-live="polite">
+            {`${data_profiler_plural(report.read, "row", "rows")}, ${data_profiler_plural(len(report.columns), "column", "columns")}, ${data_profiler_plural(warning_count, "warning", "warnings")}`}
+            {len(shown) < len(report.columns) && ` · showing ${len(shown)}`}
+        </p>}
+        {report.total > limit && <p.ui-dprof-note>{`Only the first ${format_number(limit, "en-US", 0)} of ${format_number(report.total, "en-US", 0)} rows are read.`}</p>}
+        {report.skipped > 0 && <p.ui-dprof-note>{`${data_profiler_plural(report.skipped, "item is", "items are")} not a record, and left out.`}</p>}
+        {report.more_columns > 0 && <p.ui-dprof-note>{`${report.more_columns} more columns are left out: only the first 200 are read.`}</p>}
+        {report.valid && len(report.columns) == 0 && <p.ui-dprof-empty>No rows to profile.</p>}
+        {len(report.columns) > 0 && <div.ui-dprof-bar>
+            <input.ui-dprof-find type="search" id={`${id}-find`} aria-label="Find a column" placeholder="Find a column" autocomplete="off"
+                   value={search} @input={(e) => { search = e.value }}/>
+            <label.ui-dprof-only><input type="checkbox" id={`${id}-only`} checked={only_warned} @change={(e) => { only_warned = e.checked }}/> Only columns with warnings</label>
+        </div>}
+        <div.ui-dprof-cards>
+            {for c in shown => {
+                let k = c.key
+                <article key={k} data-key={k} class={ui_cls(["ui-dprof-card", len(c.warnings) > 0 && "ui-dprof-warned", picked == k && "ui-dprof-picked"])}>
+                    <div.ui-dprof-head>
+                        <button.ui-dprof-name type="button" aria-pressed={picked == k ? "true" : "false"}
+                                @click={() => { picked = k; on_select && on_select(c) }}>{k}</button>
+                        <span.ui-dprof-type>{get(data_profiler_names, c.type)}</span>
+                    </div>
+                    <div.ui-dprof-meter role="img" aria-label={`${c.missing_pct}% missing`}><span style={`width: ${100 - float(c.missing_pct)}%`}></span></div>
+                    <dl.ui-dprof-stats>
+                        <dt>Missing</dt><dd data-stat="missing">{`${c.missing_pct}% (${c.missing} of ${c.total})`}</dd>
+                        <dt>Distinct</dt><dd data-stat="distinct">{c.distinct}</dd>
+                        {c.low != null && <dt>{c.type == "date" || c.type == "datetime" ? "Earliest" : "Minimum"}</dt>}
+                        {c.low != null && <dd data-stat="low">{c.low}</dd>}
+                        {c.high != null && <dt>{c.type == "date" || c.type == "datetime" ? "Latest" : "Maximum"}</dt>}
+                        {c.high != null && <dd data-stat="high">{c.high}</dd>}
+                        {c.mean != null && <dt>Mean</dt>}
+                        {c.mean != null && <dd data-stat="mean">{c.mean}</dd>}
+                        {c.shortest != null && <dt>Shortest</dt>}
+                        {c.shortest != null && <dd data-stat="shortest" title={c.shortest}>{data_profiler_short(c.shortest, 40)}</dd>}
+                        {c.longest != null && <dt>Longest</dt>}
+                        {c.longest != null && <dd data-stat="longest" title={c.longest}>{data_profiler_short(c.longest, 40)}</dd>}
+                    </dl>
+                    {len(c.top) > 0 && <ol.ui-dprof-top aria-label={`Commonest values of ${k}`}>
+                        {for [i, x] in enumerate(c.top) => <li key={i}><span title={x.value}>{data_profiler_short(x.value, 40)}</span><span>{`${x.n} · ${x.pct}%`}</span></li>}
+                    </ol>}
+                    {len(c.warnings) > 0 && <ul.ui-dprof-warn>{for [i, w] in enumerate(c.warnings) => <li key={i}>{w}</li>}</ul>}
+                </article>
+            }}
+        </div>
+    </section>
+}

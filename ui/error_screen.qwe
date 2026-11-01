@@ -1,0 +1,230 @@
+// ErrorScreen: a full screen for when something failed: what happened in words a person
+// can use, what to do, and a way to try again. It tells being offline apart from the
+// server's trouble, as the two need different things from the person: offline there is
+// nothing wrong but the connection, and it tries again by itself when that comes back.
+// It watches the connection all the while, so a server error that was really the phone
+// losing its signal changes to offline, and back.
+//
+//   <ErrorScreen status={503} on_retry={() => load()}/>
+//   <ErrorScreen status={r.status} reason="The price list could not be loaded." reference={r.id}
+//                on_retry={() => { reload() }} home_label="Back to the shop" on_home={() => { go_home() }}/>
+//   <ErrorScreen kind="offline" fill={true} on_retry={() => sync()}/>
+//
+// status: the HTTP status, or null or 0 for no answer at all. From that and the
+// connection it works out what happened: offline, unreachable (online, but no answer),
+// timeout (408, 504), busy (429), down (503), server (other 5xx), signin (401), denied
+// (403), missing (404, 410), request (other 4xx). kind: one of those to say so outright,
+// or "auto" (default). title, text: in place of the words chosen. reason: a sentence of
+// your own, shown under them. reference: a short id to quote, with a button to copy it.
+// retry_label ("Try again"). retry_after: seconds before it may be tried, counted down on
+// the button, for a 429 or a 503. auto_retry: try again by itself when the connection
+// returns (true). home_label, home: a second button; home is a link, for a plain page.
+// fill: it is the screen: fixed to the window and given the focus; else it fills its
+// parent, which needs a height. id, class: for the outer element.
+// children: anything more, under the buttons.
+//
+// on_retry(): inside one of your components. Try the work again, and give back how it
+// went, at once or as a Promise (a `server fn`'s call is one): false, an error value, or
+// { status, reason?, retry_after? } means it failed again, and the screen says so, with
+// the new status; anything else means it worked, and the parent shows what it has. A
+// kind that trying again cannot help (signin, denied, missing) has no such button.
+// on_home(): inside one of your components.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let error_screen_css = css`
+.ui-error-screen {
+  container-type: inline-size; box-sizing: border-box; display: flex; width: 100%; height: 100%; min-height: 100%; overflow-y: auto; overscroll-behavior: contain;
+  background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.5 var(--ui-font);
+  padding: max(16px, var(--ui-safe-top, env(safe-area-inset-top, 0px))) max(20px, var(--ui-safe-right, env(safe-area-inset-right, 0px))) max(16px, var(--ui-safe-bottom, env(safe-area-inset-bottom, 0px))) max(20px, var(--ui-safe-left, env(safe-area-inset-left, 0px)));
+}
+.ui-error-screen-fill { position: fixed; inset: 0; z-index: 60; height: auto; }
+.ui-error-screen-page { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 100%; }
+.ui-error-screen-say { flex: 1; display: grid; align-content: center; justify-items: center; gap: 10px; padding: 16px 0; text-align: center; }
+.ui-error-screen-icon { display: grid; place-items: center; width: 88px; height: 88px; border-radius: 50%; background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-error-screen-offline .ui-error-screen-icon { background: var(--ui-warning-soft); color: var(--ui-warning); }
+.ui-error-screen-icon svg { width: 44px; height: 44px; }
+.ui-error-screen-title { margin: 6px 0 0; font-size: 24px; font-weight: 650; line-height: 1.25; }
+.ui-error-screen-title:focus { outline: none; }
+.ui-error-screen-text { max-width: 44ch; margin: 0; color: var(--ui-muted); }
+.ui-error-screen-reason { max-width: 44ch; margin: 0; }
+.ui-error-screen-state { min-height: 1.5em; margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-error-screen-more { width: 100%; max-width: 420px; margin-top: 4px; text-align: left; }
+.ui-error-screen-more summary { display: flex; align-items: center; min-height: 44px; color: var(--ui-muted); cursor: pointer; }
+.ui-error-screen-more summary:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: var(--ui-radius-sm); }
+.ui-error-screen-more dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0 0 8px; font-size: 14px; }
+.ui-error-screen-more dt { color: var(--ui-muted); }
+.ui-error-screen-more dd { margin: 0; overflow-wrap: anywhere; font-family: var(--ui-mono); user-select: all; -webkit-user-select: all; }
+/* The buttons sit low, where a thumb is. */
+.ui-error-screen-actions { display: grid; gap: 10px; flex: none; }
+.ui-error-screen-actions .ui-btn { width: 100%; }
+@container (min-width: 640px) {
+  .ui-error-screen-page { align-items: center; justify-content: center; }
+  .ui-error-screen-say { flex: none; grid-template-columns: 148px minmax(0, 460px); justify-items: start; column-gap: 28px; align-items: start; text-align: left; }
+  .ui-error-screen-icon { grid-row: 1 / span 6; width: 148px; height: 148px; }
+  .ui-error-screen-icon svg { width: 72px; height: 72px; }
+  .ui-error-screen-say > :not(.ui-error-screen-icon) { grid-column: 2; }
+  .ui-error-screen-title { margin-top: 0; font-size: 28px; }
+  .ui-error-screen-actions { display: flex; justify-content: flex-end; width: min(100%, 636px); }
+  .ui-error-screen-actions .ui-btn { width: auto; min-width: 160px; }
+}
+`
+
+let error_screen_kinds = ["offline", "unreachable", "timeout", "busy", "down", "server", "signin", "denied", "missing", "request"]
+
+// What happened, from what is known. Being offline comes first: a status from before the
+// signal went says nothing about now.
+fn error_screen_kind(kind, status, online) -> str {
+    if kind != null && contains(error_screen_kinds, kind) { return kind }
+    if online == false { return "offline" }
+    let code = type_of(status) == "int" ? status : 0
+    if code <= 0 { return "unreachable" }
+    if code == 408 || code == 504 { return "timeout" }
+    if code == 429 { return "busy" }
+    if code == 503 { return "down" }
+    if code == 401 { return "signin" }
+    if code == 403 { return "denied" }
+    if code == 404 || code == 410 { return "missing" }
+    if code >= 500 { return "server" }
+    if code >= 400 { return "request" }
+    "server"
+}
+
+fn error_screen_words(kind: str) =
+    match kind {
+        "offline" => { title: "You are offline", text: "This device has no connection right now. Nothing you have done is lost.", retry: true, icon: "offline" }
+        "unreachable" => { title: "Cannot reach the server", text: "Your connection is working, but the server did not answer.", retry: true, icon: "cloud" }
+        "timeout" => { title: "That took too long", text: "The server did not answer in time. Your connection is working.", retry: true, icon: "clock" }
+        "busy" => { title: "Too many tries", text: "The server asked us to slow down. Wait a moment, then try again.", retry: true, icon: "clock" }
+        "down" => { title: "Down for a moment", text: "The server is not taking requests just now. It is not your connection.", retry: true, icon: "cloud" }
+        "signin" => { title: "Sign in again", text: "You have been signed out. Sign in to carry on.", retry: false, icon: "lock" }
+        "denied" => { title: "No access", text: "Your account cannot open this. Ask whoever runs it for access.", retry: false, icon: "lock" }
+        "missing" => { title: "Not found", text: "This has moved, or it is no longer here.", retry: false, icon: "search" }
+        "request" => { title: "That could not be done", text: "The server would not take this request. Trying again may not help.", retry: true, icon: "cloud" }
+        _ => { title: "Something went wrong on our side", text: "The server had a problem. It is not your connection.", retry: true, icon: "cloud" }
+    }
+
+// How a try went: what on_retry gave back, once it has come.
+fn error_screen_outcome(r) {
+    if is_err(r) || r == false { return { failed: true, status: null, reason: null, wait: 0 } }
+    if type_of(r) != "map" { return { failed: false } }
+    let code = get(r, "status")
+    let bad = get(r, "ok") == false || get(r, "error") != null || (type_of(code) == "int" && code >= 400)
+    if !bad { return { failed: false } }
+    let wait_for = get(r, "retry_after")
+    { failed: true, status: code, reason: get(r, "reason"), wait: type_of(wait_for) == "int" && wait_for > 0 ? wait_for : 0 }
+}
+
+fn error_screen_icon(name: str) =
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        {match name {
+            "offline" => <path d="M3 3l18 18M8.5 16.5a5 5 0 0 1 7 0M5 13a10 10 0 0 1 5-2.7M19 13a10 10 0 0 0-3-2.1M2 8.8a15 15 0 0 1 4.2-2.6M22 8.8A15 15 0 0 0 10.7 5M12 20h.01"/>
+            "clock" => <path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18ZM12 7v5l3 2"/>
+            "lock" => <path d="M6 11h12v9H6zM8.5 11V7.5a3.5 3.5 0 0 1 7 0V11"/>
+            "search" => <path d="M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14ZM16.5 16.5 21 21"/>
+            _ => <path d="M7 18a4.5 4.5 0 0 1-.6-9A6 6 0 0 1 18 9.5a4.2 4.2 0 0 1-.5 8.5H7ZM12 9.5v4M12 16h.01"/>
+        }}
+    </svg>
+
+component ErrorScreen(kind: str = "auto", status = null, title: str? = null, text: str? = null, reason: str? = null, reference: str? = null,
+                      retry_label: str = "Try again", retry_after = null, auto_retry: bool = true, home_label: str? = null, home: str? = null,
+                      fill: bool = false, id: str? = null, class: str? = null, on_retry = null, on_home = null, children) {
+    style global error_screen_css
+    state online = true
+    state code = status
+    state last_status = status
+    state said = reason
+    state last_reason = reason
+    state trying = false
+    state tries = 0
+    state failed = false
+    state left = type_of(retry_after) == "int" && retry_after > 0 ? retry_after : 0
+    state copied = ""
+    if status != last_status {
+        last_status = status
+        code = status
+        failed = false
+        tries = 0
+    }
+    if reason != last_reason {
+        last_reason = reason
+        said = reason
+    }
+    if left > 0 { every(1000, () => { left = max([0, left - 1]) }) }
+    let what = error_screen_kind(kind, code, online)
+    let words = error_screen_words(what)
+    let can_retry = on_retry != null && words.retry
+    let attempt = () => {
+        if !trying && left == 0 && on_retry != null {
+            trying = true
+            tries += 1
+            // Written so, it holds an answer at once, a Promise, a refusal and a throw alike.
+            let got = js("Promise.resolve", js_new("Promise", (done) => { done(on_retry()) }))
+            let how = error_screen_outcome(got)
+            trying = false
+            failed = how.failed
+            if how.failed {
+                if how.status != null { code = how.status }
+                if how.reason != null { said = how.reason }
+                if how.wait > 0 { left = how.wait }
+            } else {
+                tries = 0
+            }
+        }
+    }
+    let state_line = trying ? "Trying again…"
+        : (what == "offline" && auto_retry && can_retry ? "It will try again when the connection is back."
+        : (failed ? (tries > 1 ? `Still not working, after ${tries} tries.` : "Still not working.") : ""))
+    <section class={ui_cls(["ui-error-screen", what == "offline" && "ui-error-screen-offline", fill && "ui-error-screen-fill", class])} id={id} data-kind={what} aria-labelledby={id != null ? `${id}-title` : null}
+             @mount={(el) => {
+                 let win = js("window")
+                 let nav = win.navigator
+                 let on_line = () => {
+                     let was = online
+                     online = true
+                     if !was && auto_retry { attempt() }
+                 }
+                 let off_line = () => { online = false }
+                 win.addEventListener("online", on_line)
+                 win.addEventListener("offline", off_line)
+                 online = nav.onLine != false
+                 if fill { el.querySelector(".ui-error-screen-title").focus({ preventScroll: true }) }
+                 () => {
+                     win.removeEventListener("online", on_line)
+                     win.removeEventListener("offline", off_line)
+                 }
+             }}>
+        <div.ui-error-screen-page>
+            <div.ui-error-screen-say role="alert">
+                <div.ui-error-screen-icon>{error_screen_icon(words.icon)}</div>
+                <h1.ui-error-screen-title id={id != null ? `${id}-title` : null} tabindex="-1">{title ?? words.title}</h1>
+                <p.ui-error-screen-text>{text ?? words.text}</p>
+                {said != null && said != "" && <p.ui-error-screen-reason>{said}</p>}
+                <p.ui-error-screen-state role="status">{state_line}</p>
+                {(reference != null || (type_of(code) == "int" && code > 0)) && <details.ui-error-screen-more>
+                    <summary>Details for support</summary>
+                    <dl>
+                        {type_of(code) == "int" && code > 0 && <div style="display: contents"><dt>Status</dt><dd>{code}</dd></div>}
+                        {reference != null && <div style="display: contents"><dt>Reference</dt><dd>{reference}</dd></div>}
+                    </dl>
+                    {reference != null && <Button size="lg" variant="outline" on_click={() => {
+                        let board = js("navigator").clipboard
+                        if board == null {
+                            copied = "This browser cannot copy here: the reference is above."
+                        } else {
+                            let wrote = js("Promise.resolve", js_new("Promise", (done) => { done(board.writeText(reference)) }))
+                            copied = is_err(wrote) ? "It could not be copied: the reference is above." : "Copied."
+                        }
+                    }}>Copy the reference</Button>}
+                    <p.ui-error-screen-state role="status">{copied}</p>
+                </details>}
+            </div>
+            <div.ui-error-screen-actions>
+                {can_retry && <Button size="lg" loading={trying} disabled={left > 0} on_click={() => { attempt() }}>{left > 0 ? `${retry_label} in ${left} s` : retry_label}</Button>}
+                {home_label != null && <Button size="lg" variant="outline" href={home} on_click={on_home}>{home_label}</Button>}
+            </div>
+            {children}
+        </div>
+    </section>
+}

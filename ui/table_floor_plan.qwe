@@ -1,0 +1,292 @@
+// TableFloorPlan: a restaurant's tables on a floor plan, for a tablet on the host stand or
+// carried by a server. Each table shows its status in words as well as colour, a tap opens its
+// check, and an edit mode moves tables by drag or keys. The plan scales to fit, upright or
+// turned, with CSS alone, so tables stay where they are and in proportion.
+//
+//   import ui/table_floor_plan.qwe use TableFloorPlan
+//
+//   component Floor() {
+//       state tables = load_tables()
+//       <div style="height: 100dvh">
+//           <TableFloorPlan tables={tables} on_open={(id) => { open_check(id) }}
+//                           on_status={(id, s) => { set_status(id, s) }} on_layout={(t) => { save_layout(t) }}/>
+//       </div>
+//   }
+//
+// tables: each { id, label?, x, y, w?, h?, shape?, seats?, guests?, status? }, in the floor's
+// units; shape is "square" or "round"; w and h default to 90. One with no usable place is left
+// out, as is an id already seen; one past the floor is brought back onto it. Ids arrive as text.
+// width, height: the floor's size in its own units (1000 by 700). grid: what a move
+// snaps to (10). zones: fixed parts of the room, each { label, x, y, w, h }. statuses: each { id,
+// label }; the default runs free, seated, ordered, served, bill, dirty, and a table with
+// another status counts as the first. A theme colour goes with each of the defaults; others
+// are plain. editable: false hides the Edit button. label: its name for screen readers. class.
+// on_open(id): inside one of your components, a table tapped, or Open check pressed.
+// on_status(id, status): called with a new status. on_layout(tables): called with every table
+// when an edit ends with Done; Cancel puts all back and calls nothing.
+//
+// In edit mode a drag past a few pixels moves a table, snapped to the grid and kept on the
+// floor. A table cannot be set down on another: it goes back where it was. Arrow keys move the
+// focused table a grid step, five with Shift.
+
+import ui/theme.qwe use ui_cls
+
+let table_floor_plan_css = css`
+.ui-table-floor-plan { position: relative; box-sizing: border-box; display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 360px; container-type: inline-size; color: var(--ui-fg); background: var(--ui-subtle); font: 14px/1.3 var(--ui-font); }
+.ui-table-floor-plan-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.ui-table-floor-plan-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; flex: none; min-height: 44px; padding: 6px max(10px, env(safe-area-inset-right)) 6px max(10px, env(safe-area-inset-left)); border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-table-floor-plan-counts { display: flex; flex: 1; flex-wrap: wrap; gap: 4px 10px; margin: 0; padding: 0; color: var(--ui-muted); font-size: 13px; list-style: none; }
+.ui-table-floor-plan-counts b { color: var(--ui-fg); font-variant-numeric: tabular-nums; }
+.ui-table-floor-plan-room { display: grid; place-items: center; flex: 1; min-width: 0; min-height: 0; padding: 10px; container-type: size; }
+.ui-table-floor-plan-floor { position: relative; width: min(100cqw, calc(100cqh * var(--w) / var(--h))); aspect-ratio: var(--w) / var(--h); border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); box-sizing: border-box; overflow: hidden; }
+.ui-table-floor-plan-zone { position: absolute; display: grid; place-items: center; box-sizing: border-box; border: 1px dashed var(--ui-strong); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); color: var(--ui-muted); font-size: 13px; }
+.ui-table-floor-plan-spot { position: absolute; }
+.ui-table-floor-plan-table { position: relative; display: grid; place-content: center; justify-items: center; gap: 1px; box-sizing: border-box; width: 100%; height: 100%; padding: 2px; overflow: hidden; border: 2px solid var(--c, var(--ui-strong)); border-radius: var(--ui-radius); background: var(--s, var(--ui-subtle)); color: var(--ui-fg); font: inherit; cursor: pointer; touch-action: manipulation; -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
+.ui-table-floor-plan-table b { font-size: 16px; line-height: 1.1; }
+.ui-table-floor-plan-table small { font-size: 12px; line-height: 1.1; }
+.ui-table-floor-plan-round { border-radius: 50%; }
+.ui-table-floor-plan-table:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-table-floor-plan-on { box-shadow: 0 0 0 3px var(--ui-accent); }
+.ui-table-floor-plan-seated { --c: var(--ui-info); --s: var(--ui-info-soft); }
+.ui-table-floor-plan-ordered, .ui-table-floor-plan-served { --c: var(--ui-accent); --s: var(--ui-accent-soft); }
+.ui-table-floor-plan-bill { --c: var(--ui-warning); --s: var(--ui-warning-soft); }
+.ui-table-floor-plan-dirty { --c: var(--ui-danger); --s: var(--ui-danger-soft); }
+.ui-table-floor-plan-free { --c: var(--ui-success); --s: var(--ui-success-soft); }
+.ui-table-floor-plan-editing .ui-table-floor-plan-table { touch-action: none; cursor: grab; border-style: dashed; }
+.ui-table-floor-plan-moving { z-index: 3; cursor: grabbing !important; box-shadow: var(--ui-shadow-lg); }
+.ui-table-floor-plan-spring { transition: transform .18s cubic-bezier(.2, .8, .2, 1); }
+.ui-table-floor-plan-side { display: flex; flex-direction: column; flex: none; gap: 8px; max-height: 240px; overflow-y: auto; padding: 10px max(12px, env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); border-top: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-table-floor-plan-side h3 { margin: 0; font-size: 18px; }
+.ui-table-floor-plan-side p { margin: 0; color: var(--ui-muted); }
+.ui-table-floor-plan-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.ui-table-floor-plan-btn { min-width: 44px; min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px var(--ui-font); cursor: pointer; }
+.ui-table-floor-plan-btn[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-table-floor-plan-primary { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-table-floor-plan-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-table-floor-plan-btn:not(.ui-table-floor-plan-primary):hover { background: var(--ui-subtle); } }
+/* With the width of a turned tablet the panel stands beside the floor, which then keeps its height. */
+@container (min-width: 1000px) {
+  .ui-table-floor-plan-body { flex-direction: row; }
+  .ui-table-floor-plan-side { width: 280px; max-height: none; border-top: 0; border-left: 1px solid var(--ui-border); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-table-floor-plan-spring { transition: none; } }
+`
+
+let table_floor_plan_statuses = [{ id: "free", label: "Free" }, { id: "seated", label: "Seated" }, { id: "ordered", label: "Ordered" }, { id: "served", label: "Served" }, { id: "bill", label: "Bill" }, { id: "dirty", label: "To clear" }]
+
+fn table_floor_plan_is_num(v) -> bool {
+    let t = type_of(v)
+    t == "int" || t == "float"
+}
+
+// A place on the floor: on a step of the grid, and with all of the table on the floor.
+fn table_floor_plan_snap(at: num, grid: int, size: num, room: num) -> num {
+    let g = max([1, grid])
+    let near = round(at / g) * g
+    max([0, min([near, room - size])])
+}
+
+// The tables that can be shown, ids as text.
+fn table_floor_plan_clean(tables, width: int, height: int, grid: int, statuses: list) -> list {
+    if type_of(tables) != "list" { return [] }
+    let placed = tables | filter((t) => type_of(t) == "map" && get(t, "id") != null && table_floor_plan_is_num(get(t, "x")) && table_floor_plan_is_num(get(t, "y")))
+    let known = statuses | map((s) => s.id)
+    let all = placed | map((t) => {
+        let w = table_floor_plan_is_num(get(t, "w")) ? max([40, min([t.w, width])]) : 90
+        let h = table_floor_plan_is_num(get(t, "h")) ? max([40, min([t.h, height])]) : 90
+        { ...t, id: str(t.id), label: get(t, "label") != null ? str(t.label) : str(t.id), w, h,
+          x: table_floor_plan_snap(t.x, grid, w, width), y: table_floor_plan_snap(t.y, grid, h, height),
+          shape: get(t, "shape") == "round" ? "round" : "square",
+          seats: type_of(get(t, "seats")) == "int" ? t.seats : null, guests: type_of(get(t, "guests")) == "int" ? t.guests : null,
+          status: contains(known, get(t, "status")) ? t.status : known[0] }
+    })
+    let ids = all | map((t) => t.id)
+    enumerate(all) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// Do two boxes share ground? Touching edges do not.
+fn table_floor_plan_overlap(ax: num, ay: num, aw: num, ah: num, bx: num, by: num, bw: num, bh: num) -> bool {
+    ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+}
+
+// May this table stand at x, y, with the others where they are?
+fn table_floor_plan_free(tables: list, id: str, x: num, y: num) -> bool {
+    let me = find(tables, (t) => t.id == id)
+    let hit = tables | filter((t) => t.id != id && table_floor_plan_overlap(x, y, me.w, me.h, t.x, t.y, t.w, t.h))
+    len(hit) == 0
+}
+
+// How many tables stand at each status, in the list's order, leaving out those with none.
+fn table_floor_plan_counts(tables: list, statuses: list) -> list {
+    let all = statuses | map((s) => { { id: s.id, label: s.label, n: len(tables | filter((t) => t.status == s.id)) } })
+    all | filter((c) => c.n > 0)
+}
+
+// What a screen reader says of a table.
+fn table_floor_plan_says(t, status_label: str) -> str {
+    let people = t.seats != null ? (t.guests != null ? `, ${t.guests} of ${t.seats} seats` : `, ${t.seats} seats`) : ""
+    `Table ${t.label}, ${status_label}${people}`
+}
+
+// What shows under a table's name.
+fn table_floor_plan_under(t, status_label: str) -> str {
+    t.guests != null && t.seats != null ? `${t.guests}/${t.seats}` : status_label
+}
+
+component TableFloorPlan(tables = [], width: int = 1000, height: int = 700, grid: int = 10, zones = [], statuses: list = table_floor_plan_statuses, editable: bool = true,
+                         label: str = "Floor plan", on_open = null, on_status = null, on_layout = null, class: str? = null) {
+    style global table_floor_plan_css
+    let floor_w = max([100, width])
+    let floor_h = max([100, height])
+    state rows = table_floor_plan_clean(tables, max([100, width]), max([100, height]), grid, statuses)
+    state before = []          // the tables as they stood when the edit began
+    state editing = false
+    state picked = ""
+    state said = ""
+    state floor = null
+    state win = null
+    state g = null             // a press on a table in edit mode: { id, el, pid, x, y, moved, scale }
+    let zone_list = type_of(zones) == "list" ? (zones | filter((z) => type_of(z) == "map" && table_floor_plan_is_num(get(z, "x")) && table_floor_plan_is_num(get(z, "y")) && table_floor_plan_is_num(get(z, "w")) && table_floor_plan_is_num(get(z, "h")))) : []
+    let status_label = (id: str) => (find(statuses, (s) => s.id == id) ?? { label: id }).label
+    let chosen = find(rows, (t) => t.id == picked)
+    let counts = table_floor_plan_counts(rows, statuses)
+    let place_table = (id: str, x: num, y: num) => {
+        rows = rows | map((t) => t.id == id ? { ...t, x, y } : t)
+    }
+    // Where a table asked to go ends up: its place if free, or null if something stands there.
+    let settle_at = (id: str, x: num, y: num) => {
+        let t = find(rows, (r) => r.id == id)
+        let sx = table_floor_plan_snap(x, grid, t.w, floor_w)
+        let sy = table_floor_plan_snap(y, grid, t.h, floor_h)
+        table_floor_plan_free(rows, id, sx, sy) ? [sx, sy] : null
+    }
+    let release = (cancel: bool, e) => {
+        let p = g
+        g = null
+        p.el.classList.remove("ui-table-floor-plan-moving")
+        if p.moved {
+            let t = find(rows, (r) => r.id == p.id)
+            let to = cancel ? null : settle_at(p.id, t.x + (e.clientX - p.x) * p.scale, t.y + (e.clientY - p.y) * p.scale)
+            if to != null {
+                p.el.style.transform = ""
+                place_table(p.id, to[0], to[1])
+                said = `Table ${t.label} moved.`
+            } else {
+                p.el.classList.add("ui-table-floor-plan-spring")
+                p.el.style.transform = ""
+                said = cancel ? "" : `Table ${t.label} cannot stand there.`
+            }
+            p.el.dataset.dragged = "1"
+        }
+    }
+    let on_key = (e, id: str) => {
+        let by = e.shiftKey ? grid * 5 : grid
+        let step = match e.key {
+            "ArrowLeft" => [-by, 0]
+            "ArrowRight" => [by, 0]
+            "ArrowUp" => [0, -by]
+            "ArrowDown" => [0, by]
+            _ => null
+        }
+        if step != null {
+            e.preventDefault()
+            let t = find(rows, (r) => r.id == id)
+            let to = settle_at(id, t.x + step[0], t.y + step[1])
+            if to != null {
+                place_table(id, to[0], to[1])
+                said = `Table ${t.label} at ${to[0]}, ${to[1]}.`
+            } else {
+                said = `Table ${t.label} cannot stand there.`
+            }
+        }
+    }
+    <div class={ui_cls(["ui-table-floor-plan", editing && "ui-table-floor-plan-editing", class])} role="group" aria-label={label}>
+        <div.ui-table-floor-plan-bar>
+            <ul.ui-table-floor-plan-counts aria-label="Tables by status">
+                {for c in counts => <li key={c.id}><b>{c.n}</b> {c.label}</li>}
+            </ul>
+            {editable && !editing && <button.ui-table-floor-plan-btn type="button" @click={() => {
+                before = rows
+                editing = true
+                said = "Editing the plan."
+            }}>Edit plan</button>}
+            {editing && <button.ui-table-floor-plan-btn type="button" @click={() => {
+                rows = before
+                editing = false
+                said = "Changes dropped."
+            }}>Cancel</button>}
+            {editing && <button.ui-table-floor-plan-btn.ui-table-floor-plan-primary type="button" @click={() => {
+                editing = false
+                said = "Plan saved."
+                on_layout && on_layout(rows)
+            }}>Done</button>}
+        </div>
+        <div.ui-table-floor-plan-body>
+            <div.ui-table-floor-plan-room>
+                <div.ui-table-floor-plan-floor style={`--w: ${floor_w}; --h: ${floor_h}`}
+                     @mount={(me) => {
+                         floor = me
+                         win = js("window")
+                     }}>
+                    {for z in zone_list => <div.ui-table-floor-plan-zone key={`${z.x},${z.y}`} style={`left: ${z.x * 100 / floor_w}%; top: ${z.y * 100 / floor_h}%; width: ${z.w * 100 / floor_w}%; height: ${z.h * 100 / floor_h}%`}>{get(z, "label") ?? ""}</div>}
+                    // The place is on a box around the table, and the drag's transform on the table. A
+                    // style={...} on the element a handler moves is written whole when its row changes,
+                    // which would drop the table back under the finger.
+                    {for t in rows => <div.ui-table-floor-plan-spot key={t.id} style={`left: ${t.x * 100 / floor_w}%; top: ${t.y * 100 / floor_h}%; width: ${t.w * 100 / floor_w}%; height: ${t.h * 100 / floor_h}%`}><button type="button" data-id={t.id}
+                            class={ui_cls(["ui-table-floor-plan-table", `ui-table-floor-plan-${t.status}`, t.shape == "round" && "ui-table-floor-plan-round", picked == t.id && "ui-table-floor-plan-on"])}
+                            aria-label={table_floor_plan_says(t, status_label(t.status))}
+                            @pointerdown={(e) => {
+                                if editing && e.button == 0 {
+                                    let el = e.target.closest(".ui-table-floor-plan-table")
+                                    el.classList.remove("ui-table-floor-plan-spring")
+                                    el.setPointerCapture(e.pointerId)
+                                    g = { id: t.id, el, pid: e.pointerId, x: e.clientX, y: e.clientY, moved: false, scale: floor_w / floor.getBoundingClientRect().width }
+                                }
+                            }}
+                            @pointermove={(e) => {
+                                if g != null && e.pointerId == g.pid {
+                                    let dx = e.clientX - g.x
+                                    let dy = e.clientY - g.y
+                                    if !g.moved && abs(dx) + abs(dy) > 6 {
+                                        g = { ...g, moved: true }
+                                        g.el.classList.add("ui-table-floor-plan-moving")
+                                    }
+                                    if g.moved { g.el.style.transform = `translate(${dx}px, ${dy}px)` }
+                                }
+                            }}
+                            @pointerup={(e) => { if g != null && e.pointerId == g.pid { release(false, e) } }}
+                            @pointercancel={(e) => { if g != null && e.pointerId == g.pid { release(true, e) } }}
+                            @keydown={(e) => { if editing { on_key(e, t.id) } }}
+                            @click={(e) => {
+                                let el = e.target.closest(".ui-table-floor-plan-table")
+                                if el.dataset.dragged == "1" {
+                                    el.dataset.dragged = ""
+                                } else {
+                                    picked = t.id
+                                    if !editing { on_open && on_open(t.id) }
+                                }
+                            }}>
+                        <b>{t.label}</b>
+                        <small>{table_floor_plan_under(t, status_label(t.status))}</small>
+                    </button></div>}
+                </div>
+            </div>
+            <aside.ui-table-floor-plan-side aria-label="Table">
+                {editing && <p>Drag a table, or focus one and use the arrow keys. Done keeps the plan.</p>}
+                {!editing && chosen == null && <p>Tap a table to open its check.</p>}
+                {!editing && chosen != null && <h3>Table {chosen.label}</h3>}
+                {!editing && chosen != null && <p>{status_label(chosen.status)}{chosen.seats != null ? `, ${chosen.guests != null ? `${chosen.guests} of ` : ""}${chosen.seats} seats` : ""}</p>}
+                {!editing && chosen != null && <div.ui-table-floor-plan-row role="group" aria-label="Status">
+                    {for s in statuses => <button.ui-table-floor-plan-btn key={s.id} type="button" aria-pressed={chosen.status == s.id ? "true" : "false"} @click={() => {
+                        let id = picked
+                        rows = rows | map((t) => t.id == id ? { ...t, status: s.id } : t)
+                        said = `Table ${find(rows, (t) => t.id == id).label}: ${s.label}.`
+                        on_status && on_status(id, s.id)
+                    }}>{s.label}</button>}
+                </div>}
+                {!editing && chosen != null && <button.ui-table-floor-plan-btn.ui-table-floor-plan-primary type="button" @click={() => { on_open && on_open(picked) }}>Open check</button>}
+            </aside>
+        </div>
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

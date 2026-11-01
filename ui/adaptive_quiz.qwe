@@ -1,0 +1,293 @@
+// AdaptiveQuiz: a quiz that finds someone's level. Each question has a difficulty;
+// after a right answer the next is harder and after a wrong one easier, the nearest
+// unused one to that level, so no question comes twice, and it says when it had to
+// go further than one step because a level ran out. Every answer is explained. The
+// level is estimated from all the answers so far, as the mean of a probability over
+// levels, with each answer weighed by how hard it was (a guess is allowed for: one
+// in the number of choices). Confidence is how much of that probability lies within half
+// a level of the estimate. It ends at `limit` questions, when it is sure enough, or
+// when the questions run out, and says which.
+//
+//   <AdaptiveQuiz questions={bank} limit={8}/>
+//   <AdaptiveQuiz questions={bank} stop_at={80} on_finish={(r) => { level = r.level }}/>
+//
+// questions: each { text, difficulty, choices, answer, explain?, id? }: difficulty a number
+// (1 to 5, say), choices a list of text, answer the index of the right one from 0, or its
+// text, explain why it is right. A question that cannot be asked (no text, fewer than two
+// choices, an answer not among them, a difficulty that is not a number, or asked
+// already under the same id or text) is left out and reported. A page sends the props
+// to the browser, answers included, so this is for practice, not an exam. limit: the most
+// questions asked (10). start: the difficulty to start at (the middle of those
+// there are). stop_at: a confidence in percent at which to stop early (none). title: the
+// heading ("Quiz"). id: a prefix for its ids ("adaptive-quiz"), unique on the page. The
+// choices are radio buttons named answer, and result has the outcome as JSON at the end;
+// name: a prefix for those. on_answer(a): inside one of your components, given { id,
+// right, level, confidence } after each answer. on_finish(r): given the result, { level,
+// confidence, word, right, asked, reason }, when it ends.
+//
+// adaptive_quiz_clean(questions), adaptive_quiz_next(items, asked, start) and
+// adaptive_quiz_estimate(items, asked) are the logic, for a program's own use: asked is a list
+// of { id, right }. A level is on the scale of the difficulties, shown to one place.
+
+import ui/theme.qwe use ui_cls
+
+let adaptive_quiz_css = css`
+.ui-adquiz { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; min-width: 0; max-width: 620px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-adquiz .ui-adquiz-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-adquiz-meter { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 14px; margin: 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-adquiz-why { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-adquiz-card { display: grid; gap: 10px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-adquiz .ui-adquiz-question { margin: 0; padding: 0; font-size: 15px; font-weight: 600; outline: none; overflow-wrap: anywhere; }
+.ui-adquiz-question:focus-visible { box-shadow: var(--ui-focus); }
+.ui-adquiz-choices { display: grid; gap: 6px; }
+.ui-adquiz-choice { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 8px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); cursor: pointer; overflow-wrap: anywhere; }
+.ui-adquiz-choice:hover { border-color: var(--ui-strong); }
+.ui-adquiz-choice:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-adquiz-choice input { flex: none; margin: 0; accent-color: var(--ui-accent); }
+.ui-adquiz-is-right { border-color: var(--ui-success); background: var(--ui-success-soft); }
+.ui-adquiz-is-wrong { border-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-adquiz-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-adquiz-go { height: 36px; padding: 0 16px; border: 1px solid var(--ui-accent); border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg); font: 600 13px var(--ui-font); cursor: pointer; }
+.ui-adquiz-go:hover { background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-adquiz-go:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-adquiz-warn { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-adquiz-told { display: grid; gap: 4px; margin: 0; padding: 10px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-adquiz-verdict { margin: 0; font-weight: 650; }
+.ui-adquiz-explain { margin: 0; }
+.ui-adquiz-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-warning); font-size: 13px; }
+.ui-adquiz-result { display: grid; gap: 2px; margin: 0; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-adquiz-level { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ui-adquiz-review { display: grid; gap: 8px; margin: 0; padding: 0 0 0 20px; }
+.ui-adquiz-review li { overflow-wrap: anywhere; }
+.ui-adquiz-review small { display: block; color: var(--ui-muted); font-size: 12px; }
+`
+
+// How steeply the chance of a right answer rises with level.
+let adaptive_quiz_slope = 1.5
+
+// The questions fit to ask, as { id, text, level, choices, answer, explain }, and what
+// was wrong with the others: { items, problems }.
+fn adaptive_quiz_clean(questions) {
+    let items = []
+    let problems = []
+    let given = type_of(questions) == "list" ? questions : []
+    for i in 0..len(given) {
+        let q = given[i]
+        let text = type_of(q) == "map" && type_of(q.text) == "str" ? trim(q.text) : ""
+        let choices = type_of(q) == "map" && type_of(q.choices) == "list" ? q.choices | map((c) => str(c)) : []
+        let right = type_of(q) == "map" ? q.answer : null
+        let answer = type_of(right) == "int" ? (right >= 0 && right < len(choices) ? right : null) : index_of(choices, str(right))
+        let hard = type_of(q) == "map" ? q.difficulty : null
+        let number = type_of(hard) == "int" || type_of(hard) == "float"
+        let id_ = type_of(q) == "map" && q.id != null ? str(q.id) : `q${i + 1}`
+        let why = text == "" ? "has no text" : len(choices) < 2 ? "needs at least two choices"
+            : answer == null ? "has an answer that is not among its choices" : !number ? "has no difficulty"
+            : any(items, (x) => x.id == id_ || lower(x.text) == lower(text)) ? "is a repeat" : null
+        if why != null {
+            problems = problems | push(`Question ${i + 1} ${why}, so it is left out.`)
+        } else {
+            items = items | push({ id: id_, text, level: hard, choices, answer, explain: filled(trim(str(q.explain ?? ""))) })
+        }
+    }
+    { items, problems }
+}
+
+fn adaptive_quiz_levels(items: list) = items | map((x) => x.level) | unique() | sort()
+
+fn adaptive_quiz_start(items: list, start) {
+    let levels = adaptive_quiz_levels(items)
+    if start != null { return start }
+    len(levels) == 0 ? 0 : levels[int(floor((len(levels) - 1) / 2))]
+}
+
+// The next question: { item, why } or null when none is left. After a right answer the target
+// is one level up and after a wrong one down; of those left, the nearest to that, and
+// of two as near, the one the answer points to, and then the first listed.
+fn adaptive_quiz_next(items: list, asked: list, start = null) {
+    let left = items | filter((x) => !any(asked, (a) => a.id == x.id))
+    if len(left) == 0 { return null }
+    if len(asked) == 0 {
+        let wanted = adaptive_quiz_start(items, start)
+        let best = left | sort_by((x) => abs(x.level - wanted)) | first()
+        return { item: best, why: "" }
+    }
+    let previous = last(asked)
+    let was = (items | find((x) => x.id == previous.id)).level
+    let up = previous.right
+    let levels = adaptive_quiz_levels(items)
+    let above = levels | filter((l) => l > was) | first()
+    let below = levels | filter((l) => l < was) | last()
+    let wanted = up ? (above ?? was) : (below ?? was)
+    let side = (x) => (up && x.level >= wanted) || (!up && x.level <= wanted) ? 0 : 1
+    let best = left | sort_by((x) => abs(x.level - wanted) * 2 + side(x)) | first()
+    let word = up ? "Right, so a harder one" : "Not that one, so an easier one"
+    let why = best.level == wanted && wanted != was ? `${word}.`
+        : best.level == was && wanted == was ? `Right or wrong, this is the ${up ? "hardest" : "easiest"} level there is.`
+        : `${word} was due, but none is left at level ${wanted}, so this is level ${best.level}.`
+    { item: best, why }
+}
+
+// { level, confidence, word, right, asked }: level null before the first answer. The chance of a
+// right answer at level t on a question of difficulty b, with g the chance of guessing,
+// is g + (1 - g) / (1 + e^(-1.5 (t - b))); levels every quarter step start equally likely.
+fn adaptive_quiz_estimate(items: list, asked: list) {
+    let levels = adaptive_quiz_levels(items)
+    let right = asked | filter((a) => a.right) | len
+    if len(asked) == 0 || len(levels) == 0 { return { level: null, confidence: 0, word: "None yet", right, asked: len(asked) } }
+    let flat = first(levels) == last(levels)
+    let lo = float(first(levels)) - (flat ? 1.0 : 0.0)
+    let hi = float(last(levels)) + (flat ? 1.0 : 0.0)
+    let steps = int(floor((hi - lo) * 4)) + 1
+    let grid = for i in 0..steps => lo + i * 0.25
+    let weights = grid | map((t) => {
+        let w = 1.0
+        for a in asked {
+            let q = items | find((x) => x.id == a.id)
+            let guess = 1.0 / len(q.choices)
+            let chance = guess + (1.0 - guess) / (1.0 + math.exp(-adaptive_quiz_slope * (t - float(q.level))))
+            w = w * (a.right ? chance : 1.0 - chance)
+        }
+        w
+    })
+    let total = sum(weights)
+    let mean = sum(for i in 0..steps => grid[i] * weights[i]) / total
+    let near = sum(for i in 0..steps => abs(grid[i] - mean) <= 0.5 ? weights[i] : 0.0) / total
+    let confidence = round(near * 100)
+    { level: round(mean, 1), confidence, word: confidence < 50 ? "Low" : confidence < 75 ? "Medium" : "High", right, asked: len(asked) }
+}
+
+// Why to stop now, or null: "out", "limit" or "sure".
+fn adaptive_quiz_stop(items: list, asked: list, limit: int, stop_at) {
+    if len(asked) >= len(items) { return "out" }
+    if len(asked) >= limit { return "limit" }
+    if stop_at != null && adaptive_quiz_estimate(items, asked).confidence >= stop_at { return "sure" }
+    null
+}
+
+fn adaptive_quiz_reason(reason: str, count: int) = match reason {
+    "out" => "That was every question there is, so the estimate rests on these alone."
+    "limit" => `That is the limit of ${count} questions.`
+    "sure" => "It stopped early, sure enough of the level."
+    _ => ""
+}
+
+fn adaptive_quiz_noun(n: int) = n == 1 ? "1 question" : `${n} questions`
+
+component AdaptiveQuiz(questions = [], limit: int = 10, start = null, stop_at = null, title: str = "Quiz", id: str = "adaptive-quiz", name: str? = null,
+                       on_answer = null, on_finish = null, class: str? = null) {
+    style global adaptive_quiz_css
+    let bank = adaptive_quiz_clean(questions)
+    let items = bank.items
+    let opening = adaptive_quiz_next(items, [], start)
+    state asked = []
+    state current = opening == null ? null : opening.item.id
+    state why = ""
+    state picked = -1
+    state phase = opening == null ? "empty" : "ask"
+    state warned = false
+    state ending = ""
+    state moved = false
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let q = items | find((x) => x.id == current)
+    let guess = adaptive_quiz_estimate(items, asked)
+    let last_answer = phase == "told" ? last(asked) : null
+    let stopping = phase == "told" ? adaptive_quiz_stop(items, asked, limit, stop_at) : null
+    let level_text = guess.level == null ? "No estimate yet" : `Estimated level ${str(guess.level)}, confidence ${str(guess.confidence)}% (${guess.word})`
+    let outcome = { level: guess.level, confidence: guess.confidence, word: guess.word, right: guess.right, asked: guess.asked, reason: ending }
+    let shown_of = (a) => items | find((x) => x.id == a.id)
+    let check = () => {
+        if picked < 0 {
+            warned = true
+        } else {
+            let good = picked == q.answer
+            let now = asked | push({ id: q.id, chosen: picked, right: good })
+            asked = now
+            warned = false
+            phase = "told"
+            moved = true
+            let e = adaptive_quiz_estimate(items, now)
+            if on_answer != null { on_answer({ id: q.id, right: good, level: e.level, confidence: e.confidence }) }
+        }
+    }
+    let go_on = () => {
+        let reason = adaptive_quiz_stop(items, asked, limit, stop_at)
+        if reason != null {
+            ending = reason
+            phase = "done"
+            let e = adaptive_quiz_estimate(items, asked)
+            if on_finish != null { on_finish({ ...e, reason }) }
+        } else {
+            let n = adaptive_quiz_next(items, asked, start)
+            current = n.item.id
+            why = n.why
+            picked = -1
+            phase = "ask"
+        }
+    }
+    let again = () => {
+        asked = []
+        why = ""
+        picked = -1
+        warned = false
+        ending = ""
+        current = opening == null ? null : opening.item.id
+        phase = opening == null ? "empty" : "ask"
+    }
+    <section class={ui_cls(["ui-adquiz", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-adquiz-title id={`${id}-title`}>{title}</h3>
+        {len(bank.problems) > 0 && <ul.ui-adquiz-problems>
+            {for p in bank.problems | take(6) => <li>{p}</li>}
+            {len(bank.problems) > 6 && <li>{`And ${len(bank.problems) - 6} more.`}</li>}
+        </ul>}
+        {phase == "empty" && <p.ui-adquiz-warn role="alert">There are no questions to ask.</p>}
+        {phase != "empty" && <p.ui-adquiz-meter>
+            <span>{phase == "done" ? `${adaptive_quiz_noun(len(asked))} asked` : `Question ${phase == "ask" ? len(asked) + 1 : len(asked)} of up to ${min([limit, len(items)])}`}</span>
+            <span aria-live="polite">{level_text}</span>
+        </p>}
+        {phase == "ask" && why != "" && <p.ui-adquiz-why>{why}</p>}
+        {(phase == "ask" || phase == "told") && q != null && <div.ui-adquiz-card key={q.id}>
+            <p.ui-adquiz-question tabindex="-1" @mount={(el) => { if len(asked) > 0 { el.focus() } }}>
+                <span class="ui-sr">{`Difficulty ${q.level}. `}</span>{q.text}
+            </p>
+            <div.ui-adquiz-choices role="radiogroup" aria-label="Choices">
+                {for i in 0..len(q.choices) {
+                    let told = phase == "told"
+                    let mark = told && i == q.answer ? "ui-adquiz-is-right" : told && i == picked ? "ui-adquiz-is-wrong" : null
+                    <label key={i} class={ui_cls(["ui-adquiz-choice", mark])}>
+                        <input type="radio" name={named("answer")} value={str(i)} checked={picked == i} disabled={told} @change={(e) => { picked = i; warned = false }}
+                               @keydown={(e) => { if e.key == "Enter" && phase == "ask" { e.preventDefault(); check() } }}/>
+                        <span>{q.choices[i]}</span>
+                    </label>
+                }}
+            </div>
+        </div>}
+        {warned && <p.ui-adquiz-warn role="alert">Pick an answer first.</p>}
+        {phase == "ask" && <div.ui-adquiz-bar><button.ui-adquiz-go type="button" @click={check}>Check answer</button></div>}
+        {phase == "told" && <div.ui-adquiz-told role="status">
+            <p.ui-adquiz-verdict>{last_answer.right ? "Right." : `Not quite: the answer is ${q.choices[q.answer]}.`}</p>
+            {q.explain != null && <p.ui-adquiz-explain>{q.explain}</p>}
+        </div>}
+        {phase == "told" && <div.ui-adquiz-bar>
+            <button.ui-adquiz-go type="button" @mount={(el) => { if moved { el.focus() } }} @click={go_on}>{stopping != null ? "See the result" : "Next question"}</button>
+        </div>}
+        {phase == "done" && <div.ui-adquiz-result role="status">
+            <span.ui-adquiz-level>{guess.level == null ? "—" : `Level ${str(guess.level)}`}</span>
+            <span>{`${guess.right} of ${guess.asked} right. Confidence ${str(guess.confidence)}% (${guess.word}).`}</span>
+            <span.ui-adquiz-why>{adaptive_quiz_reason(ending, limit)}</span>
+        </div>}
+        {phase == "done" && <input type="hidden" name={named("result")} value={json.stringify(outcome)}/>}
+        {phase == "done" && <ol.ui-adquiz-review>
+            {for a in asked {
+                let item = shown_of(a)
+                let aid = a.id
+                <li key={aid}>
+                    {item.text}
+                    <small>{a.right ? `Right: ${item.choices[item.answer]}.` : `You said ${item.choices[a.chosen]}; the answer is ${item.choices[item.answer]}.`}</small>
+                    {item.explain != null && <small>{item.explain}</small>}
+                </li>
+            }}
+        </ol>}
+        {phase == "done" && <div.ui-adquiz-bar><button.ui-adquiz-go type="button" @click={again}>Start again</button></div>}
+    </section>
+}

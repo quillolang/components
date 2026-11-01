@@ -1,0 +1,350 @@
+// MentionTray: a message box where typing @ opens a tray of people, ranked by a fuzzy
+// match as you go on typing, over the line you are typing on, and above the on-screen
+// keyboard on both systems. Tap one, or use the arrow keys and Enter, and the name goes in
+// as one thing, an entity: it is marked, the cursor cannot stop inside it, and a Backspace
+// takes all of it at once, on any keyboard, as it is worked out from what changed rather
+// than from keys, which Android's do not report. On a phone the tray is the width of the
+// box; on a tablet it is a small card at the cursor.
+//
+//   <MentionTray people={[{ id: 7, name: "Ana Silva", handle: "ana" }, { id: 9, name: "Ben Oduya" }]}/>
+//   <MentionTray people={team} on_change={(text, mentions) => { draft = text; tagged = mentions }}/>
+//
+// people: a list of { id, name, handle?, avatar? }: name is what goes in the text, and name
+// and handle are what is matched. trigger: the character that opens it ("@"). limit: most
+// offered (6). value: what it starts with. name ("message"): a plain <form> gets the text
+// as this, and the ids mentioned, in order, each once, as name_mentions. label ("Message"),
+// placeholder, rows: lines it starts at (2). max_rows: lines it grows to (6). keyboard: false
+// when something around it keeps it above the keyboard, as ChatScreen and CommentSheet do.
+// id, class: for the outer element.
+// on_change(text, mentions): inside one of your components, as it is typed. mentions is
+// a list of { id, name, start, end }, where start and end count characters in text.
+
+import ui/theme.qwe use ui_cls
+import ui/composer_bar.qwe use composer_bar_follow
+import ui/fuzzy_select.qwe use fuzzy_select_index, fuzzy_select_rank
+
+let mention_tray_css = css`
+.ui-mention-tray { position: relative; container-type: inline-size; min-width: 0; font: 16px/22px var(--ui-font); color: var(--ui-fg); }
+.ui-mention-tray-sticky { position: sticky; bottom: 0; z-index: 3; }
+.ui-mention-tray-lifted { position: relative; transform: translateY(calc(-1 * var(--ui-mention-tray-lift, 0px))); }
+.ui-mention-tray-box { position: relative; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-bg); }
+.ui-mention-tray-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+/* The mirror lies behind the box and has its text, letter for letter: what the box cannot draw, the marks, and where its cursor is. */
+.ui-mention-tray-mirror, .ui-mention-tray-field {
+  box-sizing: border-box; display: block; width: 100%; margin: 0; padding: 10px 12px; border: 0; font: inherit; letter-spacing: normal; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; tab-size: 8;
+}
+.ui-mention-tray-mirror { position: absolute; inset: 0; overflow: hidden; color: transparent; pointer-events: none; }
+.ui-mention-tray-mirror .ui-mention-tray-name { border-radius: 4px; background: var(--ui-accent-soft); box-shadow: 0 0 0 1px var(--ui-accent-soft); }
+.ui-mention-tray-field { position: relative; resize: none; overflow-y: hidden; border-radius: var(--ui-radius); background: transparent; color: var(--ui-fg); outline: none; -webkit-appearance: none; appearance: none; overscroll-behavior: contain; }
+.ui-mention-tray-field::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-mention-tray-pop {
+  position: absolute; left: 0; right: 0; z-index: 6; box-sizing: border-box; margin: 0; padding: 4px; overflow-y: auto; list-style: none; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); box-shadow: var(--ui-shadow-lg); overscroll-behavior: contain;
+}
+.ui-mention-tray-pop::after { content: ""; display: block; height: 0; }
+.ui-mention-tray-opt { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 4px 8px; border-radius: var(--ui-radius-sm); cursor: pointer; -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
+.ui-mention-tray-opt[aria-selected="true"] { background: var(--ui-accent-soft); }
+.ui-mention-tray-face { flex: none; display: grid; place-items: center; width: 32px; height: 32px; overflow: hidden; border-radius: 50%; background: var(--ui-subtle); color: var(--ui-muted); font: 600 12px var(--ui-font); }
+.ui-mention-tray-face img { width: 100%; height: 100%; object-fit: cover; }
+.ui-mention-tray-who { display: grid; min-width: 0; line-height: 1.25; }
+.ui-mention-tray-who b { overflow: hidden; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.ui-mention-tray-who small { overflow: hidden; color: var(--ui-muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+@container (min-width: 520px) { .ui-mention-tray-pop { right: auto; width: 280px; } }
+`
+
+// A textarea counts its cursor in UTF-16 units and Quillo counts characters, so an emoji
+// before the cursor puts the two apart. A String object of the page counts as the textarea does.
+fn mention_tray_points(text: str, units: int) -> int = len(js_new("String", text).slice(0, units))
+fn mention_tray_units(text: str, points: int) -> int = js_new("String", slice(text, 0, points)).length
+
+// The mention being typed before the caret: { at, query }, at being where the trigger is;
+// null when there is none. It starts a word, stays on one line, and may hold one space, for
+// a first and a last name. Inside an entity there is none.
+fn mention_tray_query(text: str, caret: int, trigger: str, ents: list) {
+    if caret < 1 || any(ents, (e) => caret > e.start && caret <= e.end) { return null }
+    let span = max([caret - 40, 0])
+    let before = split(slice(text, span, caret), "")
+    let i = len(before) - 1
+    let spaces = 0
+    while i >= 0 {
+        let c = before[i]
+        if c == "\n" { return null }
+        if c == " " || c == "\t" {
+            spaces += 1
+            if spaces > 1 || i == len(before) - 1 { return null }
+        }
+        if c == trigger {
+            let prev = i > 0 ? before[i - 1] : (span > 0 ? slice(text, span - 1, span) : "")
+            let starts = prev == "" || prev == " " || prev == "\n" || prev == "\t" || prev == "("
+            let at = span + i
+            if !starts || any(ents, (e) => at >= e.start && at < e.end) { return null }
+            return { at, query: join(slice(before, i + 1, len(before)), "") }
+        }
+        i -= 1
+    }
+    null
+}
+
+// What an edit did to the text. `before` became `after`, by the shortest change; an entity
+// that the change touched goes, all of it, and an entity after the change moves with it.
+// { text, ents, caret }, caret being where to put the cursor if the text had to be
+// cut further than the edit went, else null.
+fn mention_tray_edit(before: str, after: str, ents: list) {
+    let a = split(before, "")
+    let b = split(after, "")
+    let la = len(a)
+    let lb = len(b)
+    let head = 0
+    while head < la && head < lb && a[head] == b[head] { head += 1 }
+    let tail = 0
+    while tail < la - head && tail < lb - head && a[la - 1 - tail] == b[lb - 1 - tail] { tail += 1 }
+    let old_end = la - tail
+    let shift = lb - la
+    let keep = ents | filter((e) => e.end <= head || e.start >= old_end) | map((e) => e.end <= head ? e : { ...e, start: e.start + shift, end: e.end + shift })
+    let hit = sort_by(ents | filter((e) => !(e.end <= head || e.start >= old_end)), (e) => e.start)
+    if len(hit) == 0 { return { text: after, ents: keep, caret: null } }
+    // What is left of those entities on either side of the change goes as well.
+    let cut_left = hit[0].start
+    let cut_right = max(hit | map((e) => e.end))
+    let left = min([cut_left, head])
+    let right_old = max([cut_right, old_end])
+    let added = slice(b, head, lb - tail)
+    let text = join(slice(a, 0, left), "") + join(added, "") + join(slice(a, right_old, la), "")
+    let moved = left + len(added) - right_old
+    let others = ents | filter((e) => e.end <= left || e.start >= right_old) | map((e) => e.end <= left ? e : { ...e, start: e.start + moved, end: e.end + moved })
+    { text, ents: others, caret: left + len(added) }
+}
+
+// A cursor or a selection in terms of the entities: { start, end }, a cursor inside one moved
+// out of it, and a selection cut through one widened to take it.
+fn mention_tray_snap(ents: list, start: int, end: int, was: int) {
+    if start == end {
+        let inside = find(ents, (e) => start > e.start && start < e.end)
+        if inside == null { return { start, end } }
+        // An arrow key steps across it; a tap anywhere else goes to the nearer edge.
+        let nearer = start - inside.start < inside.end - start ? inside.start : inside.end
+        let to = was == inside.start && start == was + 1 ? inside.end : (was == inside.end && start == was - 1 ? inside.start : nearer)
+        return { start: to, end: to }
+    }
+    let from = reduce(ents, start, (at, e) => at > e.start && at < e.end ? e.start : at)
+    let upto = reduce(ents, end, (at, e) => at > e.start && at < e.end ? e.end : at)
+    { start: from, end: upto }
+}
+
+// The text cut at the entities, for the mirror: [{ key, text, mark }] with the cursor's
+// place as its own piece, which is what is measured. It holds a word joiner, which has
+// a place on a line without being one where a line can break.
+fn mention_tray_parts(text: str, ents: list, caret: int) {
+    let cuts = unique(sort(flatten(ents | map((e) => [e.start, e.end])) + [0, caret, len(text)]))
+    let pieces = for i in range(len(cuts) - 1) => {
+        let from = cuts[i]
+        let upto = cuts[i + 1]
+        let piece = { key: `t${from}`, caret: false, text: slice(text, from, upto), mark: any(ents, (e) => from >= e.start && upto <= e.end) }
+        from == caret ? [{ key: "caret", caret: true, text: "", mark: false }, piece] : [piece]
+    }
+    caret >= len(text) ? flatten(pieces) + [{ key: "caret", caret: true, text: "", mark: false }] : flatten(pieces)
+}
+
+// Which way the tray opens from the line it serves, and how tall it may be: over the line
+// unless what is there is too little and there is more under it.
+fn mention_tray_place(above: num, below: num, want: num) {
+    let up = above >= min([want, 132]) || above >= below
+    { up, height: max([min([want, up ? above : below]), 96]) }
+}
+
+// Who to offer for a query, the best first: names by a fuzzy match, and after them anyone
+// whose handle starts with it. The two are not one text to match, or letters of a name
+// and of a handle far apart would make a match.
+fn mention_tray_rank(index: list, people: list, query: str, recent: list, limit: int) {
+    let hits = fuzzy_select_rank(index, query, recent, limit).shown | map((r) => r.row.value)
+    let by_name = hits | map((v) => find(people, (p) => str(p.id) == v))
+    let q = lower(query)
+    let by_handle = q == "" ? [] : people | filter((p) => !contains(hits, str(p.id)) && starts_with(lower(str(p.handle ?? "")), q))
+    slice(by_name + by_handle, 0, limit)
+}
+
+// Where the tray's left edge goes for a cursor at x, held inside the box.
+fn mention_tray_left(x: num, width: num, box_width: num) -> num =
+    round(max([0, min([x - 16, box_width - width])]))
+
+// How tall the box is for what it holds, between its starting rows and max_rows.
+fn mention_tray_height(content: num, rows: int, max_rows: int) -> num =
+    min([max([content, rows * 22 + 20]), max([max_rows, rows]) * 22 + 20])
+
+// The ids for a form, in order, each once.
+fn mention_tray_ids(ents: list) -> str = join(unique(ents | map((e) => str(e.id))), ",")
+
+// Up to two letters for someone with no picture.
+fn mention_tray_initials(name) -> str =
+    upper(join(split(trim(str(name ?? "")), " ") | filter((w) => w != "") | map((w) => slice(w, 0, 1)) | slice(0, 2), ""))
+
+component MentionTray(people: list = [], trigger: str = "@", limit: int = 6, value: str = "", name: str = "message", label: str = "Message",
+                      placeholder: str = "", rows: int = 2, max_rows: int = 6, keyboard: bool = true, on_change = null, id: str? = null, class: str? = null) {
+    style global mention_tray_css
+    state text = value
+    state ents = []
+    state caret = 0
+    state was = 0            // the cursor before it last moved, to tell the way it was going
+    state ask = null         // { at, query }, while a tray is wanted
+    state shut_at = -1       // the trigger Escape closed, so the same one does not reopen
+    state active = 0
+    state recent = []
+    state said = ""
+    state box = null
+    state mirror = null
+    state tray = null
+    state win = null
+    let usable = (type_of(people) == "list" ? people : []) | filter((p) => type_of(p) == "map" && p.id != null && str(p.name ?? "") != "")
+    let index = fuzzy_select_index(usable | map((p) => { label: p.name, value: str(p.id) }))
+    let found = ask != null ? mention_tray_rank(index, usable, ask.query, recent, limit) : []
+    let open = ask != null && ask.at != shut_at && len(found) > 0
+    let list_id = `${id ?? name}-mention-tray`
+    let grow = () => {
+        box.style.height = "auto"
+        let full = box.scrollHeight
+        let height = mention_tray_height(full, rows, max_rows)
+        box.style.height = `${height}px`
+        box.style.overflowY = full > height ? "auto" : "hidden"
+    }
+    let place = () => {
+        if tray != null && win != null {
+            let spot = mirror.querySelector("[data-caret]")
+            let frame = mirror.getBoundingClientRect()
+            let at = spot.getBoundingClientRect()
+            let vv = win.visualViewport
+            let top_edge = vv == null ? 0 : vv.offsetTop
+            let bottom_edge = vv == null ? win.innerHeight : vv.offsetTop + vv.height
+            let line_top = at.top - frame.top
+            let line_bottom = line_top + 22
+            let fit = mention_tray_place(at.top - top_edge - 8, bottom_edge - at.top - 22 - 8, 44 * len(found) + 10)
+            tray.style.maxHeight = `${fit.height}px`
+            tray.style.top = fit.up ? "" : `${line_bottom + 2}px`
+            tray.style.bottom = fit.up ? `calc(100% - ${line_top - 2}px)` : ""
+            tray.dataset.way = fit.up ? "up" : "down"
+            let w = tray.offsetWidth
+            tray.style.left = w < frame.width ? `${mention_tray_left(at.left - frame.left, w, frame.width)}px` : ""
+        }
+    }
+    let sync = () => {
+        let at = mention_tray_points(text, box.selectionStart)
+        if at != caret {
+            was = caret
+            caret = at
+        }
+        let wanted = box.selectionStart == box.selectionEnd ? mention_tray_query(text, at, trigger, ents) : null
+        if wanted == null { shut_at = -1 }
+        if wanted == null || ask == null || wanted.at != ask.at || wanted.query != ask.query { active = 0 }
+        ask = wanted
+        js("requestAnimationFrame", (_t = null) => { place() })
+    }
+    let told = () => {
+        on_change && on_change(text, ents | map((e) => { id: e.id, name: e.name, start: e.start, end: e.end }))
+    }
+    let put_caret = (at: int) => {
+        let u = mention_tray_units(text, at)
+        box.setSelectionRange(u, u)
+    }
+    let pick = (p) => {
+        let shown = `${trigger}${p.name}`
+        let from = ask.at
+        let upto = caret
+        let added = len(shown) + 1
+        let after = slice(text, 0, from) + shown + " " + slice(text, upto, len(text))
+        let shift = added - (upto - from)
+        let moved = ents | map((e) => e.start >= upto ? { ...e, start: e.start + shift, end: e.end + shift } : e)
+        box.setRangeText(`${shown} `, mention_tray_units(text, from), mention_tray_units(text, upto), "end")
+        text = after
+        ents = sort_by(moved + [{ id: p.id, name: p.name, start: from, end: from + len(shown) }], (e) => e.start)
+        recent = unique([str(p.id)] + recent)
+        ask = null
+        said = `${p.name} mentioned`
+        grow()
+        sync()
+        told()
+    }
+    <div class={ui_cls(["ui-mention-tray", keyboard && "ui-mention-tray-sticky", class])} id={id}
+         @mount={(el) => {
+             let w = js("window")
+             let d = w.document
+             win = w
+             let moved = (_e = null) => {
+                 if box.isSameNode(d.activeElement) {
+                     // Where the cursor went, kept out of any entity.
+                     let start = mention_tray_points(text, box.selectionStart)
+                     let end = mention_tray_points(text, box.selectionEnd)
+                     let snap = mention_tray_snap(ents, start, end, caret)
+                     if snap.start != start || snap.end != end {
+                         box.setSelectionRange(mention_tray_units(text, snap.start), mention_tray_units(text, snap.end))
+                     }
+                     sync()
+                 }
+             }
+             d.addEventListener("selectionchange", moved)
+             let stop = keyboard ? composer_bar_follow(el, (lift, _top, _height, _open) => {
+                 el.style.setProperty("--ui-mention-tray-lift", `${lift}px`)
+                 place()
+             }) : () => null
+             () => {
+                 d.removeEventListener("selectionchange", moved)
+                 stop()
+             }
+         }}>
+        <div.ui-mention-tray-lifted>
+            <div.ui-mention-tray-box>
+                <div.ui-mention-tray-mirror aria-hidden="true" @mount={(el) => { mirror = el }}>
+                    {for part in mention_tray_parts(text, ents, caret) =>
+                        <span key={part.key} class={part.mark ? "ui-mention-tray-name" : null} data-caret={part.caret ? "true" : null}>{part.caret ? "\u2060" : part.text}</span>}
+                </div>
+                <textarea.ui-mention-tray-field name={name} rows={rows} aria-label={label} placeholder={placeholder} role="combobox" aria-autocomplete="list"
+                          aria-expanded={open ? "true" : "false"} aria-controls={list_id} aria-activedescendant={open ? `${list_id}-${active}` : null}
+                          autocomplete="off" value={text}
+                          @mount={(el) => {
+                              box = el
+                              grow()
+                          }}
+                          @input={(e) => {
+                              let typed = e.value
+                              let done = mention_tray_edit(text, typed, ents)
+                              ents = done.ents
+                              text = done.text
+                              if done.text != typed {
+                                  box.value = done.text
+                                  put_caret(done.caret)
+                              }
+                              grow()
+                              sync()
+                              told()
+                          }}
+                          @scroll={() => { mirror.scrollTop = box.scrollTop }}
+                          @blur={() => { ask = null }}
+                          @keydown={(e) => {
+                              if open && !e.isComposing {
+                                  let n = len(found)
+                                  if e.key == "ArrowDown" { e.preventDefault(); active = (active + 1) % n }
+                                  if e.key == "ArrowUp" { e.preventDefault(); active = (active + n - 1) % n }
+                                  if e.key == "Enter" || e.key == "Tab" { e.preventDefault(); pick(found[active]) }
+                                  if e.key == "Escape" { e.preventDefault(); shut_at = ask.at }
+                              }
+                          }}></textarea>
+            </div>
+            <input type="hidden" name={`${name}_mentions`} value={mention_tray_ids(ents)}/>
+            {open && <ul.ui-mention-tray-pop id={list_id} role="listbox" aria-label="People"
+                         @mount={(el) => {
+                             tray = el
+                             place()
+                             () => { tray = null }
+                         }}>
+                {for i in range(len(found)) => <li.ui-mention-tray-opt key={str(found[i].id)} id={`${list_id}-${i}`} role="option" aria-selected={i == active ? "true" : "false"}
+                        @mousedown={(e) => { e.preventDefault() }}
+                        @click={() => { pick(found[i]) }}>
+                    <span.ui-mention-tray-face aria-hidden="true">{found[i].avatar != null ? <img src={found[i].avatar} alt=""/> : mention_tray_initials(found[i].name)}</span>
+                    <span.ui-mention-tray-who>
+                        <b>{found[i].name}</b>
+                        {found[i].handle != null && <small>@{found[i].handle}</small>}
+                    </span>
+                </li>}
+            </ul>}
+            <span.ui-sr role="status">{open ? `${len(found)} ${len(found) == 1 ? "person" : "people"} offered` : said}</span>
+        </div>
+    </div>
+}

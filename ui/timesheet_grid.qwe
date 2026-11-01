@@ -1,0 +1,275 @@
+// TimesheetGrid: a week by projects, with the hours typed as 7.5, 7:30, 7h30 or as a
+// span, 22:00-06:00, which may run past midnight. It rounds each entry to the quarter
+// hour, takes off the unpaid break on a long day, adds the days and the week, and
+// splits regular hours from overtime by the rule set. All sums are in whole minutes,
+// so they come out exact; bad cells are named, and stop the sheet being submitted.
+//
+//   <TimesheetGrid week="2026-11-02" projects={["Website", "Support"]}/>
+//   <TimesheetGrid week="2026-11-02" overtime="weekly" weekly_hours={37.5}
+//                  projects={[{ name: "Website", hours: ["7:30", "8", "", "22:00-06:00", "", "", ""] }]}
+//                  on_submit={(sheet) => { save(sheet) }}/>
+//
+// week: any date in the week; it starts on that week's Monday. projects: the rows, each
+// a name or { name, hours }, where hours has a cell for each day, Monday first.
+// daily_hours: a day's regular hours (8). weekly_hours: a week's (40). overtime: "daily"
+// (what is over a day's hours), "weekly" (what is over the week's) or "both", the
+// default, where the weekly limit applies to the hours left regular by the daily one,
+// so no minute is overtime twice. break_after: hours in a day past which a break is
+// taken off (6; 0 for none). break_minutes: how long it is (30). round_to: minutes each
+// entry rounds to, to the nearest, a half going up (15; 1 for no rounding). title: the
+// heading. id: a prefix for its ids, unique on the page. name: a prefix for the cells'
+// field names ("hours": hours_0_0 is the first row's Monday), so a form sends them.
+// on_submit(sheet): inside one of your components, adds a Submit button, called when no
+// cell is wrong; see timesheet_grid_sheet.
+//
+// Up, Down and Enter move between the cells of a column.
+//
+// A span counts on the day it starts, and all of it does: a night shift is one shift.
+// timesheet_grid_parse(text) reads a cell into { minutes } or { error }, with `span`
+// for a span. timesheet_grid_figures(cells, rules) works out { rows, days, breaks, net,
+// regular, overtime, total, problems }, minutes throughout, from a list of rows of
+// cells; timesheet_grid_rules(...) makes the rules. timesheet_grid_sheet gives the same
+// with hours as decimals, for payroll.
+
+import ui/theme.qwe use ui_cls
+
+let timesheet_grid_css = css`
+.ui-timesheet-grid { display: grid; gap: 12px; min-width: 0; padding: 18px 20px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-timesheet-grid .ui-timesheet-grid-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-timesheet-grid-wrap { overflow-x: auto; }
+.ui-timesheet-grid-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-timesheet-grid-table th, .ui-timesheet-grid-table td { padding: 4px 5px; border-bottom: 1px solid var(--ui-border); text-align: right; white-space: nowrap; }
+.ui-timesheet-grid-table thead th { font-weight: 600; color: var(--ui-muted); }
+.ui-timesheet-grid-table th:first-child { position: sticky; left: 0; background: var(--ui-surface); min-width: 92px; max-width: 150px; overflow: hidden; text-overflow: ellipsis; text-align: left; font-weight: 600; }
+.ui-timesheet-grid-table tfoot th, .ui-timesheet-grid-table tfoot td { color: var(--ui-muted); }
+.ui-timesheet-grid-table tfoot .ui-timesheet-grid-worked th, .ui-timesheet-grid-table tfoot .ui-timesheet-grid-worked td { color: var(--ui-fg); font-weight: 650; }
+.ui-timesheet-grid-cell { box-sizing: border-box; width: 74px; padding: 5px 6px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.3 var(--ui-font); font-variant-numeric: tabular-nums; text-align: right; }
+.ui-timesheet-grid-cell:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-timesheet-grid-cell[aria-invalid="true"] { border-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-timesheet-grid-over { color: var(--ui-warning); font-weight: 650; }
+.ui-timesheet-grid-sum { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 0; padding: 10px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-variant-numeric: tabular-nums; }
+.ui-timesheet-grid-sum b { font-weight: 700; }
+.ui-timesheet-grid-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-timesheet-grid-notes { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 12px; }
+.ui-timesheet-grid-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.ui-timesheet-grid-submit { padding: 8px 14px; border: 1px solid var(--ui-accent); border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg); font: 600 13px/1.2 var(--ui-font); cursor: pointer; }
+.ui-timesheet-grid-submit:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-timesheet-grid-said { margin: 0; min-height: 1.4em; color: var(--ui-muted); font-size: 13px; }
+`
+
+let timesheet_grid_days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+let timesheet_grid_longest = 1440
+
+// A clock time as minutes, or null: "6", "06:00", "6.30" is not one.
+fn timesheet_grid_clock(h: str, m) {
+    let hours = int(h)
+    let mins = m == null || m == "" ? 0 : int(m)
+    if is_err(hours) || is_err(mins) || hours > 24 || mins > 59 || (hours == 24 && mins > 0) { return null }
+    hours * 60 + mins
+}
+
+// See the top of the file. Decimals are read as decimals, so 7.1 is 426 minutes exactly,
+// and a part of a minute rounds half up.
+fn timesheet_grid_parse(text) -> map {
+    let raw = trim(str(text ?? ""))
+    if raw == "" { return { minutes: 0, empty: true } }
+    let t = lower(replace(replace(raw, ",", "."), "–", "-"))
+    let span = re.find(t, "^(\\d{1,2})(?::(\\d{2}))?\\s*(?:-|to)\\s*(\\d{1,2})(?::(\\d{2}))?$")
+    if span != null {
+        let from = timesheet_grid_clock(span.groups[0], span.groups[1])
+        let to = timesheet_grid_clock(span.groups[2], span.groups[3])
+        if from == null || to == null { return { error: `"${slice(raw, 0, 20)}" has a time that does not exist.` } }
+        if from == to { return { error: `"${slice(raw, 0, 20)}" starts and ends at the same time.` } }
+        let over = to < from
+        return { minutes: over ? to + 1440 - from : to - from, span: { from, to, overnight: over } }
+    }
+    let clock = re.find(t, "^(\\d{1,3}):(\\d{2})$") ?? re.find(t, "^(\\d{1,3})h\\s*(\\d{1,2})m?$")
+    if clock != null {
+        let m = int(clock.groups[1])
+        if m > 59 { return { error: `"${slice(raw, 0, 20)}" has more than 59 minutes.` } }
+        return timesheet_grid_cap(int(clock.groups[0]) * 60 + m, raw)
+    }
+    let only_min = re.find(t, "^(\\d{1,4})\\s*m(?:in)?$")
+    if only_min != null { return timesheet_grid_cap(int(only_min.groups[0]), raw) }
+    let number = re.find(t, "^(\\d{0,3}(?:\\.\\d{1,4})?)\\s*h?$")
+    if number != null && re.test(number.groups[0], "\\d") {
+        let m = int(round(dec(`0${number.groups[0]}`) * 60, 0, "half_up"))
+        return timesheet_grid_cap(m, raw)
+    }
+    if starts_with(t, "-") || starts_with(t, "−") { return { error: `"${slice(raw, 0, 20)}" is below zero.` } }
+    { error: `"${slice(raw, 0, 20)}" is not a time. Write 7.5, 7:30 or 22:00-06:00.` }
+}
+
+fn timesheet_grid_cap(m: int, raw: str) -> map =
+    m > timesheet_grid_longest ? { error: `"${slice(raw, 0, 20)}" is more than a day.` } : { minutes: m }
+
+// Minutes rounded to the nearest `step`, a half going up: at 15, 7:07 is 7:00 and 7:08 is 7:15.
+fn timesheet_grid_round(m: int, step: int) -> int = step <= 1 ? m : floor((m * 2 + step) / (step * 2)) * step
+
+// The rules, from the component's props; bad ones fall back and say so.
+fn timesheet_grid_rules(daily_hours = 8, weekly_hours = 40, overtime: str = "both", break_after = 6, break_minutes = 30, round_to = 15) -> map {
+    let mins = (v, fall) => {
+        let d = type_of(v) == "float" || type_of(v) == "int" || type_of(v) == "dec" ? dec(v) : null
+        d != null && d >= 0 ? int(round(d * 60, 0, "half_up")) : fall
+    }
+    { daily: mins(daily_hours, 480), weekly: mins(weekly_hours, 2400), rule: contains(["daily", "weekly", "both"], overtime) ? overtime : "both",
+      break_after: mins(break_after, 360), break_minutes: type_of(break_minutes) == "int" && break_minutes >= 0 ? break_minutes : 30,
+      round_to: type_of(round_to) == "int" && round_to >= 1 ? round_to : 15 }
+}
+
+// The week from the cells: see the top of the file. A day's break comes off once, after
+// the entries are added; overtime is worked out on what is left.
+fn timesheet_grid_figures(cells: list, rules: map, projects: list = []) -> map {
+    let width = 7
+    let problems = []
+    let notes = []
+    let rows = []
+    let days = range(width) | map((_) => 0)
+    for [r, row] in enumerate(cells) {
+        let label = projects[r] ?? `Row ${r + 1}`
+        let parts = []
+        for c in range(width) {
+            let p = timesheet_grid_parse(row[c])
+            if p.error != null {
+                problems = problems | push({ row: r, col: c, text: `${label}, ${timesheet_grid_days[c]}: ${p.error}` })
+                parts = parts | push(0)
+            } else {
+                let m = timesheet_grid_round(p.minutes, rules.round_to)
+                if p.span != null && p.span.overnight {
+                    notes = notes | push(`${label}, ${timesheet_grid_days[c]}: ${timesheet_grid_hm(m)} overnight, counted on the day it starts.`)
+                }
+                if m != p.minutes {
+                    notes = notes | push(`${label}, ${timesheet_grid_days[c]}: ${timesheet_grid_hm(p.minutes)} rounded to ${timesheet_grid_hm(m)}.`)
+                }
+                parts = parts | push(m)
+            }
+        }
+        rows = rows | push({ minutes: parts, total: sum(parts) })
+        days = zip(days, parts) | map((p) => p[0] + p[1])
+    }
+    for [c, m] in enumerate(days) {
+        if m > timesheet_grid_longest {
+            problems = problems | push({ row: 0, col: c, text: `${timesheet_grid_days[c]} adds up to ${timesheet_grid_hm(m)}, more than a day.` })
+        }
+    }
+    let breaks = days | map((m) => rules.break_after > 0 && m > rules.break_after ? min([rules.break_minutes, m]) : 0)
+    let net = zip(days, breaks) | map((p) => p[0] - p[1])
+    let daily_on = rules.rule != "weekly"
+    let weekly_on = rules.rule != "daily"
+    let over_day = net | map((m) => daily_on ? max([m - rules.daily, 0]) : 0)
+    let kept = sum(zip(net, over_day) | map((p) => p[0] - p[1]))
+    let over_week = weekly_on ? max([kept - rules.weekly, 0]) : 0
+    let overtime = sum(over_day) + over_week
+    { rows, days, breaks, net, over_day, over_week, total: sum(net), overtime, regular: sum(net) - overtime, problems, notes }
+}
+
+// Minutes as they read in the grid: 450 is "7:30", 0 is "0:00".
+fn timesheet_grid_hm(m: int) -> str {
+    let mins = m % 60
+    `${floor(m / 60)}:${mins < 10 ? "0" : ""}${mins}`
+}
+
+// Minutes as decimal hours, to two places: 450 is 7.50m.
+fn timesheet_grid_hours(m: int) = round(dec(m) / 60, 2, "half_up")
+
+// The sheet for on_submit: figures with hours as decimals beside the minutes.
+fn timesheet_grid_sheet(week: str, projects: list, cells: list, f: map) -> map {
+    let on = (i: int) => date.add_days(week, i)
+    { week, regular: timesheet_grid_hours(f.regular), overtime: timesheet_grid_hours(f.overtime), total: timesheet_grid_hours(f.total),
+      minutes: { regular: f.regular, overtime: f.overtime, total: f.total },
+      days: range(7) | map((i) => ({ date: on(i), entered: f.days[i], break: f.breaks[i], worked: f.net[i], overtime: f.over_day[i] })),
+      rows: enumerate(f.rows) | map((p) => ({ project: projects[p[0]], cells: cells[p[0]], minutes: p[1].minutes, total: p[1].total, hours: timesheet_grid_hours(p[1].total) })) }
+}
+
+// A row's name and first cells, however the prop gave them.
+fn timesheet_grid_project(p) -> str = type_of(p) == "map" ? str(p.name ?? "") : str(p ?? "")
+
+fn timesheet_grid_cells(p) -> list {
+    let h = type_of(p) == "map" && type_of(p.hours) == "list" ? p.hours : []
+    range(7) | map((i) => h[i] == null ? "" : str(h[i]))
+}
+
+// That week's Monday, or null for what is not a date.
+fn timesheet_grid_monday(d) {
+    if type_of(d) != "str" || !date.valid(d, "date") || d < "1000-01-08" || d > "9000-12-31" { return null }
+    date.add_days(d, 1 - date.weekday(d))
+}
+
+component TimesheetGrid(week: str = "", projects: list = [], daily_hours = 8, weekly_hours = 40, overtime: str = "both", break_after = 6, break_minutes: int = 30,
+                        round_to: int = 15, title: str = "Timesheet", id: str = "timesheet-grid", name: str = "hours", on_submit = null, class: str? = null) {
+    style global timesheet_grid_css
+    let monday = timesheet_grid_monday(week)
+    let labels = projects | map(timesheet_grid_project)
+    state cells = projects | map(timesheet_grid_cells)
+    state said = ""
+    let rules = timesheet_grid_rules(daily_hours, weekly_hours, overtime, break_after, break_minutes, round_to)
+    let f = timesheet_grid_figures(cells, rules, labels)
+    let bad = (r: int, c: int) => timesheet_grid_parse(cells[r][c]).error != null
+    let head = (i: int) => monday != null ? date.format(date.add_days(monday, i), "ddd D") : timesheet_grid_days[i]
+    let put = (r: int, c: int, v: str) => { cells = set(cells, r, set(cells[r], c, v)) }
+    let keys = (e, r: int, c: int) => {
+        let to = e.key == "ArrowUp" ? r - 1 : (e.key == "ArrowDown" || e.key == "Enter" ? r + 1 : null)
+        if to != null {
+            e.preventDefault()
+            let t = e.target.closest("table").querySelector(`[data-cell="${to}-${c}"]`)
+            t && t.focus()
+        }
+    }
+    let send = (e) => {
+        let g = timesheet_grid_figures(cells, rules, labels)
+        if monday == null {
+            said = "Set the week before submitting."
+        } else if len(g.problems) > 0 {
+            let p = g.problems[0]
+            said = `Not submitted: ${len(g.problems)} to put right.`
+            let t = e.target.closest(".ui-timesheet-grid").querySelector(`[data-cell="${p.row}-${p.col}"]`)
+            t && t.focus()
+        } else {
+            on_submit(timesheet_grid_sheet(monday, labels, cells, g))
+            said = `Submitted ${timesheet_grid_hm(g.total)} hours.`
+        }
+    }
+    <section class={ui_cls(["ui-timesheet-grid", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-timesheet-grid-title id={`${id}-title`}>{title}{monday != null ? `, week of ${date.format(monday, "D MMM YYYY")}` : ""}</h3>
+        {monday == null && <p.ui-timesheet-grid-problems role="alert">"{slice(week, 0, 30)}" is not a week: pass a date.</p>}
+        {len(cells) == 0
+            ? <p.ui-timesheet-grid-said>No projects to fill in.</p>
+            : <div.ui-timesheet-grid-wrap tabindex="0" role="region" aria-label="Hours by project and day">
+                <table.ui-timesheet-grid-table>
+                    <thead><tr>
+                        <th scope="col">Project</th>
+                        {for i in range(7) => <th key={i} scope="col">{head(i)}</th>}
+                        <th scope="col">Total</th>
+                    </tr></thead>
+                    <tbody>
+                        {for [r, label] in enumerate(labels) => <tr key={r}>
+                            <th scope="row">{label}</th>
+                            {for c in range(7) => <td key={c}>
+                                <input class="ui-timesheet-grid-cell" type="text" inputmode="text" autocomplete="off" id={`${id}-${r}-${c}`} name={`${name}_${r}_${c}`} data-cell={`${r}-${c}`}
+                                       aria-label={`${label}, ${timesheet_grid_days[c]}`} value={cells[r][c]} aria-invalid={bad(r, c) ? "true" : null}
+                                       @input={(e) => { put(r, c, e.value); said = "" }} @keydown={(e) => { keys(e, r, c) }}/>
+                            </td>}
+                            <td class="ui-timesheet-grid-row-total">{timesheet_grid_hm(f.rows[r].total)}</td>
+                        </tr>}
+                    </tbody>
+                    <tfoot>
+                        <tr><th scope="row">Entered</th>{for i in range(7) => <td key={i}>{timesheet_grid_hm(f.days[i])}</td>}<td>{timesheet_grid_hm(sum(f.days))}</td></tr>
+                        <tr><th scope="row">Break</th>{for i in range(7) => <td key={i}>{f.breaks[i] > 0 ? `−${timesheet_grid_hm(f.breaks[i])}` : "–"}</td>}<td>{sum(f.breaks) > 0 ? `−${timesheet_grid_hm(sum(f.breaks))}` : "–"}</td></tr>
+                        <tr.ui-timesheet-grid-worked><th scope="row">Worked</th>{for i in range(7) => <td key={i} class={f.over_day[i] > 0 ? "ui-timesheet-grid-over" : null}>{timesheet_grid_hm(f.net[i])}</td>}<td>{timesheet_grid_hm(f.total)}</td></tr>
+                    </tfoot>
+                </table>
+              </div>}
+        <p.ui-timesheet-grid-sum aria-live="polite">
+            <span>Regular <b.ui-timesheet-grid-regular>{timesheet_grid_hm(f.regular)}</b></span>
+            <span>Overtime <b.ui-timesheet-grid-overtime>{timesheet_grid_hm(f.overtime)}</b></span>
+            <span>Total <b.ui-timesheet-grid-total>{timesheet_grid_hm(f.total)}</b> ({str(timesheet_grid_hours(f.total))} h)</span>
+        </p>
+        {len(f.problems) > 0 && <ul.ui-timesheet-grid-problems role="alert">{for p in take(f.problems, 8) => <li key={p.text}>{p.text}</li>}</ul>}
+        {len(f.notes) > 0 && <ul.ui-timesheet-grid-notes>{for n in take(f.notes, 8) => <li key={n}>{n}</li>}</ul>}
+        {on_submit != null && <div.ui-timesheet-grid-foot>
+            <button.ui-timesheet-grid-submit type="button" @click={send}>Submit</button>
+            <p.ui-timesheet-grid-said aria-live="polite">{said}</p>
+        </div>}
+    </section>
+}

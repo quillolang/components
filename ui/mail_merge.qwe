@@ -1,0 +1,316 @@
+// MailMerge: one message for many people. A template with {{name}} and fallbacks
+// {{name|there}}, and rows of data pasted as CSV (with a header) or JSON: it previews the
+// message for each row, lists the variables no column fills and the columns nothing
+// uses, and names the rows that would go out with an empty value, before anything is
+// sent. A mistake in the template ("{{name" never closed) is shown with its line and column.
+//
+//   <MailMerge template="Hi {{name|there}}, your order {{order}} shipped." data={"name,order\nAna,1041\n,1042"}/>
+//   <MailMerge template={t} rows={customers} on_send={(rendered) => { queue(rendered) }}/>
+//
+// template: the text to start with. data: the rows to start with, as CSV or JSON text.
+// rows: the same as a list of maps, in place of data. name ("template") and data_name
+// ("data") are the fields' names, so a plain <form> sends them. id: a prefix for its ids
+// ("mail-merge"), unique on the page. rows_box: the data box's height in lines (6).
+// most: the most rows used (2000); past it, or with a very long template fewer, it uses
+// the first and says so. on_send(rendered):
+// inside one of your components, called by a Send button, which is only there with it,
+// and given the list to send: { row, text }, row counting from 1. Rows with an empty
+// value are left out unless the box under the button is ticked. class: more classes
+// for its outer element.
+//
+// mail_merge_template(text) reads a template: { parts, names, errors }. mail_merge_rows(text,
+// most) reads data: { columns, rows, errors, capped }, rows being lists of text in the
+// columns' order. mail_merge_of(template, data, most) is the whole thing, for a program's
+// own use: { names, columns, missing, unused, errors, broken, messages, empty_rows, capped },
+// where missing lists { name, fallback } for variables no column fills, unused lists
+// columns, and messages lists { row, label, text, pieces, empties, fallbacks }.
+//
+// In the template, {{ name }} may have spaces and {{name|}} says that empty is fine. A
+// value of only spaces counts as empty. Text between delimiters of CSV may be in double
+// quotes, with "" for a quote; commas, semicolons or tabs are found from the header.
+
+import ui/theme.qwe use ui_cls
+
+let mail_merge_css = css`
+.ui-mail-merge { display: grid; gap: 14px; min-width: 0; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-mail-merge-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px 14px; min-width: 0; }
+.ui-mail-merge-field { display: grid; align-content: start; gap: 4px; min-width: 0; }
+.ui-mail-merge-field label { font-size: 13px; font-weight: 500; }
+.ui-mail-merge-field small { color: var(--ui-muted); font-size: 12px; }
+.ui-mail-merge-field textarea { box-sizing: border-box; display: block; width: 100%; min-width: 0; padding: 8px 10px; resize: vertical; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.5 var(--ui-mono); }
+.ui-mail-merge-field textarea:hover { border-color: var(--ui-strong); }
+.ui-mail-merge-field textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-mail-merge-said { margin: 0; font-weight: 600; }
+.ui-mail-merge-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-mail-merge-errors { display: grid; gap: 4px; margin: 0; padding: 8px 12px 8px 28px; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); color: var(--ui-danger); font-size: 13px; }
+.ui-mail-merge-lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 14px; min-width: 0; }
+.ui-mail-merge-list { min-width: 0; padding: 8px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-mail-merge-list h4 { margin: 0 0 4px; font-size: 13px; font-weight: 600; }
+.ui-mail-merge-list ul { display: grid; gap: 3px; margin: 0; padding: 0; list-style: none; overflow-wrap: anywhere; }
+.ui-mail-merge-warn { border-color: var(--ui-warning); }
+.ui-mail-merge-link { padding: 0; border: 0; background: none; color: var(--ui-accent); font: inherit; text-align: left; text-decoration: underline; cursor: pointer; }
+.ui-mail-merge-link:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: 2px; }
+.ui-mail-merge-preview { display: grid; gap: 8px; min-width: 0; padding: 12px 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); }
+.ui-mail-merge-preview:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-mail-merge-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-mail-merge-where { flex: 1 1 auto; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-mail-merge-btn { height: 30px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px/1 var(--ui-font); cursor: pointer; }
+.ui-mail-merge-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-mail-merge-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-mail-merge-btn:disabled { opacity: .55; cursor: not-allowed; }
+.ui-mail-merge-send { background: var(--ui-accent); border-color: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-mail-merge-send:hover:not(:disabled) { background: var(--ui-accent); filter: brightness(1.08); }
+.ui-mail-merge-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-mail-merge-text mark { border-radius: 2px; color: inherit; background: var(--ui-accent-soft); }
+.ui-mail-merge-text .ui-mail-merge-fallback { background: var(--ui-warning-soft); }
+.ui-mail-merge-text .ui-mail-merge-empty { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-mail-merge-action { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.ui-mail-merge-action label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.ui-mail-merge-action input { margin: 0; accent-color: var(--ui-accent); }
+`
+
+// "line 2, column 5" of a place in a text.
+fn mail_merge_place(chars: list, at: int) -> str {
+    let before = take(chars, at)
+    let breaks = range(0, len(before)) | filter((i) => before[i] == "\n")
+    let line = len(breaks) + 1
+    let column = at - (len(breaks) == 0 ? 0 : last(breaks) + 1) + 1
+    `line ${line}, column ${column}`
+}
+
+// A template as parts: { text } and { name, fallback, raw }, its names in order of
+// first use, and its mistakes in words, each with its place.
+fn mail_merge_template(text: str) {
+    let chars = split(text, "")
+    let tags = re.find_all(text, "\\{\\{([^{}\\n]{0,200})\\}\\}")
+    let at = 0
+    let errors = []
+    let stray_in = (from: int, to: int) => {
+        if len(errors) < 5 {
+            for m in take(re.find_all(join(slice(chars, from, to), ""), "\\{\\{|\\}\\}"), 5) {
+                let place = mail_merge_place(chars, from + m.start)
+                errors = push(errors, m.text == "{{" ? `A {{ is never closed, at ${place}.` : `A }} has nothing to close, at ${place}.`)
+            }
+        }
+    }
+    let parts = flatten(for m in tags {
+        stray_in(at, m.start)
+        let plain = join(slice(chars, at, m.start), "")
+        at = m.end
+        let inner = m.groups[0]
+        let cut = index_of(inner, "|")
+        let name = trim(cut == null ? inner : slice(inner, 0, cut))
+        let fallback = cut == null ? null : trim(slice(inner, cut + 1))
+        if name == "" && len(errors) < 5 { errors = push(errors, `A variable has no name, at ${mail_merge_place(chars, m.start)}.`) }
+        [{ text: plain }, ...(name == "" ? [] : [{ name, fallback, raw: m.text }])]
+    })
+    stray_in(at, len(chars))
+    let all_parts = push(parts, { text: join(slice(chars, at, len(chars)), "") }) | filter((p) => p.name != null || p.text != "")
+    { parts: all_parts, names: all_parts | filter((p) => p.name != null) | map((p) => p.name) | unique(), errors }
+}
+
+// Which of comma, semicolon and tab divides a header line.
+fn mail_merge_divider(line: str) -> str {
+    let times = (d: str) => len(split(line, d)) - 1
+    let tabs = times("\t")
+    let semis = times(";")
+    let commas = times(",")
+    tabs > commas && tabs > semis ? "\t" : semis > commas ? ";" : ","
+}
+
+// CSV as lists of cells, by the RFC's rules: a quoted cell may hold dividers, line breaks
+// and "". It reads whole cells out of the characters at once, and stops after `most`
+// lines, as `push` copies its list in the browser. { rows, open, stopped }.
+fn mail_merge_csv(text: str, most: int) {
+    let chars = split(text, "")
+    let n = len(chars)
+    let divider = mail_merge_divider(split(text, "\n")[0])
+    let rows = []
+    let row = []
+    let i = 0
+    let open_at = null
+    while i < n && len(rows) <= most {
+        let value = ""
+        if chars[i] == "\"" {
+            let from = i + 1
+            let to = from
+            while to < n && (chars[to] != "\"" || (to + 1 < n && chars[to + 1] == "\"")) { to += chars[to] == "\"" ? 2 : 1 }
+            if to >= n { open_at = i }
+            value = replace(join(slice(chars, from, to), ""), "\"\"", "\"")
+            i = to + 1
+        }
+        let from = i
+        while i < n && chars[i] != divider && chars[i] != "\n" { i += 1 }
+        let rest = join(slice(chars, from, i), "")
+        row = push(row, value + re.replace(rest, "\r$", ""))
+        if i >= n || chars[i] == "\n" {
+            rows = push(rows, row)
+            row = []
+        } else if i + 1 == n {
+            // A divider at the very end leaves one empty cell after it.
+            rows = push(rows, push(row, ""))
+            row = []
+        }
+        i += 1
+    }
+    if len(row) > 0 { rows = push(rows, row) }
+    { rows, open: open_at == null ? null : mail_merge_place(chars, open_at), stopped: i < n }
+}
+
+// JSON as a header and lists of cells. A value is shown as it would be written.
+fn mail_merge_json(text: str) {
+    let parsed = json.parse(text)
+    if is_err(parsed) { return { columns: [], rows: [], errors: ["The data looks like JSON, but it does not parse."] } }
+    let items = type_of(parsed) == "map" ? [parsed] : parsed
+    if type_of(items) != "list" { return { columns: [], rows: [], errors: ["JSON data must be a list of records."] } }
+    let bad = range(0, len(items)) | filter((i) => type_of(items[i]) != "map")
+    if len(bad) > 0 { return { columns: [], rows: [], errors: [`Item ${bad[0] + 1} of the JSON is not a record.`] } }
+    let columns = unique(flatten(items | map((m) => keys(m))))
+    let shown = (v) => v == null ? "" : type_of(v) == "str" ? v : contains(["list", "map"], type_of(v)) ? json.stringify(v) : str(v)
+    { columns, rows: items | map((m) => columns | map((c) => shown(get(m, c, null)))), errors: [] }
+}
+
+// Data as { columns, rows, errors, capped }. The rows are lists in the columns' order,
+// not maps, as a column may be called anything, "constructor" too.
+fn mail_merge_rows(text: str, most: int = 2000) {
+    let t = trim(re.replace(text, "^﻿", ""))
+    if t == "" { return { columns: [], rows: [], errors: [], capped: false } }
+    if starts_with(t, "[") || starts_with(t, "{") {
+        let j = mail_merge_json(t)
+        return { ...j, rows: take(j.rows, most), capped: len(j.rows) > most }
+    }
+    let parsed = mail_merge_csv(t, most + 1)
+    let lines = parsed.rows | filter((r) => any(r, (c) => trim(c) != ""))
+    let columns = lines[0] | map((c) => trim(c))
+    let data = drop(lines, 1)
+    let width = len(columns)
+    let seen = columns | filter((c) => c != "")
+    let doubled = unique(seen | filter((c) => count(seen, (x) => x == c) > 1))
+    let uneven = range(0, len(data)) | filter((i) => len(data[i]) != width)
+    let errors = [
+        ...(parsed.open != null ? [`A quote is never closed, at ${parsed.open}.`] : []),
+        ...(len(doubled) > 0 ? [`The heading ${doubled[0]} comes twice: only the first is used.`] : []),
+        ...(any(columns, (c) => c == "") ? ["A column has no heading, so nothing can use it."] : []),
+        ...(len(uneven) > 0 ? [`Row ${uneven[0] + 1} has ${len(data[uneven[0]])} ${len(data[uneven[0]]) == 1 ? "cell" : "cells"}, not ${width}.`] : []),
+    ]
+    { columns, rows: take(data, most) | map((r) => range(0, width) | map((i) => r[i] ?? "")), errors, capped: parsed.stopped || len(data) > most }
+}
+
+// One row's message: { text, pieces, empties, fallbacks }, pieces being { text, kind }, of
+// kind "plain", "value", "fallback" or "empty". Each part knows its column by `at`.
+fn mail_merge_fill(parts: list, cells: list) {
+    let pieces = parts | map((p) => {
+        if p.name == null { return { text: p.text, kind: "plain", name: null } }
+        let value = p.at == null ? "" : cells[p.at] ?? ""
+        if trim(value) != "" { return { text: value, kind: "value", name: p.name } }
+        if p.fallback != null { return { text: p.fallback, kind: "fallback", name: p.name } }
+        { text: "", kind: "empty", name: p.name }
+    })
+    { text: pieces | map((p) => p.text) | join(""), pieces,
+      empties: pieces | filter((p) => p.kind == "empty") | map((p) => p.name) | unique(),
+      fallbacks: pieces | filter((p) => p.kind == "fallback" && p.text != "") | map((p) => p.name) | unique() }
+}
+
+// The whole thing (see the top of the file).
+fn mail_merge_of(template: str, data: str, most: int = 2000) {
+    let t = mail_merge_template(template)
+    let d = mail_merge_rows(data, most)
+    let columns = d.columns | filter((c) => c != "")
+    let missing = t.names | filter((n) => !contains(columns, n))
+        | map((n) => { name: n, fallback: any(t.parts, (p) => p.name == n && p.fallback != null),
+                       like: first(columns | filter((c) => lower(c) == lower(n))) })
+    let unused = columns | filter((c) => !contains(t.names, c)) | unique()
+    let placed = t.parts | map((p) => p.name == null ? p : { ...p, at: index_of(d.columns, p.name) })
+    // The work is parts by rows: a keystroke in a very long template fills fewer rows.
+    let room = floor(200000 / max([len(placed), 1]))
+    let filling = min([len(d.rows), room])
+    let messages = range(0, filling) | map((i) => {
+        let cells = d.rows[i]
+        { ...mail_merge_fill(placed, cells), row: i + 1, label: filled(trim(cells[0] ?? "")) ?? `Row ${i + 1}` }
+    })
+    { names: t.names, columns, missing, unused, errors: t.errors + d.errors, broken: len(t.errors) > 0, messages, empty_rows: messages | filter((m) => len(m.empties) > 0), capped: d.capped || filling < len(d.rows) }
+}
+
+component MailMerge(template: str = "", data: str = "", rows = null, name: str = "template", data_name: str = "data", id: str = "mail-merge", rows_box: int = 6, most: int = 2000, on_send = null, class: str? = null) {
+    style global mail_merge_css
+    state tpl = template
+    state raw = rows != null ? json.stringify(rows, true) : data
+    state place = 0
+    state with_empty = false
+    state sent = ""
+    let m = mail_merge_of(tpl, raw, most)
+    let total = len(m.messages)
+    let at = min([place, max([total - 1, 0])])
+    let msg = total == 0 ? null : m.messages[at]
+    let ready = with_empty ? m.messages : m.messages | filter((x) => len(x.empties) == 0)
+    let blank = trim(tpl) == "" && trim(raw) == ""
+    let said = blank ? "Write a template and paste some rows to preview them."
+        : len(m.errors) > 0 ? `${len(m.errors)} ${len(m.errors) == 1 ? "problem" : "problems"} to fix.`
+        : trim(tpl) == "" ? "Write a template to preview the rows."
+        : total == 0 ? "Paste some rows to preview them."
+        : len(m.empty_rows) > 0 ? `${total} ${total == 1 ? "message" : "messages"}, ${len(m.empty_rows)} with an empty value.`
+        : `${total} ${total == 1 ? "message" : "messages"} ready.`
+    let go = (n: int) => { place = max([0, min([n, total - 1])]) }
+    let keys_on = (e) => {
+        if e.key == "ArrowRight" { e.preventDefault(); go(at + 1) }
+        if e.key == "ArrowLeft" { e.preventDefault(); go(at - 1) }
+        if e.key == "Home" { e.preventDefault(); go(0) }
+        if e.key == "End" { e.preventDefault(); go(total - 1) }
+    }
+    let send = () => {
+        on_send(ready | map((x) => { row: x.row, text: x.text }))
+        sent = `Handed over ${len(ready)} ${len(ready) == 1 ? "message" : "messages"}.`
+    }
+    <section class={ui_cls(["ui-mail-merge", class])} aria-labelledby={`${id}-said`}>
+        <div.ui-mail-merge-fields>
+            <div.ui-mail-merge-field>
+                <label for={`${id}-template`}>Template</label>
+                <textarea id={`${id}-template`} name={name} rows={rows_box} value={tpl} aria-describedby={`${id}-template-hint`} @input={(e) => { tpl = e.value; sent = "" }}></textarea>
+                <small id={`${id}-template-hint`}>{"{{name}}"} is filled from a column; {"{{name|there}}"} says what to use if it is empty.</small>
+            </div>
+            <div.ui-mail-merge-field>
+                <label for={`${id}-data`}>Rows</label>
+                <textarea id={`${id}-data`} name={data_name} rows={rows_box} value={raw} spellcheck="false" aria-describedby={`${id}-data-hint`} @input={(e) => { raw = e.value; sent = "" }}></textarea>
+                <small id={`${id}-data-hint`}>CSV with a header line, or JSON: a list of records.</small>
+            </div>
+        </div>
+        <p.ui-mail-merge-said id={`${id}-said`} aria-live="polite">{said}{sent != "" && ` ${sent}`}</p>
+        {len(m.errors) > 0 && <ul.ui-mail-merge-errors id={`${id}-errors`}>{for e in m.errors => <li key={e}>{e}</li>}</ul>}
+        {m.capped && <p.ui-mail-merge-note>Only the first {format_number(total, "en-US", 0)} rows are used.</p>}
+        {(len(m.missing) > 0 || len(m.unused) > 0 || len(m.empty_rows) > 0) && <div.ui-mail-merge-lists>
+            {len(m.missing) > 0 && <div.ui-mail-merge-list.ui-mail-merge-warn id={`${id}-missing`}>
+                <h4>No column for</h4>
+                <ul>{for v in m.missing => <li key={v.name}>{v.name}{v.like != null ? `: did you mean ${v.like}?` : v.fallback ? ": the fallback goes to everyone" : ""}</li>}</ul>
+            </div>}
+            {len(m.empty_rows) > 0 && <div.ui-mail-merge-list.ui-mail-merge-warn id={`${id}-empty`}>
+                <h4>Rows with an empty value</h4>
+                <ul>{for x in take(m.empty_rows, 50) => <li key={x.row}>
+                    <button.ui-mail-merge-link type="button" @click={() => { go(x.row - 1) }}>{x.label}</button>: {join(x.empties, ", ")}
+                </li>}</ul>
+                {len(m.empty_rows) > 50 && <p.ui-mail-merge-note>And {len(m.empty_rows) - 50} more.</p>}
+            </div>}
+            {len(m.unused) > 0 && <div.ui-mail-merge-list id={`${id}-unused`}>
+                <h4>Columns not used</h4>
+                <ul>{for c in m.unused => <li key={c}>{c}</li>}</ul>
+            </div>}
+        </div>}
+        {msg != null && !m.broken && trim(tpl) != "" && <div.ui-mail-merge-preview id={`${id}-preview`} tabindex="0" role="group" aria-label="Preview of a message: the arrow keys move between rows" @keydown={keys_on}>
+            <div.ui-mail-merge-bar>
+                <span.ui-mail-merge-where id={`${id}-where`}>Row {msg.row} of {total}: {msg.label}</span>
+                <button.ui-mail-merge-btn type="button" disabled={at == 0} @click={() => { go(at - 1) }}>Previous</button>
+                <button.ui-mail-merge-btn type="button" disabled={at >= total - 1} @click={() => { go(at + 1) }}>Next</button>
+            </div>
+            <p.ui-mail-merge-text id={`${id}-text`}>
+                {for [i, p] in enumerate(msg.pieces) => p.kind == "plain" ? p.text
+                    : p.kind == "empty" ? <mark key={i} class="ui-mail-merge-empty">[{p.name} is empty]</mark>
+                    : p.kind == "fallback" ? <mark key={i} class="ui-mail-merge-fallback">{p.text}</mark>
+                    : <mark key={i}>{p.text}</mark>}
+            </p>
+        </div>}
+        {on_send != null && <div.ui-mail-merge-action>
+            <button.ui-mail-merge-btn.ui-mail-merge-send type="button" id={`${id}-send`} disabled={m.broken || trim(tpl) == "" || len(ready) == 0} @click={() => { send() }}>Send {len(ready)} {len(ready) == 1 ? "message" : "messages"}</button>
+            {len(m.empty_rows) > 0 && <label><input type="checkbox" id={`${id}-with-empty`} checked={with_empty} @change={(e) => { with_empty = e.checked }}/> Include rows with an empty value</label>}
+        </div>}
+    </section>
+}

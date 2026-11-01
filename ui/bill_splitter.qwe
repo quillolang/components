@@ -1,0 +1,397 @@
+// BillSplitter: what each person owes of a bill with tax and tip, split equally, by
+// shares or by who had which item. The whole bill is worked out first (the tax and
+// the tip rounded half up to the currency's cents), then split once by the largest
+// remainder: each person gets their exact part rounded down, and the cents left over
+// go one each to those who lost the most, the first in the list on a tie. So the parts
+// always add up to the bill, and nobody gets all the odd cents of the tax and the tip.
+// In items mode an item is shared equally by the people ticked on it, an item nobody
+// is ticked on by everyone (it says so), and the tax and tip follow what each had.
+//
+//   <BillSplitter subtotal="86.40" tax={8.25} tip={18} people={["Ana", "Ben", "Cy"]}/>
+//   <BillSplitter mode="items" tax={12} tax_as="percent" tip="10.00" tip_as="amount" currency="EUR"
+//                 people={["Ana", "Ben"]} on_change={(r) => { total = r.total }}
+//                 items={[{ name: "Pizza", price: "18.50", shared_by: ["Ana", "Ben"] }, { name: "Wine", price: 24, shared_by: ["Ben"] }]}/>
+//
+// mode: "equal" (the default), "shares" or "items"; the visitor can switch. subtotal:
+// the bill before tax and tip (for items, their sum takes its place). tax, tip: where
+// the fields start (numbers, decimals or numeric text; empty counts as 0). tax_as,
+// tip_as: "percent" (the default) or "amount". tip_on: what a percent tip is of,
+// "subtotal" (the default) or "total", with the tax. people: names, or maps { name,
+// shares }, at most 30 (two people by default). items: maps { name, price, shared_by },
+// shared_by being names, at most 100. currency: ISO code ("USD"; one Quillo does not
+// know falls back to it). locale: how to write amounts (the program's). title: the
+// heading ("Split the bill"). id: a prefix for its ids ("bill-splitter"), unique on the
+// page. name: a prefix for the names of its fields ("bill": bill_subtotal, bill_tax,
+// bill_tip, bill_person, bill_shares, bill_item, bill_price, bill_mode), so a form around it
+// sends them. on_change(r): inside one of your components, after each change, given
+// { subtotal, tax, tip, total, parts: [{ name, amount }] } as decimals when the figures are good.
+// class: more classes for its outer element.
+//
+// bill_splitter_largest_remainder(total, weights) is the split, for a program's own use:
+// whole minor units by weights, or null when the weights come to nothing.
+// bill_splitter_work(...) is the whole calculation.
+
+import ui/theme.qwe use ui_cls
+
+let bill_splitter_css = css`
+.ui-bill-split { container-type: inline-size; display: grid; gap: 16px; min-width: 0; max-width: 680px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-bill-split .ui-bill-split-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-bill-split-modes { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 0; padding: 0; border: 0; }
+.ui-bill-split-modes legend { float: left; margin-right: 8px; padding: 0; font-size: 13px; font-weight: 500; }
+.ui-bill-split-modes label, .ui-bill-split-check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ui-bill-split-modes input, .ui-bill-split-check input { margin: 0; accent-color: var(--ui-accent); }
+.ui-bill-split-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 14px; }
+@container (max-width: 480px) { .ui-bill-split-grid { grid-template-columns: minmax(0, 1fr); } }
+.ui-bill-split-field { display: grid; gap: 5px; min-width: 0; align-content: start; }
+.ui-bill-split-field > label { font-size: 13px; font-weight: 500; }
+.ui-bill-split-box { box-sizing: border-box; display: flex; align-items: center; gap: 6px; min-width: 0; height: 38px; padding: 0 8px 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-bill-split-box:hover { border-color: var(--ui-strong); }
+.ui-bill-split-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-bill-split-box input { flex: 1; width: 0; min-width: 0; height: 100%; padding: 0; border: 0; outline: none; background: transparent; color: var(--ui-fg);
+  font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-bill-split-box select { flex: none; max-width: 76px; border: 0; outline: none; background: transparent; color: var(--ui-muted); font: 12px var(--ui-font); cursor: pointer; }
+.ui-bill-split-box select:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 1px; border-radius: 3px; }
+.ui-bill-split-code { flex: none; color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-bill-split-bad .ui-bill-split-box, .ui-bill-split-box.ui-bill-split-bad { border-color: var(--ui-danger); }
+.ui-bill-split-part { display: grid; gap: 8px; min-width: 0; }
+.ui-bill-split-part h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.ui-bill-split-rows { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-bill-split-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.ui-bill-split-row .ui-bill-split-box { flex: 1 1 120px; }
+.ui-bill-split-row .ui-bill-split-num { flex: 0 1 110px; }
+.ui-bill-split-who { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0; padding: 0 0 4px; border: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-bill-split-who legend { padding: 0; }
+.ui-bill-split-btn { box-sizing: border-box; height: 32px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-bill-split-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-bill-split-btn:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-bill-split-btn:disabled { color: var(--ui-muted); cursor: not-allowed; }
+.ui-bill-split-add { justify-self: start; }
+.ui-bill-split-errors { margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-bill-split-notes { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-bill-split-out { display: grid; gap: 10px; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-bill-split-sums { display: grid; grid-template-columns: 1fr auto; gap: 2px 16px; margin: 0; }
+.ui-bill-split-sums dt { color: var(--ui-muted); }
+.ui-bill-split-sums dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.ui-bill-split-sums .ui-bill-split-total { padding-top: 4px; color: var(--ui-fg); font-weight: 700; }
+.ui-bill-split-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-bill-split-table th { padding: 4px 0; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: right; }
+.ui-bill-split-table td { padding: 5px 0; border-bottom: 1px solid var(--ui-border); text-align: right; overflow-wrap: anywhere; }
+.ui-bill-split-table th:first-child, .ui-bill-split-table td:first-child { text-align: left; }
+.ui-bill-split-table td:last-child { font-weight: 600; }
+.ui-bill-split-table th + th, .ui-bill-split-table td + td { padding-left: 12px; }
+.ui-bill-split-table tfoot td { border-bottom: 0; font-weight: 700; }
+`
+
+// The currency's code, USD when Quillo does not know it (which would stop every amount).
+fn bill_splitter_code(currency) -> str {
+    let c = upper(trim(str(currency ?? "")))
+    type_of(money.minor_units(c)) == "error" ? "USD" : c
+}
+
+// What was typed as a decimal: 0 when empty, null when it is not a plain number of 0 or
+// more up to `most`. A comma counts only as a thousands comma, so "12,50" is refused, not 1250.
+fn bill_splitter_read(text, most) {
+    let t = trim(str(text ?? ""))
+    if t == "" { return 0m }
+    if len(t) > 40 { return null }
+    let plain = re.test(t, "^[0-9]{1,3}(,[0-9]{3})+(\\.[0-9]*)?$") ? replace(t, ",", "") : t
+    if !re.test(plain, "^([0-9]+\\.?[0-9]*|\\.[0-9]+)$") { return null }
+    let d = dec(plain)
+    is_err(d) || d > most ? null : d
+}
+
+// Whole minor units split by weights, largest remainder first: everything adds up to
+// total. The remainders are compared to 12 places, so that thirds summed in another
+// order still tie, and a tie goes to the first. Null when the weights come to nothing.
+fn bill_splitter_largest_remainder(total: int, weights: list) {
+    let w = weights | map((x) => dec(x))
+    let all = sum(w)
+    if len(w) == 0 || all <= 0 { return null }
+    let exact = w | map((x) => dec(total) * (x / all))
+    let floors = exact | map((x) => int(floor(x)))
+    let left = total - sum(floors)
+    let order = sort_by(range(len(w)), (i) => 0m - round(exact[i] - floor(exact[i]), 12))
+    let ranked = range(len(w)) | map((i) => 0)
+    for [rank, i] in enumerate(order) {
+        ranked = set(ranked, i, rank)
+    }
+    range(len(w)) | map((i) => floors[i] + (ranked[i] < left ? 1 : 0))
+}
+
+// A percent of a minor amount, or the amount itself, as minor units rounded half up.
+fn bill_splitter_extra(base: int, x: dec, as_percent: bool, code: str) -> int {
+    let m = as_percent ? money.mul(money.from_minor(base, code), x / 100, "half_up") : money.of(x, code, "half_up")
+    money.to_minor(m)
+}
+
+// Each person's weight in items mode, the price of each item shared among those ticked
+// on it (everyone when nobody is), with the items' sum in minor units.
+fn bill_splitter_weights(who: list, prices: list) -> list {
+    who | map((p) => {
+        let shares = prices | map((l) => {
+            let by = l.by | filter((id) => who | any((q) => q.id == id))
+            let n = len(by) == 0 ? len(who) : len(by)
+            len(by) == 0 || contains(by, p.id) ? dec(l.minor) / n : 0m
+        })
+        sum(shares)
+    })
+}
+
+// The whole bill from the fields as typed. who: [{ id, name, shares }], lines: [{ id,
+// name, price, by }]. Gives { errors: [{ field, text }], notes, subtotal, tax, tip, total,
+// parts: [{ id, name, items, pays }] }, in minor units; subtotal is null with errors.
+fn bill_splitter_work(mode: str, sub_text, tax_text, tax_as: str, tip_text, tip_as: str, tip_on: str, who: list, lines: list, code: str) -> map {
+    let errors = []
+    let notes = []
+    let most = 999999999m
+    let amount_note = "a number of 0 or more, up to 999,999,999"
+    let tax_x = tax_as == "percent" ? bill_splitter_read(tax_text, 1000m) : bill_splitter_read(tax_text, most)
+    let tip_x = tip_as == "percent" ? bill_splitter_read(tip_text, 1000m) : bill_splitter_read(tip_text, most)
+    let sub_x = bill_splitter_read(sub_text, most)
+    if mode != "items" && sub_x == null { errors = errors | push({ field: "subtotal", text: `The bill before tax and tip must be ${amount_note}.` }) }
+    if tax_x == null { errors = errors | push({ field: "tax", text: tax_as == "percent" ? "The tax must be a percent from 0 to 1000." : `The tax must be ${amount_note}.` }) }
+    if tip_x == null { errors = errors | push({ field: "tip", text: tip_as == "percent" ? "The tip must be a percent from 0 to 1000." : `The tip must be ${amount_note}.` }) }
+    if len(who) == 0 { errors = errors | push({ field: "people", text: "Add at least one person." }) }
+    let label = (p) => bill_splitter_name(p, who)
+    let shares = mode == "shares" ? who | map((p) => bill_splitter_read(p.shares, 1000000m)) : []
+    if mode == "shares" {
+        for [i, s] in enumerate(shares) {
+            if s == null { errors = errors | push({ field: `shares-${who[i].id}`, text: `The shares of ${label(who[i])} must be a number of 0 or more.` }) }
+        }
+        if len(who) > 0 && all(shares, (s) => s != null) && sum(shares) <= 0 { errors = errors | push({ field: "people", text: "Give at least one person a share above 0." }) }
+    }
+    let priced = mode == "items" ? lines | map((l) => bill_splitter_read(l.price, most)) : []
+    if mode == "items" {
+        for [i, x] in enumerate(priced) {
+            let l = lines[i]
+            if x == null {
+                errors = errors | push({ field: `price-${l.id}`, text: `The price of ${filled(trim(l.name)) ?? `item ${i + 1}`} must be ${amount_note}.` })
+            } else if len(l.by | filter((id) => who | any((q) => q.id == id))) == 0 && x > 0 {
+                notes = notes | push(`Nobody is ticked for ${filled(trim(l.name)) ?? `item ${i + 1}`}, so it is split among everyone.`)
+            }
+        }
+    }
+    if len(errors) > 0 { return { errors, notes, subtotal: null, tax: 0, tip: 0, total: 0, parts: [] } }
+    let line_minors = priced | map((x) => money.to_minor(money.of(x, code, "half_up")))
+    let subtotal = mode == "items" ? sum(line_minors) : money.to_minor(money.of(sub_x, code, "half_up"))
+    let tax = bill_splitter_extra(subtotal, tax_x, tax_as == "percent", code)
+    let tip_base = tip_on == "total" ? subtotal + tax : subtotal
+    let tip = bill_splitter_extra(tip_base, tip_x, tip_as == "percent", code)
+    let total = subtotal + tax + tip
+    // Past this the browser's whole numbers stop being exact, and a cent could go missing.
+    if total > 4000000000000000 { return { errors: [{ field: "subtotal", text: "The bill comes to too much to split exactly." }], notes, subtotal: null, tax: 0, tip: 0, total: 0, parts: [] } }
+    let weights = bill_splitter_of(mode, who, lines, line_minors, shares)
+    let of_items = subtotal > 0 ? weights : who | map((p) => 1m)
+    let pays = bill_splitter_largest_remainder(total, of_items) ?? []
+    let had = bill_splitter_largest_remainder(subtotal, of_items) ?? []
+    let parts = who | enumerate() | map((row) => {
+        let i = row[0]
+        { id: row[1].id, name: label(row[1]), items: had[i] ?? 0, pays: pays[i] ?? 0 }
+    })
+    { errors, notes, subtotal, tax, tip, total, parts }
+}
+
+fn bill_splitter_of(mode: str, who: list, lines: list, minors: list, shares: list) -> list {
+    if mode == "shares" { return shares }
+    if mode == "items" {
+        let priced = lines | enumerate() | map((row) => ({ by: row[1].by, minor: minors[row[0]] }))
+        return bill_splitter_weights(who, priced)
+    }
+    who | map((p) => 1m)
+}
+
+// A person's name, or "Person 2" for a blank one.
+fn bill_splitter_name(p: map, who: list) -> str {
+    let place = (who | enumerate() | filter((row) => row[1].id == p.id) | map((row) => row[0] + 1) | first()) ?? 1
+    filled(trim(str(p.name ?? ""))) ?? `Person ${place}`
+}
+
+// The props' people as rows; maps or names, at most 30.
+fn bill_splitter_people(people) -> list {
+    let given = type_of(people) == "list" && len(people) > 0 ? take(people, 30) : ["", ""]
+    given | enumerate() | map((row) => {
+        let p = row[1]
+        let is_map = type_of(p) == "map"
+        { id: row[0] + 1, name: is_map ? str(p.name ?? "") : str(p ?? ""), shares: is_map && p.shares != null ? str(p.shares) : "1" }
+    })
+}
+
+// The props' items as rows, naming people by the ids of `who`.
+fn bill_splitter_items(items, who: list) -> list {
+    let given = type_of(items) == "list" ? take(items, 100) : []
+    given | filter((l) => type_of(l) == "map") | enumerate() | map((row) => {
+        let l = row[1]
+        let by = type_of(l.shared_by) == "list" ? who | filter((p) => contains(l.shared_by, p.name)) | map((p) => p.id) : []
+        { id: row[0] + 1, name: str(l.name ?? ""), price: l.price == null ? "" : str(l.price), by }
+    })
+}
+
+// Rows with the row of this id changed.
+fn bill_splitter_put(rows: list, id, field: str, value) -> list = rows | map((r) => r.id == id ? set(r, field, value) : r)
+
+component BillSplitter(subtotal = null, tax = null, tax_as: str = "percent", tip = null, tip_as: str = "percent", tip_on: str = "subtotal",
+                       mode: str = "equal", people = null, items = null, currency: str = "USD", locale: str? = null,
+                       title: str = "Split the bill", id: str = "bill-splitter", name: str = "bill", on_change = null, class: str? = null) {
+    style global bill_splitter_css
+    state how = mode == "shares" || mode == "items" ? mode : "equal"
+    state sub_text = subtotal == null ? "" : str(subtotal)
+    state tax_text = tax == null ? "" : str(tax)
+    state tip_text = tip == null ? "" : str(tip)
+    state tax_kind = tax_as == "amount" ? "amount" : "percent"
+    state tip_kind = tip_as == "amount" ? "amount" : "percent"
+    state with_tax = tip_on == "total"
+    state who = bill_splitter_people(people)
+    state lines = bill_splitter_items(items, bill_splitter_people(people))
+    state serial = 1000
+    let code = bill_splitter_code(currency)
+    let work = bill_splitter_work(how, sub_text, tax_text, tax_kind, tip_text, tip_kind, with_tax ? "total" : "subtotal", who, lines, code)
+    let ok = work.subtotal != null
+    let shown = (minor: int) => locale != null ? money.format(money.from_minor(minor, code), locale) : money.format(money.from_minor(minor, code))
+    let bad = (field: str) => work.errors | any((e) => e.field == field)
+    let field_id = (part: str) => `${id}-${part}`
+    let named = (part: str) => `${name}_${part}`
+    let tell = () => {
+        if on_change != null && ok {
+            let amount = (minor: int) => money.from_minor(minor, code).amount
+            on_change({ subtotal: amount(work.subtotal), tax: amount(work.tax), tip: amount(work.tip), total: amount(work.total),
+                        parts: work.parts | map((p) => ({ name: p.name, amount: amount(p.pays) })) })
+        }
+    }
+    let add_person = () => {
+        if len(who) < 30 {
+            serial += 1
+            who = who | push({ id: serial, name: "", shares: "1" })
+            tell()
+        }
+    }
+    let drop_person = (pid) => {
+        who = who | filter((p) => p.id != pid)
+        lines = lines | map((l) => set(l, "by", l.by | filter((x) => x != pid)))
+        tell()
+    }
+    let add_item = () => {
+        if len(lines) < 100 {
+            serial += 1
+            lines = lines | push({ id: serial, name: "", price: "", by: who | map((p) => p.id) })
+            tell()
+        }
+    }
+    let toggle = (lid, pid, on: bool) => {
+        lines = lines | map((l) => {
+            if l.id != lid { return l }
+            let rest = l.by | filter((x) => x != pid)
+            set(l, "by", on ? rest | push(pid) : rest)
+        })
+        tell()
+    }
+    <section class={ui_cls(["ui-bill-split", class])} aria-labelledby={field_id("title")}>
+        <h3.ui-bill-split-title id={field_id("title")}>{title}</h3>
+        <fieldset.ui-bill-split-modes>
+            <legend>Split</legend>
+            <label><input type="radio" name={named("mode")} value="equal" checked={how == "equal"} @change={() => { how = "equal"; tell() }}/> Equally</label>
+            <label><input type="radio" name={named("mode")} value="shares" checked={how == "shares"} @change={() => { how = "shares"; tell() }}/> By shares</label>
+            <label><input type="radio" name={named("mode")} value="items" checked={how == "items"} @change={() => { how = "items"; tell() }}/> By items</label>
+        </fieldset>
+        <div.ui-bill-split-grid>
+            {how != "items" && <div class={ui_cls(["ui-bill-split-field", bad("subtotal") && "ui-bill-split-bad"])}>
+                <label for={field_id("subtotal")}>Bill before tax and tip</label>
+                <div.ui-bill-split-box>
+                    <input type="text" inputmode="decimal" autocomplete="off" id={field_id("subtotal")} name={named("subtotal")} value={sub_text} placeholder="0.00"
+                           aria-invalid={bad("subtotal") ? "true" : null} @input={(e) => { sub_text = e.value; tell() }}/>
+                    <span.ui-bill-split-code aria-hidden="true">{code}</span>
+                </div>
+            </div>}
+            <div class={ui_cls(["ui-bill-split-field", bad("tax") && "ui-bill-split-bad"])}>
+                <label for={field_id("tax")}>Tax</label>
+                <div.ui-bill-split-box>
+                    <input type="text" inputmode="decimal" autocomplete="off" id={field_id("tax")} name={named("tax")} value={tax_text} placeholder="0"
+                           aria-invalid={bad("tax") ? "true" : null} @input={(e) => { tax_text = e.value; tell() }}/>
+                    <select aria-label="Tax is" name={named("tax_as")} value={tax_kind} @change={(e) => { tax_kind = e.value; tell() }}>
+                        <option value="percent" selected={tax_kind == "percent"}>%</option>
+                        <option value="amount" selected={tax_kind == "amount"}>{code}</option>
+                    </select>
+                </div>
+            </div>
+            <div class={ui_cls(["ui-bill-split-field", bad("tip") && "ui-bill-split-bad"])}>
+                <label for={field_id("tip")}>Tip</label>
+                <div.ui-bill-split-box>
+                    <input type="text" inputmode="decimal" autocomplete="off" id={field_id("tip")} name={named("tip")} value={tip_text} placeholder="0"
+                           aria-invalid={bad("tip") ? "true" : null} @input={(e) => { tip_text = e.value; tell() }}/>
+                    <select aria-label="Tip is" name={named("tip_as")} value={tip_kind} @change={(e) => { tip_kind = e.value; tell() }}>
+                        <option value="percent" selected={tip_kind == "percent"}>%</option>
+                        <option value="amount" selected={tip_kind == "amount"}>{code}</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+        {tip_kind == "percent" && <label.ui-bill-split-check>
+            <input type="checkbox" name={named("tip_on_total")} checked={with_tax} @change={(e) => { with_tax = e.checked; tell() }}/> Tip on the total with tax
+        </label>}
+        <div.ui-bill-split-part>
+            <h4>People</h4>
+            <ul.ui-bill-split-rows>
+                {for p in who => <li.ui-bill-split-row key={p.id}>
+                    <div.ui-bill-split-box>
+                        <label.ui-sr for={field_id(`person-${p.id}`)}>Name of person</label>
+                        <input type="text" autocomplete="off" maxlength="60" id={field_id(`person-${p.id}`)} name={named("person")} value={p.name} placeholder="Name"
+                               @input={(e) => { who = bill_splitter_put(who, p.id, "name", e.value); tell() }}/>
+                    </div>
+                    {how == "shares" && <div class={ui_cls(["ui-bill-split-box", "ui-bill-split-num", bad(`shares-${p.id}`) && "ui-bill-split-bad"])}>
+                        <label.ui-sr for={field_id(`shares-${p.id}`)}>Shares of {filled(p.name) ?? "this person"}</label>
+                        <input type="text" inputmode="decimal" autocomplete="off" id={field_id(`shares-${p.id}`)} name={named("shares")} value={p.shares}
+                               aria-invalid={bad(`shares-${p.id}`) ? "true" : null} @input={(e) => { who = bill_splitter_put(who, p.id, "shares", e.value); tell() }}/>
+                        <span.ui-bill-split-code aria-hidden="true">shares</span>
+                    </div>}
+                    <button.ui-bill-split-btn type="button" aria-label={`Remove ${filled(p.name) ?? "this person"}`} @click={() => { drop_person(p.id) }}>Remove</button>
+                </li>}
+            </ul>
+            <button.ui-bill-split-btn.ui-bill-split-add type="button" disabled={len(who) >= 30} @click={add_person}>Add a person</button>
+        </div>
+        {how == "items" && <div.ui-bill-split-part>
+            <h4>Items</h4>
+            <ul.ui-bill-split-rows>
+                {for l in lines => <li.ui-bill-split-row key={l.id}>
+                    <div.ui-bill-split-box>
+                        <label.ui-sr for={field_id(`item-${l.id}`)}>Item</label>
+                        <input type="text" autocomplete="off" maxlength="80" id={field_id(`item-${l.id}`)} name={named("item")} value={l.name} placeholder="Item"
+                               @input={(e) => { lines = bill_splitter_put(lines, l.id, "name", e.value); tell() }}/>
+                    </div>
+                    <div class={ui_cls(["ui-bill-split-box", "ui-bill-split-num", bad(`price-${l.id}`) && "ui-bill-split-bad"])}>
+                        <label.ui-sr for={field_id(`price-${l.id}`)}>Price of {filled(l.name) ?? "this item"}</label>
+                        <input type="text" inputmode="decimal" autocomplete="off" id={field_id(`price-${l.id}`)} name={named("price")} value={l.price} placeholder="0.00"
+                               aria-invalid={bad(`price-${l.id}`) ? "true" : null} @input={(e) => { lines = bill_splitter_put(lines, l.id, "price", e.value); tell() }}/>
+                    </div>
+                    <button.ui-bill-split-btn type="button" aria-label={`Remove ${filled(l.name) ?? "this item"}`} @click={() => { lines = lines | filter((x) => x.id != l.id); tell() }}>Remove</button>
+                    <fieldset.ui-bill-split-who>
+                        <legend.ui-sr>Who had {filled(l.name) ?? "this item"}</legend>
+                        {for p in who => <label.ui-bill-split-check key={p.id}>
+                            <input type="checkbox" name={named(`item_${l.id}_by`)} value={p.id} checked={contains(l.by, p.id)} @change={(e) => { toggle(l.id, p.id, e.checked) }}/>
+                            {filled(p.name) ?? "Unnamed"}
+                        </label>}
+                    </fieldset>
+                </li>}
+            </ul>
+            <button.ui-bill-split-btn.ui-bill-split-add type="button" disabled={len(lines) >= 100} @click={add_item}>Add an item</button>
+        </div>}
+        {len(work.errors) > 0 && <ul.ui-bill-split-errors role="alert">{for e in work.errors => <li key={e.field}>{e.text}</li>}</ul>}
+        {len(work.notes) > 0 && <p.ui-bill-split-notes>{join(work.notes, " ")}</p>}
+        {ok && <div.ui-bill-split-out aria-live="polite">
+            <dl.ui-bill-split-sums>
+                <dt>Subtotal</dt><dd data-key="subtotal">{shown(work.subtotal)}</dd>
+                <dt>Tax</dt><dd data-key="tax">{shown(work.tax)}</dd>
+                <dt>Tip</dt><dd data-key="tip">{shown(work.tip)}</dd>
+                <dt.ui-bill-split-total>Total</dt><dd.ui-bill-split-total data-key="total">{shown(work.total)}</dd>
+            </dl>
+            <table.ui-bill-split-table>
+                <thead><tr><th scope="col">Person</th>{how == "items" && <th scope="col">Items</th>}<th scope="col">Pays</th></tr></thead>
+                <tbody>
+                    {for p in work.parts => <tr key={p.id}><td>{p.name}</td>{how == "items" && <td>{shown(p.items)}</td>}<td>{shown(p.pays)}</td></tr>}
+                </tbody>
+                <tfoot><tr><td>Everyone</td>{how == "items" && <td>{shown(work.subtotal)}</td>}<td>{shown(work.total)}</td></tr></tfoot>
+            </table>
+        </div>}
+    </section>
+}

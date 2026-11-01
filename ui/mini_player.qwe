@@ -1,0 +1,330 @@
+// MiniPlayer: the small bar above the tabs that says what is playing, with its progress and a
+// play button. A swipe up lifts it to a full player, following the finger, and a pull down on
+// the top of that sends it back. A tap on the bar does the same, as do the keys. On a wide
+// screen the bar also has a seek bar and the times.
+//
+//   import ui/mini_player.qwe use MiniPlayer
+//
+//   <MiniPlayer src="/audio/ep12.m4a" title="Episode 12" artist="The Quillo Podcast" art="/art/show.jpg"/>
+//
+// With NowPlaying as the full player: it holds the audio, and the bar follows it by id.
+//
+//   <MiniPlayer media="player" title={now.title} artist={now.artist} art={now.art} full_player={true}>
+//       <NowPlaying id="player" queue={tracks} on_change={(s) => { now = s.track }}/>
+//   </MiniPlayer>
+//
+// media: the id of an <audio> or <video> somewhere on the page, which it follows and plays. src:
+// for a bar with audio of its own, when there is no such element; id names that audio
+// ("ui-miniplay-audio"). title, artist, art: what shows. above: the height of what it sits on, the
+// tabs, in pixels (56). full_player: children are the full player; without it a plain one
+// shows the art, a seek bar and a play button, with children below them. open: from your
+// own state, to open and close it. on_toggle(open): inside one of your components, when it opens
+// or closes. label: what screen readers call it.
+//
+// It is fixed to the screen, or to the nearest box with a transform. Inside, opened, focus stays in
+// the player: the keys are ArrowUp on the bar to open, Escape or ArrowDown on the top to close.
+
+import ui/theme.qwe use ui_cls
+import ui/scrub_bar.qwe use ScrubBar
+
+let mini_player_css = css`
+.ui-miniplay-host { display: contents; }
+.ui-miniplay {
+  --ui-miniplay-bar: 64px; position: fixed; inset: 0; z-index: 40; pointer-events: none; color: var(--ui-fg); font: 14px/1.3 var(--ui-font); container: ui-miniplay / inline-size;
+  transform: translateY(calc(100% - var(--ui-miniplay-bar) - var(--ui-miniplay-above, 56px) - env(safe-area-inset-bottom, 0px)));
+  transition: transform .3s cubic-bezier(.2, .8, .2, 1); will-change: transform;
+}
+.ui-miniplay-open { transform: none; pointer-events: auto; }
+:root:has(.ui-miniplay-open) { overflow: hidden; }
+/* Sits at the top of the panel; what comes up behind it is the rest of the panel. */
+.ui-miniplay-bar {
+  position: relative; box-sizing: border-box; display: flex; align-items: center; gap: 4px; height: var(--ui-miniplay-bar); margin: 0 8px; padding: 0 6px 0 4px; overflow: hidden; border: 1px solid var(--ui-border);
+  border-radius: 14px; background: var(--ui-surface); box-shadow: var(--ui-shadow); pointer-events: auto; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  transition: opacity .2s;
+}
+.ui-miniplay-open .ui-miniplay-bar { opacity: 0; }
+.ui-miniplay-main { display: flex; flex: 1; align-items: center; gap: 10px; min-width: 0; height: 100%; padding: 0 4px; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; touch-action: none; }
+.ui-miniplay-main:focus-visible, .ui-miniplay-play:focus-visible, .ui-miniplay-grip:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-miniplay-art { flex: none; display: grid; place-items: center; width: 46px; height: 46px; overflow: hidden; border-radius: 8px; background: var(--ui-accent-soft); color: var(--ui-accent); font-weight: 700; }
+.ui-miniplay-art img { display: block; width: 100%; height: 100%; object-fit: cover; -webkit-user-drag: none; pointer-events: none; }
+.ui-miniplay-names { display: grid; flex: 1; min-width: 0; }
+.ui-miniplay-names b, .ui-miniplay-names span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-miniplay-names b { font-weight: 600; }
+.ui-miniplay-names span { color: var(--ui-muted); font-size: 12px; }
+.ui-miniplay-play { display: grid; flex: none; place-items: center; width: 48px; height: 48px; padding: 0; border: 0; border-radius: 50%; background: none; color: var(--ui-fg); cursor: pointer; touch-action: manipulation; }
+.ui-miniplay-play svg { width: 28px; height: 28px; }
+.ui-miniplay-line { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--ui-subtle); }
+.ui-miniplay-line i { display: block; height: 100%; background: var(--ui-accent); transform-origin: 0 50%; transform: scaleX(var(--ui-miniplay-at, 0)); }
+.ui-miniplay-seek { display: none; flex: 1.2; align-items: center; min-width: 0; }
+.ui-miniplay-seek .ui-scrubbar { flex: 1; }
+.ui-miniplay-body {
+  position: absolute; inset: 0; display: flex; flex-direction: column; background: var(--ui-bg); opacity: 0; visibility: hidden; overscroll-behavior: contain;
+  transition: opacity .2s, visibility 0s .3s;
+}
+.ui-miniplay-open .ui-miniplay-body { opacity: 1; visibility: visible; transition: opacity .2s; }
+.ui-miniplay-moving .ui-miniplay-body { visibility: visible; transition: none; pointer-events: none; }
+.ui-miniplay-moving, .ui-miniplay-moving .ui-miniplay-bar { transition: none; }
+.ui-miniplay-grip {
+  flex: none; display: grid; place-items: center; width: 100%; height: 44px; margin-top: env(safe-area-inset-top, 0px); padding: 0; border: 0; background: none; cursor: grab; touch-action: none;
+  user-select: none; -webkit-user-select: none;
+}
+.ui-miniplay-grip span { width: 44px; height: 5px; border-radius: 999px; background: var(--ui-strong); }
+.ui-miniplay-content { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; --ui-nowp-height: 100%; }
+.ui-miniplay-plain { display: grid; gap: 12px; justify-items: center; padding: 8px 20px calc(16px + env(safe-area-inset-bottom, 0px)); }
+.ui-miniplay-big { display: grid; place-items: center; width: min(100%, 52dvh, 420px); aspect-ratio: 1; overflow: hidden; border-radius: 14px; background: var(--ui-accent-soft); color: var(--ui-accent); font: 700 64px var(--ui-font); box-shadow: var(--ui-shadow-lg); }
+.ui-miniplay-big img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.ui-miniplay-plain h2 { margin: 0; font-size: 20px; font-weight: 650; text-align: center; }
+.ui-miniplay-plain p { margin: 0; color: var(--ui-muted); text-align: center; }
+.ui-miniplay-plain .ui-scrubbar { justify-self: stretch; }
+.ui-miniplay-bigplay { display: grid; place-items: center; width: 68px; height: 68px; padding: 0; border: 0; border-radius: 50%; background: var(--ui-accent); color: var(--ui-accent-fg); cursor: pointer; touch-action: manipulation; }
+.ui-miniplay-bigplay svg { width: 34px; height: 34px; }
+.ui-miniplay-bigplay:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-miniplay-play:hover { background: var(--ui-subtle); } }
+/* A tablet's bar has room for a seek bar, which keeps the bar's own gestures off it. */
+@container ui-miniplay (min-width: 640px) {
+  .ui-miniplay-bar { margin: 0 16px; padding: 0 12px 0 6px; gap: 12px; }
+  .ui-miniplay-main { flex: 1; }
+  .ui-miniplay-seek { display: flex; }
+  .ui-miniplay-line { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-miniplay, .ui-miniplay-bar, .ui-miniplay-body { transition: none; } }
+`
+
+// Where a pull ends, given where the panel is, how far it can go and the finger's speed at the end:
+// true is open. A flick of 0.5 px/ms decides by its direction; otherwise it stays as it was
+// unless it was pulled past a quarter of the way.
+fn mini_player_settle(y, travel, speed, was_open: bool) -> bool {
+    if speed <= -0.5 { return true }
+    if speed >= 0.5 { return false }
+    was_open ? y < travel / 4 : y < travel * 3 / 4
+}
+
+// A panel's place, kept on the way.
+fn mini_player_keep(y, travel) = max([0, min([y, travel])])
+
+fn mini_player_num(v) {
+    let t = type_of(v)
+    if t != "int" && t != "float" { return 0 }
+    math.isfinite(v) ? v : 0
+}
+
+fn mini_player_share(time, total) = total > 0 ? max([0, min([time / total, 1])]) : 0
+
+// The last that can take focus of a list from the page: a part hidden on this screen cannot.
+fn mini_player_last(all) {
+    let i = all.length - 1
+    while i > 0 && all[i].getClientRects().length == 0 { i -= 1 }
+    all[i]
+}
+
+// Two points, moving on every 50 ms, so the speed at release is never read from one last move.
+fn mini_player_mark(g: map, y, t) -> map = t - g.b_t > 50 ? set(set(set(set(g, "a_y", g.b_y), "a_t", g.b_t), "b_y", y), "b_t", t) : g
+
+let mini_player_pause = "M6 4h4v16H6zM14 4h4v16h-4z"
+let mini_player_play = "M7 4v16l14-8z"
+
+component MiniPlayer(title: str = "", artist: str = "", art: str = "", media: str = "", src: str = "", id: str = "ui-miniplay-audio", above: int = 56,
+                     full_player: bool = false, open: bool = false, label: str = "Player", on_toggle = null, class: str? = null, children) {
+    style global mini_player_css
+    let aid = media != "" ? media : id
+    state panel = null
+    state bar = null
+    state grip = null
+    state main_btn = null
+    state body = null
+    state safe = null
+    state doc = null
+    state shown = open
+    state said_open = open
+    state moving = false
+    state playing = false
+    state time = 0
+    state total = 0
+    state said = ""
+    state press = null        // a finger on the bar or the top, while it lasts; no markup reads it
+    state moved_at = -1000    // when a press ended
+    state focus_to = open     // the side focus was last sent to
+    let element = () => doc == null ? null : doc.getElementById(aid)
+    let toggle = () => {
+        let m = element()
+        if m != null {
+            if m.paused {
+                said = ""
+                m.play().catch((err) => {
+                    if err.name == "NotAllowedError" { said = "Tap play again" }
+                })
+            } else {
+                m.pause()
+            }
+        }
+    }
+    let set_open = (to) => {
+        if to != shown {
+            shown = to
+            on_toggle && on_toggle(to)
+        }
+    }
+    if open != said_open {
+        said_open = open
+        shown = open
+    }
+    let travel = () => max([1, panel.offsetHeight - bar.offsetHeight - above - safe.offsetHeight])
+    let begin = (e) => {
+        let t = e.timeStamp
+        press = { x: e.clientX, y: e.clientY, was: shown, on: false, a_y: e.clientY, a_t: t, b_y: e.clientY, b_t: t, past: false, span: travel() }
+    }
+    let move = (e) => {
+        if press != null {
+            let dx = e.clientX - press.x
+            let dy = e.clientY - press.y
+            // Sideways first is not for the bar, for the whole press.
+            if !press.on && !press.past && (abs(dx) >= 8 || abs(dy) >= 8) {
+                if abs(dy) > abs(dx) {
+                    press = set(press, "on", true)
+                    moving = true
+                } else {
+                    press = set(press, "past", true)
+                }
+            }
+            if press.on {
+                press = mini_player_mark(press, e.clientY, e.timeStamp)
+                let y = mini_player_keep((press.was ? 0 : press.span) + dy, press.span)
+                let share = y / press.span
+                panel.style.transform = `translateY(${y}px)`
+                bar.style.opacity = str(share)
+                body.style.opacity = str(1 - share)
+            }
+        }
+    }
+    let clear = () => {
+        moving = false
+        panel.style.transform = ""
+        bar.style.opacity = ""
+        body.style.opacity = ""
+    }
+    let up = (e) => {
+        if press != null {
+            let p = press
+            press = null
+            moved_at = e.timeStamp
+            if p.on {
+                let y = mini_player_keep((p.was ? 0 : p.span) + e.clientY - p.y, p.span)
+                let speed = (e.clientY - p.a_y) / max([1, e.timeStamp - p.a_t])
+                clear()
+                set_open(mini_player_settle(y, p.span, speed, p.was))
+            } else if !p.past {
+                set_open(!p.was)
+            }
+        }
+    }
+    let cancel = () => {
+        press = null
+        clear()
+    }
+    // Focus follows the panel: to its top going up, back to the bar coming down. A moment
+    // later, as what takes it is inert until the page has been updated.
+    if focus_to != shown && panel != null {
+        every(30, () => {
+            if shown {
+                grip.focus({ preventScroll: true })
+            } else if body.contains(doc.activeElement) || doc.activeElement.isSameNode(doc.body) {
+                main_btn.focus({ preventScroll: true })
+            }
+            focus_to = shown
+        })
+    }
+    // The panel is what a finger moves, so it has no `style={...}` of its own: one is written whole when
+    // what it reads changes, which would wipe the transform under the finger.
+    <div.ui-miniplay-host style={`--ui-miniplay-above: ${above}px`}>
+    <div class={ui_cls(["ui-miniplay", shown && "ui-miniplay-open", moving && "ui-miniplay-moving", class])} role="region" aria-label={label}
+         @mount={(el) => {
+             panel = el
+             doc = js("document")
+             let pull = (m) => {
+                 time = mini_player_num(m.currentTime)
+                 total = mini_player_num(m.duration)
+                 playing = !m.paused
+             }
+             let heard = (e) => { if e.target.id == aid { pull(e.target) } }
+             let names = ["timeupdate", "durationchange", "loadedmetadata", "play", "pause", "emptied", "seeked"]
+             for n in names { doc.addEventListener(n, heard, true) }
+             let m = doc.getElementById(aid)
+             if m != null { pull(m) }
+             () => { for n in names { doc.removeEventListener(n, heard, true) } }
+         }}
+         @keydown={(e) => {
+             if shown {
+                 if e.key == "Escape" {
+                     e.preventDefault()
+                     set_open(false)
+                 }
+                 // Nothing behind the panel can be reached: Tab goes round inside it.
+                 if e.key == "Tab" {
+                     let all = body.querySelectorAll("a[href], button:not([disabled]), input, select, textarea, [tabindex='0']")
+                     let last = mini_player_last(all)
+                     let here = doc.activeElement
+                     if e.shiftKey && here == all[0] {
+                         e.preventDefault()
+                         last.focus()
+                     } else if !e.shiftKey && here == last {
+                         e.preventDefault()
+                         all[0].focus()
+                     }
+                 }
+             }
+         }}>
+        {src != "" && <audio id={id} src={src} preload="metadata"></audio>}
+        <div.ui-miniplay-bar inert={shown} @mount={(el) => { bar = el }}
+             @pointerdown={(e) => {
+                 if e.target.closest(".ui-miniplay-play, .ui-scrubbar") == null && (e.pointerType != "mouse" || e.button == 0) {
+                     bar.setPointerCapture(e.pointerId)
+                     begin(e)
+                 }
+             }}
+             @pointermove={(e) => { move(e) }}
+             @pointerup={(e) => { up(e) }}
+             @pointercancel={() => { cancel() }}>
+            <button.ui-miniplay-main type="button" aria-expanded={shown ? "true" : "false"} aria-label={`Open the player: ${title}`}
+                    @mount={(el) => { main_btn = el }}
+                    // A press was seen through by the bar, which took the pointer. This is for the keys.
+                    @click={(e) => { if e.timeStamp - moved_at > 400 { set_open(true) } }}
+                    @keydown={(e) => { if e.key == "ArrowUp" { e.preventDefault(); set_open(true) } }}>
+                <span.ui-miniplay-art>{art != "" ? <img src={art} alt="" draggable="false"/> : <span aria-hidden="true">{slice(title, 0, 1)}</span>}</span>
+                <span.ui-miniplay-names><b>{title}</b><span>{said != "" ? said : artist}</span></span>
+            </button>
+            <div.ui-miniplay-seek><ScrubBar media={aid} label="Position"/></div>
+            <button.ui-miniplay-play type="button" aria-label={playing ? "Pause" : "Play"} @click={() => { toggle() }}>
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={playing ? mini_player_pause : mini_player_play}/></svg>
+            </button>
+            <div.ui-miniplay-line role="progressbar" aria-label="Progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow={round(mini_player_share(time, total) * 100)}
+                 style={`--ui-miniplay-at: ${mini_player_share(time, total)}`}><i></i></div>
+        </div>
+        <div.ui-miniplay-body inert={!shown} @mount={(el) => { body = el }}>
+            <button.ui-miniplay-grip type="button" aria-label="Close the player"
+                    @mount={(el) => { grip = el }}
+                    @pointerdown={(e) => {
+                        grip.setPointerCapture(e.pointerId)
+                        begin(e)
+                    }}
+                    @pointermove={(e) => { move(e) }}
+                    @pointerup={(e) => { up(e) }}
+                    @pointercancel={() => { cancel() }}
+                    @click={(e) => { if e.timeStamp - moved_at > 400 { set_open(false) } }}
+                    @keydown={(e) => { if e.key == "ArrowDown" { e.preventDefault(); set_open(false) } }}><span aria-hidden="true"></span></button>
+            <div.ui-miniplay-content>
+                {!full_player && <div.ui-miniplay-plain>
+                    <div.ui-miniplay-big>{art != "" ? <img src={art} alt="" draggable="false"/> : <span aria-hidden="true">{slice(title, 0, 1)}</span>}</div>
+                    <h2>{title}</h2>
+                    <p>{artist}</p>
+                    <ScrubBar media={aid} label="Position in the track" page_scrolls={false}/>
+                    <button.ui-miniplay-bigplay type="button" aria-label={playing ? "Pause" : "Play"} @click={() => { toggle() }}>
+                        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={playing ? mini_player_pause : mini_player_play}/></svg>
+                    </button>
+                </div>}
+                {children}
+            </div>
+        </div>
+        <div @mount={(el) => { safe = el }} style="position: absolute; width: 0; height: env(safe-area-inset-bottom, 0px); visibility: hidden"></div>
+    </div>
+    </div>
+}

@@ -1,0 +1,279 @@
+// DirtyFormGuard: a form that knows what has changed. It compares each field with its
+// first value and lists the changes with before and after, each with a Revert, and
+// a Revert all. A field typed back to its first value is told apart from a real change:
+// it shows as put back and does not count, and neither does what cannot matter: spaces
+// around text, 10 for 10.00 in a number, the same boxes ticked in another order. While
+// anything really changed, leaving the page asks first, by a link too.
+//
+//   import ui/dirty_form_guard.qwe use DirtyFormGuard
+//
+//   <DirtyFormGuard id="profile" action="/profile" fields={[
+//       { name: "name", label: "Name", value: user.name },
+//       { name: "plan", label: "Plan", type: "select", value: user.plan, options: ["Free", "Team"] },
+//       { name: "limit", label: "Monthly limit", type: "number", value: user.limit },
+//       { name: "news", label: "Send me news", type: "checkbox", value: user.news },
+//   ]}/>
+//
+// A field: name, label, value (its first value), type ("text", "email", "url", "tel",
+// "number", "date", "password", "textarea", "select", "checkbox", "multi", a group of
+// checkboxes), options (for select and multi: strings or { label, value }), hint.
+// A password's before and after are not shown.
+//
+// id: a prefix for its ids ("dirty-form-guard"), unique on the page. fields: as above.
+// action, method ("post"): where a plain form sends it. submit: the button's words
+// ("Save"). warn_links: asks before following a link while changes stand (true).
+// class: more classes for its outer element.
+// on_change(changes): inside one of your components, called after each change with the
+// real ones, [{ name, label, before, after }]. on_submit(values): called with all the
+// values on Save, which also makes them the new first values.
+//
+// dirty_form_guard_state(field, first, now, touched) says "same", "put_back" or
+// "changed", and dirty_form_guard_changes(fields, first, values, touched) lists them:
+// the logic, for a program's own use. The browser's own question before leaving has
+// words it chooses. A `navigate()` from a program's own code is not seen: ask first
+// there, as the changes are given to on_change.
+
+import ui/theme.qwe use ui_cls
+
+let dirty_form_guard_css = css`
+.ui-dguard { display: grid; gap: 14px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-dguard-field { display: grid; gap: 5px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.ui-dguard-label { padding: 0; font-size: 13px; font-weight: 500; }
+.ui-dguard-mark { margin-left: 6px; color: var(--ui-warning); font-size: 12px; font-weight: 600; }
+.ui-dguard-input { box-sizing: border-box; width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); transition: border-color .15s, box-shadow .15s; }
+textarea.ui-dguard-input { height: auto; min-height: 80px; padding: 8px 10px; resize: vertical; }
+.ui-dguard-input:hover { border-color: var(--ui-strong); }
+.ui-dguard-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-dguard-changed .ui-dguard-input { border-color: var(--ui-warning); }
+.ui-dguard-check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.ui-dguard-check input { margin: 0; accent-color: var(--ui-accent); }
+.ui-dguard-check input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-dguard-choices { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.ui-dguard-hint { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-dguard-panel { display: grid; gap: 8px; padding: 12px 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-dguard-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
+.ui-dguard-count { margin: 0; font-weight: 600; font-size: 13px; }
+.ui-dguard-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-dguard-item { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; min-width: 0; }
+.ui-dguard-name { font-weight: 600; }
+.ui-dguard-was { color: var(--ui-muted); text-decoration: line-through; overflow-wrap: anywhere; }
+.ui-dguard-now { overflow-wrap: anywhere; }
+.ui-dguard-back { color: var(--ui-muted); font-size: 12px; }
+.ui-dguard-grow { flex: 1 1 auto; }
+.ui-dguard-btn { height: 28px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 500 12px/1 var(--ui-font); cursor: pointer; }
+.ui-dguard-btn:hover { border-color: var(--ui-strong); }
+.ui-dguard-btn:focus-visible, .ui-dguard-save:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-dguard-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.ui-dguard-save { height: 38px; padding: 0 16px; border: 1px solid var(--ui-accent); border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg);
+  font: 600 14px/1 var(--ui-font); cursor: pointer; }
+.ui-dguard-save:hover { background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-dguard-said { margin: 0; color: var(--ui-muted); font-size: 13px; }
+@media (prefers-reduced-motion: reduce) { .ui-dguard-input { transition: none; } }
+`
+
+fn dirty_form_guard_clean(fields) -> list =
+    (type_of(fields) == "list" ? fields : []) | filter((f) => type_of(f) == "map" && type_of(f.name) == "str" && f.name != "")
+
+fn dirty_form_guard_options(f: map) -> list =
+    (type_of(f.options) == "list" ? f.options : []) | map((o) => type_of(o) == "map" ? { label: str(o.label ?? o.value), value: str(o.value ?? o.label) } : { label: str(o), value: str(o) })
+
+// What a field holds at first, in the form its control gives: text, a yes or no, or a list.
+fn dirty_form_guard_first(f: map) {
+    if f.type == "checkbox" { return f.value == true }
+    if f.type == "multi" { return type_of(f.value) == "list" ? f.value | map(str) : [] }
+    f.value == null ? "" : str(f.value)
+}
+
+fn dirty_form_guard_firsts(fields: list) -> map = reduce(fields, {}, (m, f) => set(m, f.name, dirty_form_guard_first(f)))
+
+// A value as a decimal, or null.
+fn dirty_form_guard_number(v) {
+    if type_of(v) != "str" || !re.test(trim(v), "^[+-]?\\d*\\.?\\d+$") { return null }
+    let d = dec(replace(trim(v), "+", ""))
+    is_err(d) ? null : d
+}
+
+// "same" (never touched, or nothing at all differs), "put_back" (touched and back, or
+// changed in a way that cannot matter) or "changed".
+fn dirty_form_guard_state(f: map, first, now, touched: bool) -> str {
+    let quiet = touched ? "put_back" : "same"
+    if first == now { return quiet }
+    if f.type == "multi" { return sort(first) == sort(now) ? "put_back" : "changed" }
+    if type_of(first) != "str" || type_of(now) != "str" { return "changed" }
+    if f.type == "number" {
+        let a = dirty_form_guard_number(first)
+        let b = dirty_form_guard_number(now)
+        if a != null && b != null && a == b { return "put_back" }
+    }
+    f.type != "password" && trim(first) == trim(now) ? "put_back" : "changed"
+}
+
+// A value in words: what the list of changes shows.
+fn dirty_form_guard_shown(f: map, v) -> str {
+    if f.type == "password" { return v == "" ? "(empty)" : "••••••" }
+    if f.type == "checkbox" { return v == true ? "Ticked" : "Not ticked" }
+    let word = (x) => (find(dirty_form_guard_options(f), (o) => o.value == x) ?? { label: x }).label
+    if type_of(v) == "list" { return len(v) == 0 ? "(none)" : join(v | map(word), ", ") }
+    v == "" ? "(empty)" : word(v)
+}
+
+// Each field that moved: [{ name, label, state, before, after, was, now }], was and
+// now in words.
+fn dirty_form_guard_changes(fields: list, first: map, values: map, touched: map) -> list =
+    fields
+    | map((f) => {
+        let a = get(first, f.name)
+        let b = get(values, f.name)
+        { name: f.name, label: f.label ?? f.name, state: dirty_form_guard_state(f, a, b, get(touched, f.name) == true), before: a, after: b,
+          was: dirty_form_guard_shown(f, a), now: dirty_form_guard_shown(f, b) }
+    })
+    | filter((c) => c.state != "same")
+
+fn dirty_form_guard_real(changes: list) -> list = changes | filter((c) => c.state == "changed")
+
+// One field: its label, control and hint, and what has happened to it.
+view DirtyFormGuardField(id: str, f: map, value = null, moved: str = "same", on_value = null) {
+    let t = f.type ?? "text"
+    let fid = `${id}-${f.name}`
+    let hint_id = f.hint != null ? `${fid}-hint` : null
+    let mark = moved == "changed" && <span.ui-dguard-mark>Changed</span>
+    let held = type_of(value) == "list" ? value : []
+    <div class={ui_cls(["ui-dguard-field", moved == "changed" && "ui-dguard-changed"])} data-field={f.name}>
+        {t == "multi"
+            ? <fieldset.ui-dguard-field aria-describedby={hint_id}>
+                <legend.ui-dguard-label>{f.label ?? f.name}{mark}</legend>
+                <div.ui-dguard-choices>
+                    {for o in dirty_form_guard_options(f) => <label.ui-dguard-check key={o.value}>
+                        <input type="checkbox" name={f.name} value={o.value} checked={contains(held, o.value)}
+                               @change={(e) => { on_value(f.name, e.checked ? push(held, o.value) : remove(held, o.value)) }}/>
+                        {o.label}
+                    </label>}
+                </div>
+            </fieldset>
+            : <div.ui-dguard-field>
+                {t != "checkbox" && <label.ui-dguard-label for={fid}>{f.label ?? f.name}{mark}</label>}
+                {match t {
+                    "textarea" => <textarea.ui-dguard-input id={fid} name={f.name} value={str(value ?? "")} aria-describedby={hint_id} @input={(e) => { on_value(f.name, e.value) }}></textarea>
+                    "select" => <select.ui-dguard-input id={fid} name={f.name} aria-describedby={hint_id} @change={(e) => { on_value(f.name, e.value) }}>
+                        {for o in dirty_form_guard_options(f) => <option key={o.value} value={o.value} selected={o.value == str(value ?? "")}>{o.label}</option>}
+                    </select>
+                    "checkbox" => <label.ui-dguard-check>
+                        <input type="checkbox" id={fid} name={f.name} value="on" checked={value == true} aria-describedby={hint_id} @change={(e) => { on_value(f.name, e.checked) }}/>
+                        <span>{f.label ?? f.name}{mark}</span>
+                    </label>
+                    _ => <input.ui-dguard-input type={t == "number" ? "text" : t} inputmode={t == "number" ? "decimal" : null} id={fid} name={f.name} value={str(value ?? "")}
+                                aria-describedby={hint_id} @input={(e) => { on_value(f.name, e.value) }}/>
+                }}
+            </div>}
+        {f.hint != null && <p.ui-dguard-hint id={hint_id}>{f.hint}</p>}
+    </div>
+}
+
+component DirtyFormGuard(id: str = "dirty-form-guard", fields = [], action: str? = null, method: str = "post", submit: str = "Save", warn_links: bool = true,
+                         on_change = null, on_submit = null, class: str? = null) {
+    style global dirty_form_guard_css
+    let clean = dirty_form_guard_clean(fields)
+    state first = dirty_form_guard_firsts(dirty_form_guard_clean(fields))
+    state vals = dirty_form_guard_firsts(dirty_form_guard_clean(fields))
+    state touched = {}
+    state said = ""
+    let changes = dirty_form_guard_changes(clean, first, vals, touched)
+    let real = dirty_form_guard_real(changes)
+    let quiet = changes | filter((c) => c.state == "put_back")
+    let state_of = (name: str) => (find(changes, (c) => c.name == name) ?? { state: "same" }).state
+    let count = len(real)
+    let tell = () => {
+        on_change && on_change(dirty_form_guard_real(dirty_form_guard_changes(clean, first, vals, touched)) | map((c) => { name: c.name, label: c.label, before: c.before, after: c.after }))
+    }
+    let edit = (name: str, v) => {
+        vals = set(vals, name, v)
+        touched = set(touched, name, true)
+        said = ""
+        tell()
+    }
+    let revert = (root, c) => {
+        vals = set(vals, c.name, get(first, c.name))
+        touched = remove(touched, c.name)
+        said = `${c.label} is back to its first value.`
+        // The button goes with its row: the field is where the work goes on.
+        let el = root.querySelector(`[name="${c.name}"]`)
+        el && el.focus()
+        tell()
+    }
+    let revert_all = (root) => {
+        vals = first
+        touched = {}
+        said = "Everything is back to its first value."
+        let el = root.querySelector("input, select, textarea")
+        el && el.focus()
+        tell()
+    }
+    // Reads the state when it runs, so it stays one listener for the life of the form.
+    let leaving = (e) => {
+        if len(dirty_form_guard_real(dirty_form_guard_changes(clean, first, vals, touched))) > 0 {
+            e.preventDefault()
+            e.returnValue = ""
+        }
+    }
+    let on_link = (e) => {
+        let a = e.target.closest ? e.target.closest("a[href]") : null
+        let stays = a == null || a.target == "_blank" || a.hasAttribute("download") || e.ctrlKey || e.metaKey || e.shiftKey || starts_with(a.getAttribute("href"), "#")
+        let n = len(dirty_form_guard_real(dirty_form_guard_changes(clean, first, vals, touched)))
+        if !stays && n > 0 {
+            e.preventDefault()
+            e.stopPropagation()
+            let go = ask(`You have ${n} unsaved change${n == 1 ? "" : "s"}. Leave without saving?`, { title: "Leave this page?", ok: "Leave", cancel: "Stay", tone: "danger" })
+            if go == true {
+                touched = {}
+                vals = first
+                js("location.assign", a.href)
+            }
+        }
+    }
+    let begin = (el) => {
+        js("addEventListener", "beforeunload", leaving)
+        if warn_links { js("document.addEventListener", "click", on_link, true) }
+        () => {
+            js("removeEventListener", "beforeunload", leaving)
+            js("document.removeEventListener", "click", on_link, true)
+        }
+    }
+    <form class={ui_cls(["ui-dguard", class])} id={id} action={action} method={method} @mount={begin}
+          @submit={(e) => {
+              e.preventDefault()
+              let root = e.target
+              on_submit && on_submit(vals)
+              first = vals
+              touched = {}
+              said = "Saved."
+              tell()
+              if action != null { root.submit() }
+          }}>
+        {for f in clean => <DirtyFormGuardField key={f.name} id={id} f={f} value={get(vals, f.name)} moved={state_of(f.name)} on_value={edit}/>}
+        {len(changes) > 0 && <div.ui-dguard-panel>
+            <div.ui-dguard-head>
+                <p.ui-dguard-count aria-live="polite">{count == 0 ? "No real changes" : `${count} unsaved change${count == 1 ? "" : "s"}`}</p>
+                <button.ui-dguard-btn type="button" data-revert-all="true" @click={(e) => revert_all(e.target.closest("form"))}>Revert all</button>
+            </div>
+            <ul.ui-dguard-list>
+                {for c in real => <li.ui-dguard-item key={c.name} data-change={c.name}>
+                    <span.ui-dguard-name>{c.label}</span>
+                    <span.ui-sr>was</span><span.ui-dguard-was>{c.was}</span>
+                    <span aria-hidden="true">→</span>
+                    <span.ui-sr>now</span><span.ui-dguard-now>{c.now}</span>
+                    <span.ui-dguard-grow></span>
+                    <button.ui-dguard-btn type="button" aria-label={`Revert ${c.label}`} @click={(e) => revert(e.target.closest("form"), c)}>Revert</button>
+                </li>}
+                {for c in quiet => <li.ui-dguard-item key={c.name} data-put-back={c.name}>
+                    <span.ui-dguard-name>{c.label}</span><span.ui-dguard-back>put back: no real change</span>
+                </li>}
+            </ul>
+        </div>}
+        <div.ui-dguard-foot>
+            <button.ui-dguard-save type="submit">{submit}</button>
+            <p.ui-dguard-said role="status" aria-live="polite">{said}</p>
+        </div>
+    </form>
+}

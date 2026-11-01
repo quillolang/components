@@ -1,0 +1,341 @@
+// TripBudget: what a trip will cost. Each cost is by the trip, per person, per night,
+// per day, or per person per night or day, in any currency that has a rate. Each line is
+// worked out in its own currency and turned into the home currency once, rounded to
+// the cent there, so the lines add to the total exactly. The total is split between the
+// people to the cent, the odd cents going to the first shares, so the shares add up too.
+// With a budget it says how much is left, or how much it is over, and what is left to
+// spend a day, rounded down so that the days never add up to more than there is. With limits
+// it says which kinds of cost are over theirs. There are no live rates: they are data.
+//
+//   <TripBudget home="USD" rates={{ EUR: 1.08, JPY: 0.0067 }} people={2} nights={4} budget={2500}
+//               items={[{ label: "Hotel", amount: 135, currency: "EUR", basis: "night", category: "Stay" }]}/>
+//   <TripBudget home="GBP" rates={rates} on_change={(f) => { left = f.left }}/>
+//
+// home: the ISO code of the currency to total in ("USD"). rates: what one unit of each other
+// currency is worth in home, a map from code to a number, decimal or text. A rate that is not a
+// number above 0 is reported and not used, as is a cost in a currency with no rate; such a
+// line stays out of the total, and it says so. rates_note: where the rates are from, shown
+// beside them. people, nights: the trip (2, and 7). days: the days (nights + 1, when
+// left empty). budget: the whole trip's budget in home (none). items: the costs, each
+// { label, amount, currency?, basis?, category? }: currency is home when left out; basis is
+// "trip" (the default), "person", "night", "day", "person_night" or "person_day"; category
+// one of categories. categories: the kinds of cost (Stay, Transport, Food, Activities, Other).
+// limits: a limit in home for each kind, a map from its name. locale: how to write amounts.
+// title: the heading ("Trip budget"). id: a prefix for its ids ("trip-budget"), unique on
+// the page. The fields are named people, nights, days and budget, and each cost's label_<n>,
+// amount_<n>, currency_<n>, basis_<n> and category_<n>, numbered as they were made; name:
+// a prefix for those. on_change(f): inside one of your components, given the figures below
+// after each change, or null while a trip's field is wrong.
+//
+// trip_budget_figures(lines, rates, home, people, nights, days, budget, limits) is the
+// arithmetic, for a program's own use: lines are { label, amount, currency, basis, category }, amounts as
+// decimals, budget null for none. It gives { lines, total, shares, left, over, daily,
+// daily_each, categories, skipped } as money, each line with its cost or a problem.
+
+import ui/theme.qwe use ui_cls
+
+let trip_budget_css = css`
+.ui-tripb { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; max-width: 760px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-tripb .ui-tripb-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-tripb-trip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.ui-tripb-field { display: grid; gap: 4px; min-width: 0; font-size: 13px; font-weight: 500; }
+.ui-tripb input, .ui-tripb select { box-sizing: border-box; width: 100%; min-width: 0; height: 36px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); }
+.ui-tripb input:focus-visible, .ui-tripb select:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-tripb input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-tripb-rows { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.ui-tripb-row { display: grid; gap: 6px; padding-bottom: 10px; border-bottom: 1px solid var(--ui-border); }
+.ui-tripb-inputs { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) 84px minmax(0, 1.4fr) minmax(0, 1.2fr) 32px; gap: 6px; align-items: center; }
+.ui-tripb-amount { text-align: right; font-variant-numeric: tabular-nums; }
+.ui-tripb-remove { width: 32px; height: 32px; padding: 0; border: 1px solid transparent; border-radius: var(--ui-radius-sm); background: none; color: var(--ui-muted); font: 16px/1 var(--ui-font); cursor: pointer; }
+.ui-tripb-remove:hover { border-color: var(--ui-border); color: var(--ui-danger); }
+.ui-tripb-remove:focus-visible, .ui-tripb-add:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-tripb-sum { margin: 0; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-tripb-bad { margin: 0; color: var(--ui-danger); font-size: 12px; }
+.ui-tripb-add { justify-self: start; height: 34px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-tripb-add:hover { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-tripb-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-tripb-say { margin: 0; padding: 10px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-tripb-over { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-tripb-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 0; }
+.ui-tripb-out div { display: grid; gap: 2px; min-width: 0; }
+.ui-tripb-out dt { color: var(--ui-muted); font-size: 12px; }
+.ui-tripb-out dd { margin: 0; font-weight: 650; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-tripb-scroll { overflow-x: auto; }
+.ui-tripb-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-tripb-kinds { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-tripb-kinds th, .ui-tripb-kinds td { padding: 6px; border-bottom: 1px solid var(--ui-border); text-align: right; }
+.ui-tripb-kinds thead th { color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-tripb-kinds tbody th { text-align: left; font-weight: 600; }
+.ui-tripb-kinds thead th:first-child { text-align: left; }
+.ui-tripb-is-over td { color: var(--ui-danger); font-weight: 600; }
+.ui-tripb-rates { margin: 0; color: var(--ui-muted); font-size: 12px; }
+@media (max-width: 620px) {
+  .ui-tripb-trip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ui-tripb-inputs { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .ui-tripb-label { grid-column: 1 / -1; }
+}
+`
+
+let trip_budget_bases = [
+    { id: "trip", label: "For the trip" }, { id: "person", label: "Per person" }, { id: "night", label: "Per night" }, { id: "day", label: "Per day" },
+    { id: "person_night", label: "Per person, per night" }, { id: "person_day", label: "Per person, per day" },
+]
+
+let trip_budget_categories = ["Stay", "Transport", "Food", "Activities", "Other"]
+
+// The most a line may cost, far above any trip, so that a sum of them stays in range.
+let trip_budget_ceiling = 100000000000m
+
+fn trip_budget_number(text) {
+    let t = re.replace(trim(str(text ?? "")), "[,\\s]", "")
+    t == "" ? null : dec(t)
+}
+
+// A whole number as typed, from `least` to `most`, or null.
+fn trip_budget_count(text, least: int, most: int) {
+    let t = trim(str(text ?? ""))
+    if !re.test(t, "^\\d{1,6}$") { return null }
+    let n = int(t)
+    n < least || n > most ? null : n
+}
+
+// How many times a cost falls: the sum, as a number and in words.
+fn trip_budget_times(basis: str, people: int, nights: int, days: int) {
+    let unit = (n: int, one: str) => n == 1 ? `1 ${one}` : `${n} ${one}s`
+    match basis {
+        "person" => { n: people, words: trip_budget_people(unit(people, "person")) }
+        "night" => { n: nights, words: unit(nights, "night") }
+        "day" => { n: days, words: unit(days, "day") }
+        "person_night" => { n: people * nights, words: `${trip_budget_people(unit(people, "person"))} × ${unit(nights, "night")}` }
+        "person_day" => { n: people * days, words: `${trip_budget_people(unit(people, "person"))} × ${unit(days, "day")}` }
+        _ => { n: 1, words: "" }
+    }
+}
+
+fn trip_budget_people(s: str) = replace(s, "persons", "people")
+
+// The rates that can be used, by code, as decimals: { good, problems }.
+fn trip_budget_rates(rates, home: str) {
+    let good = {}
+    let problems = []
+    for [code, rate] in rates ?? {} {
+        let d = type_of(rate) == "float" || type_of(rate) == "int" || type_of(rate) == "dec" || type_of(rate) == "str" ? dec(rate) : err("no")
+        let known = !is_err(money.of(0, upper(code)))
+        if is_err(d) || d <= 0 || !known {
+            problems = problems | push(`The rate for ${code} is not usable: ${known ? "a rate is a number above 0" : "that is not a currency"}.`)
+        } else {
+            good = set(good, upper(code), d)
+        }
+    }
+    { good, problems }
+}
+
+// One line in its own currency and in home. A line that cannot be counted has `problem`.
+fn trip_budget_line(line, rates, home: str, people: int, nights: int, days: int) {
+    let code = upper(line.currency ?? home)
+    let times = trip_budget_times(line.basis ?? "trip", people, nights, days)
+    let base = { ...line, currency: code, times: times.n, words: times.words, cost: null, local: null, problem: null }
+    if line.amount == null { return set(base, "problem", "") }
+    if is_err(line.amount) || line.amount < 0 { return set(base, "problem", "An amount is a number of 0 or more.") }
+    let rate = code == upper(home) ? 1m : get(rates, code, null)
+    if rate == null { return set(base, "problem", `No rate for ${code}, so this is not in the total.`) }
+    let local = money.of(line.amount * times.n, code, "half_up")
+    if type_of(local) == "error" || line.amount > trip_budget_ceiling || line.amount * times.n > trip_budget_ceiling { return set(base, "problem", "That amount is too large to count.") }
+    let cost = money.of(local.amount * rate, upper(home), "half_up")
+    if type_of(cost) == "error" || cost.amount > trip_budget_ceiling { return set(base, "problem", "That amount is too large to count.") }
+    { ...base, cost, local }
+}
+
+fn trip_budget_figures(lines: list, rates, home: str, people: int, nights: int, days: int, budget, limits) {
+    let code = upper(home)
+    let done = lines | map((l) => trip_budget_line(l, rates, code, people, nights, days))
+    let counted = done | filter((l) => l.cost != null)
+    let total = reduce(counted, money.zero(code), (t, l) => money.add(t, l.cost))
+    let shares = money.allocate(total, people)
+    let plan = budget == null ? null : money.of(budget, code, "half_up")
+    let left = plan == null ? null : money.sub(plan, total)
+    let over = left != null && left.amount < 0 ? money.neg(left) : null
+    // Rounded down: a day's allowance rounded up would spend more than is there.
+    let spare = left == null || over != null ? null : left.amount
+    let daily = spare == null ? null : money.of(dec(spare / days), code, "down")
+    let daily_each = spare == null ? null : money.of(dec(spare / (days * people)), code, "down")
+    let names = (lines | map((l) => l.category) | filter((c) => c != null)) + keys(limits ?? {}) | unique()
+    let kinds = names | map((name_) => {
+        let spent = reduce(counted | filter((l) => l.category == name_), money.zero(code), (t, l) => money.add(t, l.cost))
+        let limit_ = get(limits ?? {}, name_, null)
+        let cap = limit_ == null ? null : money.of(dec(limit_), code, "half_up")
+        let past = cap != null && spent.amount > cap.amount ? money.sub(spent, cap) : null
+        { name: name_, spent, limit: cap, over: past }
+    })
+    { lines: done, total, shares, plan, left, over, daily, daily_each, categories: kinds, skipped: len(done) - len(counted) }
+}
+
+fn trip_budget_rows(items) {
+    let given = items ?? []
+    for i in 0..len(given) {
+        let x = given[i]
+        { id: i, label: str(x.label ?? ""), amount: x.amount == null ? "" : str(x.amount), currency: upper(str(x.currency ?? "")), basis: str(x.basis ?? "trip"), category: str(x.category ?? "Other") }
+    }
+}
+
+// The rows as typed, as lines for the figures. An empty row counts for nothing.
+fn trip_budget_lines(rows: list, home: str) = rows | map((r) => ({ id: r.id, label: r.label, amount: trip_budget_number(r.amount), currency: r.currency == "" ? home : r.currency, basis: r.basis, category: r.category }))
+
+fn trip_budget_money_text(m, locale) = locale != null ? money.format(m, locale) : money.format(m)
+
+// How the total falls on the people, in words.
+fn trip_budget_split(shares: list, locale) {
+    let high = shares[0]
+    let low = last(shares)
+    if high.amount == low.amount { return `${trip_budget_money_text(high, locale)} each` }
+    let many = shares | filter((s) => s.amount == high.amount) | len
+    let rest = len(shares) - many
+    `${many} at ${trip_budget_money_text(high, locale)}, ${rest} at ${trip_budget_money_text(low, locale)}`
+}
+
+fn trip_budget_says(f, locale) {
+    let m = (x) => trip_budget_money_text(x, locale)
+    if f.plan == null { return `Total ${m(f.total)}.` }
+    if f.over != null { return `Over budget by ${m(f.over)}: ${m(f.total)} against ${m(f.plan)}, so nothing is left for each day.` }
+    `${m(f.left)} left of ${m(f.plan)}: ${m(f.daily)} a day, or ${m(f.daily_each)} a day each.`
+}
+
+component TripBudget(home: str = "USD", rates = null, rates_note: str? = null, people = 2, nights = 7, days = null, budget = null, items = [], categories = null, limits = null,
+                     locale: str? = null, title: str = "Trip budget", id: str = "trip-budget", name: str? = null, on_change = null, class: str? = null) {
+    style global trip_budget_css
+    state rows = trip_budget_rows(items)
+    state next = len(items ?? [])
+    state people_text = str(people)
+    state nights_text = str(nights)
+    state days_text = days == null ? "" : str(days)
+    state budget_text = budget == null ? "" : str(budget)
+    state fresh = -1
+    state adder = null
+    let code = upper(home)
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let read_rates = trip_budget_rates(rates, code)
+    let kinds = categories ?? trip_budget_categories
+    let codes = [code] + (keys(read_rates.good) | filter((c) => c != code))
+    let party = trip_budget_count(people_text, 1, 1000)
+    let stay = trip_budget_count(nights_text, 0, 3650)
+    let span = trim(days_text) == "" ? (stay == null ? null : stay + 1) : trip_budget_count(days_text, 1, 3651)
+    let plan_read = trip_budget_number(budget_text)
+    let plan_bad = plan_read != null && (is_err(plan_read) || plan_read < 0 || plan_read > trip_budget_ceiling)
+    let ok = party != null && stay != null && span != null && !plan_bad
+    let f = ok ? trip_budget_figures(trip_budget_lines(rows, code), read_rates.good, code, party, stay, span, plan_read, limits) : null
+    let shown = (m) => trip_budget_money_text(m, locale)
+    let tell = () => {
+        if on_change != null {
+            let p = trip_budget_count(people_text, 1, 1000)
+            let s = trip_budget_count(nights_text, 0, 3650)
+            let d = trim(days_text) == "" ? (s == null ? null : s + 1) : trip_budget_count(days_text, 1, 3651)
+            let b = trip_budget_number(budget_text)
+            let wrong = p == null || s == null || d == null || (b != null && (is_err(b) || b < 0 || b > trip_budget_ceiling))
+            on_change(wrong ? null : trip_budget_figures(trip_budget_lines(rows, code), read_rates.good, code, p, s, d, b, limits))
+        }
+    }
+    let change = (row: int, field: str, text: str) => {
+        rows = rows | map((r) => r.id == row ? set(r, field, text) : r)
+        tell()
+    }
+    let add = () => {
+        fresh = next
+        rows = rows | push({ id: next, label: "", amount: "", currency: code, basis: "trip", category: first(kinds) })
+        next += 1
+    }
+    let drop = (row: int) => {
+        rows = rows | filter((r) => r.id != row)
+        tell()
+        if adder != null { adder.focus() }
+    }
+    let line_of = (row: int) => f == null ? null : f.lines | find((l) => l.id == row)
+    let row_codes = (r) => contains(codes, r.currency) || r.currency == "" ? codes : codes + [r.currency]
+    let sum_text = (l) => {
+        if l == null || l.cost == null { return "" }
+        let start = shown(money.of(l.amount, l.currency, "half_up"))
+        let times = l.words == "" ? "" : ` × ${l.words}`
+        l.currency == code ? `${start}${times} = ${shown(l.cost)}` : `${start}${times} = ${shown(l.local)} = ${shown(l.cost)}`
+    }
+    <section class={ui_cls(["ui-tripb", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-tripb-title id={`${id}-title`}>{title}</h3>
+        <div.ui-tripb-trip>
+            <label.ui-tripb-field>
+                People
+                <input type="text" inputmode="numeric" id={`${id}-people`} name={named("people")} value={people_text} autocomplete="off" aria-invalid={party == null ? "true" : null}
+                       @input={(e) => { people_text = e.value; tell() }}/>
+            </label>
+            <label.ui-tripb-field>
+                Nights
+                <input type="text" inputmode="numeric" id={`${id}-nights`} name={named("nights")} value={nights_text} autocomplete="off" aria-invalid={stay == null ? "true" : null}
+                       @input={(e) => { nights_text = e.value; tell() }}/>
+            </label>
+            <label.ui-tripb-field>
+                Days
+                <input type="text" inputmode="numeric" id={`${id}-days`} name={named("days")} value={days_text} autocomplete="off" placeholder={stay == null ? "" : str(stay + 1)}
+                       aria-invalid={span == null ? "true" : null} @input={(e) => { days_text = e.value; tell() }}/>
+            </label>
+            <label.ui-tripb-field>
+                {`Budget in ${code}`}
+                <input type="text" inputmode="decimal" id={`${id}-budget`} name={named("budget")} value={budget_text} autocomplete="off" aria-invalid={plan_bad ? "true" : null}
+                       @input={(e) => { budget_text = e.value; tell() }}/>
+            </label>
+        </div>
+        {!ok && <p.ui-tripb-error role="alert">{party == null ? "People is a whole number from 1 to 1,000."
+            : stay == null ? "Nights is a whole number from 0 to 3,650." : span == null ? "Days is a whole number from 1 to 3,651, or empty for nights + 1."
+            : "The budget is an amount of 0 or more."}</p>}
+        {for p in read_rates.problems => <p.ui-tripb-error role="alert">{p}</p>}
+        <ul.ui-tripb-rows>
+            {for r in rows {
+                let n = r.id
+                let l = line_of(n)
+                let trouble = l == null ? null : l.problem
+                <li.ui-tripb-row key={n}>
+                    <div.ui-tripb-inputs>
+                        <input.ui-tripb-label type="text" id={`${id}-label-${n}`} name={named(`label_${n}`)} value={r.label} aria-label="What it is" placeholder="What it is" maxlength="80" autocomplete="off"
+                               @mount={(el) => { if fresh == n { el.focus() } }} @input={(e) => { change(n, "label", e.value) }}/>
+                        <input.ui-tripb-amount type="text" inputmode="decimal" id={`${id}-amount-${n}`} name={named(`amount_${n}`)} value={r.amount} aria-label={`Amount for ${filled(r.label) ?? "this cost"}`} autocomplete="off"
+                               aria-invalid={trouble != null && trouble != "" ? "true" : null} @input={(e) => { change(n, "amount", e.value) }}/>
+                        <select id={`${id}-currency-${n}`} name={named(`currency_${n}`)} aria-label={`Currency of ${filled(r.label) ?? "this cost"}`} @change={(e) => { change(n, "currency", e.value) }}>
+                            {for c in row_codes(r) => <option key={c} value={c} selected={c == r.currency || (r.currency == "" && c == code)}>{c}</option>}
+                        </select>
+                        <select id={`${id}-basis-${n}`} name={named(`basis_${n}`)} aria-label={`How ${filled(r.label) ?? "this cost"} is charged`} @change={(e) => { change(n, "basis", e.value) }}>
+                            {for b in trip_budget_bases => <option key={b.id} value={b.id} selected={b.id == r.basis}>{b.label}</option>}
+                        </select>
+                        <select id={`${id}-category-${n}`} name={named(`category_${n}`)} aria-label={`Kind of cost for ${filled(r.label) ?? "this cost"}`} @change={(e) => { change(n, "category", e.value) }}>
+                            {for c in kinds => <option key={c} value={c} selected={c == r.category}>{c}</option>}
+                        </select>
+                        <button.ui-tripb-remove type="button" aria-label={`Remove ${filled(r.label) ?? "this cost"}`} @click={() => { drop(n) }}><span aria-hidden="true">×</span></button>
+                    </div>
+                    {sum_text(l) != "" && <p.ui-tripb-sum>{sum_text(l)}</p>}
+                    {trouble != null && trouble != "" && <p.ui-tripb-bad role="alert">{trouble}</p>}
+                </li>
+            }}
+        </ul>
+        <button.ui-tripb-add type="button" @mount={(el) => { adder = el }} @click={add}>Add a cost</button>
+        {f != null && <p aria-live="polite" class={ui_cls(["ui-tripb-say", f.over != null && "ui-tripb-over"])}>{trip_budget_says(f, locale)}</p>}
+        {f != null && f.skipped > 0 && <p.ui-tripb-error>{f.skipped == 1 ? "1 line is not counted, as above." : `${f.skipped} lines are not counted, as above.`}</p>}
+        {f != null && <dl.ui-tripb-out>
+            <div.ui-tripb-total><dt>{`Total in ${code}`}</dt><dd>{shown(f.total)}</dd></div>
+            <div.ui-tripb-each><dt>{party == 1 ? "For one person" : `Split between ${party}`}</dt><dd>{trip_budget_split(f.shares, locale)}</dd></div>
+            {f.left != null && f.over == null && <div.ui-tripb-left><dt>Left to spend</dt><dd>{shown(f.left)}</dd></div>}
+            {f.over != null && <div.ui-tripb-past><dt>Over budget by</dt><dd>{shown(f.over)}</dd></div>}
+            {f.daily != null && <div.ui-tripb-daily><dt>{`A day, for ${span} ${span == 1 ? "day" : "days"}`}</dt><dd>{shown(f.daily)}</dd></div>}
+            {f.daily_each != null && party > 1 && <div.ui-tripb-daily-each><dt>A day, each</dt><dd>{shown(f.daily_each)}</dd></div>}
+        </dl>}
+        {f != null && len(f.categories) > 0 && <div.ui-tripb-scroll tabindex="0" role="group" aria-label="Costs by kind"><table.ui-tripb-kinds>
+            <caption class="ui-sr">Costs by kind</caption>
+            <thead><tr><th scope="col">Kind</th><th scope="col">Planned</th><th scope="col">Limit</th><th scope="col">Over by</th></tr></thead>
+            <tbody>
+                {for c in f.categories {
+                    let kind = c.name
+                    <tr key={kind} class={c.over != null ? "ui-tripb-is-over" : null}>
+                        <th scope="row">{kind}</th><td>{shown(c.spent)}</td><td>{c.limit == null ? "—" : shown(c.limit)}</td><td>{c.over == null ? "—" : shown(c.over)}</td>
+                    </tr>
+                }}
+            </tbody>
+        </table></div>}
+        {len(keys(read_rates.good)) > 0 && <p.ui-tripb-rates>{`Rates: ${join(keys(read_rates.good) | map((c) => `1 ${c} = ${str(read_rates.good[c])} ${code}`), ", ")}.${rates_note != null ? ` ${rates_note}` : ""}`}</p>}
+    </section>
+}

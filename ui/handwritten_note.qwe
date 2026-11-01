@@ -1,0 +1,444 @@
+// HandwrittenNote: a notebook of ruled pages for a tablet and a pen. The pen writes and a
+// finger never does: a finger scrolls the page up and down and swipes to the next or
+// the last page, so a hand can rest on the glass. Pages turn by swipe, button or key, and
+// each page comes out as a PNG with its ruling.
+//
+//   import ui/handwritten_note.qwe use HandwrittenNote
+//
+//   component Notes() {
+//       state saved = load_notes()
+//       <div style="height: 80dvh">
+//           <HandwrittenNote pages={saved} on_change={(p) => { save_notes(p) }}
+//                            on_export={(number, png) => { keep(number, png) }}/>
+//       </div>
+//   }
+//
+// pages: what to start from, a list of pages, each a list of strokes as StylusCanvas has them
+// ({ color, points: [[x, y, w], ...] }); what is not of that shape is left out, and there is
+// always a page. width, height: a page's size in its own units (800 by 1200), which strokes
+// are in, so turning the tablet changes nothing. spacing: between the rules (44).
+// margin: where the margin's line stands (110). size: the pen's width at middling pressure
+// (3). label: its name for screen readers. name: a hidden input carries the pages as JSON,
+// for a plain <form>. class.
+// on_change(pages): inside one of your components, called after each stroke, erasure, undo and
+// new page. on_export(number, png): called for each page exported, from 1, with a PNG data
+// URL; without it links to save the files appear. A web view in a phone app may ignore those,
+// so an app passes on_export.
+//
+// "Finger" lets a finger write, for a tablet with no pen. A finger then does nothing else, as
+// the page cannot tell a stroke from a scroll: turn it off to scroll or swipe. Keys on the page: the left and right arrows turn it, up and
+// down scroll, Ctrl or Cmd with Z undoes. Needs stylus_canvas.qwe.
+
+import ui/theme.qwe use ui_cls
+import ui/stylus_canvas.qwe use stylus_canvas_clean, stylus_canvas_width, stylus_canvas_paint, stylus_canvas_hit
+
+let handwritten_note_css = css`
+.ui-handwritten-note { position: relative; display: flex; flex-direction: column; box-sizing: border-box; width: 100%; height: 100%; min-height: 320px; container-type: inline-size;
+  color: var(--ui-fg); background: var(--ui-subtle); font: 14px/1.4 var(--ui-font); }
+.ui-handwritten-note-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; flex: none; padding: 6px max(8px, env(safe-area-inset-right)) 6px max(8px, env(safe-area-inset-left)); border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-handwritten-note-gap { flex: 1; }
+.ui-handwritten-note-count { min-width: 92px; text-align: center; font-variant-numeric: tabular-nums; color: var(--ui-muted); }
+.ui-handwritten-note-btn { min-width: 44px; height: 44px; padding: 0 10px; border: 1px solid transparent; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-handwritten-note-btn[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-handwritten-note-btn:disabled { color: var(--ui-muted); opacity: .55; cursor: default; }
+.ui-handwritten-note-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-handwritten-note-btn:not(:disabled):hover { background: var(--ui-subtle); } }
+.ui-handwritten-note-body { display: flex; flex: 1; min-height: 0; }
+/* The list of pages is for the width of a turned tablet: upright the bar is enough, and the page takes the room. */
+.ui-handwritten-note-side { display: none; flex: none; flex-direction: column; gap: 4px; width: 148px; overflow-y: auto; padding: 8px; border-right: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-handwritten-note-tab { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 6px; min-height: 48px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-handwritten-note-tab[aria-current="page"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-handwritten-note-tab small { color: var(--ui-muted); font-weight: 400; }
+.ui-handwritten-note-tab:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-handwritten-note-scroll { position: relative; flex: 1; min-width: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; padding: 12px; outline: none; }
+.ui-handwritten-note-scroll:focus-visible { box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-handwritten-note-sheet { position: relative; width: 100%; max-width: 900px; margin: 0 auto; aspect-ratio: var(--ratio); background-color: var(--ui-surface); box-shadow: var(--ui-shadow);
+  background-image: linear-gradient(to right, transparent calc(var(--margin) - 1px), color-mix(in srgb, var(--ui-danger) 40%, transparent) var(--margin), transparent calc(var(--margin) + 1px)),
+    linear-gradient(to bottom, transparent calc(100% - 1px), var(--ui-border) calc(100% - 1px));
+  background-size: 100% 100%, 100% var(--rule);
+  touch-action: pan-y; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; cursor: crosshair; }
+.ui-handwritten-note-writes { touch-action: none; }
+.ui-handwritten-note-spring { transition: transform .2s cubic-bezier(.2, .8, .2, 1); }
+.ui-handwritten-note-sheet canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+.ui-handwritten-note-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex: none; min-height: 28px; padding: 4px max(10px, env(safe-area-inset-right)) calc(4px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)); border-top: 1px solid var(--ui-border); background: var(--ui-surface); color: var(--ui-muted); font-size: 13px; }
+.ui-handwritten-note-save { display: inline-flex; align-items: center; min-height: 44px; padding: 0 8px; color: var(--ui-accent); font-weight: 500; }
+@container (min-width: 1000px) { .ui-handwritten-note-side { display: flex; } }
+@media (prefers-reduced-motion: reduce) { .ui-handwritten-note-spring { transition: none; } }
+`
+
+// Pages from outside: each cleaned as a stroke list, and always one page to write on.
+fn handwritten_note_clean(pages) -> list {
+    if type_of(pages) != "list" || len(pages) == 0 { return [[]] }
+    pages | map((p) => stylus_canvas_clean(p))
+}
+
+// The book with page i replaced.
+fn handwritten_note_with(book: list, i: int, strokes: list) -> list {
+    enumerate(book) | map((p) => p[0] == i ? strokes : p[1])
+}
+
+// Where the rules stand on a page, from one gap down, stopping short of the bottom edge.
+fn handwritten_note_rules(height: int, spacing: int) -> list {
+    if spacing <= 0 { return [] }
+    let n = floor((height - 1) / spacing)
+    range(1, n + 1) | map((i) => i * spacing)
+}
+
+// A swipe let go after dx pixels in ms: 1 for the next page, -1 for the last, 0 to spring
+// back. Far enough does it, and so does a quick flick that is plainly one.
+fn handwritten_note_turn(dx: num, ms: num, width: num) -> int {
+    let speed = abs(dx) / max([ms, 1])
+    if abs(dx) >= width * 0.3 || (abs(dx) >= 30 && speed >= 0.5) { return dx < 0 ? 1 : -1 }
+    0
+}
+
+// May this touch not scroll? iOS tells a Pencil's touch by its touchType, and Chrome has
+// said so in the pointerdown just before. touch-action cannot tell a pen from a finger.
+fn handwritten_note_stops_scroll(touch_type, pen_down: bool) -> bool {
+    touch_type == "stylus" || pen_down
+}
+
+// A page as a PNG: the paper, the rules, the margin and the strokes, whatever the theme.
+fn handwritten_note_png(out, strokes: list, width: int, height: int, spacing: int, margin: int) -> str {
+    out.width = width
+    out.height = height
+    let c = out.getContext("2d")
+    c.fillStyle = "#ffffff"
+    c.fillRect(0, 0, width, height)
+    c.fillStyle = "#c8d4e6"
+    for y in handwritten_note_rules(height, spacing) { c.fillRect(0, y - 1, width, 2) }
+    c.fillStyle = "#e6a9ac"
+    c.fillRect(margin - 1, 0, 2, height)
+    for s in strokes { stylus_canvas_paint(c, s, "#17161f") }
+    out.toDataURL("image/png")
+}
+
+component HandwrittenNote(pages = [], width: int = 800, height: int = 1200, spacing: int = 44, margin: int = 110, size: num = 3,
+                          label: str = "Notebook", name: str? = null, on_change = null, on_export = null, class: str? = null) {
+    style global handwritten_note_css
+    state book = handwritten_note_clean(pages)
+    state at = 0
+    state tool = "pen"
+    state finger = false
+    state past = []            // undo: { page, strokes } as they were
+    state links = []           // { page, href } exported without a callback
+    state said = ""
+    state win = null
+    state scroller = null
+    state sheet = null
+    state canvas = null
+    state ctx = null
+    // What the handlers keep to themselves.
+    state g_res = 1
+    state g_width = 0
+    state g_mode = ""
+    state g_pid = null
+    state g_pen = false
+    state g_pen_down = false
+    state g_done = []
+    state g_tail = []
+    state g_a = null
+    state g_b = null
+    state g_before = null
+    state g_swipe = null       // { id, x, y, t, dx, locked }
+    state g_ratio = 0          // how far down the page is scrolled, as a share, kept through a turn of the tablet
+    let page_w = max([1, width])
+    let page_h = max([1, height])
+    let count = len(book)
+    let strokes_here = book[at] ?? []
+    let repaint = () => {
+        ctx.setTransform(1, 0, 0, 1, 0, 0)
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        ctx.setTransform(g_res, 0, 0, g_res, 0, 0)
+        let ink = win.getComputedStyle(sheet).color
+        for s in (book[at] ?? []) { stylus_canvas_paint(ctx, s, ink) }
+    }
+    let sharpen = () => {
+        let dpr = win.devicePixelRatio ?? 1
+        g_width = sheet.clientWidth
+        g_res = min([dpr * sheet.clientWidth / page_w, 4096 / page_w, 4096 / page_h])
+        canvas.width = round(page_w * g_res)
+        canvas.height = round(page_h * g_res)
+        repaint()
+    }
+    let told = () => { on_change && on_change(book) }
+    let put = (strokes: list) => {
+        past = slice(past, -99, len(past)) | push({ page: at, strokes: book[at] })
+        book = handwritten_note_with(book, at, strokes)
+    }
+    let turn_to = (to: int, from_x: num) => {
+        if to >= 0 && to < len(book) && to != at {
+            at = to
+            scroller.scrollTop = 0
+            g_ratio = 0
+            repaint()
+            said = `Page ${to + 1} of ${len(book)}`
+            sheet.classList.remove("ui-handwritten-note-spring")
+            sheet.style.transform = ""
+            if !win.matchMedia("(prefers-reduced-motion: reduce)").matches {
+                sheet.animate([{ transform: `translateX(${from_x}px)`, opacity: 0.4 }, { transform: "none", opacity: 1 }], { duration: 180, easing: "ease-out" })
+            }
+        }
+    }
+    let add_page = () => {
+        book = book | push([])
+        told()
+        turn_to(len(book) - 1, 60)
+    }
+    let undo = () => {
+        if len(past) > 0 {
+            let last = past[len(past) - 1]
+            past = slice(past, 0, len(past) - 1)
+            book = handwritten_note_with(book, last.page, last.strokes)
+            if last.page != at { turn_to(last.page, 0) } else { repaint() }
+            said = "Undone."
+            told()
+        }
+    }
+    let to_page = (x: num, y: num) => {
+        let r = sheet.getBoundingClientRect()
+        [(x - r.left) * page_w / r.width, (y - r.top) * page_h / r.height]
+    }
+    let rub = (x: num, y: num) => {
+        let p = to_page(x, y)
+        let left = (book[at] ?? []) | filter((s) => !stylus_canvas_hit(s, p[0], p[1], 10))
+        if len(left) != len(book[at] ?? []) {
+            book = handwritten_note_with(book, at, left)
+            repaint()
+        }
+    }
+    let ink_point = (e) => {
+        let p0 = to_page(e.clientX, e.clientY)
+        let w = stylus_canvas_width(size, g_pen ? e.pressure : 0.5, e.tiltX ?? 0, e.tiltY ?? 0)
+        let p = [round(p0[0] * 10) / 10, round(p0[1] * 10) / 10, w]
+        g_tail = g_tail | push(p)
+        if len(g_tail) >= 200 {
+            g_done = g_done | push(g_tail)
+            g_tail = []
+        }
+        if g_a != null {
+            ctx.lineWidth = g_b[2]
+            ctx.beginPath()
+            ctx.moveTo((g_a[0] + g_b[0]) / 2, (g_a[1] + g_b[1]) / 2)
+            ctx.quadraticCurveTo(g_b[0], g_b[1], (g_b[0] + p[0]) / 2, (g_b[1] + p[1]) / 2)
+            ctx.stroke()
+        }
+        g_a = g_b
+        g_b = p
+    }
+    let begin = (e, erasing: bool) => {
+        sheet.setPointerCapture(e.pointerId)
+        g_pid = e.pointerId
+        g_pen = e.pointerType == "pen"
+        if erasing {
+            g_mode = "erase"
+            g_before = book[at] ?? []
+            rub(e.clientX, e.clientY)
+        } else {
+            g_mode = "write"
+            g_done = []
+            g_tail = []
+            g_a = null
+            g_b = null
+            let ink = win.getComputedStyle(sheet).color
+            ctx.strokeStyle = ink
+            ctx.lineCap = "round"
+            ctx.lineJoin = "round"
+            ink_point(e)
+        }
+    }
+    let finish = () => {
+        let mode = g_mode
+        g_mode = ""
+        g_pid = null
+        if mode == "write" {
+            let s = { color: "ink", points: flatten(g_done) + g_tail }
+            put((book[at] ?? []) | push(s))
+            repaint()
+            told()
+        }
+        if mode == "erase" && len(g_before) != len(book[at] ?? []) {
+            let now = book[at] ?? []
+            book = handwritten_note_with(book, at, g_before)
+            put(now)
+            told()
+        }
+    }
+    let drop = () => {
+        let mode = g_mode
+        g_mode = ""
+        g_pid = null
+        if mode == "erase" { book = handwritten_note_with(book, at, g_before) }
+        if mode != "" { repaint() }
+    }
+    let spring = () => {
+        sheet.classList.add("ui-handwritten-note-spring")
+        sheet.style.transform = ""
+    }
+    let down = (e) => {
+        let kind = e.pointerType
+        if kind == "pen" {
+            g_pen_down = true
+            // Whatever a hand had begun gives way to the pen.
+            if g_swipe != null {
+                g_swipe = null
+                spring()
+            }
+        }
+        if kind == "touch" && !finger {
+            if !g_pen_down && g_swipe == null && e.isPrimary && max([e.width, e.height]) < 60 {
+                g_swipe = { id: e.pointerId, x: e.clientX, y: e.clientY, t: e.timeStamp, locked: false }
+            }
+        } else if (e.button == 0 || e.button == 5) && g_mode == "" {
+            e.preventDefault()
+            begin(e, tool == "eraser" || e.button == 5 || floor(e.buttons / 32) % 2 == 1)
+        }
+    }
+    let moved = (e) => {
+        if g_mode != "" && e.pointerId == g_pid {
+            if g_mode == "write" {
+                let many = e.getCoalescedEvents != null ? e.getCoalescedEvents() : []
+                if len(many) > 0 {
+                    for one in many { ink_point(one) }
+                } else {
+                    ink_point(e)
+                }
+            } else {
+                rub(e.clientX, e.clientY)
+            }
+        } else if g_swipe != null && e.pointerId == g_swipe.id {
+            let dx = e.clientX - g_swipe.x
+            let dy = e.clientY - g_swipe.y
+            if !g_swipe.locked && abs(dx) > 10 && abs(dx) > abs(dy) {
+                g_swipe = { ...g_swipe, locked: true }
+                sheet.setPointerCapture(e.pointerId)
+                sheet.classList.remove("ui-handwritten-note-spring")
+            }
+            if g_swipe.locked {
+                // There is no page past the ends: the sheet gives a little and comes back.
+                let end = (dx > 0 && at == 0) || (dx < 0 && at == len(book) - 1)
+                sheet.style.transform = `translateX(${end ? dx * 0.25 : dx}px)`
+            }
+        }
+    }
+    let lifted = (e, cancel: bool) => {
+        if e.pointerType == "pen" { g_pen_down = false }
+        if g_mode != "" && e.pointerId == g_pid {
+            if cancel { drop() } else { finish() }
+        }
+        if g_swipe != null && e.pointerId == g_swipe.id {
+            let s = g_swipe
+            g_swipe = null
+            if s.locked {
+                let dx = e.clientX - s.x
+                let by = cancel ? 0 : handwritten_note_turn(dx, e.timeStamp - s.t, sheet.clientWidth)
+                let to = at + by
+                if by != 0 && to >= 0 && to < len(book) { turn_to(to, dx * 0.6) } else { spring() }
+            }
+        }
+    }
+    let export_page = (i: int, out) => {
+        let png = handwritten_note_png(out, book[i], page_w, page_h, spacing, margin)
+        if on_export != null {
+            on_export(i + 1, png)
+        } else {
+            links = (links | filter((l) => l.page != i + 1)) | push({ page: i + 1, href: png })
+        }
+    }
+    <div class={ui_cls(["ui-handwritten-note", class])}>
+        <div.ui-handwritten-note-bar role="toolbar" aria-label="Notebook tools">
+            <button.ui-handwritten-note-btn type="button" disabled={at == 0} aria-label="Last page" @click={() => { turn_to(at - 1, -60) }}>Back</button>
+            <span.ui-handwritten-note-count>Page {at + 1} of {count}</span>
+            <button.ui-handwritten-note-btn type="button" disabled={at >= count - 1} aria-label="Next page" @click={() => { turn_to(at + 1, 60) }}>Next</button>
+            <button.ui-handwritten-note-btn type="button" @click={add_page}>New page</button>
+            <span.ui-handwritten-note-gap></span>
+            <button.ui-handwritten-note-btn type="button" aria-pressed={tool == "pen" ? "true" : "false"} @click={() => { tool = "pen" }}>Pen</button>
+            <button.ui-handwritten-note-btn type="button" aria-pressed={tool == "eraser" ? "true" : "false"} @click={() => { tool = "eraser" }}>Eraser</button>
+            <button.ui-handwritten-note-btn type="button" aria-pressed={finger ? "true" : "false"} aria-label="Fingers write" @click={() => { finger = !finger }}>Finger</button>
+            <button.ui-handwritten-note-btn type="button" disabled={len(past) == 0} @click={undo}>Undo</button>
+            <button.ui-handwritten-note-btn type="button" @click={() => {
+                let out = js("document.createElement", "canvas")
+                export_page(at, out)
+                said = `Page ${at + 1} exported.`
+            }}>Export page</button>
+            <button.ui-handwritten-note-btn type="button" @click={() => {
+                let out = js("document.createElement", "canvas")
+                for i in range(0, len(book)) { export_page(i, out) }
+                said = `${len(book)} pages exported.`
+            }}>Export all</button>
+        </div>
+        <div.ui-handwritten-note-body>
+            <nav.ui-handwritten-note-side aria-label="Pages">
+                {for i in range(0, count) => <button.ui-handwritten-note-tab key={i} type="button" aria-current={i == at ? "page" : null}
+                        @click={() => { turn_to(i, i > at ? 60 : -60) }}>
+                    Page {i + 1}<small>{len(book[i])}</small>
+                </button>}
+            </nav>
+            <div.ui-handwritten-note-scroll tabindex="0" role="group" aria-label={`${label}, page ${at + 1} of ${count}, ${len(strokes_here)} strokes. The left and right arrow keys turn the page.`}
+                 style={`--ratio: ${page_w} / ${page_h}; --rule: ${spacing * 100 / page_h}%; --margin: ${margin * 100 / page_w}%`}
+                 @mount={(me) => {
+                     win = js("window")
+                     scroller = me
+                     sheet = me.querySelector(".ui-handwritten-note-sheet")
+                     canvas = me.querySelector("canvas")
+                     ctx = canvas.getContext("2d")
+                     sharpen()
+                     let ro = js_new("ResizeObserver", () => {
+                         sharpen()
+                         // The page is taller when turned: the same line stays in sight.
+                         me.scrollTop = g_ratio * (me.scrollHeight - me.clientHeight)
+                     })
+                     ro.observe(sheet)
+                     // touch-action sees a finger and a pen alike, and is fixed by the time a handler
+                     // runs, so what stops a pen from scrolling is refusing its touch.
+                     let hold = (e) => {
+                         let t = e.touches[0]
+                         if e.cancelable && handwritten_note_stops_scroll(t != null ? t.touchType : null, g_pen_down) { e.preventDefault() }
+                     }
+                     me.addEventListener("touchstart", hold, { passive: false })
+                     me.addEventListener("touchmove", hold, { passive: false })
+                     () => {
+                         ro.disconnect()
+                         me.removeEventListener("touchstart", hold)
+                         me.removeEventListener("touchmove", hold)
+                     }
+                 }}
+                 @scroll={(e) => {
+                     // A scroll while the sheet is being resized is the browser clamping, not a person.
+                     let room = e.target.scrollHeight - e.target.clientHeight
+                     if room > 0 && sheet.clientWidth == g_width { g_ratio = e.target.scrollTop / room }
+                 }}
+                 @keydown={(e) => {
+                     if e.key == "ArrowLeft" {
+                         e.preventDefault()
+                         turn_to(at - 1, -60)
+                     }
+                     if e.key == "ArrowRight" {
+                         e.preventDefault()
+                         turn_to(at + 1, 60)
+                     }
+                     if (e.ctrlKey || e.metaKey) && lower(e.key) == "z" {
+                         e.preventDefault()
+                         undo()
+                     }
+                 }}>
+                // Its sizes come from the scroller above. A swipe sets this element's transform, and a
+                // style={...} here would be written over it whenever it ran again.
+                <div class={ui_cls(["ui-handwritten-note-sheet", finger && "ui-handwritten-note-writes"])}
+                     @pointerdown={down}
+                     @pointermove={moved}
+                     @pointerup={(e) => { lifted(e, false) }}
+                     @pointercancel={(e) => { lifted(e, true) }}
+                     @contextmenu={(e) => { e.preventDefault() }}>
+                    <canvas width={page_w} height={page_h} aria-hidden="true"></canvas>
+                </div>
+            </div>
+        </div>
+        <div.ui-handwritten-note-foot>
+            <span>{finger ? "A finger writes. Turn Finger off to scroll." : "The pen writes. A finger scrolls, and swipes sideways to turn the page."}</span>
+            {for l in links => <a.ui-handwritten-note-save key={l.page} href={l.href} download={`page-${l.page}.png`}>Save page {l.page}</a>}
+        </div>
+        {name != null && <input type="hidden" name={name} value={json.stringify(book)}/>}
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

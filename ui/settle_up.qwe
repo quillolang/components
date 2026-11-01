@@ -1,0 +1,377 @@
+// SettleUp: who owes whom after a group's shared expenses. Each expense has who paid
+// and who shared it, split equally to the cent (the odd cents to the first in the list),
+// so the balances always come to exactly zero. Then the fewest transfers that settle
+// everyone: people whose balances cancel each other out are settled among themselves,
+// which is what makes a plan shorter than one less than the number of open balances.
+// Nobody both pays and receives, and no one pays the same person twice. Finding the fewest
+// is a hard problem, so it is searched exactly for up to 14 open balances; past that it
+// takes the largest debts first and says the plan may not be the shortest.
+//
+//   <SettleUp people={["Ana", "Ben", "Cy"]} expenses={[
+//       { what: "Hotel", amount: "300.00", paid_by: "Ana" },
+//       { what: "Taxi", amount: 18, paid_by: "Ben", shared_by: ["Ben", "Cy"] }]}/>
+//   <SettleUp people={names} currency="EUR" on_change={(r) => { plan = r.transfers }}/>
+//
+// people: names, at most 30 (Person 1 and Person 2 by default). expenses: maps { what,
+// amount, paid_by, shared_by }, paid_by and shared_by being names; shared_by left out
+// means everyone, and a paid_by nobody has is the first person. At most 200. currency:
+// ISO code ("USD"; one Quillo does not know falls back to it). locale: how to write
+// amounts (the program's). title: the heading ("Settle up"). id: a prefix for its ids
+// ("settle-up"), unique on the page. name: a prefix for the names of its fields ("settle":
+// settle_person, settle_what, settle_amount, settle_paid_by, settle_expense_<n>_shared).
+// on_change(r): inside one of your components, after each change, given { balances:
+// [{ name, paid, share, balance }], transfers: [{ from, to, amount }], fewest } as
+// decimals when the figures are good; fewest is false for a plan past the exact search.
+// class: more classes for its outer element.
+//
+// settle_up_balances(people, expenses) and settle_up_transfers(balances) are the logic, for a
+// program's own use, in whole minor units: see them below.
+
+import ui/theme.qwe use ui_cls
+
+let settle_up_css = css`
+.ui-settle-up { container-type: inline-size; display: grid; gap: 16px; min-width: 0; max-width: 720px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-settle-up .ui-settle-up-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-settle-up-part { display: grid; gap: 8px; min-width: 0; }
+.ui-settle-up-part h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.ui-settle-up-rows { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.ui-settle-up-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.ui-settle-up-box { box-sizing: border-box; flex: 1 1 120px; display: flex; align-items: center; gap: 6px; min-width: 0; height: 36px; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-settle-up-box:hover { border-color: var(--ui-strong); }
+.ui-settle-up-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-settle-up-box input, .ui-settle-up-box select { flex: 1; width: 0; min-width: 0; height: 100%; padding: 0; border: 0; outline: none; background: transparent; color: var(--ui-fg);
+  font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-settle-up-box.ui-settle-up-num { flex: 0 1 120px; }
+.ui-settle-up-bad { border-color: var(--ui-danger); }
+.ui-settle-up-code { flex: none; color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-settle-up-who { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0; padding: 0; border: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-settle-up-who legend { float: left; margin-right: 8px; padding: 0; }
+.ui-settle-up-who label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ui-settle-up-who input { margin: 0; accent-color: var(--ui-accent); }
+.ui-settle-up-btn { box-sizing: border-box; height: 32px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-settle-up-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-settle-up-btn:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-settle-up-btn:disabled { color: var(--ui-muted); cursor: not-allowed; }
+.ui-settle-up-add { justify-self: start; }
+.ui-settle-up-errors { margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-settle-up-out { display: grid; gap: 12px; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-settle-up-out h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.ui-settle-up-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-settle-up-table th { padding: 4px 0; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: right; }
+.ui-settle-up-table td { padding: 5px 0; border-bottom: 1px solid var(--ui-border); text-align: right; overflow-wrap: anywhere; }
+.ui-settle-up-table th:first-child, .ui-settle-up-table td:first-child { text-align: left; }
+.ui-settle-up-table th + th, .ui-settle-up-table td + td { padding-left: 12px; }
+.ui-settle-up-up { color: var(--ui-success); font-weight: 600; }
+.ui-settle-up-down { color: var(--ui-danger); font-weight: 600; }
+.ui-settle-up-plan { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-settle-up-plan b { font-variant-numeric: tabular-nums; }
+.ui-settle-up-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+`
+
+// The currency's code, USD when Quillo does not know it.
+fn settle_up_code(currency) -> str {
+    let c = upper(trim(str(currency ?? "")))
+    type_of(money.minor_units(c)) == "error" ? "USD" : c
+}
+
+// What was typed as a decimal: 0 when empty, null when it is not a plain number of 0 or
+// more. A comma counts only as a thousands comma, so "12,50" is refused, not 1250.
+fn settle_up_read(text) {
+    let t = trim(str(text ?? ""))
+    if t == "" { return 0m }
+    if len(t) > 40 { return null }
+    let plain = re.test(t, "^[0-9]{1,3}(,[0-9]{3})+(\\.[0-9]*)?$") ? replace(t, ",", "") : t
+    if !re.test(plain, "^([0-9]+\\.?[0-9]*|\\.[0-9]+)$") { return null }
+    let d = dec(plain)
+    is_err(d) || d > 9999999999m ? null : d
+}
+
+// Each person's money. people: [{ id, name }]; expenses: [{ minor, payer, by }] in minor
+// units with payer and by as ids. Gives [{ id, name, paid, share, balance }], balances
+// summing to exactly 0: a share is the amount over those sharing, the odd units to the
+// first of them in the order of `people`.
+fn settle_up_balances(people: list, expenses: list) -> list {
+    let paid = people | map((p) => 0)
+    let share = people | map((p) => 0)
+    let place = (id) => (people | enumerate() | filter((row) => row[1].id == id) | map((row) => row[0]) | first()) ?? -1
+    for e in expenses {
+        let at = place(e.payer)
+        let among = people | enumerate() | filter((row) => contains(e.by, row[1].id)) | map((row) => row[0])
+        let n = len(among)
+        if n > 0 && at >= 0 {
+            paid = set(paid, at, paid[at] + e.minor)
+            let each = int(floor(dec(e.minor) / n))
+            let odd = e.minor - each * n
+            for [rank, i] in enumerate(among) {
+                share = set(share, i, share[i] + each + (rank < odd ? 1 : 0))
+            }
+        }
+    }
+    people | enumerate() | map((row) => {
+        let i = row[0]
+        { id: row[1].id, name: row[1].name, paid: paid[i], share: share[i], balance: paid[i] - share[i] }
+    })
+}
+
+// One zero-sum group settled: the largest debtor pays the largest creditor until one is
+// done, so a group of n takes n - 1 transfers and no pair comes up twice. `open` is a
+// list of [index, balance].
+fn settle_up_group(open: list) -> list {
+    let rest = open
+    let out = []
+    while len(rest) > 1 {
+        let debtor = first(sort_by(rest | filter((r) => r[1] < 0), (r) => r[1]))
+        let creditor = first(sort_by(rest | filter((r) => r[1] > 0), (r) => 0 - r[1]))
+        let amount = min([0 - debtor[1], creditor[1]])
+        out = out | push({ from: debtor[0], to: creditor[0], amount })
+        rest = rest | map((r) => r[0] == debtor[0] ? [r[0], r[1] + amount] : (r[0] == creditor[0] ? [r[0], r[1] - amount] : r)) | filter((r) => r[1] != 0)
+    }
+    out
+}
+
+// The most groups of balances that each sum to zero, as lists of positions: a subset's
+// best is the best of it less one member, plus one if it sums to zero itself. A walk back
+// along that best path passes the zero-sum subsets, and what lies between two is a group.
+// 2^n subsets: the caller keeps n to 14.
+fn settle_up_groups(amounts: list) -> list {
+    let n = len(amounts)
+    let size = bit.shl(1, n)
+    let sums = [0]
+    for a in amounts {
+        sums = sums + (sums | map((s) => s + a))
+    }
+    let best = [0]
+    let mask = 1
+    while mask < size {
+        let top = 0
+        let i = 0
+        while i < n {
+            let b = bit.shl(1, i)
+            if bit.and(mask, b) != 0 && best[mask - b] > top { top = best[mask - b] }
+            i += 1
+        }
+        best = best | push(top + (sums[mask] == 0 ? 1 : 0))
+        mask += 1
+    }
+    let groups = []
+    let group = []
+    mask = size - 1
+    while mask > 0 {
+        let gain = sums[mask] == 0 ? 1 : 0
+        let at = range(n) | find((i) => bit.and(mask, bit.shl(1, i)) != 0 && best[mask - bit.shl(1, i)] + gain == best[mask])
+        group = group | push(at)
+        mask = mask - bit.shl(1, at)
+        if sums[mask] == 0 {
+            groups = groups | push(group)
+            group = []
+        }
+    }
+    groups
+}
+
+// The transfers that settle balances (whole minor units summing to 0), as { transfers:
+// [{ from, to, amount }], fewest }, from and to being positions in the list. Exact up to
+// 14 open balances; past that, pairs that cancel first, then the largest first.
+fn settle_up_transfers(balances: list) -> map {
+    let open = balances | enumerate() | map((row) => [row[0], row[1]]) | filter((r) => r[1] != 0)
+    if len(open) == 0 { return { transfers: [], fewest: true } }
+    if len(open) <= 14 {
+        let found = settle_up_groups(open | map((r) => r[1]))
+        let parts = found | map((g) => settle_up_group(g | map((i) => open[i])))
+        return { transfers: flatten(parts), fewest: true }
+    }
+    let rest = open
+    let paired = []
+    for r in open {
+        if r[1] > 0 {
+            let twin = rest | find((x) => x[1] == 0 - r[1])
+            if twin != null && (rest | any((x) => x[0] == r[0])) {
+                paired = paired | push({ from: twin[0], to: r[0], amount: r[1] })
+                rest = rest | filter((x) => x[0] != twin[0] && x[0] != r[0])
+            }
+        }
+    }
+    { transfers: paired + settle_up_group(rest), fewest: false }
+}
+
+// The props' people as rows, names at most 30.
+fn settle_up_people(people) -> list {
+    let given = type_of(people) == "list" && len(people) > 0 ? take(people, 30) : ["", ""]
+    given | enumerate() | map((row) => ({ id: row[0] + 1, name: str(row[1] ?? "") }))
+}
+
+// The props' expenses as rows: a person's id for each name, everyone when shared_by is left out.
+fn settle_up_expenses(expenses, who: list) -> list {
+    let given = type_of(expenses) == "list" ? take(expenses, 200) : []
+    given | filter((e) => type_of(e) == "map") | enumerate() | map((row) => {
+        let e = row[1]
+        let payer = (who | find((p) => p.name == str(e.paid_by ?? ""))) ?? first(who)
+        let by = type_of(e.shared_by) == "list" ? who | filter((p) => contains(e.shared_by, p.name)) : who
+        { id: row[0] + 1, what: str(e.what ?? ""), amount: e.amount == null ? "" : str(e.amount), payer: payer.id, by: by | map((p) => p.id) }
+    })
+}
+
+// A person's name, or "Person 2" for a blank one.
+fn settle_up_name(who: list, id) -> str {
+    let row = who | enumerate() | find((r) => r[1].id == id)
+    if row == null { return "Nobody" }
+    filled(trim(str(row[1].name))) ?? `Person ${row[0] + 1}`
+}
+
+// Everything from the rows as typed: { errors: [{ field, text }], balances, transfers,
+// fewest }, in minor units; balances is null with errors.
+fn settle_up_work(who: list, rows: list, code: str) -> map {
+    let errors = []
+    let read = rows | map((e) => settle_up_read(e.amount))
+    for [i, e] in enumerate(rows) {
+        let label = filled(trim(e.what)) ?? `expense ${i + 1}`
+        if read[i] == null {
+            errors = errors | push({ field: `amount-${e.id}`, text: `The amount of ${label} must be a number of 0 or more, up to 9,999,999,999.` })
+        } else if read[i] > 0 && len(e.by | filter((id) => who | any((p) => p.id == id))) == 0 {
+            errors = errors | push({ field: `by-${e.id}`, text: `Nobody shares ${label}: tick at least one person.` })
+        }
+    }
+    if len(errors) > 0 { return { errors, balances: null, transfers: [], fewest: true } }
+    let spent = rows | enumerate() | map((row) => ({ minor: money.to_minor(money.of(read[row[0]], code, "half_up")), payer: row[1].payer, by: row[1].by }))
+    let named = who | map((p) => ({ id: p.id, name: settle_up_name(who, p.id) }))
+    let balances = settle_up_balances(named, spent)
+    let plan = settle_up_transfers(balances | map((b) => b.balance))
+    let transfers = plan.transfers | map((t) => ({ from: balances[t.from].name, to: balances[t.to].name, amount: t.amount }))
+    { errors, balances, transfers, fewest: plan.fewest }
+}
+
+component SettleUp(people = null, expenses = null, currency: str = "USD", locale: str? = null, title: str = "Settle up", id: str = "settle-up",
+                   name: str = "settle", on_change = null, class: str? = null) {
+    style global settle_up_css
+    state who = settle_up_people(people)
+    state rows = settle_up_expenses(expenses, settle_up_people(people))
+    state serial = 1000
+    state blocked = ""
+    let code = settle_up_code(currency)
+    let work = settle_up_work(who, rows, code)
+    let ok = work.balances != null
+    let shown = (minor: int) => locale != null ? money.format(money.from_minor(minor, code), locale) : money.format(money.from_minor(minor, code))
+    let signed = (minor: int) => minor > 0 ? `+${shown(minor)}` : shown(minor)
+    let bad = (field: str) => work.errors | any((e) => e.field == field)
+    let field_id = (part: str) => `${id}-${part}`
+    let named = (part: str) => `${name}_${part}`
+    let tell = () => {
+        if on_change != null && ok {
+            let amount = (minor: int) => money.from_minor(minor, code).amount
+            on_change({ balances: work.balances | map((b) => ({ name: b.name, paid: amount(b.paid), share: amount(b.share), balance: amount(b.balance) })),
+                        transfers: work.transfers | map((t) => ({ from: t.from, to: t.to, amount: amount(t.amount) })), fewest: work.fewest })
+        }
+    }
+    let change = (eid, field: str, value) => {
+        rows = rows | map((e) => e.id == eid ? set(e, field, value) : e)
+        tell()
+    }
+    let add_person = () => {
+        if len(who) < 30 {
+            serial += 1
+            let fresh = serial
+            who = who | push({ id: fresh, name: "" })
+            rows = rows | map((e) => set(e, "by", e.by | push(fresh)))
+            blocked = ""
+            tell()
+        }
+    }
+    let drop_person = (pid) => {
+        let held = rows | find((e) => e.payer == pid)
+        if held != null {
+            blocked = `${settle_up_name(who, pid)} paid for ${filled(trim(held.what)) ?? "an expense"}: pick another payer first.`
+        } else {
+            who = who | filter((p) => p.id != pid)
+            rows = rows | map((e) => set(e, "by", e.by | filter((x) => x != pid)))
+            blocked = ""
+            tell()
+        }
+    }
+    let add_expense = () => {
+        if len(rows) < 200 && len(who) > 0 {
+            serial += 1
+            rows = rows | push({ id: serial, what: "", amount: "", payer: who[0].id, by: who | map((p) => p.id) })
+            tell()
+        }
+    }
+    let toggle = (eid, pid, on: bool) => {
+        rows = rows | map((e) => {
+            if e.id != eid { return e }
+            let rest = e.by | filter((x) => x != pid)
+            set(e, "by", on ? rest | push(pid) : rest)
+        })
+        tell()
+    }
+    <section class={ui_cls(["ui-settle-up", class])} aria-labelledby={field_id("title")}>
+        <h3.ui-settle-up-title id={field_id("title")}>{title}</h3>
+        <div.ui-settle-up-part>
+            <h4>People</h4>
+            <ul.ui-settle-up-rows>
+                {for p in who => <li.ui-settle-up-row key={p.id}>
+                    <div.ui-settle-up-box>
+                        <label.ui-sr for={field_id(`person-${p.id}`)}>Name of person</label>
+                        <input type="text" autocomplete="off" maxlength="60" id={field_id(`person-${p.id}`)} name={named("person")} value={p.name} placeholder="Name"
+                               @input={(e) => { who = who | map((q) => q.id == p.id ? set(q, "name", e.value) : q); tell() }}/>
+                    </div>
+                    <button.ui-settle-up-btn type="button" aria-label={`Remove ${filled(p.name) ?? "this person"}`} @click={() => { drop_person(p.id) }}>Remove</button>
+                </li>}
+            </ul>
+            {blocked != "" && <p.ui-settle-up-note role="status">{blocked}</p>}
+            <button.ui-settle-up-btn.ui-settle-up-add type="button" disabled={len(who) >= 30} @click={add_person}>Add a person</button>
+        </div>
+        <div.ui-settle-up-part>
+            <h4>Expenses</h4>
+            <ul.ui-settle-up-rows>
+                {for x in rows => <li.ui-settle-up-row key={x.id}>
+                    <div.ui-settle-up-box>
+                        <label.ui-sr for={field_id(`what-${x.id}`)}>What it was for</label>
+                        <input type="text" autocomplete="off" maxlength="80" id={field_id(`what-${x.id}`)} name={named("what")} value={x.what} placeholder="What for"
+                               @input={(e) => { change(x.id, "what", e.value) }}/>
+                    </div>
+                    <div class={ui_cls(["ui-settle-up-box", "ui-settle-up-num", bad(`amount-${x.id}`) && "ui-settle-up-bad"])}>
+                        <label.ui-sr for={field_id(`amount-${x.id}`)}>Amount of {filled(x.what) ?? "this expense"}</label>
+                        <input type="text" inputmode="decimal" autocomplete="off" id={field_id(`amount-${x.id}`)} name={named("amount")} value={x.amount} placeholder="0.00"
+                               aria-invalid={bad(`amount-${x.id}`) ? "true" : null} @input={(e) => { change(x.id, "amount", e.value) }}/>
+                        <span.ui-settle-up-code aria-hidden="true">{code}</span>
+                    </div>
+                    <div.ui-settle-up-box.ui-settle-up-num>
+                        <label.ui-sr for={field_id(`payer-${x.id}`)}>Who paid for {filled(x.what) ?? "this expense"}</label>
+                        <select id={field_id(`payer-${x.id}`)} name={named("paid_by")} @change={(e) => { change(x.id, "payer", int(e.value)) }}>
+                            {for p in who => <option key={p.id} value={p.id} selected={p.id == x.payer}>{settle_up_name(who, p.id)}</option>}
+                        </select>
+                    </div>
+                    <button.ui-settle-up-btn type="button" aria-label={`Remove ${filled(x.what) ?? "this expense"}`} @click={() => { rows = rows | filter((r) => r.id != x.id); tell() }}>Remove</button>
+                    <fieldset.ui-settle-up-who>
+                        <legend>Shared by</legend>
+                        {for p in who => <label key={p.id}>
+                            <input type="checkbox" name={named(`expense_${x.id}_shared`)} value={p.id} checked={contains(x.by, p.id)} @change={(e) => { toggle(x.id, p.id, e.checked) }}/>
+                            {settle_up_name(who, p.id)}
+                        </label>}
+                    </fieldset>
+                </li>}
+            </ul>
+            <button.ui-settle-up-btn.ui-settle-up-add type="button" disabled={len(rows) >= 200} @click={add_expense}>Add an expense</button>
+        </div>
+        {len(work.errors) > 0 && <ul.ui-settle-up-errors role="alert">{for e in work.errors => <li key={e.field}>{e.text}</li>}</ul>}
+        {ok && <div.ui-settle-up-out aria-live="polite">
+            <h4>Balances</h4>
+            <table.ui-settle-up-table>
+                <thead><tr><th scope="col">Person</th><th scope="col">Paid</th><th scope="col">Share</th><th scope="col">Balance</th></tr></thead>
+                <tbody>
+                    {for b in work.balances => <tr key={b.id}>
+                        <td>{b.name}</td><td>{shown(b.paid)}</td><td>{shown(b.share)}</td>
+                        <td class={b.balance > 0 ? "ui-settle-up-up" : (b.balance < 0 ? "ui-settle-up-down" : null)}>{signed(b.balance)}</td>
+                    </tr>}
+                </tbody>
+            </table>
+            <h4>{len(work.transfers) == 0 ? "Everyone is settled" : (len(work.transfers) == 1 ? "1 transfer settles everyone" : `${len(work.transfers)} transfers settle everyone`)}</h4>
+            {len(work.transfers) > 0 && <ul.ui-settle-up-plan>
+                {for t in work.transfers => <li key={`${t.from}>${t.to}`}>{t.from} pays {t.to} <b>{shown(t.amount)}</b></li>}
+            </ul>}
+            {!work.fewest && <p.ui-settle-up-note>With more than 14 open balances this plan settles everyone exactly but may not be the shortest.</p>}
+        </div>}
+    </section>
+}

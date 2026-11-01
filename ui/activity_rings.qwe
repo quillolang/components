@@ -1,0 +1,176 @@
+// ActivityRings: progress towards a few goals as rings inside each other, as a watch shows
+// a day's moving, exercise and standing. A ring past its goal goes round again over
+// itself, in a lighter colour with a shaded head, so 150% and 50% do not look alike. The
+// rings draw themselves once, as the page opens, by CSS alone; a value that changes later
+// slides there and does not start over. The legend says each ring in words, and screen
+// readers get a whole sentence for each, not a picture.
+//
+//   <ActivityRings title="Today" center="Fri" rings={[
+//       { label: "Move", value: 420, goal: 600, unit: "kcal" },
+//       { label: "Exercise", value: 45, goal: 30, unit: "min", tone: "success" },
+//       { label: "Stand", value: 9, goal: 12, unit: "h", tone: "info" },
+//   ]}/>
+//
+// rings: each { label, value, goal, unit?, tone? }, the first on the outside. tone is
+// "accent", "success", "warning", "danger" or "info", and they take those in turn when
+// left out. A goal of 0 or less counts as nothing done, a value that is not a number as 0,
+// and an entry with no label is left out; six are drawn at most. title: what the
+// rings are, for screen readers and over the legend. center: a word in the middle.
+// size: how wide the rings are, in pixels (200), a little wider in a wide container.
+// class.
+//
+// A view: it adds nothing to the page's script. As the page opens it runs whether or not
+// it can be seen, so rings far down a long page will have finished when they are reached.
+
+import ui/theme.qwe use ui_cls
+
+let activity_rings_css = css`
+.ui-arings { container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-arings-in { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.ui-arings-pic { position: relative; flex: none; width: min(100%, var(--ui-arings-size)); aspect-ratio: 1; }
+.ui-arings-pic svg { display: block; width: 100%; height: 100%; transform: rotate(-90deg); overflow: visible; }
+.ui-arings-pic circle { fill: none; }
+.ui-arings-track { stroke: color-mix(in srgb, var(--t) 16%, transparent); }
+.ui-arings-arc { stroke: var(--t); stroke-linecap: round; transition: stroke-dasharray .45s ease;
+  animation: ui-arings-draw .9s cubic-bezier(.3, .7, .2, 1) backwards; }
+.ui-arings-lap { stroke: color-mix(in srgb, var(--t) 74%, #fff); animation-delay: .85s; animation-duration: .6s; }
+.ui-arings-pic .ui-arings-head { fill: color-mix(in srgb, var(--t) 74%, #fff); stroke: rgba(0, 0, 0, .32); stroke-width: 1.5; animation: ui-arings-show .2s 1.3s backwards; }
+.ui-arings-none { visibility: hidden; }
+@keyframes ui-arings-draw { from { stroke-dashoffset: var(--ui-arings-d); opacity: 0; } 6% { opacity: 1; } }
+@keyframes ui-arings-show { from { opacity: 0; } }
+.ui-arings-center { position: absolute; inset: 0; display: grid; place-items: center; font-weight: 650; font-size: 13px; color: var(--ui-muted); pointer-events: none; }
+.ui-arings-side { width: 100%; min-width: 0; }
+.ui-arings-title { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: var(--ui-muted); }
+.ui-arings-legend { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-arings-item { position: relative; display: grid; grid-template-columns: 12px 1fr auto; align-items: baseline; gap: 2px 8px; }
+.ui-arings-dot { align-self: center; width: 12px; height: 12px; border-radius: 50%; background: var(--t); }
+.ui-arings-name { font-weight: 600; overflow-wrap: anywhere; }
+.ui-arings-pct { font-weight: 650; font-variant-numeric: tabular-nums; color: var(--t); }
+.ui-arings-of { grid-column: 2 / -1; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-arings-tone-accent { --t: var(--ui-accent); }
+.ui-arings-tone-success { --t: var(--ui-success); }
+.ui-arings-tone-warning { --t: var(--ui-warning); }
+.ui-arings-tone-danger { --t: var(--ui-danger); }
+.ui-arings-tone-info { --t: var(--ui-info); }
+@container (min-width: 360px) {
+  .ui-arings-in { flex-direction: row; gap: 22px; }
+  .ui-arings-pic { width: min(52%, var(--ui-arings-size)); }
+}
+@container (min-width: 620px) {
+  .ui-arings-in { gap: 40px; }
+  .ui-arings-pic { width: calc(var(--ui-arings-size) * 1.4); }
+  .ui-arings-legend { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
+  .ui-arings-pct { font-size: 20px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-arings-arc, .ui-arings-pic .ui-arings-head { animation: none; transition: none; }
+}
+`
+
+let activity_rings_tones = ["accent", "success", "warning", "danger", "info"]
+
+// A number from whatever came, else 0: never below 0, never NaN or endless.
+fn activity_rings_num(x) -> float {
+    let t = type_of(x)
+    if t != "int" && t != "float" && t != "dec" { return 0.0 }
+    let f = float(x)
+    if f != f || f <= 0 || f > 1000000000 { return 0.0 }
+    f
+}
+
+// How far along, in percent: past 100 is a goal passed, and 9999 is as far as it goes.
+fn activity_rings_pct(value, goal) -> float {
+    let g = activity_rings_num(goal)
+    if g <= 0 { return 0.0 }
+    let p = activity_rings_num(value) * 100 / g
+    p > 9999 ? 9999.0 : p
+}
+
+// What the two arcs show out of the 100 of a ring: the first lap, then what is left of the
+// last one, a whole lap when it lands exactly on the goal again.
+fn activity_rings_laps(pct: num) {
+    let rest = pct % 100
+    {
+        base: pct > 100 ? 100 : round(pct, 2),
+        lap: pct <= 100 ? 0 : (rest == 0 ? 100 : round(rest, 2)),
+    }
+}
+
+// The thickness of each ring and the gap for n of them, in a picture 200 wide with a free middle.
+fn activity_rings_widths(n: int) {
+    let each = 84 / max([n, 1])
+    let w = min([round(each * 0.84, 1), 20])
+    { w, gap: min([round(each * 0.16, 1), 4]) }
+}
+
+// Where the end of a lap is, as seen before the picture is turned a quarter back.
+fn activity_rings_head(lap: num, r: num) {
+    let a = lap / 100 * 2 * math.pi
+    { x: round(100 + r * math.cos(a), 2), y: round(100 + r * math.sin(a), 2) }
+}
+
+// A value without its trailing zeros, to one decimal.
+fn activity_rings_show(x) -> str {
+    let r = round(activity_rings_num(x) * 10) / 10
+    r == floor(r) ? str(floor(r)) : str(r)
+}
+
+fn activity_rings_said(r) -> str {
+    let unit = filled(r.unit) ?? ""
+    let of = `${r.label}: ${activity_rings_show(r.value)} of ${activity_rings_show(r.goal)}${unit != "" ? " " + unit : ""}, ${round(r.pct)} percent`
+    r.pct >= 100 ? `${of}, goal reached.` : `${of}.`
+}
+
+// The rings that can be drawn, each with all it needs.
+fn activity_rings_clean(rings) {
+    if type_of(rings) != "list" { return [] }
+    let named = rings | filter((r) => type_of(r) == "map" && filled(get(r, "label")) != null) | take(6)
+    let sized = activity_rings_widths(len(named))
+    for [i, r] in enumerate(named) => {
+        let tone = get(r, "tone")
+        let pct = activity_rings_pct(get(r, "value"), get(r, "goal"))
+        let radius = round(98 - sized.w / 2 - i * (sized.w + sized.gap), 1)
+        {
+            i, label: str(r.label), value: get(r, "value"), goal: get(r, "goal"), unit: get(r, "unit"), pct, radius, w: sized.w,
+            tone: contains(activity_rings_tones, tone) ? tone : activity_rings_tones[i % len(activity_rings_tones)],
+            ...activity_rings_laps(pct),
+        }
+    }
+}
+
+view ActivityRings(rings = [], title: str? = null, center: str? = null, size: int = 200, class: str? = null) {
+    style global activity_rings_css
+    let shown = activity_rings_clean(rings)
+    <figure class={ui_cls(["ui-arings", class])} style={`--ui-arings-size: ${size}px; margin: 0`}>
+        <div.ui-arings-in>
+            <div.ui-arings-pic aria-hidden="true">
+                <svg viewBox="0 0 200 200">
+                    {for r in shown => <g key={r.i} class={`ui-arings-tone-${r.tone}`}>
+                        <circle.ui-arings-track cx="100" cy="100" r={r.radius} stroke-width={r.w}/>
+                        <circle cx="100" cy="100" r={r.radius} stroke-width={r.w} pathLength="100"
+                                class={ui_cls(["ui-arings-arc", r.base == 0 && "ui-arings-none"])}
+                                style={`stroke-dasharray: ${r.base} 100; --ui-arings-d: ${r.base}`}/>
+                        <circle cx="100" cy="100" r={r.radius} stroke-width={r.w} pathLength="100"
+                                class={ui_cls(["ui-arings-arc", "ui-arings-lap", r.lap == 0 && "ui-arings-none"])}
+                                style={`stroke-dasharray: ${r.lap} 100; --ui-arings-d: ${r.lap}`}/>
+                        <circle cx={activity_rings_head(r.lap, r.radius).x} cy={activity_rings_head(r.lap, r.radius).y} r={round(r.w / 2, 1)}
+                                class={ui_cls(["ui-arings-head", r.lap == 0 && "ui-arings-none"])}/>
+                    </g>}
+                </svg>
+                {filled(center) != null && <span.ui-arings-center>{center}</span>}
+            </div>
+            <figcaption.ui-arings-side>
+                {filled(title) != null && <p.ui-arings-title>{title}</p>}
+                <ul.ui-arings-legend>
+                    {for r in shown => <li key={r.i} class={`ui-arings-item ui-arings-tone-${r.tone}`}>
+                        <span.ui-arings-dot aria-hidden="true"></span>
+                        <span.ui-arings-name aria-hidden="true">{r.label}</span>
+                        <span.ui-arings-pct aria-hidden="true">{round(r.pct)}%</span>
+                        <span.ui-arings-of aria-hidden="true">{activity_rings_show(r.value)} / {activity_rings_show(r.goal)} {filled(r.unit) ?? ""}</span>
+                        <span.ui-sr>{activity_rings_said(r)}</span>
+                    </li>}
+                </ul>
+            </figcaption>
+        </div>
+    </figure>
+}

@@ -1,0 +1,443 @@
+// SleepChart: one night, its stages from Awake down to Deep, read with a finger. A finger
+// moved along the chart stops on any moment and says the stage it is in, up and down the
+// page still scrolling; a tap does the same. Beside it stand the totals. Midnight
+// is only a line on the way: times are counted in real minutes, so a night across a change of
+// the clocks is the length it really was, and each moment shows the time the clock said then.
+// A stretch with no data stays a hole in the chart and in the sums.
+//
+//   <SleepChart title="Saturday night" segments={[
+//       { stage: "light", start: "2026-10-31T23:25:00-07:00", end: "2026-11-01T00:10:00-07:00" },
+//       { stage: "deep", start: "2026-11-01T00:10:00-07:00", end: "2026-11-01T01:15:00-07:00" },
+//   ]}/>
+//
+// segments: each { stage, start, end }. stage is "awake", "rem", "light" or "deep" ("core" is
+// taken as light, as Apple's Health names it, and in any case of letters); anything else is
+// left out. start and end are date-times with their offset, as a watch writes them, which is
+// the form that is right across a change of the clocks; one without an offset is read as written.
+// They may also be plain clock times, "23:25", given in order, a time earlier than the one
+// before it being the next day. end may be left out where the next segment starts. Those
+// that overlap: the earlier one stands, and more than 500 are not read. title: over the chart.
+// on_select(info): inside one of your components, when a finger lifts or a key moves, with
+// { clock, stage, minutes }, or null on clearing; stage is null in a hole. class.
+//
+// Keys, on the focused chart: the arrows move 5 minutes (Shift 30), Page Up and Down a
+// segment, Home and End the ends of the night, Escape clears. A table lists every segment
+// for screen readers.
+
+import ui/theme.qwe use ui_cls
+
+let sleep_chart_css = css`
+.ui-sleepc { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-sleepc-head { margin-bottom: 10px; }
+.ui-sleepc-title { margin: 0; font-size: 13px; font-weight: 600; color: var(--ui-muted); }
+.ui-sleepc-total { margin: 0; font-size: 26px; font-weight: 700; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.ui-sleepc-span { margin: 0; color: var(--ui-muted); font-size: 14px; font-variant-numeric: tabular-nums; }
+.ui-sleepc-body { display: grid; gap: 14px; }
+.ui-sleepc-chart { min-width: 0; }
+.ui-sleepc-read { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 44px; font-size: 14px; font-variant-numeric: tabular-nums; }
+.ui-sleepc-clear { flex: none; min-width: 64px; min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-sleepc-clear:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-sleepc-grid { display: grid; grid-template-columns: 46px 1fr; column-gap: 6px; }
+.ui-sleepc-rows { display: grid; grid-template-rows: repeat(4, 1fr); margin: 0; padding: 0; list-style: none; color: var(--ui-muted); font-size: 12px; }
+.ui-sleepc-rows li { display: flex; align-items: center; }
+.ui-sleepc-plot { position: relative; height: 200px; overflow: hidden; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); outline: none; cursor: crosshair;
+  touch-action: pan-y; overscroll-behavior-x: contain; -webkit-tap-highlight-color: transparent; }
+.ui-sleepc-plot:focus-visible { box-shadow: var(--ui-focus); }
+.ui-sleepc-busy { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-sleepc-plot svg { display: block; width: 100%; height: 100%; }
+.ui-sleepc-bar-awake { fill: var(--ui-warning); }
+.ui-sleepc-bar-rem { fill: var(--ui-info); }
+.ui-sleepc-bar-light { fill: color-mix(in srgb, var(--ui-accent) 55%, var(--ui-surface)); }
+.ui-sleepc-bar-deep { fill: var(--ui-accent); }
+.ui-sleepc-steps { fill: none; stroke: var(--ui-strong); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.ui-sleepc-midnight { position: absolute; inset: 0 auto 0 0; width: 0; border-left: 1px dashed var(--ui-muted); pointer-events: none; }
+/* As wide as the plot, the line at its left edge, so a percentage of its own width is a place on the plot, at any size. */
+.ui-sleepc-cross { position: absolute; inset: 0; pointer-events: none; }
+.ui-sleepc-cross::before { content: ""; position: absolute; inset: 0 auto 0 -1px; width: 2px; background: var(--ui-fg); }
+.ui-sleepc-axis { position: relative; grid-column: 2; height: 20px; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-sleepc-tick { position: absolute; top: 2px; white-space: nowrap; }
+.ui-sleepc-sums { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; margin: 0; padding: 0; list-style: none; align-content: start; }
+.ui-sleepc-sum { display: grid; grid-template-columns: 12px 1fr auto; align-items: center; gap: 2px 6px; font-size: 14px; }
+.ui-sleepc-sum i { width: 12px; height: 12px; border-radius: 3px; background: var(--ui-strong); }
+.ui-sleepc-sum b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-sleepc-sum small { grid-column: 2 / -1; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-sleepc-dot-awake { background: var(--ui-warning) !important; }
+.ui-sleepc-dot-rem { background: var(--ui-info) !important; }
+.ui-sleepc-dot-light { background: color-mix(in srgb, var(--ui-accent) 55%, var(--ui-surface)) !important; }
+.ui-sleepc-dot-deep { background: var(--ui-accent) !important; }
+.ui-sleepc-none { margin: 0; color: var(--ui-muted); }
+@container (min-width: 620px) {
+  .ui-sleepc-body { grid-template-columns: minmax(0, 1fr) 220px; gap: 24px; }
+  .ui-sleepc-plot { height: 280px; }
+  .ui-sleepc-sums { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .ui-sleepc-sum { font-size: 15px; }
+}
+@media (hover: hover) { .ui-sleepc-clear:hover { background: var(--ui-subtle); } }
+`
+
+let sleep_chart_stages = ["awake", "rem", "light", "deep"]
+
+fn sleep_chart_stage_name(s) -> str = match s {
+    "awake" => "Awake"
+    "rem" => "REM"
+    "light" => "Light"
+    "deep" => "Deep"
+    _ => "No data"
+}
+
+fn sleep_chart_stage(x) {
+    if type_of(x) != "str" { return null }
+    let s = lower(trim(x))
+    let t = s == "core" ? "light" : s
+    contains(sleep_chart_stages, t) ? t : null
+}
+
+// An offset as a date-time writes it, in minutes.
+fn sleep_chart_offset(x) -> int {
+    if type_of(x) != "str" || len(x) != 6 { return 0 }
+    let way = slice(x, 0, 1) == "-" ? -1 : 1
+    let h = int(slice(x, 1, 3))
+    let m = int(slice(x, 4, 6))
+    if is_err(h) || is_err(m) { return 0 }
+    way * (h * 60 + m)
+}
+
+// A date-time as { ms, off }, or null. One with no offset counts as written, as if at UTC.
+fn sleep_chart_stamp(x) {
+    if type_of(x) != "str" { return null }
+    let t = date.valid(x, "date-time") ? x : (date.valid(x + "Z", "date-time") ? x + "Z" : null)
+    if t == null { return null }
+    { ms: date.ms(t), off: sleep_chart_offset(date.parts(t).offset) }
+}
+
+// "23:25" as minutes into the day, or null.
+fn sleep_chart_hhmm(x) {
+    if type_of(x) != "str" { return null }
+    let p = split(x, ":")
+    if len(p) != 2 || len(p[0]) < 1 || len(p[0]) > 2 || len(p[1]) != 2 { return null }
+    let h = int(p[0])
+    let m = int(p[1])
+    if is_err(h) || is_err(m) { return null }
+    h > 23 || m > 59 || h < 0 || m < 0 ? null : h * 60 + m
+}
+
+// Clock times walked in order: each that comes before the last is on the next day. The first
+// day is 1 so that no time is below 0.
+fn sleep_chart_walk(items) {
+    let out = reduce(items, { rows: [], day: 1, prev: -1 }, (acc, it) => {
+        let a = sleep_chart_hhmm(get(it, "start"))
+        let b = sleep_chart_hhmm(get(it, "end"))
+        if a == null { return acc }
+        let day_a = a < acc.prev ? acc.day + 1 : acc.day
+        let day_b = b != null && b < a ? day_a + 1 : day_a
+        let from = (day_a * 1440 + a) * 60000
+        let to = b == null ? null : (day_b * 1440 + b) * 60000
+        { rows: acc.rows + [{ stage: it.stage, from, to, off: 0 }], day: day_b, prev: b ?? a }
+    })
+    out.rows
+}
+
+fn sleep_chart_stamped(items) {
+    let rows = for it in items => {
+        let a = sleep_chart_stamp(get(it, "start"))
+        let b = sleep_chart_stamp(get(it, "end"))
+        a == null ? null : { stage: it.stage, from: a.ms, to: b != null ? b.ms : null, off: a.off }
+    }
+    rows | filter((r) => r != null) | sort_by((r) => r.from)
+}
+
+// The night as it will be drawn: in time order, in real milliseconds, ends filled in from
+// the next start, overlaps cut, nothing of no length, and touching stretches of a stage as one.
+fn sleep_chart_parts(segments) {
+    if type_of(segments) != "list" { return [] }
+    let known = take(segments, 500) | filter((s) => type_of(s) == "map" && sleep_chart_stage(get(s, "stage")) != null)
+                                    | map((s) => { ...s, stage: sleep_chart_stage(s.stage) })
+    let clock = len(known) > 0 && sleep_chart_hhmm(get(known[0], "start")) != null
+    let rows = clock ? sleep_chart_walk(known) : sleep_chart_stamped(known)
+    let ended = for [i, r] in enumerate(rows) => { ...r, to: r.to ?? (i + 1 < len(rows) ? rows[i + 1].from : r.from) }
+    reduce(ended, [], (out, r) => {
+        let before = last(out)
+        let from = before != null && r.from < before.to ? before.to : r.from
+        if r.to <= from { return out }
+        if before != null && before.stage == r.stage && before.to == from {
+            return slice(out, 0, len(out) - 1) + [{ ...before, to: r.to }]
+        }
+        out + [{ ...r, from }]
+    })
+}
+
+// A length of time in words.
+fn sleep_chart_dur(ms: num) -> str {
+    let all = round(ms / 60000)
+    let h = floor(all / 60)
+    let m = all % 60
+    if h == 0 { return `${m} min` }
+    m == 0 ? `${h} h` : `${h} h ${m} min`
+}
+
+// The offset in force at a moment: that of the stretch it falls in, or the last before it.
+fn sleep_chart_off_at(parts, t: num) -> int {
+    let before = parts | filter((p) => p.from <= t)
+    len(before) > 0 ? last(before).off : (len(parts) > 0 ? parts[0].off : 0)
+}
+
+// What the clock said: the day wraps at 24:00, and the moment keeps its own offset.
+fn sleep_chart_clock(t: num, off: int) -> str {
+    let m = floor(t / 60000) + off
+    let day = ((m % 1440) + 1440) % 1440
+    let h = floor(day / 60)
+    let n = day % 60
+    `${h < 10 ? "0" : ""}${h}:${n < 10 ? "0" : ""}${n}`
+}
+
+fn sleep_chart_at(parts, t: num) {
+    let hit = find(parts, (p) => t >= p.from && t < p.to)
+    if hit != null { return hit }
+    // The very end of the night still belongs to its last stretch.
+    let end = last(parts)
+    if end != null && t == end.to { return end }
+    null
+}
+
+// The hole around a moment, as a stretch with no stage.
+fn sleep_chart_hole(parts, t: num) {
+    let before = parts | filter((p) => p.to <= t)
+    let after = parts | filter((p) => p.from > t)
+    if len(before) == 0 || len(after) == 0 { return null }
+    { stage: null, from: last(before).to, to: after[0].from, off: last(before).off }
+}
+
+// The sums: minutes for each stage, the night's two ends, and what is missing.
+fn sleep_chart_totals(parts) {
+    if len(parts) == 0 { return null }
+    let of = (s) => sum(parts | filter((p) => p.stage == s) | map((p) => p.to - p.from))
+    let from = parts[0].from
+    let to = last(parts).to
+    let recorded = sum(parts | map((p) => p.to - p.from))
+    let awake = of("awake")
+    let asleep = recorded - awake
+    {
+        from, to, recorded, asleep, awake, rem: of("rem"), light: of("light"), deep: of("deep"), missing: to - from - recorded,
+        // The share of the recorded night spent asleep: a hole counts for neither.
+        efficiency: recorded > 0 ? round(asleep * 100 / recorded) : 0,
+        start_clock: sleep_chart_clock(from, parts[0].off), end_clock: sleep_chart_clock(to, last(parts).off),
+    }
+}
+
+fn sleep_chart_read(parts, t: num) -> str {
+    let off = sleep_chart_off_at(parts, t)
+    let p = sleep_chart_at(parts, t) ?? sleep_chart_hole(parts, t)
+    if p == null { return sleep_chart_clock(t, off) }
+    `${sleep_chart_clock(t, off)}: ${sleep_chart_stage_name(p.stage)}, ${sleep_chart_clock(p.from, p.off)} to ${sleep_chart_clock(p.to, sleep_chart_off_at(parts, p.to))}, ${sleep_chart_dur(p.to - p.from)}`
+}
+
+// Where in the night a share of the chart's width falls, to the minute, kept inside the night.
+fn sleep_chart_time(share: num, from: num, to: num) -> num {
+    let s = share < 0 ? 0 : (share > 1 ? 1 : share)
+    let t = from + s * (to - from)
+    let whole = round(t / 60000) * 60000
+    whole < from ? from : (whole > to ? to : whole)
+}
+
+fn sleep_chart_pct(t: num, from: num, to: num) -> float = to > from ? round((t - from) * 100 / (to - from), 3) : 0.0
+
+// The next moment for a key. Page keys go to the start of the next or last stretch.
+fn sleep_chart_key(parts, t, k: str, shift: bool) {
+    if len(parts) == 0 { return null }
+    let from = parts[0].from
+    let to = last(parts).to
+    let now_at = t ?? from
+    let step = (shift ? 30 : 5) * 60000
+    let next_start = find(parts, (p) => p.from > now_at)
+    let back = parts | filter((p) => p.from < now_at)
+    let aim = match k {
+        "ArrowRight" => now_at + step
+        "ArrowLeft" => now_at - step
+        "Home" => from
+        "End" => to
+        "PageDown" => next_start != null ? next_start.from : to
+        "PageUp" => len(back) > 0 ? last(back).from : from
+        _ => null
+    }
+    if aim == null { return null }
+    aim < from ? from : (aim > to ? to : aim)
+}
+
+// Each whole hour on the way, by the clock, then thinned so the labels fit.
+fn sleep_chart_ticks(parts) {
+    if len(parts) == 0 { return [] }
+    let from = parts[0].from
+    let to = last(parts).to
+    let off = parts[0].off
+    let first_hour = (ceil((from / 60000 + off) / 60) * 60 - off) * 60000
+    let hours = ceil((to - from) / 3600000) + 1
+    let span = hours > 36 ? 36 : hours
+    let every_h = span > 10 ? 3 : 2
+    let all = for i in range(0, span) => first_hour + i * 3600000
+    let marks = all | filter((t) => t <= to)
+                    | map((t) => { t, label: sleep_chart_clock(t, sleep_chart_off_at(parts, t)) })
+                    | filter((x) => int(slice(x.label, 0, 2)) % every_h == 0)
+    // The hour the clocks go back comes round twice, and is written once.
+    let seen = marks | map((x) => x.label)
+    enumerate(marks) | filter((p) => index_of(seen, p[1].label) == p[0]) | map((p) => p[1])
+}
+
+// Midnight, if the night holds one, where the clock read 00:00.
+fn sleep_chart_midnight(parts) {
+    if len(parts) == 0 { return null }
+    let from = parts[0].from
+    let to = last(parts).to
+    let off = parts[0].off
+    let m = (floor((from / 60000 + off) / 1440) + 1) * 1440 - off
+    let t = m * 60000
+    t > from && t < to ? t : null
+}
+
+// The lines joining one stage to the next, on a chart 1000 by 400. A hole has none.
+fn sleep_chart_steps(parts, from: num, to: num) -> str {
+    let span = to - from
+    let row = (s) => index_of(sleep_chart_stages, s) * 100 + 50
+    let x = (t) => round((t - from) * 1000 / span, 2)
+    let joins = for [i, p] in enumerate(parts) => i > 0 && parts[i - 1].to == p.from ? `M${x(p.from)} ${row(parts[i - 1].stage)}V${row(p.stage)}` : ""
+    join(joins, "")
+}
+
+component SleepChart(segments = [], title: str? = null, on_select = null, class: str? = null) {
+    style global sleep_chart_css
+    let parts = sleep_chart_parts(segments)
+    let sums = sleep_chart_totals(parts)
+    let from = sums != null ? sums.from : 0
+    let to = sums != null ? sums.to : 1
+    let span = to - from
+    let ticks = sleep_chart_ticks(parts)
+    let midnight = sleep_chart_midnight(parts)
+    state at = null          // the moment chosen, in ms
+    state busy = false       // a finger is on it
+    state g = null
+    state plot = null
+    state cross = null
+    state read = null
+    let where = (t: num) => `translateX(${sleep_chart_pct(t, from, to)}%)`
+    // By hand, as these two change with every move of a finger.
+    let show = (t) => {
+        if cross != null {
+            if t != null { cross.style.transform = where(t) }
+            read.textContent = t != null ? sleep_chart_read(parts, t) : "Touch the chart to read a moment."
+        }
+    }
+    let time_of = (x: num) => {
+        let r = plot.getBoundingClientRect()
+        sleep_chart_time((x - r.left) / r.width, from, to)
+    }
+    let choose = (t) => {
+        at = t
+        if on_select != null {
+            if t == null {
+                on_select(null)
+            } else {
+                let p = sleep_chart_at(parts, t)
+                on_select({ clock: sleep_chart_clock(t, sleep_chart_off_at(parts, t)), stage: p != null ? p.stage : null, minutes: p != null ? round((p.to - p.from) / 60000) : 0 })
+            }
+        }
+    }
+    // Follows the choice and new data, but not under a finger, which has the line for now.
+    if read != null && !busy { show(at) }
+    <section class={ui_cls(["ui-sleepc", class])} aria-label={title ?? "Sleep"}>
+        <div.ui-sleepc-head>
+            {filled(title) != null && <p.ui-sleepc-title>{title}</p>}
+            {sums != null ? <div>
+                <p.ui-sleepc-total>{sleep_chart_dur(sums.asleep)} asleep</p>
+                <p.ui-sleepc-span>{sums.start_clock} to {sums.end_clock}, {sums.efficiency}% of the recorded night{sums.missing > 0 ? `, ${sleep_chart_dur(sums.missing)} not recorded` : ""}</p>
+            </div> : <p.ui-sleepc-none>No sleep recorded.</p>}
+        </div>
+        {sums != null && <div.ui-sleepc-body>
+            <div.ui-sleepc-chart>
+                <div.ui-sleepc-read>
+                    <span @mount={(me) => { read = me }}>Touch the chart to read a moment.</span>
+                    {at != null && <button.ui-sleepc-clear type="button" @click={() => { choose(null) }}>Clear</button>}
+                </div>
+                <div.ui-sleepc-grid>
+                    <ul.ui-sleepc-rows aria-hidden="true">{for s in sleep_chart_stages => <li key={s}>{sleep_chart_stage_name(s)}</li>}</ul>
+                    <div class={ui_cls(["ui-sleepc-plot", busy && "ui-sleepc-busy"])} tabindex="0" role="slider" aria-label="A moment in the night"
+                         aria-valuemin="0" aria-valuemax={round(span / 60000)} aria-valuenow={at != null ? round((at - from) / 60000) : 0}
+                         aria-valuetext={at != null ? sleep_chart_read(parts, at) : "Nothing chosen. Use the arrow keys."}
+                         @mount={(me) => { plot = me }}
+                         @contextmenu={(e) => { if busy { e.preventDefault() } }}
+                         @pointerdown={(e) => {
+                             if e.isPrimary && e.button == 0 { g = { id: e.pointerId, x: e.clientX, y: e.clientY, on: false } }
+                         }}
+                         @pointermove={(e) => {
+                             if g != null && e.pointerId == g.id {
+                                 if !g.on {
+                                     let dx = abs(e.clientX - g.x)
+                                     let dy = abs(e.clientY - g.y)
+                                     // Up and down is the page's.
+                                     if dy > 6 && dy > dx { g = null }
+                                     if g != null && dx > 6 && dx >= dy {
+                                         plot.setPointerCapture(e.pointerId)
+                                         busy = true
+                                         g = { ...g, on: true }
+                                     }
+                                 }
+                                 if g != null && g.on { show(time_of(e.clientX)) }
+                             }
+                         }}
+                         @pointerup={(e) => {
+                             if g != null && e.pointerId == g.id {
+                                 g = null
+                                 busy = false
+                                 // Moved or not, the place it lifted is what was chosen.
+                                 choose(time_of(e.clientX))
+                             }
+                         }}
+                         @pointercancel={(e) => {
+                             if g != null && e.pointerId == g.id {
+                                 g = null
+                                 busy = false
+                                 show(at)
+                             }
+                         }}
+                         @keydown={(e) => {
+                             if e.key == "Escape" && at != null { choose(null) }
+                             let t = sleep_chart_key(parts, at, e.key, e.shiftKey)
+                             if t != null {
+                                 e.preventDefault()
+                                 choose(t)
+                             }
+                         }}>
+                        <svg viewBox="0 0 1000 400" preserveAspectRatio="none" aria-hidden="true">
+                            {for p in parts => <rect key={p.from} class={`ui-sleepc-bar-${p.stage}`} x={round((p.from - from) * 1000 / span, 2)} width={round((p.to - p.from) * 1000 / span, 2)}
+                                                     y={index_of(sleep_chart_stages, p.stage) * 100 + 8} height="84"/>}
+                            <path.ui-sleepc-steps d={sleep_chart_steps(parts, from, to)}/>
+                        </svg>
+                        {midnight != null && <span.ui-sleepc-midnight style={`left: ${sleep_chart_pct(midnight, from, to)}%`}></span>}
+                        // No style here: written from state it would wipe what a finger set on this element. show() places it.
+                        <div.ui-sleepc-cross hidden={at == null && !busy} @mount={(me) => { cross = me }}></div>
+                    </div>
+                    <div.ui-sleepc-axis aria-hidden="true">
+                        {for k in ticks => <span.ui-sleepc-tick key={k.t} style={`left: ${sleep_chart_pct(k.t, from, to)}%; transform: translateX(-${sleep_chart_pct(k.t, from, to)}%)`}>{k.label}</span>}
+                    </div>
+                </div>
+            </div>
+            <ul.ui-sleepc-sums>
+                {for s in sleep_chart_stages => <li.ui-sleepc-sum key={s}>
+                    <i class={`ui-sleepc-dot-${s}`} aria-hidden="true"></i>
+                    <span>{sleep_chart_stage_name(s)}</span>
+                    <b>{sleep_chart_dur(get(sums, s, 0))}</b>
+                    <small>{sums.recorded > 0 ? round(get(sums, s, 0) * 100 / sums.recorded) : 0}%</small>
+                </li>}
+            </ul>
+        </div>}
+        <div.ui-sr><table>
+            <caption>Sleep stages through the night</caption>
+            <thead><tr><th scope="col">From</th><th scope="col">To</th><th scope="col">Stage</th><th scope="col">Length</th></tr></thead>
+            <tbody>
+                {for p in parts => <tr key={p.from}>
+                    <td>{sleep_chart_clock(p.from, p.off)}</td><td>{sleep_chart_clock(p.to, sleep_chart_off_at(parts, p.to))}</td>
+                    <td>{sleep_chart_stage_name(p.stage)}</td><td>{sleep_chart_dur(p.to - p.from)}</td>
+                </tr>}
+            </tbody>
+        </table></div>
+    </section>
+}

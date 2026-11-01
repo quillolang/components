@@ -1,0 +1,388 @@
+// RecipeScaler: a recipe's ingredients, one a line, scaled to another number of
+// servings. It reads how recipes write amounts: 2, 1.5, 1,5, 1 1/2, 1½, ½, 1-1/2,
+// ranges (2-3, 2 to 3, 2–3), "a", "one" and "half", and most ways of writing a unit (tsp,
+// teaspoons, T, Tbsp, fl oz, lbs, 250g). What it gives back is what a kitchen can
+// measure: spoons in eighths and quarters, cups in quarters and thirds, grams to the
+// nearest 1 under 100 and the nearest 5 above, millilitres to the nearest 5 from 20 up
+// (a jug shows no finer), and it moves to the next unit when it fits (3 tsp is 1 tbsp, 4 tbsp is ¼ cup, 1,000 g is 1 kg). It can
+// also write everything in metric or US units. An amount that had to move more than
+// 5% to be measurable says "about". A line with no amount stays as it is. Mass and
+// volume never turn into each other, as that needs the ingredient's density.
+//
+//   <RecipeScaler serves={4} servings={6} ingredients={"1 1/2 cups flour\n2 eggs\nsalt to taste"}/>
+//   <RecipeScaler serves={8} system="metric" on_change={(r) => { lines = r.lines }}/>
+//
+// ingredients: the text, one ingredient a line. serves: the servings it is written
+// for (4). servings: the servings wanted (serves). system: "written" (each stays in
+// its own system, the default), "metric" or "us"; the cook can switch. In metric,
+// teaspoons and tablespoons under 4 tbsp stay spoons, as metric kitchens have them.
+// title: the heading ("Scale a recipe"). id: a prefix for its fields' ids
+// ("recipe-scaler"), unique on the page. The fields are named ingredients, serves,
+// servings and system, so a form around it sends them; name: a prefix for those
+// names. on_change(r): inside one of your components, given { factor, lines }
+// after each change: the factor as a decimal, or null while the servings are wrong,
+// and the scaled lines as text.
+//
+// recipe_scaler_scale(text, serves, servings, system) is the work, for a program's own
+// use: it gives { factor, lines, cut, unread }, each line { was, text, scaled, about }.
+// It reads at most 200 lines of 300 characters; `cut` counts what was left out.
+
+import ui/theme.qwe use ui_cls
+
+let recipe_scaler_css = css`
+.ui-recipe-scale { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; max-width: 640px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-recipe-scale .ui-recipe-scale-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-recipe-scale-bar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.ui-recipe-scale-field { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 500; }
+.ui-recipe-scale input, .ui-recipe-scale select, .ui-recipe-scale textarea { box-sizing: border-box; width: 100%; min-width: 0; padding: 0 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.5 var(--ui-font); }
+.ui-recipe-scale input, .ui-recipe-scale select { height: 38px; }
+.ui-recipe-scale textarea { min-height: 150px; padding: 8px 10px; resize: vertical; }
+.ui-recipe-scale input:focus-visible, .ui-recipe-scale select:focus-visible, .ui-recipe-scale textarea:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-recipe-scale input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-recipe-scale-quick { display: flex; flex-wrap: wrap; gap: 6px; }
+.ui-recipe-scale-quick button { height: 30px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-recipe-scale-quick button:hover { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-recipe-scale-quick button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-recipe-scale-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-recipe-scale-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-recipe-scale-out { display: grid; gap: 0; margin: 0; padding: 4px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); list-style: none; }
+.ui-recipe-scale-out li { display: grid; gap: 1px; padding: 7px 0; border-bottom: 1px solid var(--ui-border); overflow-wrap: anywhere; }
+.ui-recipe-scale-out li:last-child { border-bottom: 0; }
+.ui-recipe-scale-line { font-weight: 550; font-variant-numeric: tabular-nums; }
+.ui-recipe-scale-same .ui-recipe-scale-line { font-weight: 400; color: var(--ui-muted); }
+.ui-recipe-scale-was { color: var(--ui-muted); font-size: 12px; }
+@media (max-width: 480px) { .ui-recipe-scale-bar { grid-template-columns: minmax(0, 1fr); } }
+`
+
+let recipe_scaler_vulgar = { "½": [1, 2], "⅓": [1, 3], "⅔": [2, 3], "¼": [1, 4], "¾": [3, 4], "⅕": [1, 5], "⅖": [2, 5], "⅗": [3, 5], "⅘": [4, 5],
+    "⅙": [1, 6], "⅚": [5, 6], "⅐": [1, 7], "⅛": [1, 8], "⅜": [3, 8], "⅝": [5, 8], "⅞": [7, 8], "⅑": [1, 9], "⅒": [1, 10] }
+
+let recipe_scaler_numbers = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, twelve: 12, a: 1, an: 1 }
+
+// What each spelling means. Capital T and small t are the old shorthand for
+// tablespoon and teaspoon, so the exact spelling is tried before the small one.
+let recipe_scaler_words = {
+    tsp: "tsp", tsps: "tsp", ts: "tsp", teaspoon: "tsp", teaspoons: "tsp", t: "tsp",
+    tbsp: "tbsp", tbsps: "tbsp", tbs: "tbsp", tbl: "tbsp", tablespoon: "tbsp", tablespoons: "tbsp", T: "tbsp",
+    cup: "cup", cups: "cup", c: "cup", floz: "floz", pint: "pt", pints: "pt", pt: "pt", quart: "qt", quarts: "qt", qt: "qt",
+    gallon: "gal", gallons: "gal", gal: "gal", ml: "ml", milliliter: "ml", milliliters: "ml", millilitre: "ml", millilitres: "ml",
+    cl: "cl", dl: "dl", l: "l", liter: "l", liters: "l", litre: "l", litres: "l",
+    g: "g", gm: "g", gram: "g", grams: "g", mg: "mg", kg: "kg", kilo: "kg", kilos: "kg", kilogram: "kg", kilograms: "kg",
+    oz: "oz", ounce: "oz", ounces: "oz", lb: "lb", lbs: "lb", pound: "lb", pounds: "lb",
+}
+
+// A unit's size in millilitres or grams, exactly (the US cup is 236.5882365 ml).
+let recipe_scaler_sizes = {
+    tsp: { kind: "volume", size: "4.92892159375", system: "us" }, tbsp: { kind: "volume", size: "14.78676478125", system: "us" },
+    floz: { kind: "volume", size: "29.5735295625", system: "us" }, cup: { kind: "volume", size: "236.5882365", system: "us" },
+    pt: { kind: "volume", size: "473.176473", system: "us" }, qt: { kind: "volume", size: "946.352946", system: "us" },
+    gal: { kind: "volume", size: "3785.411784", system: "us" }, ml: { kind: "volume", size: "1", system: "metric" },
+    cl: { kind: "volume", size: "10", system: "metric" }, dl: { kind: "volume", size: "100", system: "metric" },
+    l: { kind: "volume", size: "1000", system: "metric" }, mg: { kind: "mass", size: "0.001", system: "metric" },
+    g: { kind: "mass", size: "1", system: "metric" }, kg: { kind: "mass", size: "1000", system: "metric" },
+    oz: { kind: "mass", size: "28.349523125", system: "us" }, lb: { kind: "mass", size: "453.59237", system: "us" },
+}
+
+// Words that count something else, so "2 cloves garlic" turns `cloves`, not `garlic`.
+let recipe_scaler_counters = ["clove", "can", "tin", "stick", "slice", "sprig", "bunch", "handful", "head", "piece", "packet", "jar", "bottle", "bag", "rasher", "fillet", "stalk"]
+
+fn recipe_scaler_size(unit: str) = dec(recipe_scaler_sizes[unit].size)
+
+// An amount at the start of the text, as { value, rest }, or null. The patterns go from
+// the longest to the shortest, so 1 1/2 is not read as 1 and then something else.
+fn recipe_scaler_amount(text: str) {
+    let t = trim(text)
+    let after = (m) => trim(slice(t, m.end, len(t)))
+    let over = (a, b) => b == 0 ? null : dec(a) / b
+    let mixed = re.find(t, "^(\\d+)[ -]+(\\d+)\\s*[/⁄]\\s*(\\d+)")
+    if mixed != null {
+        let part = over(int(mixed.groups[1]), int(mixed.groups[2]))
+        return part == null ? null : { value: dec(int(mixed.groups[0])) + part, rest: after(mixed) }
+    }
+    let fraction = re.find(t, "^(\\d+)\\s*[/⁄]\\s*(\\d+)")
+    if fraction != null {
+        let part = over(int(fraction.groups[0]), int(fraction.groups[1]))
+        return part == null ? null : { value: part, rest: after(fraction) }
+    }
+    let glyph = re.find(t, "^(\\d+)?\\s*([½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅐⅛⅜⅝⅞⅑⅒])")
+    if glyph != null {
+        let f = recipe_scaler_vulgar[glyph.groups[1]]
+        let whole = glyph.groups[0]
+        return { value: dec(whole == null || whole == "" ? 0 : int(whole)) + dec(f[0]) / f[1], rest: after(glyph) }
+    }
+    let grouped = re.find(t, "^\\d{1,3}(,\\d{3})+(\\.\\d+)?")
+    if grouped != null { return { value: dec(replace(grouped.text, ",", "")), rest: after(grouped) } }
+    let plain = re.find(t, "^\\d+([.,]\\d+)?")
+    if plain != null { return { value: dec(replace(plain.text, ",", ".")), rest: after(plain) } }
+    let half = re.find(t, "^half( an?)?\\b", "i")
+    if half != null { return { value: 0.5m, rest: after(half) } }
+    let word = re.find(t, "^[A-Za-z]+\\b")
+    if word != null {
+        let n = get(recipe_scaler_numbers, lower(word.text), null)
+        if n != null { return { value: dec(n), rest: after(word) } }
+    }
+    null
+}
+
+// The unit at the start of the text, as { unit, rest }, or null.
+fn recipe_scaler_unit(text: str) {
+    let long = re.find(text, "^(fl\\.? ?oz|fluid ounces?)\\b\\.?", "i")
+    if long != null { return { unit: "floz", rest: trim(slice(text, long.end, len(text))) } }
+    let m = re.find(text, "^[A-Za-z]+\\b\\.?")
+    if m == null { return null }
+    let word = replace(m.text, ".", "")
+    let unit = get(recipe_scaler_words, word, null) ?? get(recipe_scaler_words, lower(word), null)
+    unit == null ? null : { unit, rest: trim(slice(text, m.end, len(text))) }
+}
+
+fn recipe_scaler_parse(line: str) {
+    let t = trim(re.replace(line, "^\\s*[-*•·]\\s+", ""))
+    let plain = { was: t, kind: "text" }
+    if t == "" { return null }
+    if re.test(t, "^\\d{8}") { return plain }
+    let first = recipe_scaler_amount(t)
+    if first == null { return plain }
+    let dash = re.find(first.rest, "^(-|–|—|to\\b)\\s*")
+    let second = dash == null ? null : recipe_scaler_amount(slice(first.rest, dash.end, len(first.rest)))
+    let low = second == null ? first.value : min([first.value, second.value])
+    let high = second == null ? first.value : max([first.value, second.value])
+    let rest = second == null ? first.rest : second.rest
+    let unit = recipe_scaler_unit(rest)
+    // "a" counts only before a unit: "a pinch of salt" and "a little oil" are not amounts.
+    if unit == null && re.test(t, "^(a|an)\\b", "i") { return plain }
+    if low <= 0 { return plain }
+    unit != null ? { was: t, kind: "measure", low, high, unit: unit.unit, item: unit.rest } : { was: t, kind: "count", low, high, item: rest }
+}
+
+// The nearest of a list of fractions, whole numbers kept.
+fn recipe_scaler_nearest(x, steps: list) {
+    let whole = floor(x)
+    let part = x - whole
+    let best = steps | sort_by((s) => abs(s - part)) | first()
+    whole + best
+}
+
+let recipe_scaler_cups = [0m, 0.25m, 1m / 3, 0.5m, 2m / 3, 0.75m, 1m]
+let recipe_scaler_small = [0.125m, 0.25m, 0.5m, 0.75m, 1m]
+
+// A quantity in `unit`, moved to the nearest thing a kitchen can measure.
+fn recipe_scaler_measurable(x, unit: str) {
+    let by = (step) => round(x / step, 0, "half_up") * step
+    match unit {
+        "tsp" => x < 1m ? recipe_scaler_nearest(x, recipe_scaler_small) : by(0.25m)
+        "tbsp" => by(0.5m)
+        "cup" => recipe_scaler_nearest(x, recipe_scaler_cups)
+        "qt" | "gal" | "lb" => by(0.25m)
+        "oz" => x < 4m ? by(0.25m) : by(0.5m)
+        "g" => x < 100m ? max([1m, by(1m)]) : by(5m)
+        "ml" => x < 20m ? max([1m, by(1m)]) : by(5m)
+        "kg" | "l" => by(0.01m)
+        _ => by(0.25m)
+    }
+}
+
+// The units of a system for a kind of thing, smallest first, each with what takes
+// over from it.
+fn recipe_scaler_ladder(kind: str, system: str, unit: str) {
+    if kind == "mass" { return system == "us" ? ["oz", "lb"] : ["g", "kg"] }
+    if system == "us" { return ["tsp", "tbsp", "cup", "qt", "gal"] }
+    let spoon = unit == "tsp" || unit == "tbsp"
+    spoon ? ["tsp", "tbsp", "ml", "l"] : ["ml", "l"]
+}
+
+// When to move up from a unit to the next, in the next one's terms: ¼ cup, not 1 cup,
+// is where tablespoons stop, and metric spoons stop at 4 tbsp, 60 ml.
+fn recipe_scaler_step_up(from: str, to: str) = match [from, to] {
+    ["tbsp", "cup"] => 0.25m
+    ["tsp", "tbsp"] => 1m
+    ["tbsp", "ml"] => 59m
+    _ => 1m
+}
+
+// The unit and amount to write an amount of base units in: climbs while the rounded
+// amount reaches the next rung. Rounds at each rung, so 2.9 tsp, rounding to 3, is 1 tbsp.
+fn recipe_scaler_fit(base, ladder: list) {
+    let i = 0
+    let result = null
+    while result == null {
+        let unit = ladder[i]
+        let shown = recipe_scaler_measurable(base / recipe_scaler_size(unit), unit)
+        let next = i + 1 < len(ladder) ? ladder[i + 1] : null
+        if next != null && shown * recipe_scaler_size(unit) / recipe_scaler_size(next) >= recipe_scaler_step_up(unit, next) * 0.995m {
+            i += 1
+        } else {
+            result = { unit, shown }
+        }
+    }
+    result
+}
+
+// A quantity in fractions a cook reads, or decimals for kg and l.
+fn recipe_scaler_number(x, unit: str) {
+    if unit == "kg" || unit == "l" || unit == "g" || unit == "ml" { return re.replace(str(round(x, 2, "half_up")), "\\.?0+$", "") }
+    let whole = int(floor(x))
+    let part = x - whole
+    let glyph = abs(part) < 0.001m ? "" : abs(part - 0.125m) < 0.001m ? "⅛" : abs(part - 0.25m) < 0.001m ? "¼" : abs(part - 1m / 3) < 0.001m ? "⅓"
+        : abs(part - 0.5m) < 0.001m ? "½" : abs(part - 2m / 3) < 0.001m ? "⅔" : abs(part - 0.75m) < 0.001m ? "¾" : str(round(part, 2))
+    whole == 0 && glyph != "" ? glyph : `${whole}${glyph}`
+}
+
+fn recipe_scaler_plural(w: str) {
+    let l = lower(w)
+    if ends_with(l, "s") { return w }
+    if re.test(l, "(ch|sh|x)$") { return w + "es" }
+    if re.test(l, "[^aeiou]y$") { return slice(w, 0, len(w) - 1) + "ies" }
+    if re.test(l, "(tomato|potato)$") { return w + "es" }
+    w + "s"
+}
+
+fn recipe_scaler_single(w: str) {
+    let l = lower(w)
+    if re.test(l, "ies$") { return slice(w, 0, len(w) - 3) + "y" }
+    if re.test(l, "(toes|ches|shes|xes)$") { return slice(w, 0, len(w) - 2) }
+    if re.test(l, "[^s]s$") { return slice(w, 0, len(w) - 1) }
+    w
+}
+
+// The item with its noun turned to suit the count: the first word when it counts
+// something else, else the last word before a comma.
+fn recipe_scaler_noun(item: str, many: bool) {
+    if item == "" || starts_with(item, "(") { return item }
+    let comma = index_of(item, ",")
+    let head = comma == null ? item : slice(item, 0, comma)
+    let tail = comma == null ? "" : slice(item, comma, len(item))
+    let words = split(trim(head), " ")
+    let turn = (w) => many ? recipe_scaler_plural(w) : recipe_scaler_single(w)
+    let at = contains(recipe_scaler_counters, lower(recipe_scaler_single(words[0]))) ? 0 : len(words) - 1
+    let turned = for i in 0..len(words) => i == at ? turn(words[i]) : words[i]
+    join(turned, " ") + tail
+}
+
+fn recipe_scaler_unit_name(unit: str, x) = unit == "cup" ? (x > 1m ? "cups" : "cup") : unit
+
+fn recipe_scaler_join(low: str, high: str) = low == high ? high : `${low} to ${high}`
+
+// A parsed line times the factor, in the system asked for.
+fn recipe_scaler_line(p, factor, system: str) {
+    if p.kind == "text" { return { was: p.was, text: p.was, scaled: false, about: false } }
+    let high = p.high * factor
+    let low = p.low * factor
+    if p.kind == "count" {
+        let top = recipe_scaler_measurable(high, "count")
+        let shown_top = max([top, 0.25m])
+        let bottom = max([recipe_scaler_measurable(low, "count"), 0.25m])
+        let amount = recipe_scaler_join(recipe_scaler_number(bottom, "count"), recipe_scaler_number(shown_top, "count"))
+        let about = abs(shown_top - high) > high * 0.05m
+        return { was: p.was, text: trim(`${about ? "about " : ""}${amount} ${recipe_scaler_noun(p.item, shown_top > 1m)}`), scaled: true, about }
+    }
+    let info = recipe_scaler_sizes[p.unit]
+    let size = dec(info.size)
+    let base = high * size
+    let out_system = system == "written" ? info.system : system
+    let ladder = recipe_scaler_ladder(info.kind, out_system, p.unit)
+    // Less than half of the smallest spoon is a pinch: nothing else measures it.
+    if ladder[0] == "tsp" && base / recipe_scaler_size("tsp") < 0.0625m {
+        return { was: p.was, text: trim(`a pinch ${p.item}`), scaled: true, about: true }
+    }
+    let fit = recipe_scaler_fit(base, ladder)
+    let bottom = recipe_scaler_measurable(low * size / recipe_scaler_size(fit.unit), fit.unit)
+    let amount = recipe_scaler_join(recipe_scaler_number(bottom, fit.unit), recipe_scaler_number(fit.shown, fit.unit))
+    let about = abs(fit.shown * recipe_scaler_size(fit.unit) - base) > base * 0.05m
+    { was: p.was, text: trim(`${about ? "about " : ""}${amount} ${recipe_scaler_unit_name(fit.unit, fit.shown)} ${p.item}`), scaled: true, about }
+}
+
+// Servings as typed: a decimal over 0 and no more than 10,000, or null.
+fn recipe_scaler_servings(text) {
+    let d = dec(trim(str(text ?? "")))
+    is_err(d) || d <= 0 || d > 10000m ? null : d
+}
+
+fn recipe_scaler_scale(text: str, serves, servings, system: str = "written") {
+    let all_lines = split(replace(str(text), "\r", ""), "\n")
+    let long = all_lines | filter((l) => len(l) > 300) | len
+    let kept = all_lines | take(200) | filter((l) => len(l) <= 300)
+    let factor = dec(servings) / dec(serves)
+    let read = kept | map(recipe_scaler_parse) | filter((p) => p != null)
+    let lines = read | map((p) => recipe_scaler_line(p, factor, system))
+    { factor, lines, cut: max([len(all_lines) - 200, 0]) + long, unread: lines | filter((l) => !l.scaled) | len }
+}
+
+fn recipe_scaler_empty_text(n) = n == 1 ? "1 line has no amount and stays as written." : `${n} lines have no amount and stay as written.`
+
+component RecipeScaler(ingredients: str = "", serves = 4, servings = null, system: str = "written", title: str = "Scale a recipe",
+                       id: str = "recipe-scaler", name: str? = null, on_change = null, class: str? = null) {
+    style global recipe_scaler_css
+    state text = ingredients
+    state from = str(serves)
+    state to = str(servings ?? serves)
+    state units = system == "metric" || system == "us" ? system : "written"
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let start = recipe_scaler_servings(from)
+    let wanted = recipe_scaler_servings(to)
+    let r = start != null && wanted != null ? recipe_scaler_scale(text, start, wanted, units) : null
+    let factor_text = r == null ? "" : re.replace(str(round(r.factor, 2, "half_up")), "\\.?0+$", "")
+    let tell = () => {
+        if on_change != null {
+            let a = recipe_scaler_servings(from)
+            let b = recipe_scaler_servings(to)
+            let s = a != null && b != null ? recipe_scaler_scale(text, a, b, units) : null
+            on_change({ factor: s == null ? null : s.factor, lines: s == null ? [] : s.lines | map((l) => l.text) })
+        }
+    }
+    let times = (by) => {
+        let now = recipe_scaler_servings(to) ?? recipe_scaler_servings(from)
+        if now != null {
+            let next = now * by
+            if next <= 10000m {
+                to = re.replace(str(next), "\\.0+$", "")
+                tell()
+            }
+        }
+    }
+    <section class={ui_cls(["ui-recipe-scale", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-recipe-scale-title id={`${id}-title`}>{title}</h3>
+        <div.ui-recipe-scale-bar>
+            <label.ui-recipe-scale-field>
+                Recipe serves
+                <input type="text" inputmode="decimal" id={`${id}-from`} name={named("serves")} value={from} autocomplete="off" aria-invalid={start == null ? "true" : null}
+                       @input={(e) => { from = e.value; tell() }}/>
+            </label>
+            <label.ui-recipe-scale-field>
+                Scale to
+                <input type="text" inputmode="decimal" id={`${id}-to`} name={named("servings")} value={to} autocomplete="off" aria-invalid={wanted == null ? "true" : null}
+                       @input={(e) => { to = e.value; tell() }}/>
+            </label>
+            <label.ui-recipe-scale-field>
+                Units
+                <select id={`${id}-units`} name={named("system")} @change={(e) => { units = e.value; tell() }}>
+                    <option value="written" selected={units == "written"}>As written</option>
+                    <option value="metric" selected={units == "metric"}>Metric</option>
+                    <option value="us" selected={units == "us"}>US</option>
+                </select>
+            </label>
+        </div>
+        <div.ui-recipe-scale-quick>
+            <button.ui-recipe-scale-half type="button" @click={() => { times(0.5m) }}>Halve</button>
+            <button.ui-recipe-scale-double type="button" @click={() => { times(2m) }}>Double</button>
+        </div>
+        <label.ui-recipe-scale-field>
+            Ingredients, one a line
+            <textarea id={`${id}-text`} name={named("ingredients")} value={text} rows="7" spellcheck="false" @input={(e) => { text = e.value; tell() }}></textarea>
+        </label>
+        {r == null && <p.ui-recipe-scale-error role="alert">Servings are numbers above 0, up to 10,000.</p>}
+        {r != null && <p.ui-recipe-scale-note aria-live="polite">{len(r.lines) == 0 ? "Add ingredients to scale them." : `Scaled by ${factor_text}, from ${from} to ${to} servings.`}</p>}
+        {r != null && len(r.lines) > 0 && <ul.ui-recipe-scale-out>
+            {for i in 0..len(r.lines) {
+                let l = r.lines[i]
+                <li key={i} class={l.scaled ? null : "ui-recipe-scale-same"}>
+                    <span.ui-recipe-scale-line>{l.text}</span>
+                    {l.scaled && <span.ui-recipe-scale-was>{`was ${l.was}`}</span>}
+                </li>
+            }}
+        </ul>}
+        {r != null && r.unread > 0 && <p.ui-recipe-scale-note>{recipe_scaler_empty_text(r.unread)}</p>}
+        {r != null && r.cut > 0 && <p.ui-recipe-scale-error role="alert">{`Only the first 200 lines of up to 300 characters are read: ${r.cut} left out.`}</p>}
+    </section>
+}

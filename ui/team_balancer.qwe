@@ -1,0 +1,445 @@
+// TeamBalancer: splits people into teams even in number and as even in strength as it
+// can, while keeping who must stay together together and who must stay apart apart.
+// It searches for a split that keeps every rule, then swaps people between teams
+// while that narrows the gap, from several starts, and shows each team's total and the
+// spread between the strongest and weakest. Reshuffle gives another split under the
+// same rules. If the rules cannot be met it says which and why, rather than bending one.
+//
+//   <TeamBalancer people="Ada, 8\nBo, 7\nCy, 5\nDi, 4" teams={2}/>
+//   <TeamBalancer people={[{ name: "Ada", rating: 8 }, { name: "Bo", rating: 7.5 }]} together={[["Ada", "Bo"]]}
+//                 on_change={(r) => { spread = r.spread }}/>
+//
+// people: a person a line, name then rating ("Ada, 8", "Ada 8" or "Ada: 8.5"), or a list
+// of { name, rating }. A rating is a number of 0 or more; a line with none takes
+// default_rating (5) and says so. teams: how many teams (2). together, apart: rules, a
+// line each in text or a list of lists; the names on a line stay on one team, or
+// all on different teams. A name that is not on the list is reported and left out of
+// the rule. team_names: the teams' names, a list ("Team 1", "Team 2", ...). seed: where
+// the shuffling starts (0), so a page is the same on the server and in the browser;
+// reshuffles go on from it. title: the heading ("Balance teams"). id: a prefix for its
+// ids ("team-balancer"), unique on the page. The fields are named people, teams,
+// together and apart, with the split as JSON in result; name: a prefix for those.
+// on_change(r): inside one of your components, given the result below after each change.
+//
+// team_balancer_solve(people, together, apart, count, seed, team_names) is the work, for a
+// program's own use, with team_balancer_read and team_balancer_rules to read the text. It gives
+// { ok, reason, teams, spread, mean }: each team { name, members, total, count }, ratings
+// and totals as decimals. It takes 120 people and 20 teams, and a search of bounded length,
+// and says when it stopped there, as that is not the same as the rules being impossible.
+
+import ui/theme.qwe use ui_cls
+
+let team_balancer_css = css`
+.ui-teambal { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; max-width: 720px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-teambal .ui-teambal-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-teambal-inputs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.ui-teambal-field { display: grid; gap: 5px; align-content: start; min-width: 0; font-size: 13px; font-weight: 500; }
+.ui-teambal textarea, .ui-teambal-count input { box-sizing: border-box; width: 100%; min-width: 0; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.5 var(--ui-font); }
+.ui-teambal textarea { min-height: 110px; padding: 8px 10px; resize: vertical; }
+.ui-teambal-count { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+.ui-teambal-count label { display: grid; gap: 5px; width: 110px; font-size: 13px; font-weight: 500; }
+.ui-teambal-count input { height: 36px; }
+.ui-teambal textarea:focus-visible, .ui-teambal-count input:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-teambal-count input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-teambal-shuffle { height: 36px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-teambal-shuffle:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-teambal-shuffle:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-teambal-shuffle:disabled { opacity: .5; cursor: not-allowed; }
+.ui-teambal-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-warning); font-size: 13px; }
+.ui-teambal-error { margin: 0; padding: 10px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); color: var(--ui-danger); font-weight: 500; }
+.ui-teambal-summary { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-teambal-teams { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; margin: 0; padding: 0; list-style: none; }
+.ui-teambal-team { display: grid; gap: 4px; align-content: start; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-teambal-head { display: flex; justify-content: space-between; gap: 8px; }
+.ui-teambal .ui-teambal-name { margin: 0; font-size: 14px; font-weight: 650; }
+.ui-teambal-total { font-weight: 650; font-variant-numeric: tabular-nums; }
+.ui-teambal-members { display: grid; gap: 1px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-teambal-members li { display: flex; justify-content: space-between; gap: 8px; }
+.ui-teambal-members span:last-child { color: var(--ui-muted); font-variant-numeric: tabular-nums; }
+@media (max-width: 560px) { .ui-teambal-inputs { grid-template-columns: minmax(0, 1fr); } }
+`
+
+let team_balancer_most_people = 120
+let team_balancer_most_teams = 20
+let team_balancer_most_steps = 20000
+let team_balancer_most_swaps = 40000
+let team_balancer_starts = 6
+
+// Park and Miller's generator: its products stay under 2^53, so the browser and the
+// server, and so the page each makes, agree.
+fn team_balancer_step(s: int) = s * 48271 % 2147483647
+
+fn team_balancer_shuffle(xs: list, seed: int) {
+    let out = xs
+    let s = seed
+    for i in reverse(range(len(out))) {
+        s = team_balancer_step(s)
+        let j = s % (i + 1)
+        let a = out[i]
+        out = set(set(out, i, out[j]), j, a)
+    }
+    out
+}
+
+fn team_balancer_text(people) {
+    if type_of(people) != "list" { return str(people ?? "") }
+    let line = (p) => type_of(p) == "map" ? `${str(p.name ?? "")}${p.rating == null ? "" : `, ${str(p.rating)}`}` : str(p)
+    join(people | map(line), "\n")
+}
+
+fn team_balancer_rule_text(rules) {
+    if type_of(rules) != "list" { return str(rules ?? "") }
+    join(rules | map((r) => type_of(r) == "list" ? join(r | map((x) => str(x)), ", ") : str(r)), "\n")
+}
+
+// People from text: { people, problems }, each person { name, rating }.
+fn team_balancer_read(text: str, fallback) {
+    let lines = split(replace(text, "\r", ""), "\n")
+    let people = []
+    let problems = []
+    for i in 0..len(lines) {
+        let l = trim(lines[i])
+        if l != "" {
+            let m = re.find(l, "^(.*?)[\\s,:;]+(-?\\d+(\\.\\d+)?)$")
+            let who = trim(m == null ? l : m.groups[0])
+            let given = m == null ? null : dec(m.groups[1])
+            if who == "" {
+                problems = problems | push(`Line ${i + 1}: no name.`)
+            } else if any(people, (p) => lower(p.name) == lower(who)) {
+                problems = problems | push(`Line ${i + 1}: ${slice(who, 0, 40)} is already on the list; left out.`)
+            } else if len(people) >= team_balancer_most_people {
+                problems = problems | push(`Line ${i + 1}: only the first ${team_balancer_most_people} people are taken.`)
+            } else {
+                if given == null { problems = problems | push(`Line ${i + 1}: ${slice(who, 0, 40)} has no rating, so counts as ${str(fallback)}.`) }
+                if given != null && given < 0 { problems = problems | push(`Line ${i + 1}: a rating is 0 or more, so ${slice(who, 0, 40)} counts as ${str(fallback)}.`) }
+                people = people | push({ name: slice(who, 0, 60), rating: given == null || given < 0 ? dec(fallback) : given })
+            }
+        }
+    }
+    let cut = problems | filter((p) => contains(p, "only the first"))
+    { people, problems: (problems | filter((p) => !contains(p, "only the first"))) + (cut | take(1)) }
+}
+
+// Rules from text: { lines, problems }, each line the indexes of the people it names.
+fn team_balancer_rules(text: str, people: list, label: str) {
+    let lines = split(replace(text, "\r", ""), "\n")
+    let found = []
+    let problems = []
+    for i in 0..len(lines) {
+        let names = re.split(lines[i], "[,;+&]") | map((x) => trim(x)) | filter((x) => x != "")
+        let on_line = []
+        for n in names {
+            let at = range(len(people)) | find((p) => lower(people[p].name) == lower(n))
+            if at == null { problems = problems | push(`${label}, line ${i + 1}: no one called ${slice(n, 0, 40)} on the list.`) }
+            else if !contains(on_line, at) { on_line = on_line | push(at) }
+        }
+        if len(on_line) > 1 { found = found | push(on_line) }
+    }
+    { lines: found, problems }
+}
+
+// People tied together, as lists of indexes.
+fn team_balancer_groups(count: int, together: list) {
+    let owner = range(count)
+    for line in together {
+        let keep = owner[line[0]]
+        for p in line {
+            let was = owner[p]
+            owner = owner | map((o) => o == was ? keep : o)
+        }
+    }
+    let ids = owner | unique()
+    ids | map((g) => range(count) | filter((p) => owner[p] == g))
+}
+
+fn team_balancer_names(people: list, members: list) {
+    let names = members | map((p) => people[p].name)
+    let n = len(names)
+    n < 2 ? join(names, "") : `${join(slice(names, 0, n - 1), ", ")} and ${names[n - 1]}`
+}
+
+// One step of the search below: places group `order[i]` and goes on. A top-level function,
+// as a `fn` inside a function cannot call itself in the browser. Gives { place, steps },
+// place null when nothing fits from here.
+fn team_balancer_search(i: int, place: list, size: list, total: list, full: int, steps0: int, p) {
+    if i == len(p.order) { return { place, steps: steps0 } }
+    let steps = steps0 + 1
+    if steps > team_balancer_most_steps { return { place: null, steps } }
+    let g = p.order[i]
+    let picks = range(p.count) | sort_by((t) => total[t])
+    let seen_empty = false
+    for t in picks {
+        let empty = size[t] == 0
+        let after = size[t] + p.sizes[g]
+        let big = p.extra > 0 && after == p.high ? 1 : 0
+        let room = after <= p.high && (big == 0 || full < p.extra)
+        let free = !any(range(i), (j) => place[p.order[j]] == t && p.clash[g][p.order[j]])
+        // Empty teams are all alike: trying one is trying them all.
+        if room && free && !(empty && seen_empty) {
+            let r = team_balancer_search(i + 1, set(place, g, t), set(size, t, after), set(total, t, total[t] + p.ratings[g]), full + big, steps, p)
+            if r.place != null || r.steps > team_balancer_most_steps { return r }
+            steps = r.steps
+        }
+        if empty { seen_empty = true }
+    }
+    { place: null, steps }
+}
+
+// A placing of groups on teams that keeps every rule: a depth-first search, weakest team
+// first, with a bound on its steps. Gives { place } or { failed: "none" | "steps" }.
+fn team_balancer_place(order: list, sizes: list, ratings: list, clash: list, count: int, high: int, extra: int) {
+    let start = for g in 0..len(order) => -1
+    let zero = for t in 0..count => 0
+    let empty = for t in 0..count => 0.0
+    let r = team_balancer_search(0, start, zero, empty, 0, 0, { order, sizes, ratings, clash, count, high, extra })
+    r.place != null ? { place: r.place } : { failed: r.steps > team_balancer_most_steps ? "steps" : "none" }
+}
+
+fn team_balancer_cost(total: list) {
+    let mean = sum(total) / len(total)
+    total | map((t) => (t - mean) * (t - mean)) | sum()
+}
+
+fn team_balancer_totals(place: list, ratings: list, count: int) {
+    let total = for t in 0..count => 0.0
+    for g in 0..len(place) { total = set(total, place[g], total[place[g]] + ratings[g]) }
+    total
+}
+
+// Swaps equal-sized groups, and moves a group where that only exchanges two teams'
+// sizes, for as long as that narrows the teams, within a bounded number of tries.
+fn team_balancer_improve(place0: list, sizes: list, ratings: list, clash: list, count: int) {
+    let place = place0
+    let n = len(place)
+    let total = team_balancer_totals(place, ratings, count)
+    let size = for t in 0..count => 0
+    for g in 0..n { size = set(size, place[g], size[place[g]] + sizes[g]) }
+    let tries = 0
+    let better = true
+    // Would group g sit on team t without a clash, not counting group `but`?
+    let fits = (g: int, t: int, but: int) => !any(range(n), (h) => h != g && h != but && place[h] == t && clash[g][h])
+    while better && tries < team_balancer_most_swaps {
+        better = false
+        for a in 0..n {
+            for b in (a + 1)..n {
+                let ta = place[a]
+                let tb = place[b]
+                if ta != tb && sizes[a] == sizes[b] && tries < team_balancer_most_swaps {
+                    tries += 1
+                    let shift = ratings[a] - ratings[b]
+                    let gain = (total[ta] - shift - total[ta]) * (total[ta] - shift + total[ta]) + (total[tb] + shift - total[tb]) * (total[tb] + shift + total[tb])
+                    if gain < -0.000000001 && fits(a, tb, b) && fits(b, ta, a) {
+                        place = set(set(place, a, tb), b, ta)
+                        total = set(set(total, ta, total[ta] - shift), tb, total[tb] + shift)
+                        better = true
+                    }
+                }
+            }
+        }
+        for g in 0..n {
+            for t in 0..count {
+                let from = place[g]
+                if t != from && size[from] - sizes[g] == size[t] && tries < team_balancer_most_swaps {
+                    tries += 1
+                    let r = ratings[g]
+                    let gain = (total[from] - r - total[from]) * (total[from] - r + total[from]) + (total[t] + r - total[t]) * (total[t] + r + total[t])
+                    if gain < -0.000000001 && fits(g, t, -1) {
+                        place = set(place, g, t)
+                        total = set(set(total, from, total[from] - r), t, total[t] + r)
+                        let s = size[from]
+                        size = set(set(size, from, size[t]), t, s)
+                        better = true
+                    }
+                }
+            }
+        }
+    }
+    place
+}
+
+fn team_balancer_reason(people: list, apart: list, count: int) {
+    for line in apart {
+        if len(line) > count {
+            return `${team_balancer_names(people, line)} must all be apart, which takes ${len(line)} teams, and there are ${count}.`
+        }
+    }
+    `No split into ${count} even teams keeps every rule: try fewer rules or another number of teams.`
+}
+
+// { ok, reason, teams, spread, mean, signature }. Rules are lists of indexes.
+fn team_balancer_solve(people: list, together: list, apart: list, count: int, seed: int = 0, team_names = null) {
+    let n = len(people)
+    let refuse = (why: str) => ({ ok: false, reason: why, teams: [], spread: null, mean: null, signature: "" })
+    if n == 0 { return refuse("Add people to make teams.") }
+    if count < 1 { return refuse("There must be at least one team.") }
+    if count > team_balancer_most_teams { return refuse(`${team_balancer_most_teams} teams is the most this makes.`) }
+    if count > n { return refuse(`There are ${count} teams for ${n == 1 ? "1 person" : `${n} people`}: fewer teams, or more people.`) }
+    let groups = team_balancer_groups(n, together)
+    let total_groups = len(groups)
+    let group_of = for p in 0..n => 0
+    for g in 0..total_groups {
+        for p in groups[g] { group_of = set(group_of, p, g) }
+    }
+    let clash = for g in 0..total_groups => for h in 0..total_groups => false
+    for line in apart {
+        for x in line {
+            for y in line {
+                if x != y {
+                    let a = group_of[x]
+                    let b = group_of[y]
+                    if a == b { return refuse(`${people[x].name} and ${people[y].name} must be kept together and kept apart: drop one rule.`) }
+                    clash = set(clash, a, set(clash[a], b, true))
+                }
+            }
+        }
+    }
+    let high = int(ceil(n / count))
+    let extra = n % count
+    for g in groups {
+        if len(g) > high { return refuse(`${team_balancer_names(people, g)} must stay together, but a team holds at most ${high}.`) }
+    }
+    let sizes = groups | map((g) => len(g))
+    let ratings = groups | map((g) => g | map((p) => float(people[p].rating)) | sum())
+    let best = null
+    let best_cost = 0.0
+    let stopped = false
+    for start in 0..team_balancer_starts {
+        let s = (seed * 7919 + start * 104729 + 12345) % 2147483646 + 1
+        // The biggest groups and those with the most clashes are placed first: they
+        // are the hardest. A shuffle first gives the sort's ties another order.
+        let shuffled = team_balancer_shuffle(range(total_groups), s)
+        let hard = (g) => -(sizes[g] * 1000 + (clash[g] | filter((c) => c) | len) * 100)
+        let order = shuffled | sort_by(hard)
+        let placed = team_balancer_place(order, sizes, ratings, clash, count, high, extra)
+        if placed.failed == "none" { return refuse(team_balancer_reason(people, apart, count)) }
+        if placed.failed == "steps" { stopped = true } else {
+            let place = team_balancer_improve(placed.place, sizes, ratings, clash, count)
+            let totals = team_balancer_totals(place, ratings, count)
+            let cost = team_balancer_cost(totals)
+            if best == null || cost < best_cost - 0.000000001 {
+                best = place
+                best_cost = cost
+            }
+        }
+    }
+    if best == null { return refuse(stopped ? "The search stopped at its limit without finding a split: the rules may still be possible, so try fewer." : "No split keeps every rule.") }
+    let teams = for t in 0..count {
+        let members = range(n) | filter((p) => best[group_of[p]] == t) | sort_by((p) => -float(people[p].rating))
+        { name: (team_names ?? [])[t] ?? `Team ${t + 1}`, members: members | map((p) => people[p]), total: members | map((p) => people[p].rating) | sum(), count: len(members) }
+    }
+    let totals = teams | map((t) => dec(t.total))
+    let signature = teams | map((t) => t.members | map((m) => m.name) | sort() | join(",")) | sort() | join("|")
+    { ok: true, reason: "", teams: teams | map((t) => ({ ...t, total: dec(t.total) })), spread: max(totals) - min(totals), mean: sum(totals) / count, signature }
+}
+
+fn team_balancer_count(text) {
+    let t = trim(str(text ?? ""))
+    re.test(t, "^\\d{1,4}$") ? int(t) : 0
+}
+
+fn team_balancer_all(text: str, fallback, together: str, apart: str, count: int, seed: int, team_names) {
+    let read = team_balancer_read(text, fallback)
+    let t = team_balancer_rules(together, read.people, "Keep together")
+    let a = team_balancer_rules(apart, read.people, "Keep apart")
+    { read, problems: read.problems + t.problems + a.problems, rules: len(t.lines) + len(a.lines), result: team_balancer_solve(read.people, t.lines, a.lines, count, seed, team_names) }
+}
+
+fn team_balancer_people(n: int) = n == 1 ? "1 person" : `${n} people`
+
+component TeamBalancer(people = "", teams = 2, together = "", apart = "", default_rating = 5, team_names = null, seed: int = 0, title: str = "Balance teams",
+                       id: str = "team-balancer", name: str? = null, on_change = null, class: str? = null) {
+    style global team_balancer_css
+    state text = team_balancer_text(people)
+    state count_text = str(teams)
+    state with_text = team_balancer_rule_text(together)
+    state off_text = team_balancer_rule_text(apart)
+    state turn = seed
+    state said = ""
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let count = team_balancer_count(count_text)
+    let all_ = team_balancer_all(text, default_rating, with_text, off_text, count, turn, team_names)
+    let r = all_.result
+    let rules_note = all_.rules == 0 ? "" : all_.rules == 1 ? " The 1 rule is kept." : ` All ${all_.rules} rules are kept.`
+    let summary = r.ok ? `Spread ${str(r.spread)} between the strongest and weakest team, ${str(round(r.mean, 2, "half_up"))} on average.${rules_note}` : ""
+    let saved = json.stringify(r.teams | map((t) => ({ name: t.name, members: t.members | map((m) => m.name) })))
+    let tell = () => {
+        if on_change != null {
+            on_change(team_balancer_all(text, default_rating, with_text, off_text, team_balancer_count(count_text), turn, team_names).result)
+        }
+    }
+    let change = () => {
+        said = ""
+        tell()
+    }
+    // The next seeds until one gives another split; a few people have few splits.
+    let reshuffle = () => {
+        let now = team_balancer_count(count_text)
+        let seen = team_balancer_all(text, default_rating, with_text, off_text, now, turn, team_names).result
+        let tries = 1
+        let found = null
+        while found == null && tries <= 12 {
+            let next = team_balancer_all(text, default_rating, with_text, off_text, now, turn + tries, team_names).result
+            if next.ok && next.signature != seen.signature { found = turn + tries }
+            tries += 1
+        }
+        if found == null {
+            said = "No other split came up: with these people and rules this may be the only even one."
+        } else {
+            turn = found
+            said = "Reshuffled, under the same rules."
+            tell()
+        }
+    }
+    <section class={ui_cls(["ui-teambal", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-teambal-title id={`${id}-title`}>{title}</h3>
+        <div.ui-teambal-inputs>
+            <label.ui-teambal-field>
+                People and ratings, one a line
+                <textarea id={`${id}-people`} name={named("people")} value={text} rows="6" spellcheck="false" @input={(e) => { text = e.value; change() }}></textarea>
+            </label>
+            <label.ui-teambal-field>
+                Keep together, names on a line
+                <textarea id={`${id}-together`} name={named("together")} value={with_text} rows="6" spellcheck="false" @input={(e) => { with_text = e.value; change() }}></textarea>
+            </label>
+            <label.ui-teambal-field>
+                Keep apart, names on a line
+                <textarea id={`${id}-apart`} name={named("apart")} value={off_text} rows="6" spellcheck="false" @input={(e) => { off_text = e.value; change() }}></textarea>
+            </label>
+        </div>
+        <div.ui-teambal-count>
+            <label>
+                Teams
+                <input type="text" inputmode="numeric" id={`${id}-count`} name={named("teams")} value={count_text} autocomplete="off" aria-invalid={count < 1 ? "true" : null}
+                       @input={(e) => { count_text = e.value; change() }}/>
+            </label>
+            <button.ui-teambal-shuffle type="button" disabled={!r.ok} @click={reshuffle}>Reshuffle</button>
+        </div>
+        <input type="hidden" name={named("result")} value={saved}/>
+        {len(all_.problems) > 0 && <ul.ui-teambal-problems>
+            {for p in all_.problems | take(8) => <li>{p}</li>}
+            {len(all_.problems) > 8 && <li>{`And ${len(all_.problems) - 8} more.`}</li>}
+        </ul>}
+        {!r.ok && <p.ui-teambal-error role="alert">{r.reason}</p>}
+        {r.ok && <p.ui-teambal-summary aria-live="polite">{summary}</p>}
+        {said != "" && <p role="status">{said}</p>}
+        {r.ok && <ul.ui-teambal-teams>
+            {for t in r.teams {
+                let team = t.name
+                <li.ui-teambal-team key={team}>
+                    <div.ui-teambal-head>
+                        <h4.ui-teambal-name>{team}</h4>
+                        <span.ui-teambal-total>{str(t.total)}</span>
+                    </div>
+                    <ul.ui-teambal-members>
+                        {for m in t.members {
+                            let who = m.name
+                            <li key={who}><span>{who}</span><span>{str(m.rating)}</span></li>
+                        }}
+                    </ul>
+                </li>
+            }}
+        </ul>}
+    </section>
+}

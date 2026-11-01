@@ -1,0 +1,294 @@
+// ReactionBar: reactions as a phone's chat app does them. A long press on a message
+// raises a bar of emoji; keep the finger down and slide to one, and letting go there
+// picks it, while letting go elsewhere picks nothing. A long press with no slide leaves
+// the bar up to tap. Each person has one reaction: a new one takes the place of the old,
+// and the same one again takes it back. The counts sit under the message, and each is a
+// button too. The button at their end opens the same bar for keys and screen readers: the
+// arrows move, Enter picks, Escape closes.
+//
+//   <ReactionBar reactions={m.reactions} mine={m.my_reaction} on_change={(emoji, rows) => { save(m.id, emoji) }}>
+//       <MessageBubble name="Ana">{m.text}</MessageBubble>
+//   </ReactionBar>
+//
+// reactions: the counts now, a list of { emoji, count, label? }. mine: the emoji that is
+// yours, or null. choices: what the bar offers, a list of { emoji, label } (six by
+// default): a count for an emoji not offered is still shown. hold: milliseconds to a long
+// press (420). label: what the button is called ("React"). id, class: for the outer element.
+// children: the message.
+// on_change(emoji, rows): inside one of your components, your reaction now (null for
+// none) and the counts as they stand, for you to save.
+//
+// The press is told from a scroll by distance: move more than 10 px before it has risen
+// and the page has the finger. Once it has, the finger is the bar's, by a touchmove
+// listener that is not passive, as touch-action cannot change in the middle of a touch.
+// Felt taps come from quilloNative.haptic in the apps and navigator.vibrate on Android.
+
+import ui/theme.qwe use ui_cls
+
+let reaction_bar_css = css`
+.ui-reaction-bar { position: relative; display: grid; gap: 2px; min-width: 0; font: 14px/1.3 var(--ui-font); color: var(--ui-fg); }
+.ui-reaction-bar-target { min-width: 0; touch-action: pan-y; -webkit-touch-callout: none; border-radius: var(--ui-radius); transition: transform .16s; }
+.ui-reaction-bar-pressing { user-select: none; -webkit-user-select: none; transform: scale(.985); }
+.ui-reaction-bar-tally { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; min-width: 0; }
+.ui-reaction-bar-chip { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.ui-reaction-bar-chip span {
+  display: inline-flex; align-items: center; gap: 4px; height: 30px; padding: 0 9px; border: 1px solid var(--ui-border); border-radius: 999px;
+  background: var(--ui-surface); font-size: 13px; font-weight: 500; font-variant-numeric: tabular-nums;
+}
+.ui-reaction-bar-chip[aria-pressed="true"] span { border-color: var(--ui-accent); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-reaction-bar-chip:focus-visible { outline: none; }
+.ui-reaction-bar-chip:focus-visible span { box-shadow: var(--ui-focus); }
+.ui-reaction-bar-add svg { width: 18px; height: 18px; color: var(--ui-muted); }
+.ui-reaction-bar-add span { width: 34px; justify-content: center; padding: 0; border-style: dashed; }
+.ui-reaction-bar-pop {
+  position: fixed; inset: auto; margin: 0; padding: 4px; border: 1px solid var(--ui-border); border-radius: 999px; overflow: visible;
+  background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); -webkit-touch-callout: none; user-select: none; -webkit-user-select: none;
+}
+.ui-reaction-bar-pop:popover-open { display: flex; animation: ui-reaction-bar-rise .18s cubic-bezier(.2, 1.4, .4, 1); }
+@keyframes ui-reaction-bar-rise { from { opacity: 0; transform: translateY(10px) scale(.9); } }
+.ui-reaction-bar-item {
+  position: relative; display: grid; place-items: center; flex: none; width: 46px; height: 46px; padding: 0; border: 0; border-radius: 50%;
+  background: transparent; font-size: 26px; line-height: 1; cursor: pointer; transition: transform .12s;
+}
+.ui-reaction-bar-item[aria-checked="true"] { background: var(--ui-accent-soft); }
+.ui-reaction-bar-item:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-reaction-bar-on { transform: translateY(-10px) scale(1.3); }
+.ui-reaction-bar-on::after {
+  content: attr(data-tip); position: absolute; bottom: 100%; left: 50%; margin-bottom: 2px; padding: 1px 7px; border-radius: 999px; transform: translateX(-50%) scale(.77);
+  background: var(--ui-fg); color: var(--ui-bg); font: 600 12px/18px var(--ui-font); white-space: nowrap;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-reaction-bar-target, .ui-reaction-bar-item { transition: none; }
+  .ui-reaction-bar-pop:popover-open { animation: none; }
+}
+`
+
+let reaction_bar_default = [
+    { emoji: "👍", label: "Like" }, { emoji: "❤️", label: "Love" }, { emoji: "😂", label: "Funny" },
+    { emoji: "😮", label: "Wow" }, { emoji: "😢", label: "Sad" }, { emoji: "🙏", label: "Thanks" }
+]
+
+// Counts that can be trusted: a whole number of 0 or more, each emoji once, and none at nothing.
+fn reaction_bar_clean(reactions) {
+    let rows = (type_of(reactions) == "list" ? reactions : []) | filter((r) => type_of(r) == "map" && str(r.emoji ?? "") != "")
+    let plain = rows | map((r) => { ...r, emoji: str(r.emoji), count: type_of(r.count) == "int" && r.count > 0 ? r.count : 0 })
+    let once = unique(plain | map((r) => r.emoji)) | map((e) => {
+        let same = plain | filter((r) => r.emoji == e)
+        { ...same[0], count: sum(same | map((r) => r.count)) }
+    })
+    once | filter((r) => r.count > 0)
+}
+
+// The counts after one person's reaction goes from `was` to `next`, either of which may
+// be null. A count at nothing goes, and a new one joins at the end, so that no chip
+// moves under a finger.
+fn reaction_bar_apply(rows: list, was, next, label) {
+    let taken = rows | map((r) => r.emoji == was ? { ...r, count: r.count - 1 } : r) | filter((r) => r.count > 0)
+    if next == null { return taken }
+    any(taken, (r) => r.emoji == next)
+        ? taken | map((r) => r.emoji == next ? { ...r, count: r.count + 1 } : r)
+        : taken + [{ emoji: next, label, count: 1 }]
+}
+
+// Which of n items a finger at x, y is over, or -1: within `reach` above or below the
+// bar, as a finger hides what it is on, and off either end is off the bar.
+fn reaction_bar_index(x: num, y: num, left: num, width: num, top: num, bottom: num, n: int, reach: num) -> int {
+    if n < 1 || width <= 0 || x < left || x > left + width || y < top - reach || y > bottom + reach { return -1 }
+    min([floor((x - left) * n / width), n - 1])
+}
+
+// Where the bar's left edge goes: centred on `x`, kept `margin` inside the screen.
+fn reaction_bar_left(x: num, width: num, screen: num, margin: num) -> num =
+    max([margin, min([x - width / 2, screen - width - margin])])
+
+// Where its top goes: over the message, or under it when there is no room above.
+fn reaction_bar_top(top: num, bottom: num, height: num, screen: num, margin: num) -> num {
+    let over = top - height - margin
+    if over >= margin { return over }
+    min([bottom + margin, screen - height - margin])
+}
+
+// What a count says to a screen reader.
+fn reaction_bar_count_label(r, mine: bool) -> str =
+    `${r.label ?? r.emoji}: ${r.count}${mine ? ", yours" : ""}`
+
+// A tap felt: the app's, else Android's, else nothing. The app answers later, and in a
+// plain function nothing waits for it, so a refusal needs a home.
+fn reaction_bar_haptic(kind: str, ms: int) {
+    let felt = js("quilloNative.haptic", kind)
+    if is_err(felt) { js("navigator.vibrate", ms) }
+    if type_of(felt) == "promise" { felt.then((_v = null) => null, (_e = null) => null) }
+}
+
+component ReactionBar(reactions: list = [], mine: str? = null, choices: list = reaction_bar_default, hold: int = 420, label: str = "React",
+                      on_change = null, id: str? = null, class: str? = null, children) {
+    style global reaction_bar_css
+    state rows = reaction_bar_clean(reactions)
+    state chosen = mine
+    state said = ""
+    state open = false
+    state active = -1
+    state press = null       // { id, x, y }, from the finger coming down until the bar rises or it moves
+    state picking = false    // the finger that raised the bar is still down
+    state slid = false
+    state from = null
+    state target = null
+    state bar = null
+    state add = null
+    state win = null
+    let n = len(choices)
+    let label_of = (emoji) => {
+        let c = find(choices, (x) => x.emoji == emoji)
+        c != null ? c.label : emoji
+    }
+    let place = (x: num) => {
+        let r = target.getBoundingClientRect()
+        let w = bar.offsetWidth
+        let h = bar.offsetHeight
+        bar.style.left = `${reaction_bar_left(x, w, win.innerWidth, 8)}px`
+        bar.style.top = `${reaction_bar_top(r.top, r.bottom, h, win.innerHeight, 8)}px`
+    }
+    let rise = (x: num) => {
+        bar.showPopover()
+        place(x)
+        open = true
+    }
+    let close = () => {
+        if open {
+            bar.hidePopover()
+            open = false
+            active = -1
+        }
+    }
+    let react = (emoji) => {
+        let next = chosen == emoji ? null : emoji
+        rows = reaction_bar_apply(rows, chosen, next, label_of(emoji))
+        chosen = next
+        said = next != null ? `You reacted with ${label_of(next)}` : "Your reaction was taken back"
+        on_change && on_change(next, rows)
+    }
+    let pick = (i: int) => {
+        close()
+        react(choices[i].emoji)
+    }
+    let by_keys = () => {
+        if open { close() } else {
+            let r = add.getBoundingClientRect()
+            rise(r.left + r.width / 2)
+            let at = index_of(choices | map((c) => c.emoji), chosen) ?? 0
+            active = at
+            js("Array.from", bar.querySelectorAll("button"))[at].focus()
+        }
+    }
+    if press != null { every(hold, () => {
+        if press != null {
+            let p = press
+            press = null
+            picking = true
+            slid = false
+            from = { x: p.x, y: p.y }
+            rise(p.x)
+            target.setPointerCapture(p.id)
+            reaction_bar_haptic("medium", 14)
+        }
+    }) }
+    <div class={ui_cls(["ui-reaction-bar", class])} id={id}
+         @mount={(el) => {
+             let w = js("window")
+             let d = w.document
+             win = w
+             let outside = (e) => {
+                 if open && !picking && !bar.contains(e.target) && !add.contains(e.target) { close() }
+             }
+             let turned = (_e = null) => {
+                 if open {
+                     let r = bar.getBoundingClientRect()
+                     place(r.left + r.width / 2)
+                 }
+             }
+             d.addEventListener("pointerdown", outside)
+             w.addEventListener("resize", turned)
+             () => {
+                 d.removeEventListener("pointerdown", outside)
+                 w.removeEventListener("resize", turned)
+             }
+         }}>
+        <div class={ui_cls(["ui-reaction-bar-target", (press != null || picking) && "ui-reaction-bar-pressing"])}
+             @mount={(el) => { target = el }}
+             @touchmove={(e) => {
+                 // Once the bar is up the finger slides on it, up and down too, and the page must not scroll under it.
+                 if picking && e.cancelable { e.preventDefault() }
+             }}
+             @pointerdown={(e) => {
+                 if e.button == 0 && e.isPrimary && !open { press = { id: e.pointerId, x: e.clientX, y: e.clientY } }
+             }}
+             @pointermove={(e) => {
+                 if press != null {
+                     if abs(e.clientX - press.x) > 10 || abs(e.clientY - press.y) > 10 { press = null }
+                 } else if picking {
+                     if abs(e.clientX - from.x) > 8 || abs(e.clientY - from.y) > 8 { slid = true }
+                     let r = bar.getBoundingClientRect()
+                     let at = reaction_bar_index(e.clientX, e.clientY, r.left, r.width, r.top, r.bottom, n, 60)
+                     if at != active {
+                         active = at
+                         if at >= 0 { reaction_bar_haptic("selection", 6) }
+                     }
+                 }
+             }}
+             @pointerup={() => {
+                 press = null
+                 if picking {
+                     picking = false
+                     if slid {
+                         if active >= 0 { pick(active) } else { close() }
+                     }
+                 }
+             }}
+             @pointercancel={() => {
+                 press = null
+                 if picking {
+                     picking = false
+                     close()
+                 }
+             }}
+             @contextmenu={(e) => { if press != null || picking { e.preventDefault() } }}>{children}</div>
+        <div.ui-reaction-bar-tally role="group" aria-label="Reactions">
+            {for r in rows => <button.ui-reaction-bar-chip key={r.emoji} type="button" aria-pressed={r.emoji == chosen ? "true" : "false"}
+                    aria-label={reaction_bar_count_label(r, r.emoji == chosen)} @click={() => { react(r.emoji) }}>
+                <span>{r.emoji} {r.count}</span>
+            </button>}
+            <button.ui-reaction-bar-chip.ui-reaction-bar-add type="button" aria-label={label} aria-haspopup="menu" aria-expanded={open ? "true" : "false"}
+                    @mount={(el) => { add = el }} @click={by_keys}>
+                <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8.5 14.5a4.5 4.5 0 0 0 7 0M9 9.5v.01M15 9.5v.01"/></svg></span>
+            </button>
+        </div>
+        <div.ui-reaction-bar-pop popover="manual" role="menu" aria-label={label}
+             @mount={(el) => { bar = el }}
+             @keydown={(e) => {
+                 let to = match e.key {
+                     "ArrowRight" => (active + 1) % n
+                     "ArrowLeft" => (active + n - 1) % n
+                     "ArrowDown" => (active + 1) % n
+                     "ArrowUp" => (active + n - 1) % n
+                     "Home" => 0
+                     "End" => n - 1
+                     _ => -1
+                 }
+                 if to >= 0 {
+                     e.preventDefault()
+                     active = to
+                     js("Array.from", bar.querySelectorAll("button"))[to].focus()
+                 }
+                 if e.key == "Escape" || e.key == "Tab" {
+                     e.preventDefault()
+                     close()
+                     add.focus()
+                 }
+             }}>
+            {for i in range(n) => <button key={choices[i].emoji} class={ui_cls(["ui-reaction-bar-item", active == i && "ui-reaction-bar-on"])} type="button" role="menuitemradio"
+                    aria-label={choices[i].label} aria-checked={choices[i].emoji == chosen ? "true" : "false"} data-tip={choices[i].label} tabindex={active == i ? "0" : "-1"}
+                    @click={() => { pick(i) }}>{choices[i].emoji}</button>}
+        </div>
+        <span.ui-sr role="status">{said}</span>
+    </div>
+}

@@ -1,0 +1,429 @@
+// ProofOfDelivery: what a driver does at the door, in one flow. Say what happened, then who
+// took it, a signature, a photo and the place, each asked for only where a rule says so,
+// and finish with a receipt. On a phone it is one step at a time; on a tablet the whole
+// flow is on the screen at once. With no connection, the receipt waits and goes later.
+//
+// A place too far from the address, or none at all, does not strand a driver: unless the
+// rule is strict, a sentence saying why takes its place and goes on the receipt.
+//
+//   import ui/proof_of_delivery.qwe use ProofOfDelivery
+//
+//   <ProofOfDelivery delivery={{ id: "8841", to: "A. Moreau", address: "12 Rue Saint-Paul", value: "240.00", lat: 45.50, lon: -73.55 }}
+//                    on_complete={(r) => send(r)}/>
+//
+// delivery: { id, to, address, items (a list of text), value, lat, lon }. driver: a name for
+// the receipt. outcomes: which ways it can go, of "handed", "left" and "refused" (all).
+//
+// rules: what each need depends on, in place of the default:
+//   [{ need: "recipient", when: "handed" }, { need: "signature", when: "handed" },
+//    { need: "spot", when: "left" }, { need: "photo", when: "left" },
+//    { need: "reason", when: "refused" }, { need: "place", when: "always" }]
+// need: "recipient" (who took it), "spot" (where it was left), "reason" (why it was
+// refused), "signature", "photo" or "place". when: "always", an outcome, or a list of
+// them. over: only when the delivery's value is this much or more, in decimals. count: how
+// many photos (1). within: metres from delivery's lat and lon that a place must be.
+// strict: no sentence can stand in for the place. A need with no rule is not asked for.
+//
+// title ("Proof of delivery"). id: a prefix for its ids. on_complete(receipt): when
+// finished, and again when a connection comes back if it could not go; answer false, an
+// error, or a Promise of either to try again later. on_change(step): the step showing.
+// receipt: { ref, delivery, to, address, items, outcome, recipient, relation, spot, reason,
+// signature, photos, place, exception, driver, at, offset, text }. text is the receipt in
+// words, which Share sends. tel: and mailto: links do not work in the phone apps, so
+// sharing goes through the system's own sheet.
+//
+// proof_of_delivery_needs(delivery, outcome, rules), proof_of_delivery_missing(needs, form),
+// proof_of_delivery_ref(id, at, offset) and proof_of_delivery_text(receipt) are the plain logic.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/signature_pad.qwe use SignaturePad
+import ui/photo_evidence.qwe use PhotoEvidenceAdd, PhotoEvidenceThumbs, photo_evidence_place, photo_evidence_no_place, photo_evidence_place_text, photo_evidence_when
+import ui/shift_clock.qwe use shift_clock_metres
+
+let proof_of_delivery_css = css`
+.ui-pod { display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-pod h3 { margin: 0; font-size: 18px; }
+.ui-pod-head { display: grid; gap: 2px; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); overflow-wrap: anywhere; }
+.ui-pod-head b { font-size: 16px; }
+.ui-pod-head small { color: var(--ui-muted); font-size: 14px; }
+.ui-pod-dots { display: flex; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-pod-dots li { flex: 1; height: 6px; border-radius: 999px; background: var(--ui-subtle); }
+.ui-pod-dots li[data-done] { background: var(--ui-accent); }
+.ui-pod-flow { display: grid; gap: 12px; min-width: 0; }
+.ui-pod-step { display: none; gap: 10px; min-width: 0; align-content: start; }
+.ui-pod-step[data-now] { display: grid; }
+.ui-pod-step h4 { margin: 0; font-size: 17px; outline: none; }
+.ui-pod-why { margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-pod-opts { display: grid; gap: 8px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-pod-opt { position: relative; display: grid; align-content: center; min-height: 60px; padding: 6px 14px; border: 2px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); font-weight: 600; cursor: pointer; touch-action: manipulation; }
+.ui-pod-opt input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.ui-pod-opt:has(input:checked) { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-pod-opt:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-pod-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-pod-chips .ui-pod-opt { min-height: 46px; padding: 0 14px; }
+.ui-pod-label { display: grid; gap: 2px; min-width: 0; color: var(--ui-muted); font-size: 13px; }
+/* 16 px: anything smaller and iOS zooms the page when the field is touched. */
+.ui-pod-label input, .ui-pod-label textarea { box-sizing: border-box; width: 100%; min-height: 48px; padding: 8px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px/1.4 var(--ui-font); }
+.ui-pod-label input:focus, .ui-pod-label textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+/* The pad's own controls are made for a mouse, and here a finger has them. */
+.ui-pod .ui-signature-pad { width: 100%; }
+.ui-pod .ui-signature-pad-btn, .ui-pod .ui-signature-pad-link { min-width: 44px; min-height: 44px; }
+.ui-pod .ui-signature-pad-typed { height: 44px; font-size: 16px; }
+.ui-pod-place { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font: 14px/1.4 var(--ui-mono); overflow-wrap: anywhere; }
+.ui-pod-warn { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); font-weight: 600; }
+.ui-pod-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-pod-list li { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-pod-list li[data-open] { background: var(--ui-danger-soft); font-weight: 600; }
+.ui-pod-nav { display: grid; grid-template-columns: 1fr 2fr; gap: 8px; position: sticky; bottom: 0; padding: 8px 0 max(8px, env(safe-area-inset-bottom)); background: var(--ui-bg); }
+.ui-pod-receipt { display: grid; gap: 10px; padding: 14px; border: 2px solid var(--ui-strong); border-radius: var(--ui-radius); background: var(--ui-surface); min-width: 0; }
+.ui-pod-receipt h4 { margin: 0; font-size: 18px; }
+.ui-pod-ref { margin: 0; font: 700 17px var(--ui-mono); overflow-wrap: anywhere; }
+.ui-pod-receipt pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.5 var(--ui-mono); }
+.ui-pod-receipt img.ui-pod-sign { display: block; max-width: 100%; max-height: 140px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: #fff; }
+.ui-pod-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-pod-acts > * { flex: 1 1 140px; }
+.ui-pod-said { margin: 0; font-weight: 600; }
+.ui-pod-said:empty { display: none; }
+@container (min-width: 700px) {
+  .ui-pod-flow { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px 24px; }
+  .ui-pod-step[data-on] { display: grid; padding: 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius); }
+  .ui-pod-step[data-kind="review"] { grid-column: 1 / -1; }
+  .ui-pod-dots, .ui-pod-nav { display: none; }
+}
+`
+
+let proof_of_delivery_rules = [
+    { need: "recipient", when: "handed" }, { need: "signature", when: "handed" },
+    { need: "spot", when: "left" }, { need: "photo", when: "left" },
+    { need: "reason", when: "refused" }, { need: "place", when: "always" },
+]
+
+fn proof_of_delivery_outcome_text(o) -> str = match o {
+    "handed" => "Handed to someone"
+    "left" => "Left in a safe place"
+    "refused" => "Refused or not delivered"
+    _ => "Not said"
+}
+
+fn proof_of_delivery_need_text(n) -> str = match n {
+    "recipient" => "Who took it"
+    "spot" => "Where it was left"
+    "reason" => "Why it was not delivered"
+    "signature" => "Signature"
+    "photo" => "Photo"
+    "place" => "Place"
+    _ => str(n)
+}
+
+// A value as a decimal, or null: money is never compared in floats.
+fn proof_of_delivery_amount(x) {
+    let t = trim(str(x ?? ""))
+    re.test(t, "^[0-9]{1,12}([.][0-9]{1,6})?$") ? dec(t) : null
+}
+
+fn proof_of_delivery_applies(rule, outcome, value) -> bool {
+    let w = get(rule, "when") ?? "always"
+    let meant = w == "always" || w == outcome || (type_of(w) == "list" && (w | any((x) => x == outcome)))
+    if !meant || get(rule, "over") == null { return meant }
+    let line = proof_of_delivery_amount(rule.over)
+    let amount = proof_of_delivery_amount(value)
+    line != null && amount != null && amount >= line
+}
+
+// What this delivery needs, going this way: [{ need, why, count, within, strict }], one for
+// each need, the first rule to apply deciding.
+fn proof_of_delivery_needs(delivery, outcome, rules: list) -> list {
+    if outcome == null { return [] }
+    let value = type_of(delivery) == "map" ? get(delivery, "value") : null
+    let live = rules | filter((r) => type_of(r) == "map" && get(r, "need") != null && proof_of_delivery_applies(r, outcome, value))
+    let names = live | map((r) => str(r.need)) | unique()
+    names | map((n) => {
+        let r = live | find((x) => str(x.need) == n)
+        let why = get(r, "over") != null ? `Needed at ${r.over} or more.` : (get(r, "when") == "always" || get(r, "when") == null ? "Needed on every delivery." : `Needed when ${lower(proof_of_delivery_outcome_text(outcome))}.`)
+        { need: n, why: why, count: get(r, "count") ?? 1, within: get(r, "within"), strict: get(r, "strict") == true }
+    })
+}
+
+// The steps of the flow, in order, from what is needed.
+fn proof_of_delivery_steps(needs: list) -> list {
+    let has = (n) => needs | any((x) => x.need == n)
+    (["outcome"] + (has("recipient") || has("spot") || has("reason") ? ["who"] : [])
+        + (has("signature") ? ["signature"] : []) + (has("photo") ? ["photo"] : []) + (has("place") ? ["place"] : []) + ["review"])
+}
+
+// How far a place is from the address, or null when one of them is not known.
+fn proof_of_delivery_distance(delivery, place) {
+    if place == null || type_of(delivery) != "map" || get(delivery, "lat") == null || get(delivery, "lon") == null { return null }
+    shift_clock_metres(place.lat, place.lon, delivery.lat, delivery.lon)
+}
+
+// Whether what was got for a place answers its need.
+fn proof_of_delivery_place_ok(need, delivery, form) -> bool {
+    let reason = trim(str(get(form, "exception") ?? "")) != "" && !need.strict
+    if get(form, "place") == null { return reason }
+    let far = proof_of_delivery_distance(delivery, form.place)
+    need.within == null || far == null || far <= need.within || reason
+}
+
+// What is still missing, in words: [{ need, text }].
+fn proof_of_delivery_missing(needs: list, form: map, delivery = null) -> list {
+    let blank = (k) => trim(str(get(form, k) ?? "")) == ""
+    needs | filter((n) => match n.need {
+        "recipient" => blank("recipient")
+        "spot" => blank("spot")
+        "reason" => blank("reason")
+        "signature" => get(form, "signature") == null
+        "photo" => len(get(form, "photos") ?? []) < n.count
+        "place" => !proof_of_delivery_place_ok(n, delivery, form)
+        _ => false
+    }) | map((n) => ({ need: n.need, text: proof_of_delivery_need_text(n.need) }))
+}
+
+// A reference anyone can read over a phone: POD-8841-20261102-1105.
+fn proof_of_delivery_ref(id, at: int, offset: int) -> str {
+    let w = photo_evidence_when(at, offset)
+    let plain = re.replace(str(id ?? ""), "[^A-Za-z0-9-]", "")
+    `POD-${plain}-${slice(w, 0, 4)}${slice(w, 5, 7)}${slice(w, 8, 10)}-${slice(w, 11, 13)}${slice(w, 14, 16)}`
+}
+
+// The receipt in words: one fact a line, only those there are.
+fn proof_of_delivery_text(r: map) -> str {
+    let line = (label, v) => v != null && str(v) != "" ? [`${label}: ${v}`] : []
+    let parts = [`Proof of delivery ${r.ref}`] + line("Delivery", r.delivery) + line("For", r.to) + line("Address", r.address)
+        + line("Items", len(r.items) > 0 ? join(r.items, ", ") : null) + line("Outcome", proof_of_delivery_outcome_text(r.outcome))
+        + line("Received by", r.recipient != "" ? (r.relation != null ? `${r.recipient} (${lower(r.relation)})` : r.recipient) : null) + line("Left at", r.spot) + line("Reason", r.reason)
+        + line("Signature", r.signature != null ? "yes" : null) + line("Photos", len(r.photos) > 0 ? len(r.photos) : null)
+        + line("Place", r.place != null ? photo_evidence_place_text(r.place) : null) + line("Note", r.exception) + line("Driver", r.driver)
+        + line("Time", photo_evidence_when(r.at, r.offset))
+    join(parts, "\n")
+}
+
+component ProofOfDelivery(delivery: map = {}, rules: list = proof_of_delivery_rules, outcomes: list = ["handed", "left", "refused"], driver: str? = null,
+                          title: str = "Proof of delivery", id: str = "ui-pod", on_complete = null, on_change = null, class: str? = null) {
+    style global proof_of_delivery_css
+    state outcome = null
+    state current = "outcome"
+    state recipient = ""
+    state relation = "Recipient"
+    state spot = ""
+    state reason = ""
+    state signature = null
+    state photos = []
+    state place = null
+    state exception = ""
+    state locating = false
+    state place_said = ""
+    state settings = false
+    state receipt = null
+    state sent = false
+    state sending = false
+    state online = true
+    state said = ""
+    state root = null
+    let needs = proof_of_delivery_needs(delivery, outcome, rules)
+    let steps = proof_of_delivery_steps(needs)
+    let at_step = steps | index_of(current)
+    let here = at_step ?? 0
+    let has = (n) => needs | any((x) => x.need == n)
+    let need_of = (n) => needs | find((x) => x.need == n)
+    let form = { recipient: recipient, spot: spot, reason: reason, signature: signature, photos: photos, place: place, exception: exception }
+    let missing = proof_of_delivery_missing(needs, form, delivery)
+    let far = proof_of_delivery_distance(delivery, place)
+    let place_need = need_of("place")
+    let too_far = place_need != null && place_need.within != null && far != null && far > place_need.within
+    let move = (to) => {
+        current = to
+        on_change && on_change(to)
+        js("requestAnimationFrame", (_t = null) => {
+            let h = root.querySelector(".ui-pod-step[data-now] h4")
+            h && h.focus({ preventScroll: true })
+        })
+    }
+    let locate = () => {
+        locating = true
+        place_said = "Finding where you are…"
+        settings = false
+        let p = js("Promise.resolve", photo_evidence_place(8000, 10000))
+        locating = false
+        if get(p, "error") != null {
+            place = null
+            place_said = photo_evidence_no_place(p.error, p.in_app == true)
+            settings = p.error == "refused" && p.in_app == true
+        } else {
+            place = p
+            place_said = ""
+        }
+    }
+    let flush = () => {
+        if receipt != null && !sent && !sending && online && on_complete != null {
+            sending = true
+            let r = js("Promise.resolve", on_complete(receipt))
+            sending = false
+            if r == false || is_err(r) {
+                said = "It could not be sent yet. It is kept here and will be tried again."
+            } else {
+                sent = true
+                said = ""
+            }
+        }
+    }
+    let share = () => {
+        let w = js("window")
+        let n = js("navigator")
+        if w.quilloNative != null {
+            // iOS answers { shared, to } and Android true, so only a refusal is looked at.
+            let r = js("quilloNative.share", receipt.text)
+            if is_err(r) { said = "It could not be shared from here." }
+        } else if n.share != null {
+            let r = js("Promise.resolve", n.share({ text: receipt.text }))
+            // A person closing the sheet is not a failure.
+            if is_err(r) && !contains(str(r.error), "cancel") && !contains(str(r.error), "Abort") { said = "It could not be shared from here." }
+        } else if n.clipboard != null {
+            let r = js("Promise.resolve", n.clipboard.writeText(receipt.text))
+            said = is_err(r) ? "This browser would not copy it. The receipt is above, to select." : "Copied."
+        } else {
+            said = "Nothing here can share it. The receipt is above, to select."
+        }
+    }
+    let finish = () => {
+        if len(missing) > 0 {
+            said = `Still needed: ${join(missing | map((m) => lower(m.text)), ", ")}`
+        } else {
+            let at = now()
+            let offset = 0 - js_new("Date").getTimezoneOffset()
+            let parts = { ref: proof_of_delivery_ref(get(delivery, "id"), at, offset), delivery: get(delivery, "id"), to: get(delivery, "to"), address: get(delivery, "address"),
+                items: type_of(get(delivery, "items")) == "list" ? delivery.items : [], outcome: outcome, recipient: has("recipient") ? trim(recipient) : "",
+                relation: has("recipient") ? relation : null, spot: has("spot") ? trim(spot) : "", reason: has("reason") ? trim(reason) : "",
+                signature: has("signature") ? signature : null, photos: has("photo") ? photos : [], place: has("place") ? place : null,
+                exception: has("place") ? trim(exception) : "", driver: driver, at: at, offset: offset }
+            receipt = set(parts, "text", proof_of_delivery_text(parts))
+            said = !online && on_complete != null ? "No connection. The receipt goes when there is one." : ""
+            flush()
+        }
+    }
+    <section class={ui_cls(["ui-pod", class])}
+             @mount={(el) => {
+                 root = el
+                 let w = js("window")
+                 online = js("navigator").onLine != false
+                 let up = (_e = null) => {
+                     online = true
+                     flush()
+                 }
+                 let down = (_e = null) => { online = false }
+                 w.addEventListener("online", up)
+                 w.addEventListener("offline", down)
+                 () => {
+                     w.removeEventListener("online", up)
+                     w.removeEventListener("offline", down)
+                 }
+             }}>
+        <h3>{title}</h3>
+        <div.ui-pod-head>
+            <b>{str(get(delivery, "to") ?? "Delivery")}</b>
+            <span>{str(get(delivery, "address") ?? "")}</span>
+            {get(delivery, "id") != null && <small>No. {delivery.id}</small>}
+        </div>
+        <div.ui-pod-main hidden={receipt != null}>
+            <ol.ui-pod-dots aria-hidden="true">
+                {for [i, s] in enumerate(steps) => <li key={s} data-done={i <= here ? "" : null}></li>}
+            </ol>
+            <div.ui-pod-flow>
+                <div.ui-pod-step data-kind="outcome" data-on="" data-now={current == "outcome" ? "" : null}>
+                    <h4 tabindex="-1">What happened?</h4>
+                    <fieldset.ui-pod-opts aria-label="What happened">
+                        {for o in outcomes => <label class="ui-pod-opt" key={o}>
+                            <input type="radio" name={`${id}-outcome`} value={o} checked={outcome == o} @change={() => { outcome = o }}/>
+                            {proof_of_delivery_outcome_text(o)}
+                        </label>}
+                    </fieldset>
+                </div>
+                <div.ui-pod-step data-kind="who" data-on={steps | any((s) => s == "who") ? "" : null} data-now={current == "who" ? "" : null}>
+                    <h4 tabindex="-1">{has("recipient") ? "Who took it?" : (has("spot") ? "Where was it left?" : "Why was it not delivered?")}</h4>
+                    <div hidden={!has("recipient")}>
+                        <label class="ui-pod-label" for={`${id}-recipient`}>Their name
+                            <input id={`${id}-recipient`} name={`${id}-recipient`} autocomplete="off" enterkeyhint="done" value={recipient} @input={(e) => { recipient = e.value }}/>
+                        </label>
+                        <fieldset.ui-pod-chips aria-label="Who they are" style="margin-top: 8px">
+                            {for r in ["Recipient", "Family", "Neighbour", "Reception"] => <label class="ui-pod-opt" key={r}>
+                                <input type="radio" name={`${id}-relation`} value={r} checked={relation == r} @change={() => { relation = r }}/>
+                                {r}
+                            </label>}
+                        </fieldset>
+                    </div>
+                    <div hidden={!has("spot")}>
+                        <fieldset.ui-pod-chips aria-label="Common places">
+                            {for r in ["Porch", "Back door", "Garage", "Locker"] => <label class="ui-pod-opt" key={r}>
+                                <input type="radio" name={`${id}-spot`} value={r} checked={spot == r} @change={() => { spot = r }}/>
+                                {r}
+                            </label>}
+                        </fieldset>
+                        <label class="ui-pod-label" for={`${id}-spot-text`} style="margin-top: 8px">Or say where
+                            <input id={`${id}-spot-text`} autocomplete="off" enterkeyhint="done" value={spot} @input={(e) => { spot = e.value }}/>
+                        </label>
+                    </div>
+                    <div hidden={!has("reason")}>
+                        <label class="ui-pod-label" for={`${id}-reason`}>What happened
+                            <textarea id={`${id}-reason`} name={`${id}-reason`} rows="3" value={reason} @input={(e) => { reason = e.value }}></textarea>
+                        </label>
+                    </div>
+                </div>
+                <div.ui-pod-step data-kind="signature" data-on={has("signature") ? "" : null} data-now={current == "signature" ? "" : null}>
+                    <h4 tabindex="-1">Signature</h4>
+                    {has("signature") && <p.ui-pod-why>{need_of("signature").why}</p>}
+                    <SignaturePad name={`${id}-signature`} label="Sign here" width={560} height={220} field={`${id}-sign`} on_change={(png) => { signature = png }}/>
+                </div>
+                <div.ui-pod-step data-kind="photo" data-on={has("photo") ? "" : null} data-now={current == "photo" ? "" : null}>
+                    <h4 tabindex="-1">Photo</h4>
+                    {has("photo") && <p.ui-pod-why>{need_of("photo").why}{need_of("photo").count > 1 ? ` ${need_of("photo").count} photos.` : ""}</p>}
+                    <PhotoEvidenceAdd tag={str(get(delivery, "address") ?? "")} job={get(delivery, "id") != null ? `Delivery ${delivery.id}` : null}
+                                      label={len(photos) > 0 ? "Add another photo" : "Take photo"} on_add={(p) => { photos = photos + [p] }}/>
+                    <PhotoEvidenceThumbs photos={photos} on_remove={(p) => { photos = photos | filter((x) => x.id != p.id) }}/>
+                </div>
+                <div.ui-pod-step data-kind="place" data-on={has("place") ? "" : null} data-now={current == "place" ? "" : null}>
+                    <h4 tabindex="-1">Place</h4>
+                    <Button size="lg" full={true} loading={locating} on_click={locate}>{place != null ? "Check again" : "Confirm the place"}</Button>
+                    <p.ui-pod-said role="status">{place_said}</p>
+                    {settings && <Button size="lg" variant="outline" on_click={() => { js("quilloNative.openSettings") }}>Open Settings</Button>}
+                    {place != null && <p.ui-pod-place>{photo_evidence_place_text(place)}{far != null ? `, ${far} m from the address` : ""}</p>}
+                    {too_far && <p.ui-pod-warn>That is {far} m from the address. Allowed: {place_need.within} m.</p>}
+                    {place_need != null && (too_far || (place == null && place_said != "" && !locating)) && (place_need.strict
+                        ? <p.ui-pod-warn>This delivery needs the place: try from nearer the address.</p>
+                        : <label class="ui-pod-label" for={`${id}-exception`}>Say why, for the receipt
+                            <textarea id={`${id}-exception`} rows="2" value={exception} @input={(e) => { exception = e.value }}></textarea>
+                        </label>)}
+                </div>
+                <div.ui-pod-step data-kind="review" data-on="" data-now={current == "review" ? "" : null}>
+                    <h4 tabindex="-1">Check and finish</h4>
+                    <ul.ui-pod-list>
+                        <li><span>Outcome</span><b>{proof_of_delivery_outcome_text(outcome)}</b></li>
+                        {for n in needs {
+                            let open = missing | any((m) => m.need == n.need)
+                            <li key={n.need} data-open={open ? "" : null}><span>{proof_of_delivery_need_text(n.need)}</span><b>{open ? "Missing" : "Done"}</b></li>
+                        }}
+                    </ul>
+                    <p.ui-pod-said role="status">{said}</p>
+                    <Button size="lg" full={true} disabled={outcome == null} on_click={finish}>Finish delivery</Button>
+                </div>
+            </div>
+            <div.ui-pod-nav>
+                <Button size="lg" variant="outline" disabled={here == 0} on_click={() => { move(steps[max([0, here - 1])]) }}>Back</Button>
+                <Button size="lg" disabled={outcome == null || here >= len(steps) - 1} on_click={() => { move(steps[min([len(steps) - 1, here + 1])]) }}>Next</Button>
+            </div>
+        </div>
+        {!online && receipt == null && <p.ui-pod-warn>No connection. Carry on: the receipt waits on this device.</p>}
+        {receipt != null && <div.ui-pod-receipt>
+            <h4>{sent ? "Delivered and sent" : (on_complete != null ? "Finished, waiting to send" : "Finished")}</h4>
+            <p.ui-pod-ref>{receipt.ref}</p>
+            <pre>{receipt.text}</pre>
+            {receipt.signature != null && <img.ui-pod-sign src={receipt.signature} alt="The signature"/>}
+            {len(receipt.photos) > 0 && <PhotoEvidenceThumbs photos={receipt.photos}/>}
+            <p.ui-pod-said role="status">{said}</p>
+            <div.ui-pod-acts>
+                <Button size="lg" on_click={share}>Share receipt</Button>
+                {on_complete != null && !sent && online && <Button size="lg" variant="outline" loading={sending} on_click={flush}>Try again</Button>}
+            </div>
+        </div>}
+    </section>
+}

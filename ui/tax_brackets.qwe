@@ -1,0 +1,286 @@
+// TaxBrackets: progressive income tax from brackets given as data. Income less deductions
+// is taxed a slice at a time, each bracket's rate on its own slice, so it shows the tax
+// from each one, with credits taken off the tax itself. It gives the effective rate (tax
+// over income) and the marginal rate (on the next unit of income, so an income exactly
+// on a boundary is at the higher rate, which only its next unit pays), the take-home, and
+// what a raise really adds once its slices are taxed. A loss, or deductions past the income,
+// is no tax. Credits stop at the tax unless they are refundable. The brackets can be
+// edited as JSON below the figures, and bad data says what is wrong with it.
+//
+//   <TaxBrackets income="62000" deductions="12000" credits="500" raise="5000" currency="EUR"
+//                brackets={[{ upto: 10000, rate: 10 }, { upto: 40000, rate: 20 }, { upto: null, rate: 30 }]}/>
+//   <TaxBrackets income={pay} raise="4%" on_change={(t) => { net = t.take_home }}/>
+//
+// brackets: a list of maps { upto, rate } from the lowest up, or the same as JSON text: upto is
+// where the bracket ends and null on the last, rate a percent. Left out, a plain 10/20/30 example.
+// income: may be negative. deductions, credits: where the fields start. raise: an amount or a percent
+// like "4%". refundable: credits past the tax are paid out (false). currency: ISO code ("USD"; one
+// Quillo does not know falls back to it). locale: how to write amounts (the program's). title: the
+// heading ("Income tax"). id: a prefix for its ids ("tax-brackets"), unique on the page. name: a prefix for
+// the names of its fields ("tax": tax_income, tax_deductions, tax_credits, tax_raise, tax_refundable,
+// tax_brackets). on_change(t): inside one of your components, after each change, given { taxable, tax,
+// effective, marginal, take_home, raise_kept } as decimals when the figures are good; raise_kept is
+// null without a raise. class: more classes for its outer element.
+//
+// tax_brackets_read_brackets(data), tax_brackets_figures(...) and tax_brackets_raise(...) are the
+// logic, for a program's own use.
+
+import ui/theme.qwe use ui_cls
+
+let tax_brackets_css = css`
+.ui-tax-brackets { container-type: inline-size; display: grid; gap: 16px; min-width: 0; max-width: 680px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-tax-brackets .ui-tax-brackets-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-tax-brackets-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px 14px; }
+.ui-tax-brackets-field { display: grid; gap: 5px; min-width: 0; align-content: start; }
+.ui-tax-brackets-field label { font-size: 13px; font-weight: 500; }
+.ui-tax-brackets-field input { box-sizing: border-box; width: 100%; min-width: 0; height: 36px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-tax-brackets-field input:hover, .ui-tax-brackets-data textarea:hover { border-color: var(--ui-strong); }
+.ui-tax-brackets-field input:focus, .ui-tax-brackets-data textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-tax-brackets-field input[aria-invalid], .ui-tax-brackets-data textarea[aria-invalid] { border-color: var(--ui-danger); }
+.ui-tax-brackets-check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.ui-tax-brackets-check input { margin: 0; accent-color: var(--ui-accent); }
+.ui-tax-brackets-errors { margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-tax-brackets-out { display: grid; gap: 12px; min-width: 0; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-tax-brackets-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.ui-tax-brackets-table th { padding: 4px 0; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: right; }
+.ui-tax-brackets-table td { padding: 4px 0; border-bottom: 1px solid var(--ui-border); text-align: right; overflow-wrap: anywhere; }
+.ui-tax-brackets-table th:first-child, .ui-tax-brackets-table td:first-child { text-align: left; }
+.ui-tax-brackets-table th + th, .ui-tax-brackets-table td + td { padding-left: 10px; }
+.ui-tax-brackets-next td { font-weight: 650; }
+.ui-tax-brackets-sums { display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; margin: 0; }
+.ui-tax-brackets-sums dt { color: var(--ui-muted); }
+.ui-tax-brackets-sums dd { margin: 0; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-tax-brackets-home { padding-top: 4px; color: var(--ui-fg) !important; font-size: 16px; font-weight: 700; }
+.ui-tax-brackets-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-tax-brackets-raise { margin: 0; padding: 8px 10px; border-radius: var(--ui-radius-sm); background: var(--ui-accent-soft); font-weight: 500; }
+.ui-tax-brackets-data { display: grid; gap: 6px; min-width: 0; }
+.ui-tax-brackets-data summary { width: fit-content; font-size: 13px; font-weight: 500; cursor: pointer; }
+.ui-tax-brackets-data summary:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px; border-radius: 3px; }
+.ui-tax-brackets-data label { display: block; margin: 6px 0 4px; color: var(--ui-muted); font-size: 12px; }
+.ui-tax-brackets-data textarea { box-sizing: border-box; width: 100%; min-height: 110px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.5 var(--ui-mono); }
+`
+
+// The currency's code, USD when Quillo does not know it.
+fn tax_brackets_code(currency) -> str {
+    let c = upper(trim(str(currency ?? "")))
+    type_of(money.minor_units(c)) == "error" ? "USD" : c
+}
+
+// What was typed as a decimal: 0 when empty, null when it is not a plain number up to
+// 100 billion, negative only if `signed`. A comma counts only as a thousands comma.
+fn tax_brackets_read(text, signed: bool) {
+    let t = replace(trim(str(text ?? "")), "−", "-")
+    if t == "" { return 0m }
+    if len(t) > 40 { return null }
+    let minus = signed && starts_with(t, "-")
+    let body = minus ? slice(t, 1, len(t)) : t
+    let plain = re.test(body, "^[0-9]{1,3}(,[0-9]{3})+(\\.[0-9]*)?$") ? replace(body, ",", "") : body
+    if !re.test(plain, "^([0-9]+\\.?[0-9]*|\\.[0-9]+)$") { return null }
+    let d = dec(plain)
+    if is_err(d) || d > 100000000000m { return null }
+    minus ? 0m - d : d
+}
+
+// The brackets as text for the box, one a line.
+fn tax_brackets_text(brackets) -> str {
+    if type_of(brackets) == "str" { return brackets }
+    if type_of(brackets) != "list" { return "[\n  {\"upto\": 10000, \"rate\": 10},\n  {\"upto\": 40000, \"rate\": 20},\n  {\"upto\": null, \"rate\": 30}\n]" }
+    let line = (b) => type_of(b) == "map" ? `  {"upto": ${b.upto == null ? "null" : str(b.upto)}, "rate": ${str(b.rate ?? 0)}}` : `  ${json.stringify(b)}`
+    `[\n${join(brackets | map(line), ",\n")}\n]`
+}
+
+// Brackets from a list or JSON text: { rows: [{ from, upto, rate }], error }; upto is null on
+// the last. An error says which bracket and what is wrong with it.
+fn tax_brackets_read_brackets(data) -> map {
+    let fail = (text: str) => ({ rows: [], error: text })
+    let parsed = type_of(data) == "str" ? (len(data) > 20000 ? err("too long") : json.parse(data)) : data
+    if is_err(parsed) { return fail("The brackets are not valid JSON.") }
+    if type_of(parsed) != "list" || len(parsed) == 0 { return fail("The brackets must be a list with at least one bracket.") }
+    if len(parsed) > 40 { return fail("At most 40 brackets.") }
+    let rows = []
+    let from = 0m
+    for [i, b] in enumerate(parsed) {
+        let n = i + 1
+        if type_of(b) != "map" { return fail(`Bracket ${n} must be a map with upto and rate.`) }
+        let rate = contains(["int", "float", "dec", "str"], type_of(b.rate)) ? tax_brackets_read(b.rate, false) : null
+        if rate == null || rate > 100m { return fail(`Bracket ${n} needs a rate from 0 to 100.`) }
+        let last_one = i == len(parsed) - 1
+        if b.upto == null {
+            if !last_one { return fail(`Bracket ${n} has no upper limit, so only the last may leave it out.`) }
+            rows = rows | push({ from, upto: null, rate })
+        } else {
+            if last_one { return fail(`The last bracket must have no upper limit (upto: null), so that every income is covered.`) }
+            let upto = contains(["int", "float", "dec", "str"], type_of(b.upto)) ? tax_brackets_read(b.upto, false) : null
+            if upto == null { return fail(`Bracket ${n} needs upto to be a number.`) }
+            if upto <= from { return fail(`Bracket ${n} ends at ${upto}, which is not above where it starts, ${from}.`) }
+            rows = rows | push({ from, upto, rate })
+            from = upto
+        }
+    }
+    { rows, error: null }
+}
+
+// The bracket the next unit of a taxable amount (minor units) falls in: an amount exactly on
+// a limit is past it, since that limit's bracket is already full.
+fn tax_brackets_marginal(taxable: int, brackets: list, code: str) -> dec {
+    let top = (b: map) => money.to_minor(money.of(b.upto, code, "half_up"))
+    let found = brackets | find((b) => b.upto == null || taxable < top(b))
+    found == null ? last(brackets).rate : found.rate
+}
+
+// The tax on an income. income, deductions, credits: minor units, income perhaps below 0;
+// brackets as tax_brackets_read_brackets gives. Gives { taxable, slices: [{ from, upto, rate,
+// amount, tax, next }], before, used, unused, tax, take_home, effective, marginal }.
+// Each slice is rounded half up to the unit, so that the slices add up to the tax shown.
+fn tax_brackets_figures(income: int, deductions: int, credits: int, refundable: bool, brackets: list, code: str) -> map {
+    let minor = (x: dec) => money.to_minor(money.of(x, code, "half_up"))
+    let taxable = max([income - deductions, 0])
+    let marginal = tax_brackets_marginal(taxable, brackets, code)
+    let next_from = (brackets | find((b) => b.upto == null || taxable < minor(b.upto))) ?? last(brackets)
+    let slices = brackets | map((b) => {
+        let low = minor(b.from)
+        let high = b.upto == null ? taxable : min([taxable, minor(b.upto)])
+        let amount = max([high - low, 0])
+        { from: b.from, upto: b.upto, rate: b.rate, amount, tax: int(round(dec(amount) * b.rate / 100, 0, "half_up")), next: b.from == next_from.from }
+    })
+    let before = sum(slices | map((s) => s.tax))
+    let used = refundable ? credits : min([credits, before])
+    let tax = before - used
+    { taxable, slices, before, used, unused: credits - used, tax, take_home: income - tax,
+      effective: income > 0 ? round(dec(tax) * 100 / dec(income), 2, "half_up") : 0m, marginal }
+}
+
+// What a raise of `amount` minor units does: { new, extra_tax, kept, share, crossed } from the
+// figures before it: kept is what reaches take-home, share its percent, crossed the rates of
+// the brackets the raise reaches beyond the one it starts in.
+fn tax_brackets_raise(income: int, amount: int, deductions: int, credits: int, refundable: bool, brackets: list, code: str) -> map {
+    let before = tax_brackets_figures(income, deductions, credits, refundable, brackets, code)
+    let after = tax_brackets_figures(income + amount, deductions, credits, refundable, brackets, code)
+    let kept = after.take_home - before.take_home
+    let starts = before.slices | enumerate() | filter((row) => row[1].next) | map((row) => row[0]) | first()
+    let ends = after.slices | enumerate() | filter((row) => row[1].next) | map((row) => row[0]) | first()
+    let crossed = (ends ?? 0) > (starts ?? 0) ? slice(brackets, (starts ?? 0) + 1, (ends ?? 0) + 1) | map((b) => b.rate) : []
+    { after, extra_tax: after.tax - before.tax, kept, share: amount > 0 ? round(dec(kept) * 100 / dec(amount), 1, "half_up") : 0m, crossed }
+}
+
+// A raise as typed: { percent, value }, or null when it is neither an amount nor a percent.
+fn tax_brackets_read_raise(text) {
+    let t = trim(str(text ?? ""))
+    if ends_with(t, "%") {
+        let p = tax_brackets_read(trim(slice(t, 0, len(t) - 1)), false)
+        return p == null || p > 1000m ? null : { percent: true, value: p }
+    }
+    let a = tax_brackets_read(t, false)
+    a == null ? null : { percent: false, value: a }
+}
+
+// All the figures from the fields as typed: { errors, brackets, income, raise, figures,
+// raised }; figures is null with errors.
+fn tax_brackets_work(income_text, deductions_text, credits_text, raise_text, refundable: bool, data, code: str) -> map {
+    let errors = []
+    let income = tax_brackets_read(income_text, true)
+    let deductions = tax_brackets_read(deductions_text, false)
+    let credits = tax_brackets_read(credits_text, false)
+    let rise = tax_brackets_read_raise(raise_text)
+    let table = tax_brackets_read_brackets(data)
+    if income == null { errors = errors | push({ field: "income", text: "The income must be a number, up to 100,000,000,000." }) }
+    if deductions == null { errors = errors | push({ field: "deductions", text: "The deductions must be a number of 0 or more." }) }
+    if credits == null { errors = errors | push({ field: "credits", text: "The credits must be a number of 0 or more." }) }
+    if rise == null { errors = errors | push({ field: "raise", text: "The raise must be an amount or a percent like 4%." }) }
+    if table.error != null { errors = errors | push({ field: "brackets", text: table.error }) }
+    if len(errors) > 0 { return { errors, brackets: [], income: 0, figures: null, raised: null } }
+    let minor = (x: dec) => money.to_minor(money.of(x, code, "half_up"))
+    let whole = minor(abs(income)) * (income < 0m ? -1 : 1)
+    let less = minor(deductions)
+    let off = minor(credits)
+    let raise_by = rise.percent ? max([0, int(round(dec(whole) * rise.value / 100, 0, "half_up"))]) : minor(rise.value)
+    { errors, brackets: table.rows, income: whole,
+      figures: tax_brackets_figures(whole, less, off, refundable, table.rows, code),
+      raised: raise_by > 0 ? merge(tax_brackets_raise(whole, raise_by, less, off, refundable, table.rows, code), { amount: raise_by }) : null }
+}
+
+component TaxBrackets(brackets = null, income = null, deductions = null, credits = null, raise = null, refundable: bool = false, currency: str = "USD", locale: str? = null,
+                      title: str = "Income tax", id: str = "tax-brackets", name: str = "tax", on_change = null, class: str? = null) {
+    style global tax_brackets_css
+    state income_text = income == null ? "" : str(income)
+    state deductions_text = deductions == null ? "" : str(deductions)
+    state credits_text = credits == null ? "" : str(credits)
+    state raise_text = raise == null ? "" : str(raise)
+    state pays_out = refundable
+    state data_text = tax_brackets_text(brackets)
+    let code = tax_brackets_code(currency)
+    let work = tax_brackets_work(income_text, deductions_text, credits_text, raise_text, pays_out, data_text, code)
+    let t = work.figures
+    let ok = t != null
+    let shown = (minor: int) => locale != null ? money.format(money.from_minor(minor, code), locale) : money.format(money.from_minor(minor, code))
+    let shown_limit = (x: dec) => locale != null ? money.format(money.of(x, code, "half_up"), locale) : money.format(money.of(x, code, "half_up"))
+    let range_of = (s: map) => s.upto == null ? `Over ${shown_limit(s.from)}` : `${shown_limit(s.from)} to ${shown_limit(s.upto)}`
+    let bad = (field: str) => work.errors | any((e) => e.field == field)
+    let field_id = (part: str) => `${id}-${part}`
+    let named = (part: str) => `${name}_${part}`
+    let tell = () => {
+        if on_change != null && ok {
+            let amount = (minor: int) => money.from_minor(minor, code).amount
+            on_change({ taxable: amount(t.taxable), tax: amount(t.tax), effective: t.effective, marginal: t.marginal, take_home: amount(t.take_home), raise_kept: work.raised == null ? null : amount(work.raised.kept) })
+        }
+    }
+    <section class={ui_cls(["ui-tax-brackets", class])} aria-labelledby={field_id("title")}>
+        <h3.ui-tax-brackets-title id={field_id("title")}>{title}</h3>
+        <div.ui-tax-brackets-grid>
+            <div.ui-tax-brackets-field>
+                <label for={field_id("income")}>Income ({code})</label>
+                <input type="text" inputmode="decimal" autocomplete="off" id={field_id("income")} name={named("income")} value={income_text} placeholder="0.00" aria-invalid={bad("income") ? "true" : null}
+                       @input={(e) => { income_text = e.value; tell() }}/>
+            </div>
+            <div.ui-tax-brackets-field>
+                <label for={field_id("deductions")}>Deductions</label>
+                <input type="text" inputmode="decimal" autocomplete="off" id={field_id("deductions")} name={named("deductions")} value={deductions_text} placeholder="0.00" aria-invalid={bad("deductions") ? "true" : null}
+                       @input={(e) => { deductions_text = e.value; tell() }}/>
+            </div>
+            <div.ui-tax-brackets-field>
+                <label for={field_id("credits")}>Credits</label>
+                <input type="text" inputmode="decimal" autocomplete="off" id={field_id("credits")} name={named("credits")} value={credits_text} placeholder="0.00" aria-invalid={bad("credits") ? "true" : null}
+                       @input={(e) => { credits_text = e.value; tell() }}/>
+            </div>
+            <div.ui-tax-brackets-field>
+                <label for={field_id("raise")}>A raise of</label>
+                <input type="text" autocomplete="off" id={field_id("raise")} name={named("raise")} value={raise_text} placeholder="5000 or 4%" aria-invalid={bad("raise") ? "true" : null}
+                       @input={(e) => { raise_text = e.value; tell() }}/>
+            </div>
+        </div>
+        <label.ui-tax-brackets-check><input type="checkbox" name={named("refundable")} checked={pays_out} @change={(e) => { pays_out = e.checked; tell() }}/> Credits past the tax are paid out</label>
+        {len(work.errors) > 0 && <ul.ui-tax-brackets-errors role="alert">{for e in work.errors => <li key={e.field}>{e.text}</li>}</ul>}
+        {ok && <div.ui-tax-brackets-out aria-live="polite">
+            <table.ui-tax-brackets-table>
+                <thead><tr><th scope="col">Bracket</th><th scope="col">Rate</th><th scope="col">Taxed</th><th scope="col">Tax</th></tr></thead>
+                <tbody>
+                    {for s in t.slices => <tr class={s.next ? "ui-tax-brackets-next" : null} key={str(s.from)}><td>{range_of(s)}</td><td>{s.rate}%</td><td>{shown(s.amount)}</td><td>{shown(s.tax)}</td></tr>}
+                </tbody>
+            </table>
+            <dl.ui-tax-brackets-sums>
+                <dt>Taxable income</dt><dd data-key="taxable">{shown(t.taxable)}</dd>
+                <dt>Tax before credits</dt><dd data-key="before">{shown(t.before)}</dd>
+                <dt>Credits used</dt><dd data-key="used">{shown(t.used)}</dd>
+                <dt>Tax</dt><dd data-key="tax">{shown(t.tax)}</dd>
+                <dt>Effective rate</dt><dd data-key="effective">{t.effective}%</dd>
+                <dt>Marginal rate</dt><dd data-key="marginal">{t.marginal}%</dd>
+                <dt.ui-tax-brackets-home>Take-home</dt><dd.ui-tax-brackets-home data-key="home">{shown(t.take_home)}</dd>
+            </dl>
+            {work.income < 0 && <p.ui-tax-brackets-note>A loss is not taxed.</p>}
+            {t.unused > 0 && <p.ui-tax-brackets-note data-key="unused">{shown(t.unused)} of the credits is more than the tax, and goes unused.</p>}
+            {work.raised != null && <p.ui-tax-brackets-raise data-key="raise">
+                {`Of a raise of ${shown(work.raised.amount)} you keep ${shown(work.raised.kept)} (${work.raised.share}%), as tax goes up by ${shown(work.raised.extra_tax)}.`}
+                {len(work.raised.crossed) > 0 ? ` Part of it falls in the ${join(work.raised.crossed | map((r) => `${r}%`), " and ")} ${len(work.raised.crossed) == 1 ? "bracket" : "brackets"}.` : ""}
+                {work.raised.extra_tax == 0 && len(work.raised.crossed) == 0 ? " It adds no tax." : ""}
+            </p>}
+        </div>}
+        <details.ui-tax-brackets-data open={bad("brackets") ? true : null}>
+            <summary>Edit the brackets</summary>
+            <label for={field_id("brackets")}>Brackets as JSON, each with upto and rate, the last with upto null</label>
+            <textarea id={field_id("brackets")} name={named("brackets")} rows="6" spellcheck="false" aria-invalid={bad("brackets") ? "true" : null} @input={(e) => { data_text = e.value; tell() }}>{data_text}</textarea>
+        </details>
+    </section>
+}

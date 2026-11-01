@@ -1,0 +1,230 @@
+// RetryBanner: what failed to load, and when it will be tried again, as a countdown that
+// backs off each time, with a Try now. It tries by itself, stops counting while offline
+// and tries at once on return, waits while the app is in the background, and goes away when
+// everything has loaded.
+//
+//   import ui/retry_banner.qwe use RetryBanner
+//
+//   component Prices() {
+//       state failed = []
+//       <RetryBanner loads={failed} on_retry={(l) => { load_again(l.id) }} on_clear={() => { failed = [] }}/>
+//   }
+//
+// loads: what failed, each { id, label } or a word. Give a new list as things fail; one
+// taken out of the list goes, and an id that fails again later comes back.
+// on_retry(load): tries one again, and may wait. Anything but these counts as loaded: false,
+// { ok: false }, an error value, or { retry_after: seconds }, for a server that said when
+// (Retry-After), which is waited for in place of the back-off. on_clear(): all loaded.
+// on_give_up(loads): max_tries were used up.
+// base_ms: the first wait (2000). factor: what each wait is multiplied by (2). limit_ms: the
+// longest wait (60000). jitter: a share of the wait added at random, so that a thousand
+// phones do not come back in one moment (0.1). max_tries: stop counting after this many
+// failures in a row, leaving Try now (never). title: the heading, for what it says in place of
+// "2 things did not load". place: "inline", "top" or "bottom", the last two fixed to the
+// screen, clear of the notch and the home bar. wait_ms: how long a try may take (20000). id, class.
+//
+// A try that loads anything starts the back-off again, as the far end is plainly alive. Try
+// now does not lengthen it: a person pressing it is not a machine failing. The countdown goes
+// by the clock, so it is right after the system has stopped the page's timers.
+//
+// retry_banner_delay(attempt, base, factor, limit) is the wait, and
+// retry_banner_outcome(answer) reads an answer.
+
+import ui/theme.qwe use ui_cls
+
+let retry_banner_css = css`
+.ui-rtry-host { position: relative; min-width: 0; }
+.ui-rtry { container-type: inline-size; box-sizing: border-box; min-width: 0; border: 1px solid color-mix(in srgb, var(--ui-danger) 40%, var(--ui-border)); border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-rtry-top { position: fixed; z-index: 45; top: 0; left: 0; right: 0; padding-top: env(safe-area-inset-top); border-width: 0 0 1px; border-radius: 0; }
+.ui-rtry-bottom { position: fixed; z-index: 45; bottom: 0; left: 0; right: 0; padding-bottom: env(safe-area-inset-bottom); border-width: 1px 0 0; border-radius: 0; }
+.ui-rtry-in { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; align-items: center; padding: 10px 12px; padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
+.ui-rtry-text { display: grid; gap: 1px; min-width: 0; }
+.ui-rtry-title { margin: 0; font-weight: 600; }
+.ui-rtry-what { margin: 0; overflow-wrap: anywhere; color: var(--ui-muted); font-size: 14px; }
+.ui-rtry-line { margin: 0; font-size: 14px; font-variant-numeric: tabular-nums; }
+.ui-rtry-btn { min-width: 88px; min-height: 46px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 600 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-rtry-btn:disabled { color: var(--ui-muted); cursor: default; }
+.ui-rtry-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-rtry-track { height: 3px; overflow: hidden; background: color-mix(in srgb, var(--ui-danger) 15%, transparent); }
+.ui-rtry-fill { height: 100%; background: var(--ui-danger); transition: width .25s linear; }
+.ui-rtry-ok { margin: 0; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-success-soft); color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+@media (hover: hover) { .ui-rtry-btn:hover:enabled { border-color: var(--ui-strong); background: var(--ui-subtle); } }
+@media (prefers-reduced-motion: reduce) { .ui-rtry-fill { transition: none; } }
+`
+
+// The list as it should be: { id, label }, a word counting as both.
+fn retry_banner_clean(loads) -> list {
+    if type_of(loads) != "list" { return [] }
+    let good = loads | map((l) => {
+        if type_of(l) == "str" && l != "" { return { id: l, label: l } }
+        if type_of(l) == "map" && l.id != null { return { id: str(l.id), label: str(l.label ?? l.id) } }
+        null
+    }) | filter((l) => l != null)
+    let ids = good | map((l) => l.id)
+    good | enumerate | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// How long to wait before a try, given the failures so far. The power is held down, so
+// nothing grows past what a number can hold.
+fn retry_banner_delay(attempt: int, base: int, factor: num, limit: int) -> int {
+    let once = max([1, base])
+    let times = pow(max([1, factor]), min([max([0, attempt]), 40]))
+    min([limit, round(once * times)])
+}
+
+// What an answer means: { ok, after (seconds, or null) }.
+fn retry_banner_outcome(r) -> map {
+    if is_err(r) || r == false { return { ok: false, after: null } }
+    if type_of(r) == "map" {
+        let after = type_of(r.retry_after) == "int" || type_of(r.retry_after) == "float" ? r.retry_after : null
+        if after != null && after > 0 { return { ok: false, after } }
+        if r.ok == false { return { ok: false, after: null } }
+    }
+    { ok: true, after: null }
+}
+
+fn retry_banner_title(n: int) -> str = n == 1 ? "1 thing did not load" : `${n} things did not load`
+
+// A wait as words.
+fn retry_banner_wait(s: int) -> str = s < 60 ? `${s} s` : (s % 60 == 0 ? `${floor(s / 60)} min` : `${floor(s / 60)} min ${s % 60} s`)
+
+// The line under it, for each state it can be in.
+fn retry_banner_line(trying: bool, offline: bool, stopped: bool, left) -> str {
+    if trying { return "Trying again…" }
+    if offline { return "Waiting for the connection." }
+    if stopped { return "Stopped trying. Try now when you are ready." }
+    left != null ? `Trying again in ${retry_banner_wait(left)}` : ""
+}
+
+// What a screen reader hears: the state, not every second of the countdown.
+fn retry_banner_said(n: int, trying: bool, offline: bool, stopped: bool, shown: bool) -> str {
+    if n == 0 { return shown ? "All loaded." : "" }
+    if trying { return "Trying again." }
+    if offline { return `${retry_banner_title(n)}. Waiting for the connection.` }
+    if stopped { return `${retry_banner_title(n)}. Stopped trying.` }
+    `${retry_banner_title(n)}. It will be tried again.`
+}
+
+component RetryBanner(loads = [], on_retry = null, on_clear = null, on_give_up = null, base_ms: int = 2000, factor: num = 2, limit_ms: int = 60000, jitter: num = 0.1,
+                      max_tries: int? = null, title: str? = null, place: str = "inline", wait_ms: int = 20000, id: str? = null, class: str? = null) {
+    style global retry_banner_css
+    let all = retry_banner_clean(loads)
+    state cleared = []
+    state started = false
+    state attempt = 0
+    state deadline = null
+    state span = 1
+    state rest = 0
+    state trying = false
+    state stopped = false
+    state offline = false
+    state hidden = false
+    state flash = false
+    let open = all | filter((l) => !contains(cleared, l.id))
+    let left = deadline != null ? ceil(rest / 1000) : null
+    let share = deadline != null ? round(rest * 100 / span) : 0
+    // One no longer listed may fail again later.
+    if len(cleared | filter((c) => !contains(all | map((l) => l.id), c))) > 0 {
+        cleared = cleared | filter((c) => contains(all | map((l) => l.id), c))
+    }
+    let plan = (ms: int) => {
+        span = ms
+        rest = ms
+        deadline = now() + ms
+    }
+    let extra = () => floor(retry_banner_delay(attempt, base_ms, factor, limit_ms) * jitter * random())
+    // What failed is there, and nothing is counting: start. Also the first time, and after a return.
+    if started && len(open) > 0 && deadline == null && !trying && !stopped && !offline {
+        plan(retry_banner_delay(attempt, base_ms, factor, limit_ms) + extra())
+    }
+    let call = (l: map) => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            js("AbortSignal.timeout", wait_ms).addEventListener("abort", (_e = null) => { done(err("no answer")) })
+            js("Promise.resolve", on_retry({ id: l.id, label: l.label })).then(done, (_e = null) => { done(err("failed")) })
+        }))
+    }
+    let attempt_all = (manual: bool) => {
+        if !trying && on_retry != null {
+            trying = true
+            deadline = null
+            stopped = false
+            let good = false
+            let after = null
+            for l in open {
+                let out = retry_banner_outcome(call(l))
+                if out.ok {
+                    cleared = cleared | push(l.id)
+                    good = true
+                } else if out.after != null {
+                    after = out.after
+                }
+            }
+            let still = all | filter((l) => !contains(cleared, l.id))
+            if len(still) == 0 {
+                attempt = 0
+                flash = true
+                trying = false
+                on_clear && on_clear()
+            } else {
+                attempt = good ? 0 : (manual ? attempt : attempt + 1)
+                if !good && max_tries != null && attempt >= max_tries {
+                    stopped = true
+                    on_give_up && on_give_up(still)
+                } else if after != null {
+                    plan(round(after * 1000))
+                }
+                trying = false
+            }
+        }
+    }
+    let tick = () => {
+        if deadline != null && !hidden && !offline {
+            let ms = deadline - now()
+            rest = max([0, ms])
+            if ms <= 0 { attempt_all(false) }
+        }
+    }
+    if started && len(open) > 0 { every(250, tick) }
+    if flash { every(2500, () => { flash = false }) }
+    <div.ui-rtry-host @mount={(_el) => {
+        let w = js("window")
+        let d = js("document")
+        offline = js("navigator.onLine") == false
+        hidden = d.hidden
+        let went = (_e = null) => {
+            offline = true
+            deadline = null
+        }
+        let came = (_e = null) => {
+            offline = false
+            if len(all | filter((l) => !contains(cleared, l.id))) > 0 { attempt_all(false) }
+        }
+        let turned = (_e = null) => {
+            hidden = d.hidden
+            tick()
+        }
+        w.addEventListener("offline", went)
+        w.addEventListener("online", came)
+        d.addEventListener("visibilitychange", turned)
+        started = true
+        () => {
+            w.removeEventListener("offline", went)
+            w.removeEventListener("online", came)
+            d.removeEventListener("visibilitychange", turned)
+        }
+    }}>
+        <span.ui-sr role="status">{retry_banner_said(len(open), trying, offline, stopped, flash)}</span>
+        {len(open) > 0 && <div class={ui_cls(["ui-rtry", place == "top" && "ui-rtry-top", place == "bottom" && "ui-rtry-bottom", class])} id={id}>
+            <div.ui-rtry-in>
+                <div.ui-rtry-text>
+                    <p.ui-rtry-title>{title ?? retry_banner_title(len(open))}</p>
+                    <p.ui-rtry-what>{join(open | map((l) => l.label), ", ")}</p>
+                    <p.ui-rtry-line>{retry_banner_line(trying, offline, stopped, left)}</p>
+                </div>
+                {on_retry != null && <button.ui-rtry-btn type="button" disabled={trying} @click={() => { attempt_all(true) }}>Try now</button>}
+            </div>
+            <div.ui-rtry-track aria-hidden="true"><div.ui-rtry-fill style={`width: ${share}%`}></div></div>
+        </div>}
+        {len(open) == 0 && flash && <p.ui-rtry-ok>All loaded</p>}
+    </div>
+}

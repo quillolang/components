@@ -1,0 +1,313 @@
+// FullscreenPicker: when a <select> has too much in it for a phone. It covers the screen with
+// a list and a search box, Cancel and Done in the header, and gives back what was chosen.
+// The list is never hidden by the on-screen keyboard: it ends where the keyboard starts,
+// dragging the list puts the keyboard away, as on a phone's own lists, and the keyboard's
+// own search key does too. On a tablet it is a card in the middle of the screen.
+//
+//   import ui/fullscreen_picker.qwe use FullscreenPicker
+//
+//   <FullscreenPicker title="Country" trigger="Country" items={countries} value="PT" name="country"
+//                     on_done={(code) => { country = code }}/>
+//   <FullscreenPicker title="Toppings" items={toppings} multiple={true} value={["ham"]} open={asking}
+//                     on_done={(list) => { chosen = list; asking = false }} on_cancel={() => { asking = false }}/>
+//
+// items: a list of plain text, or of maps with label, value (its label when left out),
+// hint (smaller text, also searched) and disabled. value: what is chosen to begin with: a
+// value, or a list of them with multiple. multiple: any number can be chosen. title: its
+// heading ("Choose"). trigger: the text of a button that opens it, which goes on to show
+// what is chosen. Inside one of your components, open it from your own state: open={...}.
+// name: sends the choice with a form, in a hidden input (with multiple, joined by commas).
+// placeholder: in the search box ("Search"). done, cancel: the header's words. empty: said
+// when nothing matches. limit: the most rows shown at once (200): a list of thousands stays
+// fast, and it says to type more. id: its elements' ids start with this; give each on a page
+// its own (the name, or "picker"). on_done(value): called on Done, with the value, or
+// null, or the list with multiple. on_cancel(): called on Cancel, Escape or the back gesture,
+// which put the choice back as it was.
+//
+// Search ignores case and accents, needs every word typed, and puts names starting with
+// what was typed first, then names with a word starting with it. Up and Down move in the
+// list from the search box, and Enter chooses.
+
+import ui/button.qwe use Button
+import ui/bottom_sheet.qwe use bottom_sheet_back, bottom_sheet_keyboard_watch
+
+let fullscreen_picker_css = css`
+html:has(.ui-fullscreen-picker[open]) { overflow: hidden; }
+.ui-fullscreen-picker-host { display: contents; }
+.ui-fullscreen-picker {
+  position: fixed; inset: var(--ui-fullscreen-picker-top, 0px) 0 auto 0; box-sizing: border-box; flex-direction: column; width: 100%; max-width: none;
+  height: var(--ui-fullscreen-picker-h, 100dvh); max-height: none; margin: 0; padding: 0; overflow: hidden; border: 0;
+  background: var(--ui-surface); color: var(--ui-fg); font: 15px/1.4 var(--ui-font); overscroll-behavior: contain;
+  transform: translateY(100%); transition: transform .3s cubic-bezier(.22, 1, .36, 1), overlay .3s allow-discrete, display .3s allow-discrete;
+}
+.ui-fullscreen-picker[open] { display: flex; transform: none; }
+@starting-style { .ui-fullscreen-picker[open] { transform: translateY(100%); } }
+.ui-fullscreen-picker::backdrop { background: var(--ui-overlay); }
+.ui-fullscreen-picker-head {
+  display: flex; align-items: center; gap: 4px; flex: none; padding: max(4px, env(safe-area-inset-top)) max(4px, env(safe-area-inset-right)) 4px max(4px, env(safe-area-inset-left));
+  border-bottom: 1px solid var(--ui-border);
+}
+.ui-fullscreen-picker-head h2 { flex: 1; min-width: 0; margin: 0; overflow: hidden; font-size: 17px; font-weight: 600; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+.ui-fullscreen-picker-word {
+  flex: none; min-width: 64px; height: 44px; padding: 0 12px; border: 0; border-radius: var(--ui-radius-sm); background: transparent;
+  color: var(--ui-accent); font: 16px var(--ui-font); cursor: pointer;
+}
+.ui-fullscreen-picker-done { font-weight: 600; }
+.ui-fullscreen-picker-word:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-fullscreen-picker-search { flex: none; padding: 8px 12px; border-bottom: 1px solid var(--ui-border); }
+/* 16px, or iOS zooms the page when the box takes focus. */
+.ui-fullscreen-picker-input {
+  box-sizing: border-box; display: block; width: 100%; height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-subtle); color: var(--ui-fg); font: 16px var(--ui-font);
+}
+.ui-fullscreen-picker-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-fullscreen-picker-list { position: relative; flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding-bottom: env(safe-area-inset-bottom); }
+.ui-fullscreen-picker-row {
+  display: flex; align-items: center; gap: 12px; box-sizing: border-box; width: 100%; min-height: 52px; padding: 6px 16px; border: 0; border-bottom: 1px solid var(--ui-border);
+  background: transparent; color: var(--ui-fg); font: 16px/1.3 var(--ui-font); text-align: left; cursor: pointer;
+}
+.ui-fullscreen-picker-row:disabled { color: var(--ui-muted); opacity: .6; cursor: not-allowed; }
+.ui-fullscreen-picker-row:active:not(:disabled), .ui-fullscreen-picker-active { background: var(--ui-subtle); }
+@media (hover: hover) { .ui-fullscreen-picker-row:hover:not(:disabled) { background: var(--ui-subtle); } }
+.ui-fullscreen-picker-row:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: -2px; }
+.ui-fullscreen-picker-label { flex: 1; min-width: 0; }
+.ui-fullscreen-picker-hint { display: block; color: var(--ui-muted); font-size: 13px; }
+.ui-fullscreen-picker-tick { flex: none; width: 20px; height: 20px; color: var(--ui-accent); opacity: 0; }
+.ui-fullscreen-picker-row[aria-selected="true"] .ui-fullscreen-picker-tick { opacity: 1; }
+.ui-fullscreen-picker-note { margin: 0; padding: 20px 16px; color: var(--ui-muted); text-align: center; }
+/* A <dialog> sits over the whole window, so the window's width is the right one to ask, Split View included. */
+@media (min-width: 600px) {
+  .ui-fullscreen-picker {
+    inset: 0 0 var(--ui-fullscreen-picker-kb, 0px) 0; width: 560px; height: min(720px, calc(100dvh - 48px - var(--ui-fullscreen-picker-kb, 0px))); margin: auto;
+    border: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 6px); box-shadow: var(--ui-shadow-lg);
+    transform: translateY(24px); opacity: 0; transition: transform .2s, opacity .2s, overlay .2s allow-discrete, display .2s allow-discrete;
+  }
+  .ui-fullscreen-picker[open] { opacity: 1; }
+  @starting-style { .ui-fullscreen-picker[open] { transform: translateY(24px); opacity: 0; } }
+}
+@media (prefers-reduced-motion: reduce) { .ui-fullscreen-picker { transition: none; } }
+`
+
+let fullscreen_picker_marks = {
+    "à": "a", "á": "a", "â": "a", "ã": "a", "ä": "a", "å": "a", "ā": "a", "ă": "a", "ą": "a", "æ": "ae", "ç": "c", "ć": "c", "č": "c", "ď": "d", "đ": "d",
+    "è": "e", "é": "e", "ê": "e", "ë": "e", "ē": "e", "ė": "e", "ę": "e", "ě": "e", "ğ": "g", "ì": "i", "í": "i", "î": "i", "ï": "i", "ī": "i", "ı": "i",
+    "ł": "l", "ñ": "n", "ń": "n", "ň": "n", "ò": "o", "ó": "o", "ô": "o", "õ": "o", "ö": "o", "ø": "o", "ō": "o", "ő": "o", "œ": "oe", "ř": "r", "ś": "s",
+    "š": "s", "ş": "s", "ß": "ss", "ť": "t", "ț": "t", "ù": "u", "ú": "u", "û": "u", "ü": "u", "ū": "u", "ů": "u", "ű": "u", "ý": "y", "ÿ": "y", "ź": "z", "ż": "z", "ž": "z" }
+
+// Text as search sees it: lower case, without accents.
+fn fullscreen_picker_fold(s) {
+    let chars = split(lower(str(s ?? "")), "")
+    join(chars | map((c) => get(fullscreen_picker_marks, c, c)), "")
+}
+
+// Plain text or maps, into rows each with its search text. Bad rows are left out.
+fn fullscreen_picker_rows(items) {
+    let list_of = type_of(items) == "list" ? items : []
+    let good = list_of | filter((i) => {
+        let kind = type_of(i)
+        kind == "str" || kind == "int" || kind == "float" || (kind == "map" && (i.label != null || i.value != null))
+    })
+    let made = good | map((i) => {
+        let is_map = type_of(i) == "map"
+        let label = str(is_map ? (i.label ?? i.value) : i)
+        let value = is_map ? (i.value ?? i.label) : i
+        let hint = is_map && i.hint != null ? str(i.hint) : ""
+        { key: str(value), value: value, label: label, hint: hint, disabled: is_map && i.disabled == true,
+          name: fullscreen_picker_fold(label), hay: fullscreen_picker_fold(`${label} ${hint}`) }
+    })
+    made
+}
+
+// Those that have every word typed, the best first: what starts with the words, then what
+// has a word starting with the first, then the rest, each in their own order.
+fn fullscreen_picker_match(rows, typed) {
+    let q = trim(fullscreen_picker_fold(typed))
+    if q == "" { return rows }
+    let words = split(q, " ") | filter((w) => w != "")
+    let hits = rows | filter((r) => all(words, (w) => contains(r.hay, w)))
+    let first = words[0]
+    let starts = hits | filter((r) => starts_with(r.name, q))
+    let inside = hits | filter((r) => !starts_with(r.name, q) && contains(` ${r.name}`, ` ${first}`))
+    let rest = hits | filter((r) => !starts_with(r.name, q) && !contains(` ${r.name}`, ` ${first}`))
+    starts + inside + rest
+}
+
+// What is chosen, as keys, from a value, a list of them, or nothing.
+fn fullscreen_picker_keys(value, multiple: bool) {
+    if value == null { return [] }
+    if type_of(value) == "list" { return value | map((v) => str(v)) }
+    multiple ? (str(value) == "" ? [] : [str(value)]) : [str(value)]
+}
+
+// The next row a key leads to, from `from` (-1 for none yet), skipping disabled rows, stopping
+// at the ends.
+fn fullscreen_picker_step(rows, from: int, by: int) {
+    let i = from + by
+    let found = from
+    let looking = true
+    while looking && i >= 0 && i < len(rows) {
+        if !rows[i].disabled {
+            found = i
+            looking = false
+        }
+        i = i + by
+    }
+    found
+}
+
+// A button's words: what was asked, and what is chosen, by its label.
+fn fullscreen_picker_said(trigger, rows, keys) {
+    let names = rows | filter((r) => contains(keys, r.key)) | map((r) => r.label)
+    if len(names) == 0 { return trigger }
+    len(names) == 1 ? `${trigger}: ${names[0]}` : `${trigger}: ${len(names)} chosen`
+}
+
+component FullscreenPicker(items = [], title: str = "Choose", value = null, multiple: bool = false, trigger: str? = null,
+                           name: str? = null, placeholder: str = "Search", done: str = "Done", cancel: str = "Cancel",
+                           empty: str = "Nothing matches", limit: int = 200, id: str? = null, open: bool = false,
+                           on_done = null, on_cancel = null) {
+    style global fullscreen_picker_css
+    let rows = fullscreen_picker_rows(items)
+    state dlg = null
+    state input = null
+    state list_box = null
+    state win = null
+    state q = ""
+    state kept = fullscreen_picker_keys(value, multiple)    // what is chosen, past Done
+    state picked = kept                                     // what is ticked now
+    state active = -1
+    state finished = false
+    state undo_back = null
+    state undo_kb = null
+    let base = id ?? name ?? "picker"
+    let found = fullscreen_picker_match(rows, q)
+    let room = max([1, limit])
+    let shown = take(found, room)
+    let shut = () => { dlg.close() }
+    let forget = () => {
+        undo_kb && undo_kb()
+        undo_kb = null
+        undo_back && undo_back()
+        undo_back = null
+    }
+    let show = () => {
+        q = ""
+        active = -1
+        picked = kept
+        finished = false
+        input.value = ""
+        dlg.showModal()
+        list_box.scrollTop = 0
+        undo_kb = bottom_sheet_keyboard_watch(win, (px) => {
+            let seen = win.visualViewport
+            let up = px > 0 && seen != null
+            dlg.style.setProperty("--ui-fullscreen-picker-kb", `${px}px`)
+            // iOS slides the whole page up to show a field, and this must stay on the screen:
+            // it stands where the part still seen starts, as tall as that part.
+            dlg.style.setProperty("--ui-fullscreen-picker-top", `${up ? seen.offsetTop : 0}px`)
+            if up {
+                dlg.style.setProperty("--ui-fullscreen-picker-h", `${seen.height}px`)
+            } else {
+                dlg.style.removeProperty("--ui-fullscreen-picker-h")
+            }
+        })
+        undo_back = bottom_sheet_back(win, shut)
+        // With a real keyboard, type at once. On a phone the list is what they came for,
+        // and the on-screen keyboard would cover half of it before they saw it.
+        if win.matchMedia("(pointer: fine)").matches { input.focus() }
+    }
+    if open && dlg != null && !dlg.open { show() }
+    if !open && dlg != null && dlg.open && trigger == null { shut() }
+    let toggle = (r) => {
+        if !r.disabled {
+            if multiple {
+                picked = contains(picked, r.key) ? (picked | filter((k) => k != r.key)) : picked + [r.key]
+            } else {
+                picked = [r.key]
+            }
+        }
+    }
+    let finish = () => {
+        finished = true
+        kept = picked
+        shut()
+    }
+    <div.ui-fullscreen-picker-host>
+        {trigger != null && <Button variant="outline" size="lg" on_click={show}>{fullscreen_picker_said(trigger, rows, kept)}</Button>}
+        {name != null && <input type="hidden" name={name} value={join(kept, ",")}/>}
+        <dialog.ui-fullscreen-picker aria-label={title}
+                @mount={(el) => {
+                    // win first: giving dlg a value sets off the `if open` above.
+                    win = js("window")
+                    dlg = el
+                    if open && !dlg.open { show() }
+                    // Taken off the page while open, it must not leave anything on the window.
+                    () => { forget() }
+                }}
+                @close={() => {
+                    forget()
+                    dlg.style.removeProperty("--ui-fullscreen-picker-kb")
+                    dlg.style.removeProperty("--ui-fullscreen-picker-top")
+                    dlg.style.removeProperty("--ui-fullscreen-picker-h")
+                    if finished {
+                        let chosen = rows | filter((r) => contains(kept, r.key)) | map((r) => r.value)
+                        if on_done != null { on_done(multiple ? chosen : (len(chosen) > 0 ? chosen[0] : null)) }
+                    } else {
+                        picked = kept
+                        on_cancel && on_cancel()
+                    }
+                }}>
+            <div.ui-fullscreen-picker-head>
+                <button.ui-fullscreen-picker-word type="button" @click={shut}>{cancel}</button>
+                <h2>{title}</h2>
+                <button.ui-fullscreen-picker-word.ui-fullscreen-picker-done type="button" @click={finish}>{done}</button>
+            </div>
+            <div.ui-fullscreen-picker-search>
+                <input.ui-fullscreen-picker-input type="search" placeholder={placeholder} aria-label={placeholder} autocomplete="off" autocapitalize="none"
+                       spellcheck="false" enterkeyhint="search" role="combobox" aria-expanded="true" aria-controls={`ui-fullscreen-picker-${base}`}
+                       aria-activedescendant={active >= 0 && active < len(shown) ? `ui-fullscreen-picker-${base}-${active}` : null}
+                       @mount={(el) => { input = el }}
+                       @input={(e) => {
+                           q = e.value
+                           active = -1
+                       }}
+                       @keydown={(e) => {
+                           if e.key == "ArrowDown" || e.key == "ArrowUp" {
+                               e.preventDefault()
+                               active = fullscreen_picker_step(shown, active, e.key == "ArrowDown" ? 1 : -1)
+                               let row = active >= 0 ? win.document.getElementById(`ui-fullscreen-picker-${base}-${active}`) : null
+                               if row != null { row.scrollIntoView({ block: "nearest" }) }
+                           }
+                           if e.key == "Enter" {
+                               e.preventDefault()
+                               if active >= 0 && active < len(shown) {
+                                   toggle(shown[active])
+                               } else {
+                                   // The on-screen keyboard's search key: one answer is the answer,
+                                   // and either way the list wants the room.
+                                   if len(shown) == 1 { toggle(shown[0]) }
+                                   input.blur()
+                               }
+                           }
+                       }}/>
+            </div>
+            <div.ui-fullscreen-picker-list id={`ui-fullscreen-picker-${base}`} role="listbox" aria-label={title} aria-multiselectable={multiple ? "true" : null}
+                 @mount={(el) => { list_box = el }}
+                 @touchmove={() => {
+                     // A list being dragged is a list being read: the keyboard goes, as on a phone's own.
+                     if input.isSameNode(win.document.activeElement) { input.blur() }
+                 }}>
+                {for [i, r] in enumerate(shown) =>
+                    <button key={r.key} id={`ui-fullscreen-picker-${base}-${i}`} type="button" role="option" tabindex="-1"
+                            class={i == active ? "ui-fullscreen-picker-row ui-fullscreen-picker-active" : "ui-fullscreen-picker-row"}
+                            aria-selected={contains(picked, r.key) ? "true" : "false"} disabled={r.disabled} @click={() => toggle(r)}>
+                        <span.ui-fullscreen-picker-label>{r.label}{r.hint != "" && <span.ui-fullscreen-picker-hint>{r.hint}</span>}</span>
+                        <svg.ui-fullscreen-picker-tick viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 13l4 4L19 7"/></svg>
+                    </button>}
+                {len(found) == 0 && <p.ui-fullscreen-picker-note>{empty}</p>}
+                {len(found) > room && <p.ui-fullscreen-picker-note>Showing {room} of {len(found)}. Keep typing to narrow it down.</p>}
+            </div>
+            <p.ui-sr aria-live="polite">{len(found)} found</p>
+        </dialog>
+    </div>
+}

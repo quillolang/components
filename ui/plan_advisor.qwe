@@ -1,0 +1,329 @@
+// PlanAdvisor: which plan is cheapest for what someone actually uses. Usage is set
+// on sliders, or typed, and each plan is costed in full: its fee, monthly or at
+// the annual discount, and the overage on what goes past what it includes, charged
+// by the pack. Plans are compared by the year, in decimals, so a rounded month
+// cannot decide it; a plan that cannot hold the usage says so; and on a tie the plan
+// listed later wins, as it has more room. It then says at what usage the answer
+// changes, for each slider with the others held, by walking the slider's range.
+//
+//   <PlanAdvisor meters={[{ id: "seats", label: "Seats", low: 1, high: 50, start: 8 },
+//                         { id: "gb", label: "Storage", unit: "GB", low: 0, high: 1000, step: 10, start: 120 }]}
+//                plans={[{ id: "team", name: "Team", price: 29, annual_discount: 20, included: { seats: 5, gb: 50 },
+//                          overage: { seats: { price: 8 }, gb: { per: 10, price: 2 } } },
+//                        { id: "biz", name: "Business", price: 99, annual_discount: 20, included: { seats: 20, gb: "unlimited" },
+//                          overage: { seats: { price: 7 } } }]}/>
+//
+// meters: a list of { id, label, unit?, low?, high, step?, start? }: low 0, step 1 and
+// start at low unless given; unit a word after the number (label, in lower case,
+// when left out). plans: a list of { id, name, price, included?, overage?,
+// annual_discount?, annual_price? }: price a month's fee; included a map from meter to
+// the amount it holds (0 when left out), or "unlimited"; overage a map from meter to
+// { per?, price }, price for each `per` (1) or part of it past that, a meter with no
+// overage being a hard limit; annual_discount a percentage off a year of fees, or
+// annual_price the year's fee itself. billing: "monthly" (the default) or "annual";
+// the reader can switch it. currency: ISO code ("USD"). locale: how to write amounts
+// (the program's). title: the heading ("Find the cheapest plan"). id: a prefix for
+// its ids ("plan-advisor"), unique on the page. Each meter's text field is named by
+// its id, and the billing radios billing, so a form around it sends them; name: a
+// prefix for those names, which two on one page need to keep their radios apart.
+// on_change(result): inside one of your components, given
+// plan_advisor_compare's answer after each change, with usage and billing.
+//
+// plan_advisor_model(plans, meters, currency) reads the data,
+// plan_advisor_compare(model, usage, billing) gives { best, ranked, blocked } and
+// plan_advisor_turns(model, usage, billing) the turning points, for a program's own
+// use. A range of more than 400 steps is walked 400 at a time and the turn then
+// found by halving, so a change stays quick; a plan that wins only between two
+// of those points could be missed.
+
+import ui/theme.qwe use ui_cls
+
+let plan_advisor_css = css`
+.ui-planadv { display: grid; gap: 16px; min-width: 0; max-width: 680px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-planadv .ui-planadv-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-planadv-meter { display: grid; grid-template-columns: minmax(0, 1fr) 110px; gap: 4px 12px; align-items: center; }
+.ui-planadv-meter label { grid-column: 1 / -1; font-size: 13px; font-weight: 500; }
+.ui-planadv-meter input[type="range"] { width: 100%; margin: 0; accent-color: var(--ui-accent); }
+.ui-planadv-meter input[type="range"]:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px; }
+.ui-planadv-box { box-sizing: border-box; display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-planadv-box:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-planadv-box input { flex: 1; width: 0; min-width: 0; height: 100%; padding: 0; border: 0; outline: none; background: transparent; color: var(--ui-fg); font: 14px var(--ui-font); text-align: right; font-variant-numeric: tabular-nums; }
+.ui-planadv-box span { flex: none; color: var(--ui-muted); font-size: 12px; }
+.ui-planadv-bad .ui-planadv-box { border-color: var(--ui-danger); }
+.ui-planadv-billing { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; margin: 0; padding: 0; border: 0; font-size: 13px; }
+.ui-planadv-billing legend { float: left; margin-right: 8px; padding: 0; font-weight: 500; }
+.ui-planadv-billing label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.ui-planadv-billing input { margin: 0; accent-color: var(--ui-accent); }
+.ui-planadv-verdict { margin: 0; font-size: 15px; font-weight: 650; color: var(--ui-success); }
+.ui-planadv-turns { display: grid; gap: 3px; margin: 0; padding: 0 0 0 18px; font-size: 13px; }
+.ui-planadv-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-planadv-plan { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1px 12px; padding: 10px 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-planadv-win { border-color: var(--ui-success); background: var(--ui-success-soft); }
+.ui-planadv-out { background: var(--ui-subtle); color: var(--ui-muted); }
+.ui-planadv-name { font-weight: 650; overflow-wrap: anywhere; }
+.ui-planadv-cost { font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+.ui-planadv-how { grid-column: 1 / -1; color: var(--ui-muted); font-size: 12px; }
+.ui-planadv-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-planadv-problems { margin: 0; padding: 8px 12px 8px 26px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 12px; }
+@media (max-width: 420px) { .ui-planadv { padding: 16px; } .ui-planadv-meter { grid-template-columns: 1fr; } }
+`
+
+// A number of 0 or more as a decimal, null when blank, an error value when it is not.
+fn plan_advisor_read(x) {
+    let t = re.replace(trim(str(x ?? "")), ",", "")
+    if t == "" { return null }
+    // Nine digits keep a price times a usage inside what a decimal holds.
+    if !re.test(t, "^[0-9]{1,9}(\\.[0-9]{1,8})?$") { return err("is not a number of 0 or more") }
+    dec(t)
+}
+
+// The plans and meters as data it can trust.
+fn plan_advisor_model(plans, meters, currency: str) {
+    let problems = []
+    let asked = upper(trim(currency))
+    let known = !is_err(money.minor_units(asked))
+    let code = known ? asked : "USD"
+    if !known { problems = problems | push(`The currency "${currency}" is not known, so USD is used.`) }
+    let minor = money.minor_units(code)
+    let dials = []
+    for m in type_of(meters) == "list" ? take(meters, 8) : [] {
+        let id = type_of(m) == "map" && m.id != null ? str(m.id) : ""
+        let low = type_of(m) == "map" ? (plan_advisor_read(m.low ?? 0)) : null
+        let high = type_of(m) == "map" ? plan_advisor_read(m.high) : null
+        let step = type_of(m) == "map" ? plan_advisor_read(m.step ?? 1) : null
+        if id == "" || low == null || is_err(low) || high == null || is_err(high) || high <= low || step == null || is_err(step) || step == 0 {
+            problems = problems | push("A meter needs an id, a high above its low, and a step above 0: one is left out.")
+        } else {
+            let start = plan_advisor_read(m.start)
+            let label = str(m.label ?? id)
+            dials = dials | push({ id, label, unit: str(m.unit ?? lower(label)), low, high, step, start: start == null || is_err(start) ? low : start })
+        }
+    }
+    let tidy = []
+    for p in type_of(plans) == "list" ? take(plans, 12) : [] {
+        let price = type_of(p) == "map" ? plan_advisor_read(p.price) : null
+        if type_of(p) != "map" || p.id == null || price == null || is_err(price) {
+            problems = problems | push(`${type_of(p) == "map" ? str(p.name ?? p.id ?? "A plan") : "A plan"} has no price it can read, so it is left out.`)
+        } else {
+            let holds = {}
+            let rates = {}
+            let open = {}
+            for d in dials {
+                let inc = type_of(p.included) == "map" ? get(p.included, d.id) : null
+                let unlimited = inc == "unlimited"
+                let amount = unlimited ? null : plan_advisor_read(inc)
+                let rate = type_of(p.overage) == "map" ? get(p.overage, d.id) : null
+                let unit_cost = type_of(rate) == "map" ? plan_advisor_read(rate.price) : null
+                let per = type_of(rate) == "map" ? plan_advisor_read(rate.per ?? 1) : null
+                if is_err(amount) { problems = problems | push(`${str(p.name ?? p.id)}: what it includes of ${d.label} cannot be read, so it counts as 0.`) }
+                let bad_rate = rate != null && (unit_cost == null || is_err(unit_cost) || per == null || is_err(per) || per == 0)
+                if bad_rate { problems = problems | push(`${str(p.name ?? p.id)}: its overage on ${d.label} cannot be read, so that is a limit.`) }
+                holds = set(holds, d.id, amount == null || is_err(amount) ? 0m : amount)
+                open = set(open, d.id, unlimited)
+                rates = set(rates, d.id, rate == null || bad_rate ? null : { per, price: unit_cost })
+            }
+            let cut = plan_advisor_read(p.annual_discount)
+            let fixed = plan_advisor_read(p.annual_price)
+            let pct = cut == null || is_err(cut) || cut > 100 ? 0m : cut
+            let year = fixed != null && !is_err(fixed) ? round(fixed, minor, "half_up") : round(price * 12 * (100 - pct) / 100, minor, "half_up")
+            tidy = tidy | push({ id: str(p.id), name: str(p.name ?? p.id), price: round(price, minor, "half_up"), year_annual: year, holds, rates, open })
+        }
+    }
+    { plans: tidy, meters: dials, code, minor, problems }
+}
+
+// A year of a plan's fees.
+fn plan_advisor_fee(plan, billing: str) = billing == "annual" ? plan.year_annual : plan.price * 12
+
+// One meter on one plan at a usage: { cost, packs, over, limit }, cost for a month,
+// limit true when the plan cannot hold it.
+fn plan_advisor_over(plan, id: str, v) {
+    if plan.open[id] { return { cost: 0m, packs: 0, over: 0m, limit: false } }
+    let held = plan.holds[id]
+    if v <= held { return { cost: 0m, packs: 0, over: 0m, limit: false } }
+    let rate = plan.rates[id]
+    if rate == null { return { cost: 0m, packs: 0, over: v - held, limit: true } }
+    let packs = ceil((v - held) / rate.per)
+    { cost: packs * rate.price, packs, over: v - held, limit: false }
+}
+
+// A plan costed for a usage: { plan, fee, overage, year, month, lines, blocked }.
+fn plan_advisor_cost(model, plan, usage, billing: str) {
+    let lines = model.meters | map((d) => merge(plan_advisor_over(plan, d.id, usage[d.id]), { meter: d }))
+    let stuck = lines | find((l) => l.limit)
+    let fee = plan_advisor_fee(plan, billing)
+    let month_over = sum(lines | map((l) => l.cost)) + 0m
+    let year = fee + month_over * 12
+    { plan, fee, overage: month_over, year, month: round(year / 12, model.minor, "half_up"), lines: lines | filter((l) => l.cost > 0), blocked: stuck != null ? stuck.meter : null }
+}
+
+// Every plan costed, cheapest first by the exact year: { best, ranked, blocked }.
+// sort_by is stable, so reversing around it puts the later of equal plans first.
+fn plan_advisor_compare(model, usage, billing: str) {
+    let all_costs = model.plans | map((p) => plan_advisor_cost(model, p, usage, billing))
+    let fits = all_costs | filter((c) => c.blocked == null)
+    let ranked = sort_by(reverse(fits), (c) => c.year)
+    { best: first(ranked), ranked, blocked: all_costs | filter((c) => c.blocked != null) }
+}
+
+// The plan that wins at v on one meter, the others held: its id, "" when none can.
+// What the other meters add is worked out once, so a walk costs one meter a point.
+fn plan_advisor_winner(rest, id: str, v) {
+    let best = ""
+    let best_year = null
+    for r in rest {
+        let o = plan_advisor_over(r.plan, id, v)
+        if !o.limit {
+            let year = r.year + o.cost * 12
+            if best_year == null || year <= best_year {
+                best = r.plan.id
+                best_year = year
+            }
+        }
+    }
+    best
+}
+
+let plan_advisor_walk = 400
+
+// Where the winner first differs from `now`, going from step a to step b of a meter:
+// by whole steps, or by strides and halving past plan_advisor_walk steps.
+fn plan_advisor_turn(rest, d, now: str, a: int, b: int) {
+    let dir = b > a ? 1 : -1
+    let span = abs(b - a)
+    let at = (i: int) => d.low + d.step * i
+    let stride = span > plan_advisor_walk ? ceil(span / plan_advisor_walk) : 1
+    let i = a
+    while i != b {
+        let move = stride > abs(b - i) ? abs(b - i) : stride
+        let j = i + dir * move
+        if plan_advisor_winner(rest, d.id, at(j)) != now {
+            // The change lies in (i, j]: halve down to one step.
+            let lo = i
+            let hi = j
+            while abs(hi - lo) > 1 {
+                let mid = lo + dir * floor(abs(hi - lo) / 2)
+                if plan_advisor_winner(rest, d.id, at(mid)) != now { hi = mid } else { lo = mid }
+            }
+            return { at: at(hi), plan: plan_advisor_winner(rest, d.id, at(hi)) }
+        }
+        i = j
+    }
+    null
+}
+
+// For each meter, with the others held: { meter, up, down }, each { at, plan } or null.
+fn plan_advisor_turns(model, usage, billing: str) {
+    model.meters | map((d) => {
+        let others = model.meters | filter((x) => x.id != d.id)
+        let rest = model.plans | map((p) => {
+            let lines = others | map((x) => plan_advisor_over(p, x.id, usage[x.id]))
+            { plan: p, stuck: any(lines, (l) => l.limit), year: plan_advisor_fee(p, billing) + (sum(lines | map((l) => l.cost)) + 0m) * 12 }
+        }) | filter((r) => !r.stuck)
+        let v = usage[d.id]
+        let now = plan_advisor_winner(rest, d.id, v)
+        let here = int(floor((v - d.low) / d.step))
+        let top = int(floor((d.high - d.low) / d.step))
+        let first_up = here + 1
+        { meter: d, up: first_up <= top ? plan_advisor_turn(rest, d, now, here, top) : null,
+          down: here > 0 && v > d.low ? plan_advisor_turn(rest, d, now, here + (v > d.low + d.step * here ? 1 : 0), 0) : null }
+    })
+}
+
+component PlanAdvisor(plans = [], meters = [], billing: str = "monthly", currency: str = "USD", locale: str? = null, title: str = "Find the cheapest plan",
+                      id: str = "plan-advisor", name: str? = null, on_change = null, class: str? = null) {
+    style global plan_advisor_css
+    let model = plan_advisor_model(plans, meters, currency)
+    state texts = reduce(model.meters, {}, (m, d) => set(m, d.id, str(d.start)))
+    state paying = billing == "annual" ? "annual" : "monthly"
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let shown = (x) => {
+        let m = money.of(x, model.code, "half_up")
+        is_err(m) ? "a very large amount" : locale != null ? money.format(m, locale) : money.format(m)
+    }
+    let usage_of = (t) => reduce(model.meters, {}, (m, d) => {
+        let r = plan_advisor_read(t[d.id])
+        set(m, d.id, r == null || is_err(r) ? null : r)
+    })
+    let usage = usage_of(texts)
+    let bad = model.meters | filter((d) => usage[d.id] == null)
+    let ready = len(bad) == 0 && len(model.plans) > 0 && len(model.meters) > 0
+    let r = ready ? plan_advisor_compare(model, usage, paying) : null
+    let turns = ready && r.best != null ? plan_advisor_turns(model, usage, paying) : []
+    let name_of = (i: str) => i == "" ? "no plan" : (model.plans | find((p) => p.id == i)).name
+    let num = (x) => format_number(x, locale ?? "en-US", len(re.replace(str(x), "^[^.]*\\.?", "")))
+    // "1 seat", from a unit given as "seats".
+    let amount = (x, unit: str) => `${num(x)} ${x == 1 ? re.replace(unit, "s$", "") : unit}`
+    let tell = (t, b: str) => {
+        let u = usage_of(t)
+        if on_change != null && all(model.meters, (d) => u[d.id] != null) && len(model.plans) > 0 {
+            on_change(merge(plan_advisor_compare(model, u, b), { usage: u, billing: b }))
+        }
+    }
+    let edit = (i: str, text: str) => {
+        let t = set(texts, i, text)
+        texts = t
+        tell(t, paying)
+    }
+    let turn_text = (t) => {
+        let unit = t.meter.unit
+        let parts = []
+        if t.up != null { parts = parts | push(`from ${amount(t.up.at, unit)}, ${name_of(t.up.plan)}`) }
+        if t.down != null { parts = parts | push(`at ${amount(t.down.at, unit)} or less, ${name_of(t.down.plan)}`) }
+        len(parts) == 0 ? `${t.meter.label}: ${r.best.plan.name} stays cheapest from ${num(t.meter.low)} to ${amount(t.meter.high, unit)}.` : `${t.meter.label}: ${join(parts, "; ")}.`
+    }
+    let how = (c) => {
+        let fee = paying == "annual" ? `${shown(c.fee)} a year` : `${shown(c.plan.price)} a month`
+        let extras = c.lines | map((l) => `${shown(l.cost)} a month for ${amount(l.over, l.meter.unit)} over`)
+        join([fee] + extras, " + ")
+    }
+    let saving = (c) => {
+        let gain = c.plan.price * 12 - c.plan.year_annual
+        paying == "monthly" && gain > 0 ? `Paying yearly would save ${shown(gain)} a year.` : null
+    }
+    <section class={ui_cls(["ui-planadv", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-planadv-title id={`${id}-title`}>{title}</h3>
+        {len(model.problems) > 0 && <ul.ui-planadv-problems>{for p in model.problems => <li>{p}</li>}</ul>}
+        {for d in model.meters => <div key={d.id} class={ui_cls(["ui-planadv-meter", usage[d.id] == null && "ui-planadv-bad"])}>
+            <label for={`${id}-${d.id}`}>{d.label}</label>
+            <input type="range" min={str(d.low)} max={str(d.high)} step={str(d.step)} value={usage[d.id] != null ? str(usage[d.id]) : str(d.low)} aria-label={`${d.label} slider`}
+                   aria-valuetext={`${texts[d.id]} ${d.unit}`} @input={(e) => { edit(d.id, e.value) }}/>
+            <div.ui-planadv-box>
+                <input type="text" inputmode="decimal" id={`${id}-${d.id}`} name={named(d.id)} value={texts[d.id]} autocomplete="off" aria-invalid={usage[d.id] == null ? "true" : null}
+                       @input={(e) => { edit(d.id, e.value) }}/>
+                <span aria-hidden="true">{d.unit}</span>
+            </div>
+        </div>}
+        <fieldset.ui-planadv-billing>
+            <legend>Billing</legend>
+            <label><input type="radio" name={named("billing")} value="monthly" checked={paying == "monthly"} @change={(e) => { paying = "monthly"; tell(texts, "monthly") }}/> Monthly</label>
+            <label><input type="radio" name={named("billing")} value="annual" checked={paying == "annual"} @change={(e) => { paying = "annual"; tell(texts, "annual") }}/> Annual</label>
+        </fieldset>
+        <div aria-live="polite">
+            {len(bad) > 0 && <p.ui-planadv-error role="alert">{bad | map((d) => `${d.label} is not a number of 0 or more.`) | join(" ")}</p>}
+            {len(model.plans) == 0 && <p.ui-planadv-error role="alert">No plans to compare.</p>}
+            {len(model.meters) == 0 && <p.ui-planadv-error role="alert">No usage to compare on.</p>}
+            {ready && r.best == null && <p.ui-planadv-error role="alert">No plan can hold this much.</p>}
+            {ready && r.best != null && <div>
+                <p.ui-planadv-verdict>{r.best.plan.name} is cheapest: {shown(r.best.year)} a year, about {shown(r.best.month)} a month.</p>
+                {saving(r.best) != null && <p.ui-planadv-how>{saving(r.best)}</p>}
+            </div>}
+        </div>
+        {ready && r.best != null && <div aria-live="polite">
+            <p.ui-planadv-how>The answer changes:</p>
+            <ul.ui-planadv-turns>{for t in turns => <li key={t.meter.id}>{turn_text(t)}</li>}</ul>
+        </div>}
+        {ready && <ul.ui-planadv-list>
+            {for c in r.ranked => <li key={c.plan.id} class={ui_cls(["ui-planadv-plan", c.plan.id == r.best.plan.id && "ui-planadv-win"])}>
+                <span.ui-planadv-name>{c.plan.name}</span>
+                <span.ui-planadv-cost>{shown(c.year)} a year</span>
+                <span.ui-planadv-how>{how(c)}</span>
+            </li>}
+            {for c in r.blocked => <li key={c.plan.id} class="ui-planadv-plan ui-planadv-out">
+                <span.ui-planadv-name>{c.plan.name}</span>
+                <span.ui-planadv-how>Cannot hold this: {amount(c.plan.holds[c.blocked.id], c.blocked.unit)} at most.</span>
+            </li>}
+        </ul>}
+    </section>
+}

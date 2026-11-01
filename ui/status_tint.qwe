@@ -1,0 +1,151 @@
+// StatusTint: gives the browser's bar the colour of this page and theme. It writes a
+// `theme-color` meta tag ahead of any the page has, follows the theme as it changes,
+// whether by the system's dark mode or a class on the page, and takes the tag away when
+// it leaves, so whatever the page had before is back. Several may stand at once, a
+// sheet's over a page's: the newest wins, and leaving in any order leaves the right one.
+//
+//   <StatusTint/>                                  the theme's page colour
+//   <StatusTint color="#0a7d55" dark="#0b3d2e"/>   by theme
+//   <StatusTint color={screen == "alerts" ? "var(--ui-danger)" : null}/>
+//
+// color: any CSS colour, or null (default) for the theme's --ui-bg. dark: the same, for
+// the dark theme; color is used there too when this is left out. A colour the browser
+// cannot read is the same as none. background: also paint the page's own <html>, which
+// is what shows above a page pulled past its end, and which recent Safaris are said to
+// take their bar from in place of theme-color (not tried here). note: say on the page
+// what was done, and what could not be.
+// on_change(color): inside one of your components, given the colour as it changes.
+//
+// It takes up no room. Where it does not work: a phone app's web view reads no
+// theme-color, and the shells have no call for the status bar's colour, so in the apps
+// it does nothing but say so under `note`; a desktop browser shows this only for an
+// installed app.
+
+let status_tint_css = css`
+.ui-status-tint { display: contents; }
+.ui-status-tint-probe { background-color: var(--ui-bg); }
+.ui-status-tint-note { display: block; margin: 0; color: var(--ui-muted); font: 13px/1.5 var(--ui-font); }
+`
+
+fn status_tint_byte(x) -> str {
+    let n = min([max([round(x), 0]), 255])
+    let digits = split("0123456789abcdef", "")
+    digits[floor(n / 16)] + digits[n % 16]
+}
+
+// A computed colour as #rrggbb, or as it came for a space other than sRGB, as theme-color
+// takes any CSS colour. Fully see-through is null.
+fn status_tint_hex(text) {
+    if type_of(text) != "str" || text == "" || text == "transparent" { return null }
+    let unit = starts_with(text, "color(srgb ")
+    if !unit && !starts_with(text, "rgb") { return text }
+    let nums = re.find_all(text, "[0-9]+[.]?[0-9]*") | map((m) => float(m.text))
+    if len(nums) < 3 { return text }
+    if len(nums) > 3 && nums[3] == 0 { return null }
+    let k = unit ? 255 : 1
+    "#" + status_tint_byte(nums[0] * k) + status_tint_byte(nums[1] * k) + status_tint_byte(nums[2] * k)
+}
+
+// The line of tints standing, kept on the meta tag itself so that it is the page's and no
+// global's: this one's colour, replaced where it stands or added as the newest.
+fn status_tint_put(stack: list, id, color) -> list {
+    if any(stack, (s) => s.id == id) {
+        return stack | map((s) => s.id == id ? { id, color } : s)
+    }
+    stack + [{ id, color }]
+}
+
+fn status_tint_drop(stack: list, id) -> list = stack | filter((s) => s.id != id)
+
+fn status_tint_top(stack: list) = len(stack) > 0 ? stack[len(stack) - 1].color : null
+
+fn status_tint_read(tag) -> list {
+    let text = tag.getAttribute("data-stack")
+    if text == null || text == "" { return [] }
+    let got = json.parse(text)
+    is_err(got) || type_of(got) != "list" ? [] : got
+}
+
+// The tag, made first in <head>, as the browser takes the first that fits.
+fn status_tint_tag(doc) {
+    let found = doc.querySelector("meta[data-ui-status-tint]")
+    if found != null { return found }
+    let tag = doc.createElement("meta")
+    tag.setAttribute("name", "theme-color")
+    tag.setAttribute("data-ui-status-tint", "")
+    tag.setAttribute("data-was", doc.documentElement.style.backgroundColor)
+    doc.head.prepend(tag)
+    tag
+}
+
+fn status_tint_write(doc, tag, stack: list, paint: bool) {
+    if len(stack) == 0 {
+        doc.documentElement.style.backgroundColor = tag.getAttribute("data-was") ?? ""
+        tag.remove()
+    } else {
+        let top = status_tint_top(stack)
+        tag.setAttribute("data-stack", json.stringify(stack))
+        tag.setAttribute("content", top)
+        if paint { doc.documentElement.style.backgroundColor = top }
+    }
+}
+
+component StatusTint(color: str? = null, dark: str? = null, background: bool = false, note: bool = false, on_change = null) {
+    style global status_tint_css
+    state win = null
+    state probe = null
+    state me = null
+    state shown = null
+    state native = false
+    let paint = (light, deep) => {
+        let doc = win.document
+        probe.style.backgroundColor = ""
+        let deep_now = contains(str(win.getComputedStyle(probe).colorScheme), "dark")
+        let wanted = deep_now && deep != null ? deep : light
+        if wanted != null { probe.style.backgroundColor = wanted }
+        let hex = status_tint_hex(win.getComputedStyle(probe).backgroundColor)
+        // See-through, or unreadable: the theme's.
+        if hex == null {
+            probe.style.backgroundColor = ""
+            hex = status_tint_hex(win.getComputedStyle(probe).backgroundColor)
+        }
+        if hex != null {
+            let tag = status_tint_tag(doc)
+            status_tint_write(doc, tag, status_tint_put(status_tint_read(tag), me, hex), background)
+            if hex != shown {
+                shown = hex
+                on_change && on_change(hex)
+            }
+        }
+    }
+    if probe != null { paint(color, dark) }
+    <span.ui-status-tint
+         @mount={(el) => {
+             let w = js("window")
+             let doc = w.document
+             let scheme = js("matchMedia", "(prefers-color-scheme: dark)")
+             let id = uuid()
+             let again = () => { paint(color, dark) }
+             let changes = js_new("MutationObserver", again)
+             changes.observe(doc.documentElement, { attributes: true, attributeFilter: ["class"] })
+             changes.observe(doc.body, { attributes: true, attributeFilter: ["class"] })
+             scheme.addEventListener("change", again)
+             doc.addEventListener("ui-theme-change", again)
+             win = w
+             me = id
+             native = w.quilloNative != null
+             probe = el.querySelector(".ui-status-tint-probe")
+             () => {
+                 changes.disconnect()
+                 scheme.removeEventListener("change", again)
+                 doc.removeEventListener("ui-theme-change", again)
+                 let tag = doc.querySelector("meta[data-ui-status-tint]")
+                 if tag != null { status_tint_write(doc, tag, status_tint_drop(status_tint_read(tag), id), background) }
+             }
+         }}>
+        <span.ui-status-tint-probe hidden></span>
+        {note && <span.ui-status-tint-note role="status">{native
+            ? "This app's bar keeps its own colour: a web view reads no theme-color."
+            : (shown != null ? `The browser's bar is asked for ${shown}.` : "")}</span>}
+    </span>
+}

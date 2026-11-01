@@ -1,0 +1,330 @@
+// MeterReading: a round of meters to read. Each reading is checked as it is keyed in,
+// against the last one and against what the meter usually does, so a slip of a thumb
+// shows at once, with the reading it probably meant. Anything odd needs a stamped photo
+// of the dial before it can be saved, so the office can see it was no typing mistake.
+// The keypad is on the screen and big enough for gloves, and takes the place of the
+// phone's own keyboard, which comes back with a button.
+//
+//   import ui/meter_reading.qwe use MeterReading
+//
+//   <MeterReading today="2026-11-02" on_finish={(rs) => send(rs)} meters={[
+//       { id: "m1", name: "Water main", location: "Basement", unit: "m³", last: "1234.5", last_on: "2026-10-02", daily: "2.5", digits: 6 },
+//       { id: "p1", name: "Boiler pressure", unit: "bar", kind: "gauge", last: "1.4", low: "0.8", high: "2.5" },
+//   ]}/>
+//
+// meters: each { id, name, location, unit, last, last_on, kind, daily, digits, decimals, low,
+// high, jump, tolerance }.
+// kind: "total" (default) only counts up, as a water or power meter does; "gauge" moves
+// both ways, as a pressure does. last: the last reading, as text. last_on: its date. daily:
+// the usual use a day. digits: how many whole digits the dial has, so that passing
+// 999999 is known for what it is. decimals: how many digits the dial shows after the
+// point, so a reading keyed with the point left out can be put right. low and high: the
+// sane range of a reading. jump: how far a gauge may move from the last reading.
+// tolerance: how many times the usual use is still usual (3). Numbers are text and worked
+// in decimals, so nothing is rounded on the way.
+//
+// today: the date of the round, as text, which the server should pass. job: a line on
+// photos' stamps. use_place: asks for a place for photos (true). title ("Meter round").
+// id: a prefix for its ids. readings: what was done, as on_change gave it, to pick up a round.
+//
+// on_change(readings): after each save. on_reading(reading): each one saved. on_finish(readings):
+// when Finish is pressed with every meter read or skipped. A reading: { meter, name,
+// value, unit, used, status ("ok", "odd" or "skipped"), code, message, why, photos, at }.
+//
+// meter_reading_check(meter, text, today) gives { status, code, message, value, used,
+// suggest }, status being "empty", "bad", "ok" or "odd". code: "ok", "no_number",
+// "too_long", "below_last", "rollover", "high_use", "low_use", "no_change",
+// "out_of_range" or "big_jump". suggest: the reading it was probably meant to be.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/photo_evidence.qwe use PhotoEvidenceAdd, PhotoEvidenceThumbs
+
+let meter_reading_css = css`
+.ui-mread { display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-mread h3 { margin: 0; font-size: 18px; }
+.ui-mread-cols { display: grid; gap: 12px; min-width: 0; }
+.ui-mread-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; min-width: 0; }
+.ui-mread-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; box-sizing: border-box; width: 100%; min-height: 52px; padding: 6px 12px; border: 2px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 600 15px var(--ui-font); text-align: left; cursor: pointer; touch-action: manipulation; }
+.ui-mread-row[aria-current="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-mread-row:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-mread-row small { color: var(--ui-muted); font: 500 13px var(--ui-mono); overflow-wrap: anywhere; }
+.ui-mread-row[data-state="odd"] small, .ui-mread-row[data-state="skipped"] small { color: var(--ui-fg); }
+.ui-mread-entry { display: grid; gap: 10px; min-width: 0; }
+.ui-mread-meter { display: grid; gap: 2px; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); overflow-wrap: anywhere; }
+.ui-mread-meter b { font-size: 17px; }
+.ui-mread-meter span { color: var(--ui-muted); font-size: 14px; }
+.ui-mread-field { display: grid; gap: 2px; color: var(--ui-muted); font-size: 13px; }
+.ui-mread-box { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+/* 16 px and over: anything smaller and iOS zooms the page when the field is touched. */
+.ui-mread-box input { box-sizing: border-box; width: 100%; height: 64px; padding: 0 12px; border: 2px solid var(--ui-strong); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 700 28px var(--ui-mono); text-align: right; }
+.ui-mread-box input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-mread-note { box-sizing: border-box; width: 100%; height: 48px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px var(--ui-font); }
+.ui-mread-note:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-mread-unit { color: var(--ui-fg); font-size: 17px; font-weight: 600; }
+.ui-mread-said { display: grid; gap: 6px; margin: 0; padding: 8px 12px; border-left: 6px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-weight: 600; }
+.ui-mread-said[hidden] { display: none; }
+.ui-mread-said[data-status="ok"] { border-color: var(--ui-success); background: var(--ui-success-soft); }
+.ui-mread-said[data-status="odd"] { border-color: var(--ui-warning); background: var(--ui-warning-soft); }
+.ui-mread-said[data-status="bad"] { border-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-mread-pad { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.ui-mread-key { display: grid; place-items: center; min-height: 64px; padding: 0; border: 2px solid var(--ui-strong); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 700 24px var(--ui-mono); cursor: pointer; touch-action: manipulation; -webkit-user-select: none; user-select: none; }
+.ui-mread-key:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-mread-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-mread-acts > * { flex: 1 1 130px; }
+.ui-mread-skip { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-mread-skip > * { flex: 1 1 130px; }
+.ui-mread-sum { margin: 0; font-weight: 600; }
+.ui-mread-done { display: grid; gap: 6px; padding: 12px; border: 2px solid var(--ui-strong); border-radius: var(--ui-radius); }
+.ui-mread-done h4 { margin: 0; font-size: 17px; }
+.ui-mread-done p { margin: 0; }
+@media (hover: hover) { .ui-mread-key:hover { background: var(--ui-subtle); } }
+@container (min-width: 640px) {
+  .ui-mread-cols { grid-template-columns: 240px minmax(0, 1fr); gap: 20px; align-items: start; }
+}
+@container (min-width: 960px) {
+  .ui-mread-entry { grid-template-columns: minmax(0, 1fr) 320px; align-items: start; }
+  .ui-mread-pad { grid-column: 2; grid-row: 1 / span 6; }
+}
+`
+
+// A reading typed: a dec or null. A comma is a decimal point: half the world types one.
+// Whole digits and decimals are capped, as a dec of a long text is slow and no meter has them.
+fn meter_reading_number(text, signed: bool = false) {
+    let t = re.replace(trim(str(text ?? "")), ",", ".")
+    let shape = signed ? "^-?[0-9]{1,12}([.][0-9]{1,4})?$" : "^[0-9]{1,12}([.][0-9]{1,4})?$"
+    re.test(t, shape) ? dec(t) : null
+}
+
+// A value from a meter's data: text or a number.
+fn meter_reading_value(x, signed: bool = true) = x == null ? null : meter_reading_number(str(x), signed)
+
+// A decimal as text, without a run of zeros after the point.
+fn meter_reading_text(d) -> str {
+    let t = str(d)
+    contains(t, ".") ? re.replace(re.replace(t, "0+$", ""), "[.]$", "") : t
+}
+
+// Whole days from one date to another, or null when either is not a date.
+fn meter_reading_days(from, to) {
+    if type_of(from) != "str" || type_of(to) != "str" { return null }
+    if !re.test(from, "^[0-9]{4}-[0-9]{2}-[0-9]{2}$") || !re.test(to, "^[0-9]{4}-[0-9]{2}-[0-9]{2}$") { return null }
+    if !date.valid(from) || !date.valid(to) { return null }
+    date.days_between(from, to)
+}
+
+fn meter_reading_power(n: int) {
+    range(0, n) | reduce(dec("1"), (a, _i) => a * 10)
+}
+
+// What a reading comes to against the usual use: null when usual, or { code, message }.
+// Days of 0 are the same day: anything may have happened, and nothing says otherwise.
+fn meter_reading_use(meter, used, unit: str, today) {
+    let daily = meter_reading_value(get(meter, "daily"), false)
+    let days = meter_reading_days(get(meter, "last_on"), today)
+    if daily == null || days == null || days <= 0 || daily == dec("0") { return null }
+    let expected = daily * days
+    let tol = meter_reading_value(get(meter, "tolerance"), false) ?? dec("3")
+    if used == dec("0") {
+        return { code: "no_change", message: `No change in ${days} days. Usually about ${meter_reading_text(expected)}${unit}.` }
+    }
+    if used > expected * tol {
+        return { code: "high_use", message: `Used ${meter_reading_text(used)}${unit} in ${days} days. Usually about ${meter_reading_text(expected)}${unit}.` }
+    }
+    if used * tol < expected {
+        return { code: "low_use", message: `Only ${meter_reading_text(used)}${unit} in ${days} days. Usually about ${meter_reading_text(expected)}${unit}.` }
+    }
+    null
+}
+
+// The check of a reading against its meter. Bad means it cannot be saved; odd means it can,
+// with a photo. Each message says the number it compared with.
+fn meter_reading_judge(meter, value, today) -> map {
+    let gauge = get(meter, "kind") == "gauge"
+    let unit = get(meter, "unit") != null ? ` ${meter.unit}` : ""
+    let last = meter_reading_value(get(meter, "last"))
+    let low = meter_reading_value(get(meter, "low"))
+    let high = meter_reading_value(get(meter, "high"))
+    let digits = get(meter, "digits")
+    let dial = type_of(digits) == "int" && digits > 0 && digits <= 12 ? meter_reading_power(digits) : null
+    let answer = (status, code, message, used) => ({ status: status, code: code, message: message, value: meter_reading_text(value), used: used != null ? meter_reading_text(used) : null, suggest: null })
+    if dial != null && value >= dial { return answer("bad", "too_long", `This dial has only ${digits} digits.`, null) }
+    if (low != null && value < low) || (high != null && value > high) {
+        let span = low != null && high != null ? `${meter_reading_text(low)} to ${meter_reading_text(high)}` : (low != null ? `at least ${meter_reading_text(low)}` : `at most ${meter_reading_text(high)}`)
+        return answer("odd", "out_of_range", `Outside the sane range: ${span}${unit}.`, null)
+    }
+    if last == null { return answer("ok", "ok", "Looks right.", null) }
+    if gauge {
+        let span = get(meter, "jump") != null ? meter_reading_value(meter.jump, false) : null
+        let moved = value >= last ? value - last : last - value
+        if span != null && moved > span { return answer("odd", "big_jump", `Moved ${meter_reading_text(moved)}${unit} from the last, ${meter_reading_text(last)}${unit}.`, null) }
+        return answer("ok", "ok", "Looks right.", null)
+    }
+    if value < last {
+        if dial != null {
+            let used = dial - last + value
+            return answer("odd", "rollover", `Looks like the dial went round past ${meter_reading_text(dial - 1)}: ${meter_reading_text(used)}${unit} used.`, used)
+        }
+        return answer("odd", "below_last", `Lower than the last reading, ${meter_reading_text(last)}${unit}.`, null)
+    }
+    let used = value - last
+    let usual = meter_reading_use(meter, used, unit, today)
+    usual != null ? answer("odd", usual.code, usual.message, used) : answer("ok", "ok", `Used ${meter_reading_text(used)}${unit}. Looks right.`, used)
+}
+
+// The check of what is typed. A reading far too big, with no point in it, is very often the
+// right digits with the point left out: what it would be, if that is fine, is offered.
+fn meter_reading_check(meter, text, today = null) -> map {
+    let plain = trim(str(text ?? ""))
+    if plain == "" { return { status: "empty", code: "empty", message: "", value: null, used: null, suggest: null } }
+    let signed = get(meter, "kind") == "gauge"
+    let value = meter_reading_number(plain, signed)
+    if value == null { return { status: "bad", code: "no_number", message: "That is not a reading: digits and one point.", value: null, used: null, suggest: null } }
+    let judged = meter_reading_judge(meter, value, today)
+    let places = get(meter, "decimals")
+    let can_shift = judged.status != "ok" && type_of(places) == "int" && places > 0 && places <= 4 && !contains(plain, ".") && !contains(plain, ",")
+    if !can_shift { return judged }
+    let moved = value / meter_reading_power(places)
+    meter_reading_judge(meter, moved, today).status == "ok" ? set(judged, "suggest", meter_reading_text(moved)) : judged
+}
+
+// What a key does to the text: one more digit, one point, one less.
+fn meter_reading_press(text: str, k: str) -> str {
+    if k == "del" { return slice(text, 0, max([0, len(text) - 1])) }
+    if k == "." && contains(text, ".") { return text }
+    if len(text) >= 17 { return text }
+    k == "." && text == "" ? "0." : text + k
+}
+
+// The meters, with good ids, in the order given.
+fn meter_reading_list(meters: list) -> list = meters | filter((m) => type_of(m) == "map" && get(m, "id") != null)
+
+// A map of meter id to its reading.
+fn meter_reading_by_id(done: list, id) = done | find((r) => r.meter == id)
+
+// The first meter with nothing done, after this one if it can be.
+fn meter_reading_next(meters: list, done: list, at) {
+    let open = meters | filter((m) => meter_reading_by_id(done, str(m.id)) == null) | map((m) => str(m.id))
+    if len(open) == 0 { return null }
+    let i = meters | map((m) => str(m.id)) | index_of(at)
+    let later = open | filter((id) => (meters | map((m) => str(m.id)) | index_of(id)) > (i ?? -1))
+    len(later) > 0 ? later[0] : open[0]
+}
+
+component MeterReading(meters: list = [], today: str? = null, job: str? = null, use_place: bool = true, title: str = "Meter round", readings: list = [], id: str = "ui-mread",
+                       on_change = null, on_reading = null, on_finish = null, class: str? = null) {
+    style global meter_reading_css
+    state done = readings
+    state current = meter_reading_next(meter_reading_list(meters), readings, null)
+    state text = ""
+    state typing = false     // the phone's keyboard, not the keypad
+    state photos = []
+    state note = ""
+    state said = ""
+    state skipping = false
+    state finished = false
+    let list = meter_reading_list(meters)
+    let meter = list | find((m) => str(m.id) == current)
+    let check = meter != null ? meter_reading_check(meter, text, today) : { status: "empty", code: "empty", message: "", value: null, used: null, suggest: null }
+    let odd = check.status == "odd"
+    let can_save = check.status == "ok" || (odd && len(photos) > 0)
+    let open_count = list | filter((m) => meter_reading_by_id(done, str(m.id)) == null) | len()
+    let open_meter = (mid) => {
+        current = mid
+        let r = meter_reading_by_id(done, mid)
+        text = r != null && r.status != "skipped" ? r.value : ""
+        photos = r != null ? r.photos : []
+        note = r != null ? r.why ?? "" : ""
+        skipping = false
+        said = ""
+    }
+    let store = (r) => {
+        done = (done | filter((x) => x.meter != r.meter)) + [r]
+        on_reading && on_reading(r)
+        on_change && on_change(done)
+        let next = meter_reading_next(list, done, r.meter)
+        said = `Saved ${r.name}.`
+        if next != null {
+            let was = said
+            open_meter(next)
+            said = was
+        } else {
+            current = null
+            text = ""
+        }
+    }
+    let save = () => {
+        if can_save {
+            store({ meter: str(meter.id), name: str(get(meter, "name") ?? meter.id), value: check.value, unit: get(meter, "unit"), used: check.used, status: check.status,
+                    code: check.code, message: check.message, why: trim(note) != "" ? trim(note) : null, photos: photos, at: now() })
+        } else if odd {
+            said = "Take a photo of the dial first."
+        }
+    }
+    let skip = (why) => {
+        store({ meter: str(meter.id), name: str(get(meter, "name") ?? meter.id), value: null, unit: get(meter, "unit"), used: null, status: "skipped",
+                code: "skipped", message: why, why: why, photos: [], at: now() })
+    }
+    <section class={ui_cls(["ui-mread", class])}>
+        <h3>{title}</h3>
+        <div.ui-mread-cols>
+            <ol.ui-mread-list aria-label="Meters">
+                {for m in list {
+                    let r = meter_reading_by_id(done, str(m.id))
+                    <li key={str(m.id)}>
+                        <button.ui-mread-row type="button" data-state={r != null ? r.status : null} aria-current={current == str(m.id) ? "true" : null} @click={() => { open_meter(str(m.id)) }}>
+                            <span>{str(get(m, "name") ?? m.id)}</span>
+                            <small>{r == null ? "To read" : (r.status == "skipped" ? "Skipped" : `${r.value}${r.status == "odd" ? ", odd" : ""}`)}</small>
+                        </button>
+                    </li>
+                }}
+            </ol>
+            {meter != null ? <div.ui-mread-entry>
+                <div.ui-mread-meter>
+                    <b>{str(get(meter, "name") ?? meter.id)}</b>
+                    {get(meter, "location") != null && <span>{meter.location}</span>}
+                    {get(meter, "last") != null && <span>Last: {str(meter.last)}{get(meter, "unit") != null ? ` ${meter.unit}` : ""}{get(meter, "last_on") != null ? `, ${meter.last_on}` : ""}</span>}
+                </div>
+                <label class="ui-mread-field" for={`${id}-value`}>Reading
+                    <span.ui-mread-box>
+                        <input id={`${id}-value`} name={`${id}-value`} type="text" autocomplete="off" inputmode={typing ? "decimal" : "none"} enterkeyhint="done" value={text}
+                               aria-describedby={`${id}-said`} @input={(e) => { text = e.value }}/>
+                        {get(meter, "unit") != null && <span.ui-mread-unit>{meter.unit}</span>}
+                    </span>
+                </label>
+                <div.ui-mread-said id={`${id}-said`} data-status={check.status} role="status" hidden={check.status == "empty"}>
+                    <span>{check.message}</span>
+                    {check.suggest != null && <Button size="lg" variant="outline" on_click={() => { text = check.suggest }}>Use {check.suggest}</Button>}
+                </div>
+                {!typing && <div.ui-mread-pad role="group" aria-label="Keypad">
+                    {for k in ["1", "2", "3", "4", "5", "6", "7", "8", "9", ".", "0", "del"] => <button.ui-mread-key type="button" key={k} aria-label={k == "del" ? "Delete" : (k == "." ? "Point" : k)}
+                        @click={() => { text = meter_reading_press(text, k) }}>{k == "del" ? "⌫" : k}</button>}
+                </div>}
+                <div hidden={!odd}>
+                    <PhotoEvidenceAdd label={len(photos) > 0 ? "Add another photo" : "Take photo of the dial"} tag={str(get(meter, "name") ?? "")} job={job} use_place={use_place}
+                                      on_add={(p) => { photos = photos + [p] }}/>
+                    <PhotoEvidenceThumbs photos={photos} on_remove={(p) => { photos = photos | filter((x) => x.id != p.id) }}/>
+                    <label class="ui-mread-field" for={`${id}-why`}>Note, if it helps
+                        <input.ui-mread-note id={`${id}-why`} type="text" autocomplete="off" enterkeyhint="done" value={note} @input={(e) => { note = e.value }}/>
+                    </label>
+                </div>
+                <div.ui-mread-acts>
+                    <Button size="lg" disabled={check.status == "empty" || check.status == "bad"} variant={can_save ? "solid" : "outline"} on_click={save}>Save reading</Button>
+                    <Button size="lg" variant="outline" on_click={() => { skipping = !skipping }}>Cannot read it</Button>
+                    <Button size="lg" variant="ghost" on_click={() => { typing = !typing }}>{typing ? "Keypad" : "Keyboard"}</Button>
+                </div>
+                {skipping && <div.ui-mread-skip>
+                    {for w in ["No access", "Dial not readable", "Meter not found"] => <Button size="lg" variant="outline" key={w} on_click={() => { skip(w) }}>{w}</Button>}
+                </div>}
+            </div> : <div.ui-mread-done>
+                <h4>{finished ? "Round sent" : "Every meter is done"}</h4>
+                <p>{done | filter((r) => r.status != "skipped") | len()} read, {done | filter((r) => r.status == "odd") | len()} odd, {done | filter((r) => r.status == "skipped") | len()} skipped.</p>
+                {!finished && <Button size="lg" full={true} on_click={() => {
+                    finished = true
+                    on_finish && on_finish(done)
+                }}>Finish the round</Button>}
+            </div>}
+        </div>
+        <p.ui-mread-sum role="status">{said != "" ? `${said} ` : ""}{open_count} of {len(list)} left.</p>
+    </section>
+}

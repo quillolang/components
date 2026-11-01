@@ -1,0 +1,312 @@
+// BestCoupon: the lowest total a cart can reach with the coupons on offer, found by
+// trying them, not by a rule of thumb. A coupon that does not stack goes alone;
+// those that stack are tried in every combination and, as a percentage taken before
+// an amount saves more than after it, every order, or in the order the shop sets.
+// It shows the winner step by step, says what the order was worth, and gives each
+// other coupon its reason for losing: expired, short of its minimum by so much,
+// nothing in its category, or how much less it would have saved. Each step rounds
+// half up to the cent and comes off what is left, so the steps add up to the total.
+//
+//   <BestCoupon today="2026-11-01" cart={[
+//       { name: "Trail shoes", category: "shoes", price: 120 }, { name: "Socks", category: "apparel", price: 10, qty: 3 }]}
+//       coupons={[{ code: "SAVE10", kind: "percent", value: 10, stackable: true },
+//                 { code: "TAKE15", kind: "fixed", value: 15, stackable: true, min_spend: 100 },
+//                 { code: "SHOES25", kind: "percent", value: 25, category: "shoes" }]}/>
+//
+// cart: a list of { name, price, qty?, category? }, price a number, decimal or text.
+// coupons: a list of { code, kind, value, label?, stackable?, category?, min_spend?,
+// cap?, expires? }: kind "percent" or "fixed"; value the percent or the amount;
+// stackable whether it goes with other stackable coupons (false); category the only
+// lines it applies to (all of them); min_spend what must be spent on those lines;
+// cap the most a percentage may take; expires its last day ("YYYY-MM-DD"). Codes are
+// matched without regard to case; the first of a repeated code counts. order: "best"
+// tries every order (the default), "percent_first", "fixed_first" or "listed" keep to
+// one. basis: what min_spend is held against: "before" the cart as it is (the default)
+// or "after" what is left when the coupon's turn comes. today: a prop, not the clock,
+// so server and browser agree; without it nothing counts as expired. currency: ISO
+// code ("USD"). locale: how to write amounts and dates (the program's). title: the
+// heading ("Best coupon"). id: a prefix for its ids ("best-coupon"), unique on the page.
+// name: the hidden field with the winning codes, joined by commas ("coupons"), so a
+// form around it sends them; each coupon's box is named `<name>_offered`.
+// on_change({ codes, total, saving }): inside one of your components, after a box
+// changes; amounts are decimals.
+//
+// At most 6 stacking coupons are tried together, those saving the most alone, which
+// is under 2,000 orders, and it says so past that. best_coupon_model(cart, coupons,
+// currency, order, basis, today) and best_coupon_solve(model, off) are the logic,
+// for a program to check an order the same way: off lists codes to leave out, and
+// the answer is { subtotal, total, saving, steps, rows, order_gain }.
+
+import ui/theme.qwe use ui_cls
+
+let best_coupon_css = css`
+.ui-bestcoupon { display: grid; gap: 14px; min-width: 0; max-width: 640px; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-bestcoupon .ui-bestcoupon-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-bestcoupon-out { display: grid; gap: 8px; padding: 12px 16px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-bestcoupon-steps { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-bestcoupon-steps li { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
+.ui-bestcoupon-steps span:last-child { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ui-bestcoupon-total { display: flex; justify-content: space-between; gap: 12px; padding-top: 6px; border-top: 1px solid var(--ui-border); font-size: 16px; font-weight: 700; }
+.ui-bestcoupon-total span:last-child { color: var(--ui-accent); font-variant-numeric: tabular-nums; }
+.ui-bestcoupon-say { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-bestcoupon-win { margin: 0; font-weight: 600; color: var(--ui-success); }
+.ui-bestcoupon-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-bestcoupon-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0 10px; align-items: start; padding: 8px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-bestcoupon-row:focus-within { border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-bestcoupon-row input { margin: 3px 0 0; accent-color: var(--ui-accent); }
+.ui-bestcoupon-used { border-color: var(--ui-success); background: var(--ui-success-soft); }
+.ui-bestcoupon-name { font-weight: 600; overflow-wrap: anywhere; }
+.ui-bestcoupon-what { color: var(--ui-muted); font-weight: 400; }
+.ui-bestcoupon-why { grid-column: 2; color: var(--ui-muted); font-size: 12px; }
+.ui-bestcoupon-used .ui-bestcoupon-why { color: var(--ui-success); }
+.ui-bestcoupon-problems { margin: 0; padding: 8px 12px 8px 26px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 12px; }
+@media (max-width: 420px) { .ui-bestcoupon { padding: 16px; } }
+`
+
+let best_coupon_limit = 6
+
+// An amount of 0 or more as a decimal, or null.
+fn best_coupon_read(x) {
+    let t = trim(str(x ?? ""))
+    // Nine digits, by at most 10,000 of a line and 500 lines, stays inside what money holds.
+    if !re.test(t, "^[0-9]{1,9}(\\.[0-9]{1,8})?$") { return null }
+    dec(t)
+}
+
+fn best_coupon_key(s) -> str = lower(trim(str(s ?? "")))
+
+// One coupon as data, or the sentence saying why it cannot be used.
+fn best_coupon_coupon(c, minor: int, i: int) {
+    let code = upper(trim(str(c.code ?? "")))
+    if code == "" { return err("has no code") }
+    let value = best_coupon_read(c.value)
+    if c.kind != "percent" && c.kind != "fixed" { return err(`has the kind "${str(c.kind)}", not percent or fixed`) }
+    if value == null { return err("has no value it can read") }
+    if c.kind == "percent" && value > 100 { return err("takes more than 100%") }
+    if c.expires != null && !date.valid(str(c.expires), "date") { return err("has an expiry that is not a date") }
+    let needs = c.min_spend == null ? 0m : best_coupon_read(c.min_spend)
+    let cap = c.cap == null ? null : best_coupon_read(c.cap)
+    if needs == null || (c.cap != null && cap == null) { return err("has a minimum or cap it cannot read") }
+    { code, at: i, label: filled(str(c.label ?? "")) ?? code, kind: c.kind, value: c.kind == "fixed" ? round(value, minor, "half_up") : value, stackable: c.stackable == true,
+      category: c.category == null ? null : best_coupon_key(c.category), category_name: str(c.category ?? ""), needs: round(needs, minor, "half_up"), cap, expires: c.expires }
+}
+
+// The cart and coupons as data it can trust. Lines of one category are one bucket:
+// a coupon can only tell categories apart, so that is all a step has to keep.
+fn best_coupon_model(cart, coupons, currency: str, order: str = "best", basis: str = "before", today: str = "") {
+    let problems = []
+    let asked = upper(trim(currency))
+    let known = !is_err(money.minor_units(asked))
+    let code = known ? asked : "USD"
+    if !known { problems = problems | push(`The currency "${currency}" is not known, so USD is used.`) }
+    let minor = money.minor_units(code)
+    let buckets = []
+    for l in type_of(cart) == "list" ? take(cart, 500) : [] {
+        let price = type_of(l) == "map" ? best_coupon_read(l.price) : null
+        let qty = type_of(l) == "map" ? (l.qty ?? 1) : 1
+        if price == null || type_of(qty) != "int" || qty < 1 || qty > 10000 {
+            problems = problems | push(`${type_of(l) == "map" ? str(l.name ?? "A line") : "A line"} has no price or quantity it can read, so it is left out.`)
+        } else {
+            let cat = best_coupon_key(l.category)
+            let amount = round(price, minor, "half_up") * qty
+            let found = buckets | find((b) => b.cat == cat)
+            buckets = found != null ? buckets | map((b) => b.cat == cat ? merge(b, { start: b.start + amount, net: b.net + amount }) : b)
+                                    : buckets | push({ cat, name: str(l.category ?? ""), start: amount, net: amount })
+        }
+    }
+    let good = []
+    let wrong = []
+    let seen = []
+    for p in enumerate(type_of(coupons) == "list" ? take(coupons, 100) : []) {
+        let c = p[1]
+        if type_of(c) != "map" {
+            problems = problems | push("A coupon that is not a coupon is left out.")
+        } else {
+            let read = best_coupon_coupon(c, minor, p[0])
+            let shown = upper(trim(str(c.code ?? "")))
+            if !is_err(read) && contains(seen, read.code) {
+                problems = problems | push(`The code ${read.code} is given twice: the second is left out.`)
+            } else if is_err(read) {
+                wrong = wrong | push({ code: shown != "" ? shown : "A coupon", why: read.error })
+            } else {
+                seen = seen | push(read.code)
+                good = good | push(read)
+            }
+        }
+    }
+    { buckets, coupons: good, wrong, problems, code, minor, order, basis, today, subtotal: sum(buckets | map((b) => b.start)) + 0m }
+}
+
+// One coupon on what is left: { off, buckets, fail, spend }, with fail "none" or "min"
+// when it takes nothing. Shares follow what each bucket still holds, so they cannot
+// go below 0, and money.allocate loses no cent between them.
+fn best_coupon_apply(model, buckets, c) {
+    let hit = (b) => c.category == null || b.cat == c.category
+    let base = sum(buckets | filter(hit) | map((b) => b.net)) + 0m
+    let spend = model.basis == "after" ? base : sum(buckets | filter(hit) | map((b) => b.start)) + 0m
+    if base == 0 { return { off: 0m, buckets, fail: "none", spend } }
+    if spend < c.needs { return { off: 0m, buckets, fail: "min", spend } }
+    let raw = c.kind == "percent" ? round(base * c.value / 100, model.minor, "half_up") : c.value > base ? base : c.value
+    let off = c.cap != null && raw > c.cap ? round(c.cap, model.minor, "half_up") : raw
+    if off == 0 { return { off, buckets, fail: "zero", spend } }
+    let open = buckets | filter((b) => hit(b) && b.net > 0)
+    let shares = money.allocate(money.of(off, model.code), open | map((b) => b.net))
+    let taken = reduce(enumerate(open), {}, (m, p) => set(m, p[1].cat, shares[p[0]].amount))
+    { off, fail: null, spend, buckets: buckets | map((b) => has(taken, b.cat) ? merge(b, { net: b.net - taken[b.cat] }) : b) }
+}
+
+fn best_coupon_left(buckets) = sum(buckets | map((b) => b.net)) + 0m
+
+// The lower total, the fewer coupons on a tie, the earlier found after that.
+fn best_coupon_better(a, b) {
+    if a == null { return b }
+    if b == null { return a }
+    if b.total < a.total || (b.total == a.total && len(b.steps) < len(a.steps)) { return b }
+    a
+}
+
+// The best of what follows, trying each coupon next: in any order, or in the one
+// `rest` is in when the shop sets it.
+fn best_coupon_walk(model, buckets, steps, rest, any_order: bool) {
+    let best = null
+    for i in range(len(rest)) {
+        let c = rest[i]
+        let s = best_coupon_apply(model, buckets, c)
+        if s.fail == null {
+            let total = best_coupon_left(s.buckets)
+            let done = steps + [{ code: c.code, label: c.label, off: s.off, left: total }]
+            let tail = any_order ? slice(rest, 0, i) + slice(rest, i + 1) : slice(rest, i + 1)
+            best = best_coupon_better(best, best_coupon_better({ steps: done, total }, best_coupon_walk(model, s.buckets, done, tail, any_order)))
+        }
+    }
+    best
+}
+
+// The coupons in the order the shop set.
+fn best_coupon_ordered(model, list) {
+    if model.order == "percent_first" { return sort_by(list, (c) => c.kind == "percent" ? 0 : 1) }
+    if model.order == "fixed_first" { return sort_by(list, (c) => c.kind == "fixed" ? 0 : 1) }
+    list
+}
+
+// The total of these coupons in the order given, or null when one takes nothing.
+fn best_coupon_run(model, codes) {
+    let now = model.buckets
+    for code in codes {
+        let s = best_coupon_apply(model, now, model.coupons | find((c) => c.code == code))
+        if s.fail != null { return null }
+        now = s.buckets
+    }
+    best_coupon_left(now)
+}
+
+// See the top of the file.
+fn best_coupon_solve(model, off) {
+    let on = model.coupons | filter((c) => !contains(off, c.code))
+    let dead = (c) => model.today != "" && c.expires != null && c.expires < model.today
+    let live = on | filter((c) => !dead(c))
+    let solo = reduce(live, {}, (m, c) => set(m, c.code, best_coupon_apply(model, model.buckets, c)))
+    let works = live | filter((c) => solo[c.code].fail == null)
+    let stack_all = works | filter((c) => c.stackable)
+    // The most that are tried together are those saving the most alone.
+    let stack = take(reverse(sort_by(reverse(stack_all), (c) => solo[c.code].off)), best_coupon_limit)
+    let any_order = model.order != "percent_first" && model.order != "fixed_first" && model.order != "listed"
+    let pool = best_coupon_ordered(model, sort_by(stack, (c) => c.at))
+    let stacked = best_coupon_walk(model, model.buckets, [], pool, any_order)
+    let alone = reduce(works | filter((c) => !c.stackable), null, (b, c) => best_coupon_better(b, {
+        total: best_coupon_left(solo[c.code].buckets), steps: [{ code: c.code, label: c.label, off: solo[c.code].off, left: best_coupon_left(solo[c.code].buckets) }] }))
+    let win = best_coupon_better(stacked, alone)
+    let steps = win != null ? win.steps : []
+    let total = win != null ? win.total : model.subtotal
+    let used = steps | map((s) => s.code)
+    // What the order was worth: the same coupons the other way round.
+    let flipped = any_order && len(used) > 1 ? best_coupon_run(model, reverse(used)) : null
+    let row = (c) => {
+        if contains(used, c.code) { return { code: c.code, label: c.label, used: true, why: null } }
+        let lost = (why) => ({ code: c.code, label: c.label, used: false, why })
+        if contains(off, c.code) { return lost({ kind: "off" }) }
+        if dead(c) { return lost({ kind: "expired", on: c.expires }) }
+        let s = solo[c.code]
+        if s.fail == "none" { return lost({ kind: "none", category: c.category_name }) }
+        if s.fail == "min" { return lost({ kind: "min", needs: c.needs, spend: s.spend, category: c.category_name }) }
+        if s.fail == "zero" { return lost({ kind: "nothing" }) }
+        if !c.stackable { return lost({ kind: "alone", saves: s.off, behind: s.off < model.subtotal - total ? model.subtotal - total - s.off : 0m }) }
+        if !contains(stack | map((x) => x.code), c.code) { return lost({ kind: "past_limit" }) }
+        if stacked != null && win.steps == stacked.steps {
+            let tried = reduce(steps, model.buckets, (b, st) => best_coupon_apply(model, b, model.coupons | find((x) => x.code == st.code)).buckets)
+            let last_go = best_coupon_apply(model, tried, c)
+            return lost(last_go.fail == "min" ? { kind: "late", needs: c.needs, spend: last_go.spend, category: c.category_name } : { kind: "adds_nothing" })
+        }
+        lost({ kind: "stack", saves: stacked != null ? model.subtotal - stacked.total : s.off, behind: stacked != null ? stacked.total - total : model.subtotal - total - s.off })
+    }
+    { subtotal: model.subtotal, total, saving: model.subtotal - total, steps, order_gain: flipped != null && flipped > total ? flipped - total : 0m,
+      rows: (steps | map((s) => row(on | find((c) => c.code == s.code)))) + (model.coupons | filter((c) => !contains(used, c.code)) | map(row)) }
+}
+
+component BestCoupon(cart = [], coupons = [], order: str = "best", basis: str = "before", today: str = "", currency: str = "USD", locale: str? = null,
+                     title: str = "Best coupon", id: str = "best-coupon", name: str = "coupons", on_change = null, class: str? = null) {
+    style global best_coupon_css
+    state off = []
+    let model = best_coupon_model(cart, coupons, currency, order, basis, today)
+    let shown = (x) => {
+        let m = money.of(x, model.code, "half_up")
+        is_err(m) ? "a very large amount" : locale != null ? money.format(m, locale) : money.format(m)
+    }
+    let when = (d) => date.format(str(d), { locale: locale ?? "en-US", style: "medium" })
+    let r = best_coupon_solve(model, off)
+    let of_cat = (cat) => cat != "" ? ` of ${cat}` : ""
+    let why = (w) => {
+        if w.kind == "off" { return "Switched off." }
+        if w.kind == "expired" { return `Expired on ${when(w.on)}.` }
+        if w.kind == "none" { return w.category != "" ? `Nothing in ${w.category} in this cart.` : "Nothing in the cart to take it off." }
+        if w.kind == "min" { return `Needs ${shown(w.needs)}${of_cat(w.category)}, and this cart has ${shown(w.spend)}: ${shown(w.needs - w.spend)} short.` }
+        if w.kind == "late" { return `Needs ${shown(w.needs)}${of_cat(w.category)} when its turn comes, and only ${shown(w.spend)} is left by then.` }
+        if w.kind == "nothing" { return "Takes nothing off this cart." }
+        if w.kind == "past_limit" { return `Not tried: only the ${best_coupon_limit} stacking coupons that save the most alone go together.` }
+        if w.kind == "adds_nothing" { return "Adds nothing on top of the winner." }
+        if w.kind == "alone" { return w.behind > 0 ? `Cannot be combined. Alone it saves ${shown(w.saves)}, ${shown(w.behind)} less than the winner.` : `Cannot be combined. Alone it saves ${shown(w.saves)}, the same as the winner with fewer coupons kept back.` }
+        `Only goes with other stacking coupons, which together save ${shown(w.saves)}, ${shown(w.behind)} less than the winner.`
+    }
+    let describe = (c) => {
+        let x = model.coupons | find((k) => k.code == c.code)
+        x.kind == "percent" ? `${str(x.value)}% off` : `${shown(x.value)} off`
+    }
+    let toggle = (code: str, on: bool) => {
+        let next = on ? off | filter((c) => c != code) : off + [code]
+        off = next
+        if on_change != null {
+            let g = best_coupon_solve(model, next)
+            on_change({ codes: g.steps | map((s) => s.code), total: g.total, saving: g.saving })
+        }
+    }
+    <section class={ui_cls(["ui-bestcoupon", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-bestcoupon-title id={`${id}-title`}>{title}</h3>
+        <input type="hidden" name={name} value={r.steps | map((s) => s.code) | join(",")}/>
+        {len(model.problems) > 0 && <ul.ui-bestcoupon-problems>{for p in model.problems => <li>{p}</li>}</ul>}
+        <div.ui-bestcoupon-out aria-live="polite">
+            {len(model.buckets) == 0 && <p.ui-bestcoupon-say>The cart is empty, so there is nothing to save on.</p>}
+            {len(model.buckets) > 0 && len(r.steps) > 0 && <p.ui-bestcoupon-win>Best: {r.steps | map((s) => s.label) | join(" then ")} saves {shown(r.saving)}.</p>}
+            {len(model.buckets) > 0 && len(r.steps) == 0 && <p.ui-bestcoupon-say>No coupon takes anything off this cart.</p>}
+            <ul.ui-bestcoupon-steps>
+                <li><span>Cart</span><span>{shown(r.subtotal)}</span></li>
+                {for s in r.steps => <li key={s.code}><span>{s.label}</span><span><span aria-hidden="true">−</span><span.ui-sr>minus </span>{shown(s.off)}</span></li>}
+            </ul>
+            <div.ui-bestcoupon-total><span>To pay</span><span>{shown(r.total)}</span></div>
+            {r.order_gain > 0 && <p.ui-bestcoupon-say>In this order it saves {shown(r.order_gain)} more than the other way round.</p>}
+            {r.order_gain == 0 && len(r.steps) > 1 && order != "best" && <p.ui-bestcoupon-say>In the shop's order.</p>}
+        </div>
+        <ul.ui-bestcoupon-list aria-label="Coupons on offer">
+            {for c in r.rows => <li key={c.code} class={ui_cls(["ui-bestcoupon-row", c.used && "ui-bestcoupon-used"])}>
+                <input type="checkbox" id={`${id}-${c.code}`} name={`${name}_offered`} value={c.code} checked={!contains(off, c.code)} aria-describedby={`${id}-${c.code}-why`}
+                       @change={(e) => { toggle(c.code, e.checked) }}/>
+                <label.ui-bestcoupon-name for={`${id}-${c.code}`}>{c.label} <span.ui-bestcoupon-what>{describe(c)}</span></label>
+                <span.ui-bestcoupon-why id={`${id}-${c.code}-why`}>{c.used ? `Used: takes off ${shown((r.steps | find((s) => s.code == c.code)).off)}.` : why(c.why)}</span>
+            </li>}
+            {for w in model.wrong => <li class="ui-bestcoupon-row" key={`bad-${w.code}`}>
+                <span></span><span.ui-bestcoupon-name>{w.code}</span>
+                <span.ui-bestcoupon-why>Cannot be used: it {w.why}.</span>
+            </li>}
+        </ul>
+    </section>
+}

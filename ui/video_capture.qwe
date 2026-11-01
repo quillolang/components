@@ -1,0 +1,380 @@
+// VideoCapture: records a short clip through the camera, with a limit that ends it, a ring
+// that shows how much is left, and a look at the clip before it is accepted. The clip is a
+// real file in a file field, so a plain multipart <form> sends it. Where recording cannot
+// happen, a person who said no, a page that may not reach the camera or a browser without
+// MediaRecorder, the same field becomes the system's own camera (`<input capture>`), which
+// needs no permission from the page.
+//
+//   <form method="post" action="/clip" enctype="multipart/form-data">
+//       <VideoCapture name="clip" limit={15} hint="Show the damage from each side."/>
+//       <Button size="lg" type="submit">Send</Button>
+//   </form>
+//   <VideoCapture facing="user" sound={false} on_change={(c) => { clip = c }}/>
+//
+// name: the file field's name ("video"). label: what opens the camera ("Record a clip").
+// limit: the most seconds a clip may run (15; at least 1, at most 600). facing:
+// "environment" (the back camera, default) or "user". sound: records the microphone too
+// (true; a person who refuses it still gets a clip, without sound). bitrate: bits a second
+// for the picture (2500000). max_size: the most bytes a file from the fallback may have
+// (none). hint, field (the input's id) and class as for every field.
+// on_change(clip): inside one of your components, given { name, size, type, seconds } once
+// a clip is accepted, or null when it is taken away. `seconds` is null when a fallback
+// file's length cannot be read here.
+//
+// The camera is let go when the clip is done, when the app leaves the screen (a recording
+// under way ends and keeps what it has) and when the component leaves the page.
+//
+// Needs Button: `import ui/button.qwe use Button`.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let video_capture_css = css`
+.ui-video-capture { container-type: inline-size; width: 100%; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-video-capture-body { display: grid; gap: 10px; }
+.ui-video-capture-frame {
+  position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 3 / 4; max-height: 70dvh; width: 100%; margin: 0 auto;
+  border-radius: var(--ui-radius); background: #111; color: #eee; text-align: center;
+}
+.ui-video-capture-frame video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.ui-video-capture-frame video[hidden] { display: none; }
+.ui-video-capture-review { object-fit: contain !important; background: #000; }
+.ui-video-capture-msg { z-index: 1; max-width: 80%; padding: 16px; }
+.ui-video-capture-clock {
+  position: absolute; top: 10px; left: 50%; z-index: 2; transform: translateX(-50%); padding: 3px 10px; border-radius: 999px;
+  background: rgba(0, 0, 0, .55); color: #fff; font: 600 14px/1.4 var(--ui-font); font-variant-numeric: tabular-nums;
+}
+.ui-video-capture-go { position: absolute; bottom: 14px; left: 50%; z-index: 2; width: 84px; height: 84px; transform: translateX(-50%); }
+.ui-video-capture-ring { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); pointer-events: none; }
+.ui-video-capture-ring circle { fill: none; stroke-width: 6; }
+.ui-video-capture-ring-back { stroke: rgba(255, 255, 255, .4); }
+.ui-video-capture-ring-left { stroke: var(--ui-danger); }
+.ui-video-capture-shutter {
+  position: absolute; inset: 10px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; background: #fff; color: var(--ui-danger);
+  cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+}
+.ui-video-capture-shutter:focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
+.ui-video-capture-shutter span { display: block; width: 44px; height: 44px; border-radius: 50%; background: currentColor; transition: border-radius .15s, transform .15s; }
+.ui-video-capture-on .ui-video-capture-shutter span { border-radius: 8px; transform: scale(.6); }
+.ui-video-capture-side { display: grid; gap: 8px; align-content: start; }
+.ui-video-capture-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-video-capture-bar > * { flex: 1 1 auto; }
+.ui-video-capture-file {
+  position: relative; display: none; align-items: center; justify-content: center; min-height: 46px; padding: 0 22px; overflow: hidden; flex: 1 1 auto;
+  border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg); font: 500 16px/1 var(--ui-font); cursor: pointer;
+}
+.ui-video-capture-file-on { display: inline-flex; }
+.ui-video-capture-file input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; font-size: 16px; cursor: pointer; }
+.ui-video-capture-file:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-video-capture-note, .ui-video-capture-hint { margin: 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-video-capture-why { margin: 0; color: var(--ui-danger); font-size: 13px; }
+/* A tablet, or a wide pane: the frame beside its controls, and upright clips stay upright. */
+@container (min-width: 440px) {
+  .ui-video-capture-body { grid-template-columns: minmax(0, 1fr) 170px; align-items: start; gap: 16px; }
+  .ui-video-capture-bar { flex-direction: column; }
+  .ui-video-capture-bar > * { flex: none; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-video-capture-shutter span { transition: none; } }
+`
+
+// What to record in, best first. avc3 leads because turning the phone changes the picture's
+// size in mid-recording: avc1, which plain "video/mp4" gives on Chrome, cannot carry that, and
+// avc3 can. Plain mp4 comes next for Safari, which names no codec, then WebM.
+let video_capture_kinds = ["video/mp4;codecs=avc3.42E01E,mp4a.40.2", "video/mp4", "video/webm;codecs=vp9,opus", "video/webm"]
+
+let video_capture_ring_len = 238.76       // 2 pi r, for the ring's r of 38
+
+// The limit a prop gives, kept to what can be recorded: a bad one is the default's 15.
+fn video_capture_limit(s: num) -> num = s <= 0 ? 15 : s < 1 ? 1 : s > 600 ? 600 : s
+
+// How much of the ring's stroke is hidden after t of limit seconds: none at the start, all at the end.
+fn video_capture_ring(t: num, limit: num) -> num {
+    let part = limit <= 0 ? 1 : t / limit
+    round(video_capture_ring_len * (part < 0 ? 0 : part > 1 ? 1 : part), 2)
+}
+
+// Seconds as m:ss, rounded down, so 14.9 is still 0:14.
+fn video_capture_clock(s: num) -> str {
+    let t = s < 0 ? 0 : floor(s)
+    let sec = t % 60
+    `${floor(t / 60)}:${sec < 10 ? "0" : ""}${sec}`
+}
+
+// A file's end from its type, with any `;codecs=` cut off.
+fn video_capture_ext(mime: str) -> str {
+    let base = split(mime, ";")[0]
+    match base {
+        "video/mp4" => "mp4"
+        "video/webm" => "webm"
+        "video/quicktime" => "mov"
+        _ => "video"
+    }
+}
+
+// A length the browser gave: an unfinished file says Infinity or NaN, which is "not known".
+fn video_capture_seconds(d) {
+    if d == null || is_err(d) || type_of(d) == "str" { return null }
+    d > 0 && d < 86400 ? d : null
+}
+
+// What a refusal of the camera means: "refused" for a person or a policy, "none" for the rest.
+fn video_capture_why(name) -> str = name == "NotAllowedError" || name == "SecurityError" ? "refused" : "none"
+
+component VideoCapture(name: str = "video", label: str = "Record a clip", limit: num = 15, facing: str = "environment", sound: bool = true,
+                       bitrate: int = 2500000, max_size: int? = null, hint: str? = null, field: str? = null, on_change = null, class: str? = null) {
+    style global video_capture_css
+    state status = "idle"       // idle, starting, live, recording, finishing, review, accepted, refused, none
+    state stream = null
+    state recorder = null
+    state parts = []
+    state began = 0
+    state spent = 0
+    state clip = null           // { url, blob, type, seconds, name, size }
+    state screen = null         // the live picture
+    state input = null
+    state said = ""
+    state silent = false
+    state settings = false      // the app can open its page in Settings
+    let most = video_capture_limit(limit)
+    let id = field ?? `video-capture-${name}`
+    let fallback = status == "refused" || status == "none"
+    let release = () => {
+        if stream != null {
+            for t in js("Array.from", stream.getTracks()) { t.stop() }
+            stream = null
+        }
+        if screen != null { screen.srcObject = null }
+    }
+    let free = () => {
+        if clip != null {
+            js("URL.revokeObjectURL", clip.url)
+            clip = null
+        }
+    }
+    let stop_recording = () => {
+        if recorder != null && recorder.state != "inactive" {
+            status = "finishing"
+            recorder.stop()
+        }
+    }
+    let lost = (words: str) => {
+        if status == "recording" {
+            said = words
+            stop_recording()
+        } else {
+            if status == "live" || status == "starting" {
+                release()
+                said = words
+                status = "idle"
+            }
+        }
+    }
+    if status == "recording" {
+        every(100, () => {
+            spent = (now() - began) / 1000
+            if spent >= most { stop_recording() }
+        })
+    }
+    let cannot = (kind: str, words: str) => {
+        release()
+        settings = kind == "refused" && js("window").quilloNative != null
+        said = words
+        status = kind
+    }
+    // The stream, or the name of what stopped it: an error value would not say which refusal it was.
+    let ask = (wanted) => js("Promise.resolve", js_new("Promise", (done) => {
+        done(js("navigator.mediaDevices.getUserMedia", wanted).then((s) => { stream: s, why: null }, (e) => { stream: null, why: e.name }))
+    }))
+    let open = () => {
+        if status == "starting" { return null }
+        said = ""
+        silent = false
+        let w = js("window")
+        if js("navigator").mediaDevices == null {
+            cannot("none", "This page cannot reach a camera. Use the phone's camera instead.")
+            return null
+        }
+        if w.MediaRecorder == null {
+            cannot("none", "This browser cannot record here. Use the phone's camera instead.")
+            return null
+        }
+        status = "starting"
+        let look = { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        let got = ask({ video: look, audio: sound })
+        // Refused with sound: the camera alone may still be allowed.
+        if got.stream == null && sound {
+            got = ask({ video: look, audio: false })
+            silent = got.stream != null
+        }
+        if got.stream == null {
+            let kind = video_capture_why(got.why)
+            cannot(kind, kind == "refused"
+                ? "The camera was not allowed. Allow it in Settings, or use the phone's camera instead."
+                : "No camera could be opened here. Use the phone's camera instead.")
+            return null
+        }
+        let s = got.stream
+        stream = s
+        let track = js("Array.from", s.getVideoTracks())[0]
+        track.addEventListener("ended", (_e = null) => { lost("The camera stopped. Open it again to go on.") })
+        screen.srcObject = s
+        status = "live"
+        screen.play().catch((_ = null) => { said = "" })
+    }
+    let finished = (mime: str) => {
+        let kept = parts
+        recorder = null
+        parts = []
+        let seconds = spent > most ? most : spent
+        release()
+        let blob = js_new("Blob", js("Array.from", kept), { type: mime })
+        if blob.size == 0 {
+            cannot("none", "Nothing was recorded. Use the phone's camera instead.")
+            return null
+        }
+        let ext = video_capture_ext(mime)
+        clip = { url: js("URL.createObjectURL", blob), blob, type: split(mime, ";")[0], seconds, name: `clip.${ext}`, size: blob.size }
+        status = "review"
+    }
+    let record = () => {
+        if stream == null { return null }
+        let kinds = video_capture_kinds | filter((t) => js("MediaRecorder.isTypeSupported", t))
+        let mime = len(kinds) > 0 ? kinds[0] : ""
+        // In a Promise, here and at the start: both throw, which would stop the handler, not give an error value.
+        let r = js("Promise.resolve", js_new("Promise", (done) => {
+            done(js_new("MediaRecorder", stream, mime != "" ? { mimeType: mime, videoBitsPerSecond: bitrate } : { videoBitsPerSecond: bitrate }))
+        }))
+        if is_err(r) {
+            cannot("none", "This browser cannot record here. Use the phone's camera instead.")
+            return null
+        }
+        parts = []
+        r.addEventListener("dataavailable", (e) => { if e.data.size > 0 { parts = parts | push(e.data) } })
+        r.addEventListener("stop", (_e = null) => { finished(r.mimeType != "" ? r.mimeType : mime != "" ? mime : "video/webm") })
+        r.addEventListener("error", (_e = null) => {
+            recorder = null
+            parts = []
+            cannot("none", "Recording stopped with an error. Use the phone's camera instead.")
+        })
+        let going = js("Promise.resolve", js_new("Promise", (done) => {
+            r.start(500)
+            done(true)
+        }))
+        if is_err(going) {
+            cannot("none", "This browser cannot record here. Use the phone's camera instead.")
+            return null
+        }
+        recorder = r
+        began = now()
+        spent = 0
+        status = "recording"
+        if js("window").quilloNative != null { js("quilloNative.haptic", "medium") }
+    }
+    let tell = () => { on_change && on_change({ name: clip.name, size: clip.size, type: clip.type, seconds: clip.seconds }) }
+    let accept = () => {
+        let dt = js_new("DataTransfer")
+        dt.items.add(js_new("File", [clip.blob], clip.name, { type: clip.type }))
+        input.files = dt.files
+        status = "accepted"
+        tell()
+    }
+    let again = () => {
+        let had = status == "accepted"
+        free()
+        input.value = ""
+        if had { on_change && on_change(null) }
+        status = "idle"
+        open()
+    }
+    // The system's camera, or a file: it has made the clip, so only its length is left to check.
+    let take_file = (e) => {
+        let file = e.target.files[0]
+        if file == null { return null }
+        free()
+        if max_size != null && file.size > max_size {
+            input.value = ""
+            said = "That clip is too large to send."
+            return null
+        }
+        let url = js("URL.createObjectURL", file)
+        let probe = js("document.createElement", "video")
+        probe.preload = "metadata"
+        probe.muted = true
+        let d = js("Promise.resolve", js_new("Promise", (done) => {
+            probe.addEventListener("loadedmetadata", (_e = null) => { done(probe.duration) })
+            probe.addEventListener("error", (_e = null) => { done(null) })
+            probe.src = url
+        }))
+        let seconds = video_capture_seconds(d)
+        if seconds != null && seconds > most + 1 {
+            js("URL.revokeObjectURL", url)
+            input.value = ""
+            said = `That clip runs ${video_capture_clock(seconds)}. The limit is ${video_capture_clock(most)}.`
+            return null
+        }
+        said = ""
+        clip = { url, blob: file, type: file.type ?? "video/mp4", seconds, name: file.name, size: file.size }
+        status = "accepted"
+        tell()
+    }
+    <div class={ui_cls(["ui-video-capture", status == "recording" && "ui-video-capture-on", class])} data-state={status}
+         @mount={(_el) => {
+             let d = js("document")
+             let seen = (_e = null) => { if d.hidden { lost("The camera was closed while the app was away.") } }
+             d.addEventListener("visibilitychange", seen)
+             () => {
+                 d.removeEventListener("visibilitychange", seen)
+                 if recorder != null && recorder.state != "inactive" { recorder.stop() }
+                 release()
+                 free()
+             }
+         }}>
+        <div.ui-video-capture-body>
+            <div.ui-video-capture-frame>
+                <video muted={true} playsinline={true} autoplay={true} hidden={status != "live" && status != "recording"}
+                       aria-label="The camera's picture" @mount={(el) => { screen = el }}></video>
+                {(status == "review" || status == "accepted") && clip != null &&
+                    <video.ui-video-capture-review src={clip.url} controls={true} playsinline={true} aria-label="The clip recorded"></video>}
+                {(status == "idle" || status == "starting" || status == "finishing" || fallback) && <p.ui-video-capture-msg role="status">
+                    {match status {
+                        "starting" => "Asking for the camera…"
+                        "finishing" => "Finishing the clip…"
+                        "refused" => "The camera is off."
+                        "none" => "No camera here."
+                        _ => `Up to ${video_capture_clock(most)}`
+                    }}
+                </p>}
+                {status == "recording" && <span.ui-video-capture-clock role="timer" aria-label="Time recorded">{video_capture_clock(spent)} / {video_capture_clock(most)}</span>}
+                {(status == "live" || status == "recording") && <div.ui-video-capture-go>
+                    <svg.ui-video-capture-ring viewBox="0 0 84 84" aria-hidden="true">
+                        <circle.ui-video-capture-ring-back cx="42" cy="42" r="38"/>
+                        <circle.ui-video-capture-ring-left cx="42" cy="42" r="38" stroke-dasharray={str(video_capture_ring_len)}
+                                stroke-dashoffset={str(video_capture_ring(spent, most))}/>
+                    </svg>
+                    <button.ui-video-capture-shutter type="button" aria-label={status == "recording" ? "Stop recording" : "Start recording"}
+                            @click={() => { if status == "recording" { stop_recording() } else { record() } }}><span></span></button>
+                </div>}
+            </div>
+            <div.ui-video-capture-side>
+                <div.ui-video-capture-bar>
+                    {(status == "idle" || status == "starting") && <Button size="lg" disabled={status == "starting"} on_click={open}>{label}</Button>}
+                    {status == "live" && <Button size="lg" variant="outline" tone="neutral" on_click={() => { release(); status = "idle" }}>Close the camera</Button>}
+                    {status == "review" && <Button size="lg" on_click={accept}>Use this clip</Button>}
+                    {(status == "review" || status == "accepted") && <Button size="lg" variant="outline" tone="neutral" on_click={again}>Retake</Button>}
+                    {fallback && <Button size="lg" variant="outline" tone="neutral" on_click={open}>Try again</Button>}
+                    {status == "refused" && settings && <Button size="lg" variant="outline" tone="neutral" on_click={() => { js("quilloNative.openSettings") }}>Open Settings</Button>}
+                    <label class={ui_cls(["ui-video-capture-file", fallback && "ui-video-capture-file-on"])}>
+                        <span>Use the phone's camera</span>
+                        <input type="file" id={id} name={name} accept="video/*" capture={facing} @mount={(el) => { input = el }} @change={take_file}/>
+                    </label>
+                </div>
+                {(status == "review" || status == "accepted") && clip != null && <p.ui-video-capture-note>
+                    {clip.seconds != null ? `${round(clip.seconds, 1)} s, ` : ""}{round(clip.size / 1024)} KB{silent ? ", no sound" : ""}
+                    {status == "accepted" ? ". Ready to send." : ". Not sent until you use it."}
+                </p>}
+                {hint != null && <p.ui-video-capture-hint>{hint}</p>}
+                {said != "" && <p.ui-video-capture-why role="alert">{said}</p>}
+            </div>
+        </div>
+    </div>
+}

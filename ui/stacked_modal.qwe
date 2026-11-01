@@ -1,0 +1,292 @@
+// StackedModal: modals over modals, as a phone's own apps stack sheets. Each new one rises
+// over the last, the one below shrinks back and peeks out above it, and the page behind
+// them scales back too, so one can see how deep one has gone. Each is dragged down by a
+// finger, one at a time, and what is below comes forward as it goes. Each is the browser's
+// own <dialog>: focus stays in the top one, Escape closes that one, and focus returns to
+// where it was. On a tablet they stand as cards in the middle of the screen.
+//
+//   import ui/stacked_modal.qwe use StackedModal, StackedModalPage
+//
+//   component NewEvent() {
+//       state first = false
+//       state second = false
+//       <div>
+//           <StackedModalPage>
+//               <Button on_click={() => { first = true }}>New event</Button>
+//           </StackedModalPage>
+//           <StackedModal title="New event" open={first} on_close={() => { first = false }}>
+//               <Button on_click={() => { second = true }}>Repeat…</Button>
+//           </StackedModal>
+//           <StackedModal title="Repeat" open={second} on_close={() => { second = false }}> ... </StackedModal>
+//       </div>
+//   }
+//
+// StackedModal is one card; write as many as can be open at once, each with its own state.
+// They stack in the order they opened. title: its heading, and its name for screen readers.
+// trigger: the text of a button that opens it. open: from your own state, with on_close().
+// dismissable: dragging it off, a tap above it or Escape closes it (true); false leaves only
+// its Close button and the back gesture, and it resists the drag. on_close(): called when it has closed. children:
+// what it holds.
+//
+// StackedModalPage wraps the page, or the part of it that should scale back: without one
+// the page simply stays. While a card is open it has a transform, so what is `position:
+// fixed` inside it is held to it. It is back to none when the last one closes.
+//
+// The equal of the drag is the Close button, Escape and the phone's back gesture, which each
+// take one card at a time.
+
+import ui/button.qwe use Button
+import ui/bottom_sheet.qwe use bottom_sheet_track, bottom_sheet_track_move, bottom_sheet_speed, bottom_sheet_rubber, bottom_sheet_dismissed, bottom_sheet_back, bottom_sheet_keyboard_watch
+
+let stacked_modal_css = css`
+html:has(.ui-stacked-modal[open]) { overflow: hidden; }
+.ui-stacked-modal-host { display: contents; }
+.ui-stacked-modal-page { transition: transform .34s cubic-bezier(.22, 1, .36, 1), border-radius .34s; }
+.ui-stacked-modal {
+  position: fixed; inset: max(44px, calc(env(safe-area-inset-top) + 16px)) 0 var(--ui-stacked-modal-kb, 0px) 0; box-sizing: border-box; flex-direction: column;
+  width: 100%; max-width: none; height: auto; max-height: none; margin: 0; padding: 0; overflow: hidden; border: 0;
+  border-radius: calc(var(--ui-radius) + 8px) calc(var(--ui-radius) + 8px) 0 0; background: var(--ui-surface); color: var(--ui-fg);
+  box-shadow: 0 -4px 24px rgba(15, 14, 24, .18), 0 160px 0 0 var(--ui-surface); font: 15px/1.5 var(--ui-font); overscroll-behavior: contain;
+  transform-origin: 50% 0; transform: translateY(105%); will-change: transform;
+  transition: transform .34s cubic-bezier(.22, 1, .36, 1), filter .34s, overlay .34s allow-discrete, display .34s allow-discrete;
+}
+.ui-stacked-modal[open] { display: flex; transform: translateY(var(--ui-stacked-modal-y, 0px)) scale(var(--ui-stacked-modal-scale, 1)); filter: brightness(var(--ui-stacked-modal-dim, 1)); }
+@starting-style { .ui-stacked-modal[open] { transform: translateY(105%); } }
+.ui-stacked-modal::backdrop { background: var(--ui-overlay); opacity: .7; }
+.ui-stacked-modal-grip { display: flex; flex: none; align-items: center; justify-content: center; height: 22px; touch-action: none; }
+.ui-stacked-modal-grip span { width: 40px; height: 5px; border-radius: 999px; background: var(--ui-strong); }
+.ui-stacked-modal-head {
+  display: flex; align-items: center; gap: 8px; flex: none; padding: 0 8px 6px 20px; border-bottom: 1px solid var(--ui-border);
+  touch-action: none; -webkit-touch-callout: none; user-select: none;
+}
+.ui-stacked-modal-head h2 { flex: 1; min-width: 0; margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; }
+.ui-stacked-modal-close {
+  display: grid; place-items: center; flex: none; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); cursor: pointer;
+}
+@media (hover: hover) { .ui-stacked-modal-close:hover { background: var(--ui-subtle); color: var(--ui-fg); } }
+.ui-stacked-modal-close:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-stacked-modal-close svg { width: 18px; height: 18px; }
+.ui-stacked-modal-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px 20px calc(24px + env(safe-area-inset-bottom)); }
+.ui-stacked-modal-body > :first-child { margin-top: 0; }
+.ui-stacked-modal-body > :last-child { margin-bottom: 0; }
+/* A <dialog> sits over the whole window, so the window's width is the right one to ask, Split View included. */
+@media (min-width: 600px) {
+  .ui-stacked-modal {
+    inset: 8dvh 0 calc(8dvh + var(--ui-stacked-modal-kb, 0px)) 0; width: min(600px, calc(100vw - 48px)); margin: 0 auto; border: 1px solid var(--ui-border);
+    border-radius: calc(var(--ui-radius) + 6px); box-shadow: var(--ui-shadow-lg);
+  }
+}
+@media (prefers-reduced-motion: reduce) { .ui-stacked-modal, .ui-stacked-modal-page { transition: none; } }
+`
+
+// How a card stands with `depth` cards over it, 0 being the top one, or nearly so as the one
+// above is dragged away: smaller, higher, darker, up to three deep, so that the fourth
+// behind is lost behind the third.
+fn stacked_modal_pose(depth: num) {
+    let d = min([max([0, depth]), 3])
+    { scale: round(1 - 0.05 * d, 4), y: round(-12 * d, 2), dim: round(1 - 0.08 * d, 4) }
+}
+
+// How the page stands behind `count` cards.
+fn stacked_modal_page_scale(count: num) = count <= 0 ? 1 : round(1 - 0.05 * min([max([0, count]), 3]) - 0.01, 4)
+
+// The open cards, lowest first. The page's own order would be the order they were written.
+fn stacked_modal_cards(win) {
+    let found = win.document.querySelectorAll("dialog.ui-stacked-modal[open]")
+    let all = range(found.length) | map((i) => found[i])
+    sort_by(all, (d) => int(d.dataset.order ?? "0"))
+}
+
+// Stands every card, and the page, by how many are over each. `away` is how far, from 0 to
+// 1, the top card has been dragged off; a drag follows the finger, so nothing eases.
+fn stacked_modal_stand(win, away: num = 0, instant: bool = false) {
+    let cards = stacked_modal_cards(win)
+    let count = len(cards)
+    for i in range(count) {
+        let card = cards[i]
+        let over = count - 1 - i
+        if over > 0 {
+            let pose = stacked_modal_pose(over - away)
+            card.style.setProperty("--ui-stacked-modal-y", `${pose.y}px`)
+            card.style.setProperty("--ui-stacked-modal-scale", str(pose.scale))
+            card.style.setProperty("--ui-stacked-modal-dim", str(pose.dim))
+            card.style.transition = instant ? "none" : ""
+        } else {
+            if !instant {
+                card.style.removeProperty("--ui-stacked-modal-y")
+                card.style.removeProperty("--ui-stacked-modal-scale")
+                card.style.removeProperty("--ui-stacked-modal-dim")
+            }
+        }
+    }
+    let pages = win.document.querySelectorAll(".ui-stacked-modal-page")
+    for i in range(pages.length) {
+        let page = pages[i]
+        if count == 0 {
+            page.style.removeProperty("transform")
+            page.style.removeProperty("transform-origin")
+            page.style.removeProperty("border-radius")
+            page.style.removeProperty("transition")
+        } else {
+            // Scaled about the middle of what is seen, however far the page is scrolled.
+            let box = page.getBoundingClientRect()
+            let middle = win.innerHeight / 2 - box.top
+            let scale = stacked_modal_page_scale(count - away)
+            page.style.transformOrigin = `50% ${round(middle, 1)}px`
+            page.style.transform = `scale(${scale})`
+            page.style.borderRadius = "14px"
+            page.style.transition = instant ? "none" : ""
+        }
+    }
+}
+
+// The next card's place in the order: one above all those open.
+fn stacked_modal_next(win) {
+    let cards = stacked_modal_cards(win)
+    len(cards) == 0 ? 1 : int(cards[len(cards) - 1].dataset.order ?? "0") + 1
+}
+
+view StackedModalPage(children) {
+    style global stacked_modal_css
+    <div.ui-stacked-modal-page>{children}</div>
+}
+
+component StackedModal(title: str, trigger: str? = null, open: bool = false, dismissable: bool = true, on_close = null, children) {
+    style global stacked_modal_css
+    state dlg = null
+    state body = null
+    state win = null
+    state track = null
+    state zone = null           // "handle" or "body", then "drag"
+    state moved = false
+    state undo_back = null
+    state undo_kb = null
+    let shut = () => { dlg.close() }
+    let forget = () => {
+        undo_kb && undo_kb()
+        undo_kb = null
+        undo_back && undo_back()
+        undo_back = null
+    }
+    let spring = () => {
+        dlg.style.removeProperty("transform")
+        dlg.style.removeProperty("transition")
+    }
+    let show = () => {
+        // Its place first: what is measured and stood next counts it.
+        dlg.dataset.order = str(stacked_modal_next(win))
+        dlg.showModal()
+        stacked_modal_stand(win)
+        undo_kb = bottom_sheet_keyboard_watch(win, (px) => { dlg.style.setProperty("--ui-stacked-modal-kb", `${px}px`) })
+        undo_back = bottom_sheet_back(win, shut)
+    }
+    if open && dlg != null && !dlg.open { show() }
+    if !open && dlg != null && dlg.open && trigger == null { shut() }
+    let moving = (e) => {
+        if track != null {
+            track = bottom_sheet_track_move(track, e.clientX, e.clientY, e.timeStamp)
+            if track.lock == "x" && zone != "drag" {
+                track = null
+                zone = null
+            }
+            if track != null && track.lock == "y" {
+                if zone == "body" && (track.y < track.y0 || body.scrollTop > 0) {
+                    track = null
+                    zone = null
+                } else {
+                    if zone != "drag" {
+                        zone = "drag"
+                        moved = true
+                        dlg.setPointerCapture(e.pointerId)
+                        dlg.style.transition = "none"
+                    }
+                    let dy = track.y - track.y0
+                    let y = dy >= 0 ? (dismissable ? dy : bottom_sheet_rubber(dy, 60)) : 0 - bottom_sheet_rubber(0 - dy, 60)
+                    dlg.style.transform = `translateY(${round(y, 2)}px)`
+                    if dismissable && dy > 0 { stacked_modal_stand(win, min([1, dy / dlg.offsetHeight]), true) }
+                }
+            }
+        }
+    }
+    let ended = (e) => {
+        if track != null && zone == "drag" {
+            let leave = dismissable && bottom_sheet_dismissed(track.y - track.y0, dlg.offsetHeight, bottom_sheet_speed(track, "y", e.timeStamp))
+            spring()
+            if leave { shut() } else { stacked_modal_stand(win) }
+        }
+        track = null
+        zone = null
+    }
+    let cancelled = () => {
+        if zone == "drag" {
+            spring()
+            stacked_modal_stand(win)
+        }
+        track = null
+        zone = null
+    }
+    <div.ui-stacked-modal-host>
+        {trigger != null && <Button variant="outline" size="lg" on_click={show}>{trigger}</Button>}
+        <dialog.ui-stacked-modal aria-label={title}
+                @mount={(el) => {
+                    // win first: giving dlg a value sets off the `if open` above.
+                    win = js("window")
+                    dlg = el
+                    if open && !dlg.open { show() }
+                    // Taken off the page while open: nothing stays on the window, and the
+                    // page must come forward as it does when the card closes.
+                    () => {
+                        forget()
+                        // It is still in the page as this runs, and would be counted.
+                        dlg.open = false
+                        stacked_modal_stand(win)
+                    }
+                }}
+                @close={() => {
+                    forget()
+                    track = null
+                    zone = null
+                    spring()
+                    dlg.style.removeProperty("--ui-stacked-modal-kb")
+                    dlg.style.removeProperty("--ui-stacked-modal-y")
+                    dlg.style.removeProperty("--ui-stacked-modal-scale")
+                    dlg.style.removeProperty("--ui-stacked-modal-dim")
+                    stacked_modal_stand(win)
+                    on_close && on_close()
+                }}
+                @cancel={(e) => {
+                    if !dismissable { e.preventDefault() }
+                }}
+                @click={(e) => {
+                    if dismissable && e.target.isSameNode(dlg) && !moved && e.clientY < dlg.getBoundingClientRect().top { shut() }
+                    moved = false
+                }}
+                @pointerdown={(e) => {
+                    let t = e.target
+                    let on_handle = t.closest(".ui-stacked-modal-grip, .ui-stacked-modal-head") != null && t.closest(".ui-stacked-modal-close") == null
+                    let on_body = t.closest(".ui-stacked-modal-body") != null
+                    moved = false
+                    if e.button == 0 && (on_handle || (on_body && e.pointerType == "touch")) {
+                        track = bottom_sheet_track(e.clientX, e.clientY, e.timeStamp)
+                        zone = on_handle ? "handle" : "body"
+                    }
+                }}
+                @pointermove={moving}
+                @pointerup={ended}
+                @pointercancel={cancelled}
+                @touchmove={(e) => {
+                    if zone == "drag" && e.cancelable { e.preventDefault() }
+                }}>
+            <div.ui-stacked-modal-grip aria-hidden="true"><span></span></div>
+            <div.ui-stacked-modal-head>
+                <h2>{title}</h2>
+                <button.ui-stacked-modal-close type="button" aria-label="Close" @click={shut}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                         aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div.ui-stacked-modal-body @mount={(el) => { body = el }}>{children}</div>
+        </dialog>
+    </div>
+}

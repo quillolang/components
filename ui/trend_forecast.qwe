@@ -1,0 +1,418 @@
+// TrendForecast: fits a series and carries it forward: a least-squares trend, a
+// seasonal pattern when the series has one, and a forecast with a prediction band.
+// It reports R-squared and says so plainly when the fit is too poor to lean on.
+//
+//   <TrendForecast points={[{ t: "2026-01-01", value: 120 }, { t: "2026-02-01", value: 131 }]} horizon={6}/>
+//   <TrendForecast points={[12, 15, 11, 14, 17, 13, 16, 19, 15]} confidence={80} on_change={(f) => { next = f.forecast }}/>
+//
+// The method. A straight line by least squares; the leftovers' autocorrelation is
+// looked at for lags from 2 up to half the series, and the shortest clear peak (0.4 or
+// more, within a fifth of the best) is taken as the period, but only if the pattern
+// leaves a smaller error once the extra numbers it costs are counted. The pattern is
+// the average leftover in each place of the cycle, centred on 0, and the line is
+// fitted again without it. The band is the usual prediction interval of a regression,
+// sqrt(1 + 1/n + (x - mean)^2 / Sxx) times the error, with Student's t, so it widens
+// with distance and with few points. This is arithmetic on floats, and a forecast is
+// an estimate: nothing here is money.
+//
+// points: the series in order, numbers or { t, value } (t a date or any label; a null
+// value is left out of the fit and keeps its place). The reader can paste over it, in
+// the box named series: a line for each point, "label, value" or the value alone; a
+// first line of headings is skipped, and the first 1,000 points are used. horizon: how
+// many steps ahead, 1 to 60 (6). confidence: 80, 90, 95 or 99 percent (95). period:
+// "auto" to look for one (the default), "none", or a whole number. All three are
+// fields of those names; name: a prefix for the names. After dated points the
+// forecast is dated too, by the month when the steps are months. title: the heading
+// ("Trend and forecast"). id: a prefix for its ids ("trend-forecast"), unique on the
+// page. on_change(result): inside one of your components, given { slope, intercept,
+// period, r2, forecast } after each change, or null with too little data; forecast
+// is a list of { label, value, low, high }.
+//
+// trend_forecast_parse(text) and trend_forecast_fit(values, period, confidence, horizon)
+// are the work, for a program's own use. fit takes a list of numbers and nulls and
+// gives { slope, intercept, period, seasonal, r2, error, forecast, notes, ... }, or
+// { too_few: true }; trend_forecast_t(confidence, dof) is Student's t.
+
+import ui/theme.qwe use ui_cls
+
+let trend_forecast_css = css`
+.ui-trend-forecast { display: grid; gap: 12px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-trend-forecast .ui-trend-forecast-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-trend-forecast-controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 14px; max-width: 520px; }
+.ui-trend-forecast-field { display: grid; gap: 4px; min-width: 0; font-size: 13px; }
+.ui-trend-forecast-field input, .ui-trend-forecast-field select { box-sizing: border-box; width: 100%; height: 36px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-trend-forecast-field input:focus, .ui-trend-forecast-field select:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-trend-forecast-field input[aria-invalid] { border-color: var(--ui-danger); }
+.ui-trend-forecast-chart { display: block; width: 100%; max-width: 640px; height: auto; }
+.ui-trend-forecast-band { fill: var(--ui-accent); opacity: .16; }
+.ui-trend-forecast-history { fill: none; stroke: var(--ui-fg); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.ui-trend-forecast-ahead { fill: none; stroke: var(--ui-accent); stroke-width: 2; stroke-dasharray: 6 4; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.ui-trend-forecast-now { stroke: var(--ui-strong); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.ui-trend-forecast-axis { display: flex; justify-content: space-between; gap: 12px; max-width: 640px; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-trend-forecast-live { display: grid; gap: 8px; min-width: 0; }
+.ui-trend-forecast-say { margin: 0; font-weight: 600; }
+.ui-trend-forecast-facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.ui-trend-forecast-facts div { min-width: 0; padding: 8px 10px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-trend-forecast-facts dt { color: var(--ui-muted); font-size: 12px; }
+.ui-trend-forecast-facts dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-trend-forecast-warn { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+.ui-trend-forecast-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-trend-forecast-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-trend-forecast-scroll { max-height: 240px; min-width: 0; overflow: auto; }
+.ui-trend-forecast-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-trend-forecast-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-trend-forecast-table th { position: sticky; top: 0; padding: 5px 8px; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); color: var(--ui-muted); font-size: 12px; font-weight: 600; text-align: right; }
+.ui-trend-forecast-table td { padding: 5px 8px; border-bottom: 1px solid var(--ui-border); text-align: right; }
+.ui-trend-forecast-table th:first-child, .ui-trend-forecast-table td:first-child { text-align: left; }
+.ui-trend-forecast-data summary { color: var(--ui-muted); font-size: 13px; cursor: pointer; }
+.ui-trend-forecast-data summary:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-trend-forecast-box { box-sizing: border-box; width: 100%; min-height: 120px; margin-top: 6px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.4 var(--ui-mono); resize: vertical; }
+.ui-trend-forecast-box:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+@media (max-width: 520px) { .ui-trend-forecast-controls, .ui-trend-forecast-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ui-trend-forecast-table th, .ui-trend-forecast-table td { padding: 5px 4px; } }
+`
+
+let trend_forecast_cap = 1000
+let trend_forecast_levels = [80, 90, 95, 99]
+
+// A number with commas and up to two decimals, in whole numbers so that the server
+// and the browser write the same text.
+fn trend_forecast_num(v: num) -> str {
+    let units = round(abs(v) * 100)
+    let whole = floor(units / 100)
+    let frac = units - whole * 100
+    let tail = frac == 0 ? "" : (frac % 10 == 0 ? `.${floor(frac / 10)}` : `.${frac < 10 ? "0" : ""}${frac}`)
+    `${v < 0 && units > 0 ? "-" : ""}${trend_forecast_group(whole)}${tail}`
+}
+
+fn trend_forecast_group(n: num) -> str {
+    if n < 1000 { return str(n) }
+    let rest = str(n % 1000)
+    `${trend_forecast_group(floor(n / 1000))},${repeat("0", 3 - len(rest))}${rest}`
+}
+
+fn trend_forecast_three(v: num) -> str {
+    let units = round(abs(v) * 1000)
+    let frac = str(units % 1000)
+    `${v < 0 && units > 0 ? "-" : ""}${floor(units / 1000)}.${repeat("0", 3 - len(frac))}${frac}`
+}
+
+// A value as typed: a float, or null when it is not a number we can trust.
+fn trend_forecast_read(text: str) {
+    let t = replace(trim(text), ",", "")
+    re.test(t, "^[-+]?\\d{1,15}(\\.\\d{1,12})?$") ? float(dec(t)) : null
+}
+
+// The text of a list of points, for the box.
+fn trend_forecast_text(points: list) -> str =
+    slice(points, 0, trend_forecast_cap) | map((p) => {
+        if type_of(p) != "map" { return p == null ? "" : str(p) }
+        let v = p.value == null ? "" : str(p.value)
+        p.t == null ? v : `${p.t}, ${v}`
+    }) | join("\n")
+
+// The box's lines to { points, problems, over }. A point is { label, value }, the value
+// null for a missing one. A bad line is named, and skipped.
+fn trend_forecast_parse(text: str) -> map {
+    let lines = split(replace(text, "\r", ""), "\n")
+    let read = for n in range(len(lines)) {
+        let line = trim(lines[n])
+        let cut = re.find(line, "[,;\\t]")
+        let label = cut == null ? "" : trim(slice(line, 0, cut.start))
+        let raw = cut == null ? line : trim(slice(line, cut.end, len(line)))
+        let v = trend_forecast_read(raw)
+        let empty = raw == "" || raw == "null" || raw == "NA" || raw == "-"
+        if line == "" { { skip: true } } else {
+            if v == null && !empty { { line: n + 1, bad: raw, skip: false } } else { { label, value: v, skip: false, bad: null } }
+        }
+    }
+    let used = read | filter((r) => !r.skip)
+    // A first line that is no number is a heading.
+    let body = len(used) > 0 && used[0].bad != null ? slice(used, 1, len(used)) : used
+    let bad = body | filter((r) => r.bad != null)
+    let good = body | filter((r) => r.bad == null)
+    let problems = slice(bad, 0, 6) | map((r) => `Line ${r.line}: "${slice(r.bad, 0, 40)}" is not a number, so it is skipped.`)
+    { points: slice(good, 0, trend_forecast_cap) | map((r) => ({ label: r.label, value: r.value })),
+      problems: problems + (len(bad) > 6 ? [`And ${len(bad) - 6} more lines like these.`] : []), over: len(good) > trend_forecast_cap ? len(good) - trend_forecast_cap : 0 }
+}
+
+// The line through (x, y) pairs: { slope, intercept, mean_x, sxx }.
+fn trend_forecast_line(xs: list, ys: list) -> map {
+    let mean_x = sum(xs) / len(xs)
+    let mean_y = sum(ys) / len(ys)
+    let sxx = sum(xs | map((x) => (x - mean_x) * (x - mean_x)))
+    let sxy = sum(for i in range(len(xs)) => (xs[i] - mean_x) * (ys[i] - mean_y))
+    let slope = sxx == 0 ? 0 : sxy / sxx
+    { slope, intercept: mean_y - slope * mean_x, mean_x, sxx }
+}
+
+// Autocorrelation of what is left at each lag from 1 to `top`, over the pairs there are.
+fn trend_forecast_lags(values: list, top: int) -> list {
+    let total = sum(values | filter((v) => v != null) | map((v) => v * v))
+    let count = len(values | filter((v) => v != null))
+    if total <= 0 { return [] }
+    for lag in range(1, top + 1) {
+        let pairs = range(len(values) - lag) | filter((i) => values[i] != null && values[i + lag] != null)
+        len(pairs) == 0 ? 0 : (sum(pairs | map((i) => values[i] * values[i + lag])) / len(pairs)) / (total / count)
+    }
+}
+
+// The period in what is left, or null: the shortest clear peak of the autocorrelation.
+fn trend_forecast_find_period(left: list) {
+    let top = floor(len(left) / 2)
+    if top < 2 { return null }
+    let lags = trend_forecast_lags(left, top)
+    if len(lags) == 0 { return null }
+    let at = (p: int) => lags[p - 1]
+    let peaks = range(2, top + 1) | filter((p) => at(p) >= 0.4 && at(p) >= at(p - 1) && (p == top || at(p) >= at(p + 1)))
+    if len(peaks) == 0 { return null }
+    let best = max(peaks | map(at))
+    find(peaks, (p) => at(p) >= best * 0.8)
+}
+
+// The pattern for a period: the average of what is left in each place, centred on 0.
+fn trend_forecast_pattern(left: list, period: int) -> list {
+    let raw = for ph in range(period) {
+        let here = range(len(left)) | filter((i) => i % period == ph && left[i] != null) | map((i) => left[i])
+        len(here) == 0 ? 0 : sum(here) / len(here)
+    }
+    let centre = sum(raw) / period
+    raw | map((s) => s - centre)
+}
+
+fn trend_forecast_t(confidence: num, dof: int) -> num {
+    let p = 1 - (1 - confidence / 100) / 2
+    if dof == 1 { return math.tan(math.pi * (p - 0.5)) }
+    if dof == 2 { return (2 * p - 1) / sqrt(2 * p * (1 - p)) }
+    // The Cornish-Fisher expansion from the normal: to about 0.1% from three degrees up.
+    let z = stats.normal_inv(p)
+    let z3 = z * z * z
+    let z5 = z3 * z * z
+    let z7 = z5 * z * z
+    let z9 = z7 * z * z
+    let v = float(dof)
+    z + (z3 + z) / (4 * v) + (5 * z5 + 16 * z3 + 3 * z) / (96 * v * v) + (3 * z7 + 19 * z5 + 17 * z3 - 15 * z) / (384 * v * v * v)
+        + (79 * z9 + 776 * z7 + 1482 * z5 - 1920 * z3 - 945 * z) / (92160 * v * v * v * v)
+}
+
+// A model for one period (null for none), fitted on the values that are there.
+fn trend_forecast_model(values: list, xs: list, ys: list, period) -> map {
+    let first_line = trend_forecast_line(xs, ys)
+    let left_of = (l: map, pattern: list) => for i in range(len(values)) {
+        let y = values[i]
+        y == null ? null : y - l.intercept - l.slope * i - (len(pattern) > 0 ? pattern[i % period] : 0)
+    }
+    if period == null {
+        return { line: first_line, pattern: [], sse: sum(left_of(first_line, []) | filter((r) => r != null) | map((r) => r * r)), used: 2 }
+    }
+    let pattern = trend_forecast_pattern(left_of(first_line, []), period)
+    let line = trend_forecast_line(xs, xs | map((x) => values[x] - pattern[x % period]))
+    let pattern2 = trend_forecast_pattern(for i in range(len(values)) => values[i] == null ? null : values[i] - line.intercept - line.slope * i, period)
+    let line2 = trend_forecast_line(xs, xs | map((x) => values[x] - pattern2[x % period]))
+    { line: line2, pattern: pattern2, sse: sum(left_of(line2, pattern2) | filter((r) => r != null) | map((r) => r * r)), used: 1 + period }
+}
+
+fn trend_forecast_fit(values: list, period, confidence: num, horizon: int) -> map {
+    let xs = range(len(values)) | filter((i) => values[i] != null)
+    let ys = xs | map((i) => values[i])
+    let n = len(ys)
+    if n < 3 { return { too_few: true, count: n } }
+    let plain = trend_forecast_model(values, xs, ys, null)
+    let left = for i in range(len(values)) => values[i] == null ? null : values[i] - plain.line.intercept - plain.line.slope * i
+    let asked = type_of(period) == "int"
+    let wanted = period == "none" ? null : (asked ? period : trend_forecast_find_period(left))
+    let room = wanted != null && wanted >= 2 && n >= 2 * wanted && n - 1 - wanted >= 1
+    let tried = room ? trend_forecast_model(values, xs, ys, wanted) : null
+    // A pattern costs numbers: it stays when the error per degree of freedom falls.
+    let keeps = tried != null && (asked || tried.sse / (n - tried.used) < plain.sse / (n - plain.used) * 0.9)
+    let m = keeps ? tried : plain
+    let chosen = keeps ? wanted : null
+    let mean_y = sum(ys) / n
+    let sst = sum(ys | map((y) => (y - mean_y) * (y - mean_y)))
+    let flat = sst <= mean_y * mean_y * 0.0000000000000001 || sst == 0
+    let sse = m.sse < sst * 0.000000000000000001 ? 0 : m.sse
+    let r2 = flat ? null : 1 - sse / sst
+    let dof = n - m.used
+    let error = dof >= 1 ? sqrt(sse / dof) : null
+    let t = dof >= 1 ? trend_forecast_t(confidence, dof) : null
+    let line = m.line
+    let at = (x: int) => line.intercept + line.slope * x + (len(m.pattern) > 0 ? m.pattern[x % chosen] : 0)
+    let last_x = len(values) - 1
+    let forecast = for h in range(1, horizon + 1) {
+        let x = last_x + h
+        let dx = x - line.mean_x
+        let half = error == null ? null : t * error * sqrt(1 + 1 / n + dx * dx / line.sxx)
+        { h, value: at(x), low: half == null ? null : at(x) - half, high: half == null ? null : at(x) + half }
+    }
+    let lost = wanted != null && !keeps && asked ? `A pattern of ${wanted} needs at least ${2 * wanted} values, so none is used.` : null
+    { too_few: false, count: n, slope: line.slope, intercept: line.intercept, period: chosen, seasonal: m.pattern, r2, error, forecast, flat, lost }
+}
+
+// Warnings a reader must not miss, plainly.
+fn trend_forecast_warnings(f: map, values: list, horizon: int) -> list {
+    let there = values | filter((v) => v != null)
+    let low = min(f.forecast | map((p) => p.value))
+    [
+        f.flat ? "The values do not change, so the forecast is only that same value." : null,
+        !f.flat && f.r2 < 0.5 ? `Poor fit: the ${f.period == null ? "trend explains" : "trend and pattern explain"} only ${trend_forecast_num(round(max([f.r2, 0]) * 1000) / 10)}% of the variation. Treat this forecast as a rough guess.` : null,
+        f.count < 8 ? `Only ${f.count} values: a band from so few says little.` : null,
+        f.error == null ? "Too few values for this model to leave any way of judging its error, so there is no band." : null,
+        min(there) >= 0 && low < 0 ? "The forecast goes below 0, which this series has never done." : null,
+        horizon > f.count ? "The forecast runs longer than the history behind it." : null,
+    ] | filter((w) => w != null)
+}
+
+// The labels after the last point: dated when the points are, else +1, +2.
+fn trend_forecast_labels(points: list, horizon: int) -> list {
+    let labels = points | map((p) => p.label)
+    let is_date = len(labels) >= 2 && all(labels, (l) => date.valid(l, "date"))
+    if !is_date { return for h in range(1, horizon + 1) => `+${h}` }
+    let spans = vec.diff(labels | map((l) => date.ms(l))) | map((ms) => ms / 86400000)
+    let usual = round(stats.median(spans))
+    let last_day = labels[len(labels) - 1]
+    if usual < 1 { return for h in range(1, horizon + 1) => `+${h}` }
+    for h in range(1, horizon + 1) => usual >= 28 && usual <= 31 ? date.add_months(last_day, h) : date.add_days(last_day, usual * h)
+}
+
+fn trend_forecast_xy(v: num) -> str {
+    let tenths = round(v * 10)
+    let sign = tenths < 0 ? "-" : ""
+    let a = abs(tenths)
+    a % 10 == 0 ? `${sign}${floor(a / 10)}` : `${sign}${floor(a / 10)}.${a % 10}`
+}
+
+// The chart's geometry: { history, ahead, band, now, lo, hi }.
+fn trend_forecast_plot(values: list, f: map, width: num, height: num) -> map {
+    let shown = values | filter((v) => v != null)
+    let tops = f.forecast | map((p) => p.high ?? p.value)
+    let bottoms = f.forecast | map((p) => p.low ?? p.value)
+    let lo0 = min(shown + bottoms)
+    let hi0 = max(shown + tops)
+    let span = hi0 - lo0 == 0 ? 1 : hi0 - lo0
+    let total = len(values) + len(f.forecast) - 1
+    let x = (i: int) => 8 + (width - 16) * (total == 0 ? 0 : i / total)
+    let y = (v: num) => 8 + (height - 16) * (1 - (v - lo0) / span)
+    let last_i = len(values) - 1
+    let segs = for i in range(len(values)) {
+        let v = values[i]
+        v == null ? "" : `${i == 0 || values[i - 1] == null ? "M" : "L"}${trend_forecast_xy(x(i))} ${trend_forecast_xy(y(v))}`
+    }
+    let tail = f.forecast | map((p) => `${trend_forecast_xy(x(last_i + p.h))} ${trend_forecast_xy(y(p.value))}`)
+    let last_value = last(shown)
+    let start = `${trend_forecast_xy(x(last_i))} ${trend_forecast_xy(y(last_value))}`
+    let has_band = f.error != null
+    let up = has_band ? f.forecast | map((p) => `${trend_forecast_xy(x(last_i + p.h))} ${trend_forecast_xy(y(p.high))}`) : []
+    let down = has_band ? reverse(f.forecast) | map((p) => `${trend_forecast_xy(x(last_i + p.h))} ${trend_forecast_xy(y(p.low))}`) : []
+    { history: join(segs, " "), ahead: `M${start} L${join(tail, " L")}`, band: has_band ? join([start] + up + down, " ") : null, now: trend_forecast_xy(x(last_i)), lo: lo0, hi: hi0 }
+}
+
+fn trend_forecast_summary(f: map) -> str {
+    if f.flat { return "Flat: the series does not move." }
+    let step = abs(f.slope)
+    let way = step < 0.005 ? "Level" : (f.slope > 0 ? `Rising by ${trend_forecast_num(step)} a step` : `Falling by ${trend_forecast_num(step)} a step`)
+    `${way}${f.period == null ? ", with no repeating pattern" : `, repeating every ${f.period} steps`}.`
+}
+
+// What a field holds: a whole number from 1 to 60, or null.
+fn trend_forecast_horizon(text: str) {
+    let t = trim(text)
+    if !re.test(t, "^\\d{1,3}$") { return null }
+    let n = int(t)
+    n >= 1 && n <= 60 ? n : null
+}
+
+fn trend_forecast_period_of(choice: str) = choice == "auto" || choice == "none" ? choice : int(choice)
+
+component TrendForecast(points: list = [], horizon = 6, confidence: int = 95, period = "auto", title: str = "Trend and forecast", id: str = "trend-forecast",
+                        name: str? = null, on_change = null, class: str? = null) {
+    style global trend_forecast_css
+    state text = trend_forecast_text(points)
+    state ahead = str(horizon)
+    state level = contains(trend_forecast_levels, confidence) ? confidence : 95
+    state choice = str(period)
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let parsed = trend_forecast_parse(text)
+    let series = parsed.points
+    let values = series | map((p) => p.value)
+    let steps = trend_forecast_horizon(ahead)
+    let f = steps == null ? null : trend_forecast_fit(values, trend_forecast_period_of(choice), level, steps)
+    let good = f != null && !f.too_few
+    let notes = good ? trend_forecast_warnings(f, values, steps) : []
+    let labels = good ? trend_forecast_labels(series, steps) : []
+    let plot = good ? trend_forecast_plot(values, f, 640, 220) : null
+    let tell = () => {
+        if on_change != null {
+            let p = trend_forecast_parse(text).points
+            let n = trend_forecast_horizon(ahead)
+            let r = n == null ? null : trend_forecast_fit(p | map((q) => q.value), trend_forecast_period_of(choice), level, n)
+            if r == null || r.too_few { on_change(null) } else {
+                let names = trend_forecast_labels(p, n)
+                on_change({ slope: r.slope, intercept: r.intercept, period: r.period, r2: r.r2,
+                            forecast: r.forecast | map((o) => ({ label: names[o.h - 1], value: o.value, low: o.low, high: o.high })) })
+            }
+        }
+    }
+    <section class={ui_cls(["ui-trend-forecast", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-trend-forecast-title id={`${id}-title`}>{title}</h3>
+        <div.ui-trend-forecast-controls>
+            <label.ui-trend-forecast-field for={`${id}-horizon`}>Steps ahead
+                <input type="text" inputmode="numeric" id={`${id}-horizon`} name={named("horizon")} value={ahead} autocomplete="off" aria-invalid={steps == null ? "true" : null}
+                       @input={(e) => { ahead = e.value; tell() }}/></label>
+            <label.ui-trend-forecast-field for={`${id}-period`}>Pattern
+                <select id={`${id}-period`} name={named("period")} @change={(e) => { choice = e.value; tell() }}>
+                    <option value="auto" selected={choice == "auto"}>Find it</option>
+                    <option value="none" selected={choice == "none"}>None</option>
+                    {for p in [2, 3, 4, 5, 6, 7, 12, 24, 52] => <option value={p} selected={choice == str(p)}>Every {p}</option>}
+                </select></label>
+            <label.ui-trend-forecast-field for={`${id}-level`}>Band
+                <select id={`${id}-level`} name={named("confidence")} @change={(e) => { level = int(e.value); tell() }}>
+                    {for l in trend_forecast_levels => <option value={l} selected={l == level}>{l}%</option>}
+                </select></label>
+        </div>
+        {good && <div>
+            <svg.ui-trend-forecast-chart viewBox="0 0 640 220" role="img" aria-label={`${trend_forecast_summary(f)} History of ${f.count} values and ${steps} steps of forecast.`}>
+                {plot.band != null && <polygon.ui-trend-forecast-band points={plot.band}/>}
+                <line.ui-trend-forecast-now x1={plot.now} x2={plot.now} y1="0" y2="220"/>
+                <path.ui-trend-forecast-history d={plot.history}/>
+                <path.ui-trend-forecast-ahead d={plot.ahead}/>
+            </svg>
+            <div.ui-trend-forecast-axis aria-hidden="true">
+                <span>{filled(series[0].label) ?? "Start"}</span><span>{trend_forecast_num(plot.lo)} to {trend_forecast_num(plot.hi)}</span><span>{labels[steps - 1]}</span>
+            </div>
+        </div>}
+        <div.ui-trend-forecast-live aria-live="polite">
+            {steps == null && <p.ui-trend-forecast-problems role="alert">Steps ahead must be a whole number from 1 to 60.</p>}
+            {steps != null && !good && <p.ui-trend-forecast-note>{len(series) == 0 ? "Paste a series to fit." : `Too few values: a trend needs at least 3, and there ${f.count == 1 ? "is 1" : `are ${f.count}`}.`}</p>}
+            {good && <p.ui-trend-forecast-say>{trend_forecast_summary(f)}</p>}
+            {good && <dl.ui-trend-forecast-facts>
+                <div data-k="slope"><dt>Trend a step</dt><dd>{trend_forecast_three(f.slope)}</dd></div>
+                <div data-k="period"><dt>Pattern</dt><dd>{f.period == null ? "None" : `Every ${f.period}`}</dd></div>
+                <div data-k="r2"><dt>R-squared</dt><dd>{f.r2 == null ? "None" : trend_forecast_three(f.r2)}</dd></div>
+                <div data-k="error"><dt>Typical error</dt><dd>{f.error == null ? "None" : trend_forecast_num(f.error)}</dd></div>
+            </dl>}
+            {good && f.lost != null && <p.ui-trend-forecast-note>{f.lost}</p>}
+            {good && <div>{for w in notes => <p.ui-trend-forecast-warn>{w}</p>}</div>}
+            {len(parsed.problems) > 0 && <ul.ui-trend-forecast-problems>{for p in parsed.problems => <li>{p}</li>}</ul>}
+            {parsed.over > 0 && <p.ui-trend-forecast-note>Only the first {trend_forecast_cap} points are used; {parsed.over} more were left out.</p>}
+        </div>
+        {good && <div.ui-trend-forecast-scroll tabindex="0" role="group" aria-label="Forecast values">
+            <table.ui-trend-forecast-table>
+                <thead><tr><th scope="col">Step</th><th scope="col">Forecast</th><th scope="col">Low</th><th scope="col">High</th></tr></thead>
+                <tbody>
+                    {for o in f.forecast => <tr key={o.h} data-h={o.h}>
+                        <td>{labels[o.h - 1]}</td><td>{trend_forecast_num(o.value)}</td>
+                        <td>{o.low == null ? "" : trend_forecast_num(o.low)}</td><td>{o.high == null ? "" : trend_forecast_num(o.high)}</td>
+                    </tr>}
+                </tbody>
+            </table>
+        </div>}
+        <details.ui-trend-forecast-data>
+            <summary>The data</summary>
+            <label.ui-sr for={`${id}-series`}>Series, a line for each point</label>
+            <textarea.ui-trend-forecast-box id={`${id}-series`} name={named("series")} spellcheck="false" rows="8" @input={(e) => { text = e.value; tell() }}>{text}</textarea>
+        </details>
+    </section>
+}

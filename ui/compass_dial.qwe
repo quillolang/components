@@ -1,0 +1,262 @@
+// CompassDial: a dial that turns as the phone turns, so its N stays north. It takes the
+// heading from where each system keeps it: iOS's own compass heading, Android's absolute
+// orientation, and only then an orientation that is relative to where the page began,
+// which it says is not north. A heading crossing north goes the short way, and it
+// is smoothed so a hand's shake does not show. It counts the screen being turned. When the
+// reading is poor, it says how to calibrate; a phone near metal wanders, and it notices.
+//
+//   <CompassDial/>
+//   <CompassDial bearing={132} target="Base camp"/>
+//   <CompassDial on_heading={(h) => { facing = h }}/>
+//
+// bearing: degrees from north of a place to go; it marks it on the rim and says which way
+// to turn. target: what that place is called. smooth: how much of each new reading
+// is taken, 0 to 1; less is steadier and slower (0.2). on_heading(degrees): inside one of
+// your components, called as the whole-degree heading changes. Android's Chrome and a
+// phone in the Quillo app ask nothing; iOS asks once with a tap, and the button to do that shows
+// only where needed. A person who refused can turn it on in Settings.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let compass_dial_css = css`
+.ui-compass { container-type: inline-size; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-compass-in { display: grid; gap: 12px; justify-items: center; }
+.ui-compass-face { position: relative; width: min(100%, 280px); aspect-ratio: 1; }
+.ui-compass-rose { position: absolute; inset: 0; width: 100%; height: 100%; will-change: transform; }
+.ui-compass-ring { fill: var(--ui-surface); stroke: var(--ui-border); stroke-width: 1; }
+.ui-compass-tick { stroke: var(--ui-muted); stroke-width: 1; }
+.ui-compass-tick-big { stroke: var(--ui-fg); stroke-width: 2; }
+.ui-compass-letter { fill: var(--ui-fg); font: 600 14px/1 var(--ui-font); text-anchor: middle; }
+.ui-compass-north { fill: var(--ui-danger); }
+.ui-compass-mark { fill: var(--ui-accent); }
+.ui-compass-lubber { position: absolute; left: 50%; top: -2px; width: 0; height: 0; margin-left: -8px; border: 8px solid transparent; border-top: 14px solid var(--ui-danger); }
+.ui-compass-side { display: grid; gap: 12px; justify-items: center; min-width: 0; }
+.ui-compass-read { display: grid; gap: 2px; justify-items: center; text-align: center; }
+.ui-compass-big { font: 600 30px/1.15 var(--ui-font); font-variant-numeric: tabular-nums; }
+.ui-compass-turn { color: var(--ui-accent); font-weight: 500; }
+.ui-compass-say { margin: 0; color: var(--ui-muted); max-width: 34ch; }
+.ui-compass-say:empty { display: none; }
+.ui-compass-say[data-bad] { color: var(--ui-fg); }
+.ui-compass-bar { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+/* With room, the readings and advice stand beside the dial. */
+@container (min-width: 420px) {
+  .ui-compass-in { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: center; column-gap: 20px; }
+  .ui-compass-face { width: min(100%, 420px, 70dvh); }
+}
+`
+
+fn compass_dial_num(x) = (type_of(x) == "int" || type_of(x) == "float") && math.isfinite(x)
+
+// Into 0 to 360, for a degree of any size.
+fn compass_dial_wrap(d) = d - 360 * floor(d / 360)
+
+// The shortest way from one heading to another: -180 to 180, positive clockwise.
+fn compass_dial_delta(from, to) = compass_dial_wrap(to - from + 180) - 180
+
+// One step towards a new heading, the short way. `turned` is not wrapped: it goes
+// on past 360, so a dial set by it never swings back round through south to cross north.
+fn compass_dial_ease(turned, heading, f) = turned + compass_dial_delta(turned, heading) * f
+
+// The device's heading from its orientation. Alpha turns the opposite way to a compass.
+// Lying down, the top edge points where the heading is, whatever the roll. Held up
+// to read, the top edge points at the sky and says little, so this uses the way the back
+// faces, from the Device Orientation spec's worked example.
+fn compass_dial_heading(alpha, beta, gamma) {
+    let b = compass_dial_num(beta) ? beta : 0
+    let g = compass_dial_num(gamma) ? gamma : 0
+    if abs(b) < 65 {
+        compass_dial_wrap(360 - alpha)
+    } else {
+        let ra = math.radians(alpha)
+        let rb = math.radians(b)
+        let rg = math.radians(g)
+        let east = -math.cos(ra) * math.sin(rg) - math.sin(ra) * math.sin(rb) * math.cos(rg)
+        let north = -math.sin(ra) * math.sin(rg) + math.cos(ra) * math.sin(rb) * math.cos(rg)
+        compass_dial_wrap(math.degrees(math.atan2(east, north)))
+    }
+}
+
+// N, NE and so on: eight points, 45° each, with north running from 337.5 to 22.5.
+fn compass_dial_point(h) {
+    let names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    names[floor(compass_dial_wrap(h + 22.5) / 45) % 8]
+}
+
+// How far the last few headings wander, in degrees: the circular standard deviation,
+// as a plain average of 359 and 1 would be 180.
+fn compass_dial_spread(samples) {
+    let n = len(samples)
+    if n < 2 {
+        0
+    } else {
+        let s = sum(samples | map((d) => math.sin(math.radians(d)))) / n
+        let c = sum(samples | map((d) => math.cos(math.radians(d)))) / n
+        let r = sqrt(s * s + c * c)
+        r >= 1 ? 0 : (r < 0.000001 ? 180 : math.degrees(sqrt(-2 * math.log(r))))
+    }
+}
+
+// What to tell a person. iOS gives an accuracy, in degrees, with -1 for none at all;
+// Android gives nothing, so there the wander stands in for it.
+fn compass_dial_advice(source, accuracy, spread) {
+    if source == "relative" {
+        "This device reports only turns from where it started, so this is not true north."
+    } else if compass_dial_num(accuracy) && (accuracy < 0 || accuracy > 25) {
+        "The compass needs calibrating: move the phone in a figure of eight."
+    } else if spread > 15 {
+        "The reading is wandering. Move away from metal and magnets, then move the phone in a figure of eight."
+    } else {
+        ""
+    }
+}
+
+// Which way to turn for a bearing: "Turn 12° right", or "Straight ahead" within 3°.
+fn compass_dial_turn(heading, bearing) {
+    let d = round(compass_dial_delta(heading, bearing))
+    if abs(d) <= 3 {
+        "Straight ahead"
+    } else {
+        `Turn ${abs(d)}° ${d > 0 ? "right" : "left"}`
+    }
+}
+
+fn compass_dial_note(status) = match status {
+    "tap" => "This phone asks before a page can read the compass."
+    "refused" => "The compass was refused. Allow Motion and Orientation access to use it."
+    "none" => "There is no compass here. Try it on a phone."
+    _ => ""
+}
+
+component CompassDial(bearing: num? = null, target: str? = null, smooth: num = 0.2, on_heading = null, class: str? = null) {
+    style global compass_dial_css
+    state status = "wait"    // wait, tap, on, refused, none
+    state source = null      // "true", or "relative" where it is not north
+    state shown = null       // the heading in whole degrees
+    state turned = null      // the smoothed heading, unwrapped: goes past 360 and below 0
+    state accuracy = null
+    state samples = []
+    state spread = 0
+    state count = 0
+    state turn = 0           // the screen's angle
+    state rose = null
+    state strong = false     // an absolute reading has come: relative ones are ignored after that
+    state ears = false
+    state heard = false
+    state silent = false
+
+    let feed = (h, acc, src) => {
+        heard = true
+        silent = false
+        if status != "on" { status = "on" }
+        if src != source { source = src }
+        // The dial shows where the top of the screen points, however the screen is turned.
+        let top = compass_dial_wrap(h + turn)
+        turned = turned == null ? top : compass_dial_ease(turned, top, max([min([smooth, 1]), 0.01]))
+        if rose != null { rose.style.transform = `rotate(${round(-turned, 2)}deg)` }
+        let whole = round(compass_dial_wrap(turned)) % 360
+        if whole != shown {
+            shown = whole
+            on_heading && on_heading(whole)
+        }
+        accuracy = acc
+        // The wander is worked out now and then: the last 24 readings, every eighth.
+        count += 1
+        if count % 8 == 0 {
+            samples = slice(samples | push(top), -24, len(samples) + 1)
+            spread = compass_dial_spread(samples)
+        }
+    }
+    // An empty event here says nothing: the other event's says whether there is a sensor.
+    let absolute = (e) => {
+        if compass_dial_num(e.alpha) {
+            strong = true
+            feed(compass_dial_heading(e.alpha, e.beta, e.gamma), null, "true")
+        }
+    }
+    let relative = (e) => {
+        if compass_dial_num(e.webkitCompassHeading) {
+            strong = true
+            feed(e.webkitCompassHeading, e.webkitCompassAccuracy, "true")
+        } else if compass_dial_num(e.alpha) {
+            if !strong { feed(compass_dial_heading(e.alpha, e.beta, e.gamma), null, e.absolute == true ? "true" : "relative") }
+        } else if !heard {
+            status = "none"
+        }
+    }
+    let hush = () => {
+        if ears {
+            ears = false
+            js("window.removeEventListener", "deviceorientationabsolute", absolute)
+            js("window.removeEventListener", "deviceorientation", relative)
+        }
+        silent = false
+    }
+    let listen = () => {
+        hush()
+        ears = true
+        heard = false
+        strong = false
+        status = "on"
+        silent = true
+        samples = []
+        spread = 0
+        turned = null
+        js("window.addEventListener", "deviceorientationabsolute", absolute)
+        js("window.addEventListener", "deviceorientation", relative)
+    }
+    // As in ShakeDetector: only asking tells whether it needs asking.
+    let start = (tapped) => {
+        let ok = js("DeviceOrientationEvent.requestPermission")
+        if is_err(ok) && !contains(ok.error, "not defined") {
+            hush()
+            status = tapped ? "refused" : "tap"
+        } else if ok == "denied" {
+            hush()
+            status = "refused"
+        } else {
+            listen()
+        }
+    }
+    if silent { every(2500, () => { if !heard { hush(); status = "none" } }) }
+    let note = compass_dial_note(status)
+    let advice = status == "on" && shown != null ? compass_dial_advice(source, accuracy, spread) : ""
+    let say = note != "" ? note : advice
+    <div class={ui_cls(["ui-compass", class])} data-source={source} @mount={(_el) => {
+        let so = js("screen.orientation")
+        let rotated = (_e = null) => { turn = is_err(so) ? 0 : (so.angle ?? 0) }
+        if !is_err(so) && so != null { so.addEventListener("change", rotated) }
+        rotated()
+        start(false)
+        () => {
+            hush()
+            if !is_err(so) && so != null { so.removeEventListener("change", rotated) }
+        }
+    }}>
+        <div.ui-compass-in>
+            <div.ui-compass-face role="img" aria-label={shown == null ? "Compass" : `Heading ${shown} degrees ${compass_dial_point(shown)}`}>
+                <svg.ui-compass-rose viewBox="0 0 200 200" aria-hidden="true" @mount={(el) => { rose = el }}>
+                    <circle.ui-compass-ring cx="100" cy="100" r="98"/>
+                    {for d in [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330] =>
+                        <line key={d} class={d % 90 == 0 ? "ui-compass-tick ui-compass-tick-big" : "ui-compass-tick"} x1="100" y1="6" x2="100" y2="18" transform={`rotate(${d} 100 100)`}/>}
+                    <text.ui-compass-letter x="100" y="36" class="ui-compass-north">N</text>
+                    <text.ui-compass-letter x="170" y="105" transform="rotate(90 170 100)">E</text>
+                    <text.ui-compass-letter x="100" y="174" transform="rotate(180 100 170)">S</text>
+                    <text.ui-compass-letter x="30" y="105" transform="rotate(270 30 100)">W</text>
+                    {bearing != null && <path.ui-compass-mark d="M100 4l7 13h-14z" transform={`rotate(${round(compass_dial_wrap(bearing))} 100 100)`}/>}
+                </svg>
+                <div.ui-compass-lubber aria-hidden="true"></div>
+            </div>
+            <div.ui-compass-side>
+            <div.ui-compass-read>
+                <span.ui-compass-big>{shown == null ? "--" : `${shown}° ${compass_dial_point(shown)}`}</span>
+                {bearing != null && shown != null && <span.ui-compass-turn>{target != null ? `${target}: ` : ""}{compass_dial_turn(shown, bearing)}</span>}
+            </div>
+            <p.ui-compass-say role="status" data-bad={say != "" ? "" : null}>{say}</p>
+            {(status == "tap" || status == "refused" || status == "none") && <div.ui-compass-bar>
+                <Button size="lg" class="ui-compass-start" on_click={() => { start(true) }}>{status == "tap" ? "Turn on the compass" : "Try again"}</Button>
+            </div>}
+            </div>
+        </div>
+    </div>
+}

@@ -1,0 +1,200 @@
+// SlugInput: the part of a URL that a title becomes, made as the title is typed. It
+// writes accents as plain letters (Crème Brûlée is creme-brulee, Straße is strasse,
+// Москва is moskva), joins words with single hyphens, and checks the result against the
+// addresses already taken and those kept for the site itself, offering the next free
+// one. Once someone edits the link by hand it stops following the title, as their
+// choice matters more, until they ask it to follow again.
+//
+//   <SlugInput id="post" label="Link" prefix="https://example.com/blog/" taken={slugs} reserved={["admin", "new"]}/>
+//   <SlugInput id="page" title={title} show_title={false} on_change={(r) => { slug = r.slug }}/>
+//
+// id: a prefix for its ids, unique on the page. name: the link field's name ("slug");
+// it is a real field, so a form sends it. label: its label ("Link"). value: the link to
+// start with, which counts as edited by hand. title_label ("Title"), title_name
+// ("title"), title_value: the title field it shows of its own. show_title: false leaves
+// that out, and title (text, which it follows live) stands for it; inside your own
+// component on_change is then called for edits to the link, while the title's own
+// changes are yours to see. prefix: what stands before the link in the preview. taken:
+// the links in use, any case. reserved: those kept for the site, any case. limit: the
+// longest link (60), cut at a word where it can be. hint, required, disabled as for every
+// field. class: more classes. on_change(result): inside one of your components, { slug,
+// status } after each change; status "empty", "free", "taken" or "reserved".
+//
+// slug_input_make(text, limit) makes a link from any text, slug_input_check(slug, taken,
+// reserved) says if it is free, and slug_input_next_free(slug, taken, reserved, limit)
+// gives the next free one: my-post-2, and my-post-3 after it; a number already there
+// counts on. It tries 1,000 and then gives null. slug_input_transliterate(text) is the
+// lettering alone. They work on the server as they do here. Only the first 2,000
+// characters of a title are read, which is far more than a link holds.
+
+import ui/theme.qwe use ui_cls
+
+let slug_input_css = css`
+.ui-sluginput { display: grid; gap: 10px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-sluginput-field { display: grid; gap: 6px; min-width: 0; }
+.ui-sluginput-label { font-size: 13px; font-weight: 500; }
+.ui-sluginput-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-sluginput-control { box-sizing: border-box; width: 100%; height: 38px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1 var(--ui-font);
+  transition: border-color .15s, box-shadow .15s; }
+.ui-sluginput-control:hover { border-color: var(--ui-strong); }
+.ui-sluginput-control:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-sluginput-control[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-sluginput-control:disabled { opacity: .55; cursor: not-allowed; }
+.ui-sluginput-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-sluginput-url { display: block; color: var(--ui-muted); font: 12px/1.5 var(--ui-mono); overflow-wrap: anywhere; }
+.ui-sluginput-url b { color: var(--ui-fg); font-weight: 600; }
+.ui-sluginput-out { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; min-height: 20px; font-size: 13px; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-sluginput-free { color: var(--ui-success); }
+.ui-sluginput-bad { color: var(--ui-danger); }
+.ui-sluginput-use, .ui-sluginput-follow { padding: 0; border: 0; border-radius: 3px; background: none; font: 600 13px var(--ui-font); color: var(--ui-accent);
+  cursor: pointer; text-decoration: underline; overflow-wrap: anywhere; }
+.ui-sluginput-follow { font-weight: 500; color: var(--ui-muted); }
+.ui-sluginput-use:focus-visible, .ui-sluginput-follow:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) { .ui-sluginput-control { transition: none; } }
+`
+
+let slug_input_read_limit = 2000
+let slug_input_tries = 1000
+// Letters by what they are written as. Marks that come apart from their letter (an é
+// typed as e and an accent) are dropped by a pattern, not here.
+let slug_input_groups = [
+    ["àáâãäåāăąǎȧ", "a"], ["æǽ", "ae"], ["çćĉċč", "c"], ["ďđð", "d"], ["èéêëēĕėęě", "e"], ["ĝğġģ", "g"], ["ĥħ", "h"], ["ìíîïĩīĭįıǐ", "i"], ["ĵ", "j"], ["ķ", "k"],
+    ["ĺļľŀł", "l"], ["ñńņňŉ", "n"], ["òóôõöøōŏőǒ", "o"], ["œ", "oe"], ["ŕŗř", "r"], ["śŝşšș", "s"], ["ß", "ss"], ["ţťŧț", "t"], ["þ", "th"], ["ùúûüũūŭůűųǔ", "u"],
+    ["ŵ", "w"], ["ýÿŷ", "y"], ["źżž", "z"],
+    ["а", "a"], ["б", "b"], ["в", "v"], ["г", "g"], ["д", "d"], ["её", "e"], ["ж", "zh"], ["з", "z"], ["и", "i"], ["й", "y"], ["к", "k"], ["л", "l"], ["м", "m"], ["н", "n"],
+    ["о", "o"], ["п", "p"], ["р", "r"], ["с", "s"], ["т", "t"], ["у", "u"], ["ф", "f"], ["х", "kh"], ["ц", "ts"], ["ч", "ch"], ["ш", "sh"], ["щ", "shch"], ["ъь", ""], ["ы", "y"],
+    ["э", "e"], ["ю", "yu"], ["я", "ya"],
+    ["αά", "a"], ["β", "v"], ["γ", "g"], ["δ", "d"], ["εέ", "e"], ["ζ", "z"], ["ηή", "i"], ["θ", "th"], ["ιίϊΐ", "i"], ["κ", "k"], ["λ", "l"], ["μ", "m"], ["ν", "n"], ["ξ", "x"],
+    ["οό", "o"], ["π", "p"], ["ρ", "r"], ["σς", "s"], ["τ", "t"], ["υύϋΰ", "y"], ["φ", "f"], ["χ", "ch"], ["ψ", "ps"], ["ωώ", "o"]]
+let slug_input_letters = reduce(slug_input_groups, {}, (m, g) => reduce(split(g[0], ""), m, (acc, c) => set(acc, c, g[1])))
+
+// Small letters with their accents written plainly; what has no plain form stays.
+fn slug_input_transliterate(text) {
+    let s = re.replace(lower(slice(str(text ?? ""), 0, slug_input_read_limit)), "[̀-ͯ]", "")
+    split(s, "") | map((c) => slug_input_letters[c] ?? c) | join("")
+}
+
+// Cut to length, at a hyphen where one is near enough to keep most of it.
+fn slug_input_cut(s: str, limit: int) {
+    if len(s) <= limit { return s }
+    let piece = slice(s, 0, limit)
+    if slice(s, limit, limit + 1) == "-" { return piece }
+    let at = len(piece) - (index_of(reverse(piece), "-") ?? len(piece))
+    let kept = at > limit / 2 ? slice(piece, 0, at - 1) : piece
+    re.replace(kept, "-+$", "")
+}
+
+// The words of any text, joined by hyphens, one at each end if it had any.
+fn slug_input_words(text) {
+    let s = replace(slug_input_transliterate(text), "&", " and ")
+    re.replace(re.replace(s, "['’`]", ""), "[^a-z0-9]+", "-")
+}
+
+// A link from any text.
+fn slug_input_make(text, limit: int = 60) = slug_input_cut(re.replace(slug_input_words(text), "^-+|-+$", ""), limit)
+
+// What is typed into the link itself: as above, but a last hyphen stays, or no one
+// could ever type a second word.
+fn slug_input_tidy(text, limit: int = 60) = slice(re.replace(slug_input_words(text), "^-+", ""), 0, limit)
+
+fn slug_input_lowered(xs: list) = reduce(xs, {}, (m, x) => set(m, lower(str(x)), true))
+
+fn slug_input_check(slug: str, taken: list = [], reserved: list = []) {
+    if slug == "" { return "empty" }
+    let s = lower(slug)
+    contains(reserved | map((x) => lower(str(x))), s) ? "reserved" : contains(taken | map((x) => lower(str(x))), s) ? "taken" : "free"
+}
+
+// The next free link, or null after slug_input_tries.
+fn slug_input_next_free(slug: str, taken: list = [], reserved: list = [], limit: int = 60) {
+    let used = slug_input_lowered([...taken, ...reserved])
+    let numbered = re.find(slug, "^(.+)-(\\d{1,6})$")
+    let base = numbered != null ? numbered.groups[0] : slug
+    let n = numbered != null ? int(numbered.groups[1]) + 1 : 2
+    let tries = 0
+    while tries < slug_input_tries {
+        let tail = `-${n}`
+        let stem = re.replace(slice(base, 0, limit - len(tail)), "-+$", "")
+        let candidate = stem + tail
+        if !has(used, candidate) { return candidate }
+        n += 1
+        tries += 1
+    }
+    null
+}
+
+component SlugInput(id: str, name: str = "slug", label: str = "Link", value: str = "", title: str? = null, show_title: bool = true,
+                    title_label: str = "Title", title_name: str = "title", title_value: str = "", prefix: str? = null, taken: list = [],
+                    reserved: list = [], limit: int = 60, hint: str? = null, required: bool = false, disabled: bool = false,
+                    on_change = null, class: str? = null) {
+    style global slug_input_css
+    state own = title_value
+    state hand = value != ""
+    state typed = value
+    let source = show_title ? own : title ?? ""
+    let followed = slug_input_make(source, limit)
+    let slug = hand ? typed : followed
+    let final = re.replace(slug, "-+$", "")
+    let status = slug_input_check(final, taken, reserved)
+    let blocked = status == "taken" || status == "reserved"
+    let free = blocked ? slug_input_next_free(final, taken, reserved, limit) : null
+    let empty_title = status == "empty" && trim(source) != "" && !hand
+    let described = ui_cls([hint != null && `${id}-hint`, `${id}-out`])
+    let tell = (s: str) => {
+        let clean = re.replace(s, "-+$", "")
+        on_change && on_change({ slug: clean, status: slug_input_check(clean, taken, reserved) })
+    }
+    <div class={ui_cls(["ui-sluginput", class])}>
+        {show_title && <div.ui-sluginput-field>
+            <label.ui-sluginput-label for={`${id}-title`}>{title_label}</label>
+            <input.ui-sluginput-control type="text" id={`${id}-title`} name={title_name} value={own} disabled={disabled} autocomplete="off"
+                   @input={(e) => {
+                       own = e.value
+                       if !hand { tell(slug_input_make(e.value, limit)) }
+                   }}/>
+        </div>}
+        <div.ui-sluginput-field>
+            <label.ui-sluginput-label for={id}>
+                {label}{required && <span.ui-sluginput-req aria-hidden="true">*</span>}
+            </label>
+            <input.ui-sluginput-control type="text" id={id} name={name} value={slug} required={required} disabled={disabled} autocomplete="off"
+                   spellcheck="false" autocapitalize="none" aria-invalid={blocked ? "true" : null} aria-describedby={described}
+                   @input={(e) => {
+                       let el = e.target
+                       let raw = e.value
+                       let caret = el.selectionStart ?? len(raw)
+                       let clean = slug_input_tidy(raw, limit)
+                       let head = slug_input_tidy(slice(raw, 0, caret), limit)
+                       hand = true
+                       typed = clean
+                       if clean != raw {
+                           el.value = clean
+                           el.setSelectionRange(len(head), len(head))
+                       }
+                       tell(clean)
+                   }}
+                   @blur={() => { if hand { typed = re.replace(typed, "-+$", "") } }}/>
+            {hint != null && <p.ui-sluginput-hint id={`${id}-hint`}>{hint}</p>}
+            {prefix != null && <code.ui-sluginput-url>{prefix}<b>{final}</b></code>}
+        </div>
+        <div.ui-sluginput-out id={`${id}-out`} aria-live="polite">
+            {status == "free" && <span.ui-sluginput-free>{final} is free.</span>}
+            {status == "taken" && <span.ui-sluginput-bad>{final} is taken.</span>}
+            {status == "reserved" && <span.ui-sluginput-bad>{final} is reserved for the site.</span>}
+            {empty_title && <span.ui-sluginput-bad>That title has no letters or digits a link can use: type a link by hand.</span>}
+            {blocked && free == null && <span>No free link near it after {slug_input_tries} tries: try other words.</span>}
+            {free != null && <button.ui-sluginput-use type="button" @click={() => {
+                let chosen = free
+                hand = true
+                typed = chosen
+                tell(chosen)
+            }}>Use {free}</button>}
+            {hand && <button.ui-sluginput-follow type="button" @click={() => {
+                hand = false
+                typed = ""
+                tell(followed)
+            }}>Follow the title again</button>}
+        </div>
+    </div>
+}

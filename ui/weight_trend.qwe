@@ -1,0 +1,384 @@
+// WeightTrend: what a scale says, and what it means. Each weigh-in is a dot, and over them runs
+// a smoothed line that moves a tenth of the way to each new day's weight, which is how much of a
+// day's number is the body and not the water. A finger along the chart reads any
+// weigh-in, with the page still scrolling up and down. Days with no weigh-in are not drawn over:
+// past a few, the line stops, the hole is marked, and the line starts again from the next
+// weigh-in, so it never claims to know what happened in between.
+//
+//   <WeightTrend unit="kg" goal={75} entries={[
+//       { date: "2026-10-01", weight: 81.4 },
+//       { date: "2026-10-02", weight: 80.9 },
+//   ]}/>
+//
+// entries: each { date, weight }; several on a day count as their average, and a date
+// or a weight that makes no sense is left out. unit: what weight and goal are in, "kg" or "lb"
+// ("kg"). show: the unit to start showing in, which a person can change (the same as unit). goal:
+// a line to aim for, in unit. gap_days: how many days without a weigh-in make a hole
+// (7, and 2 at the least). title. on_select(info): inside one of your components, when a finger lifts or a
+// key moves, with { date, weight, trend } in the unit shown, or null on clearing. on_unit(unit):
+// when the person changes the unit. class.
+//
+// Keys, on the focused chart: the arrows go from weigh-in to weigh-in, Home and End to the ends,
+// Escape clears. A table lists every weigh-in and hole for screen readers. No server call, and no
+// file: all of it comes from entries.
+
+import ui/theme.qwe use ui_cls
+
+let weight_trend_css = css`
+.ui-wtrend { position: relative; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-wtrend-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.ui-wtrend-title { margin: 0; font-size: 13px; font-weight: 600; color: var(--ui-muted); }
+.ui-wtrend-now { margin: 0; font-size: 26px; font-weight: 700; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.ui-wtrend-units { display: flex; flex: none; padding: 2px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); }
+.ui-wtrend-unit { min-width: 48px; min-height: 44px; border: 0; border-radius: 4px; background: transparent; color: var(--ui-muted); font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-wtrend-unit[aria-pressed="true"] { background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow); }
+.ui-wtrend-unit:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-wtrend-body { display: grid; gap: 12px; }
+.ui-wtrend-chart { min-width: 0; }
+.ui-wtrend-read { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 44px; font-size: 14px; font-variant-numeric: tabular-nums; }
+.ui-wtrend-clear { flex: none; min-width: 64px; min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; }
+.ui-wtrend-clear:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-wtrend-plot { position: relative; height: 230px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); overflow: hidden; outline: none; cursor: crosshair;
+  touch-action: pan-y; overscroll-behavior-x: contain; -webkit-tap-highlight-color: transparent; }
+.ui-wtrend-plot:focus-visible { box-shadow: var(--ui-focus); }
+.ui-wtrend-busy { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.ui-wtrend-plot svg { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+.ui-wtrend-grid { position: absolute; left: 0; right: 0; height: 0; border-top: 1px solid var(--ui-border); pointer-events: none; }
+.ui-wtrend-grid span { position: absolute; left: 4px; top: 1px; color: var(--ui-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.ui-wtrend-goal { position: absolute; left: 0; right: 0; height: 0; border-top: 2px dashed var(--ui-success); pointer-events: none; }
+.ui-wtrend-goal span { position: absolute; right: 4px; bottom: 2px; color: var(--ui-success); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-wtrend-hole { position: absolute; top: 0; bottom: 0; display: grid; place-items: center; overflow: hidden; color: var(--ui-muted); font-size: 11px; white-space: nowrap; pointer-events: none;
+  background: repeating-linear-gradient(135deg, transparent 0 6px, color-mix(in srgb, var(--ui-muted) 16%, transparent) 6px 8px); }
+.ui-wtrend-dots { fill: none; stroke: var(--ui-strong); stroke-width: 6; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.ui-wtrend-line { fill: none; stroke: var(--ui-accent); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+/* As wide as the plot, the line at its left edge, so a percentage of its own width is a place on the plot at any size. */
+.ui-wtrend-cross { position: absolute; inset: 0; pointer-events: none; }
+.ui-wtrend-cross::before { content: ""; position: absolute; inset: 0 auto 0 -1px; width: 2px; background: var(--ui-fg); }
+.ui-wtrend-pt { position: absolute; left: -7px; width: 14px; height: 14px; margin-top: -7px; border: 3px solid var(--ui-surface); border-radius: 50%; background: var(--ui-accent); }
+.ui-wtrend-axis { display: flex; justify-content: space-between; gap: 8px; color: var(--ui-muted); font-size: 12px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.ui-wtrend-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.ui-wtrend-stats div { min-width: 0; }
+.ui-wtrend-stats dt { color: var(--ui-muted); font-size: 12px; }
+.ui-wtrend-stats dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ui-wtrend-none { margin: 0; color: var(--ui-muted); }
+@container (min-width: 620px) {
+  .ui-wtrend-body { grid-template-columns: minmax(0, 1fr) 190px; gap: 24px; }
+  .ui-wtrend-plot { height: 320px; }
+  .ui-wtrend-stats { grid-template-columns: minmax(0, 1fr); align-content: start; gap: 18px; }
+  .ui-wtrend-stats dd { font-size: 20px; }
+}
+@media (hover: hover) { .ui-wtrend-clear:hover { background: var(--ui-subtle); } }
+`
+
+let weight_trend_lb = 0.45359237
+
+fn weight_trend_kg(x: num, unit: str) -> float = unit == "lb" ? x * weight_trend_lb : float(x)
+
+fn weight_trend_out(kg: num, unit: str) -> float = unit == "lb" ? kg / weight_trend_lb : float(kg)
+
+// To one decimal, always showing it, as a scale does.
+fn weight_trend_one(x: num) -> str {
+    let r = round(abs(x) * 10)
+    `${x < 0 && r > 0 ? "-" : ""}${floor(r / 10)}.${r % 10}`
+}
+
+fn weight_trend_show(kg: num, unit: str) -> str = `${weight_trend_one(weight_trend_out(kg, unit))} ${unit}`
+
+// A change, with its sign: 0.0 has none.
+fn weight_trend_signed(kg: num, unit: str) -> str {
+    let v = weight_trend_out(kg, unit)
+    let t = weight_trend_one(v)
+    `${v > 0 && t != "0.0" ? "+" : ""}${t} ${unit}`
+}
+
+fn weight_trend_day(d: str) -> int = floor(date.ms(d) / 86400000)
+
+fn weight_trend_label(d: str) -> str = date.format(d, "D MMM")
+
+// The weigh-ins that can be used: one a day, the day's average, in date order.
+fn weight_trend_clean(entries, unit: str) {
+    if type_of(entries) != "list" { return [] }
+    let good = take(entries, 4000) | filter((e) => {
+        if type_of(e) != "map" { return false }
+        let d = get(e, "date")
+        let w = get(e, "weight")
+        let t = type_of(w)
+        if type_of(d) != "str" || len(d) < 10 || !date.valid(slice(d, 0, 10), "date") { return false }
+        if t != "int" && t != "float" { return false }
+        w == w && w > 0 && w < 2000
+    }) | map((e) => { date: slice(e.date, 0, 10), kg: weight_trend_kg(e.weight, unit) })
+    let days = group_by(good, (e) => e.date)
+    // Keys of this form are not number-like, and they are sorted here in any case.
+    sort(keys(days)) | map((d) => {
+        let same = get(days, d, [])
+        { date: d, day: weight_trend_day(d), kg: sum(same | map((e) => e.kg)) / len(same) }
+    })
+}
+
+// The smoothed line. Each day moves it a tenth of the way to the weight, so d days move it
+// 1 - 0.9^d of the way. Past a hole it starts afresh from the weigh-in, in a new run.
+fn weight_trend_smooth(rows, gap_days: int) {
+    let out = reduce(rows, { list: [], prev: null, run: 0 }, (acc, r) => {
+        let p = acc.prev
+        let days = p != null ? r.day - p.day : 0
+        let hole = p != null && days > gap_days
+        let trend = p == null || hole ? r.kg : p.trend + (1 - pow(0.9, days)) * (r.kg - p.trend)
+        let run = hole ? acc.run + 1 : acc.run
+        let row = { ...r, trend, run }
+        { list: acc.list + [row], prev: row, run }
+    })
+    out.list
+}
+
+fn weight_trend_holes(rows, gap_days: int) {
+    let pairs = zip(rows, drop(rows, 1))
+    pairs | filter((p) => p[1].day - p[0].day > gap_days)
+          | map((p) => { from: p[0].day, to: p[1].day, days: p[1].day - p[0].day, from_date: p[0].date, to_date: p[1].date })
+}
+
+// The scale, in kg: all weights, the line and the goal, with room around them and 2 kg at the least.
+fn weight_trend_range(rows, goal_kg) {
+    if len(rows) == 0 { return { lo: 0, hi: 1 } }
+    let all = (rows | map((r) => r.kg)) + (rows | map((r) => r.trend)) + (goal_kg != null ? [goal_kg] : [])
+    let lo = min(all)
+    let hi = max(all)
+    let wide = hi - lo < 2 ? 2.0 : hi - lo
+    let mid = (hi + lo) / 2
+    { lo: mid - wide * 0.58, hi: mid + wide * 0.58 }
+}
+
+// Across and down, on a chart of 1000 by 300, with a margin so the first and last dots are whole.
+fn weight_trend_x(day: num, d0: num, d1: num) -> float = d1 > d0 ? round(20 + (day - d0) * 960 / (d1 - d0), 2) : 500.0
+
+fn weight_trend_y(kg: num, lo: num, hi: num) -> float = round((hi - kg) * 300 / (hi - lo), 2)
+
+// The line, as a path, lifted between runs so no stroke crosses a hole.
+fn weight_trend_line(rows, d0, d1, lo, hi) -> str {
+    let parts = for [i, r] in enumerate(rows) => {
+        let jump = i == 0 || rows[i - 1].run != r.run
+        `${jump ? "M" : "L"}${weight_trend_x(r.day, d0, d1)} ${weight_trend_y(r.trend, lo, hi)}`
+    }
+    join(parts, "")
+}
+
+// The dots as one path of tiny strokes with round ends, which stay round on a chart that stretches.
+fn weight_trend_dots(rows, d0, d1, lo, hi) -> str {
+    let parts = for r in rows => `M${weight_trend_x(r.day, d0, d1)} ${weight_trend_y(r.kg, lo, hi)}h.01`
+    join(parts, "")
+}
+
+// Lines across the chart at round numbers of the unit shown.
+fn weight_trend_ticks(lo: num, hi: num, unit: str) {
+    let a = weight_trend_out(lo, unit)
+    let b = weight_trend_out(hi, unit)
+    let wide = b - a
+    let step = wide <= 4 ? 1 : (wide <= 10 ? 2 : (wide <= 25 ? 5 : (wide <= 50 ? 10 : 20)))
+    let first = ceil(a / step)
+    let n = floor(b / step) - first + 1
+    for i in range(0, n > 8 ? 8 : (n < 0 ? 0 : n)) => (first + i) * step
+}
+
+// How fast the line moves, a week, over the last four weeks of its current run. Under two weeks
+// of it there is no saying.
+fn weight_trend_rate(rows) {
+    if len(rows) == 0 { return null }
+    let end = last(rows)
+    let run = rows | filter((r) => r.run == end.run && r.day >= end.day - 28)
+    let days = end.day - run[0].day
+    days < 14 ? null : (end.trend - run[0].trend) * 7 / days
+}
+
+// The weigh-in nearest a day. Halving, as this runs on each move of a finger.
+fn weight_trend_nearest(rows, day: num) {
+    let lo = 0
+    let hi = len(rows) - 1
+    while lo < hi {
+        let mid = floor((lo + hi) / 2)
+        if rows[mid].day < day { lo = mid + 1 } else { hi = mid }
+    }
+    if lo > 0 && day - rows[lo - 1].day <= rows[lo].day - day { return lo - 1 }
+    lo
+}
+
+// What a place on the chart reads. In a hole, the hole, as there is nothing to read there.
+fn weight_trend_at(rows, holes, day: num) {
+    let hole = find(holes, (h) => day > h.from + 1 && day < h.to - 1)
+    if hole != null { return { hole, i: null } }
+    { hole: null, i: weight_trend_nearest(rows, day) }
+}
+
+fn weight_trend_read(row, unit: str) -> str = `${weight_trend_label(row.date)}: ${weight_trend_show(row.kg, unit)}, trend ${weight_trend_show(row.trend, unit)}`
+
+fn weight_trend_hole_read(h) -> str = `No weigh-in for ${h.days} days, ${weight_trend_label(h.from_date)} to ${weight_trend_label(h.to_date)}`
+
+component WeightTrend(entries = [], unit: str = "kg", show: str? = null, goal: num? = null, gap_days: int = 7, title: str? = null, on_select = null, on_unit = null, class: str? = null) {
+    style global weight_trend_css
+    let given = unit == "lb" ? "lb" : "kg"
+    state shown = show == "lb" || show == "kg" ? show : given
+    let gap = gap_days < 2 ? 2 : gap_days
+    let goal_kg = goal != null && goal > 0 ? weight_trend_kg(goal, given) : null
+    let rows = weight_trend_smooth(weight_trend_clean(entries, given), gap)
+    let holes = weight_trend_holes(rows, gap)
+    let n = len(rows)
+    let d0 = n > 0 ? rows[0].day : 0
+    let d1 = n > 0 ? last(rows).day : 0
+    let span = weight_trend_range(rows, goal_kg)
+    let lo = span.lo
+    let hi = span.hi
+    let tip = n > 0 ? last(rows) : null
+    let rate = weight_trend_rate(rows)
+    state pick = null        // { i } a weigh-in, or { hole } a hole: what is chosen
+    state busy = false
+    state g = null
+    state plot = null
+    state cross = null
+    state point = null
+    state read = null
+    let hint = "Touch the chart to read a day."
+    let say = (p) => {
+        if p == null {
+            read.textContent = hint
+        } else if p.hole != null {
+            read.textContent = weight_trend_hole_read(p.hole)
+        } else {
+            read.textContent = weight_trend_read(rows[p.i], shown)
+        }
+    }
+    // By hand, as these change with every move of a finger.
+    let show_it = (p) => {
+        if cross != null {
+            say(p)
+            if p != null {
+                let day = p.hole != null ? (p.hole.from + p.hole.to) / 2 : rows[p.i].day
+                cross.style.transform = `translateX(${weight_trend_x(day, d0, d1) / 10}%)`
+                point.hidden = p.hole != null
+                if p.hole == null { point.style.top = `${weight_trend_y(rows[p.i].trend, lo, hi) / 3}%` }
+            }
+        }
+    }
+    let at_x = (x: num) => {
+        let r = plot.getBoundingClientRect()
+        let px = (x - r.left) * 1000 / r.width
+        let day = d0 + (px - 20) * (d1 - d0) / 960
+        weight_trend_at(rows, holes, day < d0 ? d0 : (day > d1 ? d1 : day))
+    }
+    let choose = (p) => {
+        pick = p
+        if on_select != null {
+            if p == null || p.hole != null {
+                on_select(null)
+            } else {
+                let r = rows[p.i]
+                on_select({ date: r.date, weight: round(weight_trend_out(r.kg, shown), 1), trend: round(weight_trend_out(r.trend, shown), 1) })
+            }
+        }
+    }
+    let change_unit = (u: str) => {
+        if u != shown {
+            shown = u
+            on_unit && on_unit(u)
+        }
+    }
+    // Follows the choice, the unit and new data, but not under a finger, which has the line for now.
+    if read != null && shown != "" && !busy { show_it(pick) }
+    <section class={ui_cls(["ui-wtrend", class])} aria-label={title ?? "Weight"}>
+        <div.ui-wtrend-head>
+            <div>
+                {filled(title) != null && <p.ui-wtrend-title>{title}</p>}
+                <p.ui-wtrend-now>{tip != null ? weight_trend_show(tip.trend, shown) : "No weigh-ins yet."}</p>
+            </div>
+            <div.ui-wtrend-units role="group" aria-label="Unit">
+                {for u in ["kg", "lb"] => <button.ui-wtrend-unit key={u} type="button" aria-pressed={shown == u ? "true" : "false"} @click={() => { change_unit(u) }}>{u}</button>}
+            </div>
+        </div>
+        {n > 0 && <div.ui-wtrend-body>
+            <div.ui-wtrend-chart>
+                <div.ui-wtrend-read>
+                    <span @mount={(me) => { read = me }}>{hint}</span>
+                    {pick != null && <button.ui-wtrend-clear type="button" @click={() => { choose(null) }}>Clear</button>}
+                </div>
+                <div class={ui_cls(["ui-wtrend-plot", busy && "ui-wtrend-busy"])} tabindex="0" role="slider" aria-label="A weigh-in"
+                     aria-valuemin="1" aria-valuemax={n} aria-valuenow={pick != null && pick.i != null ? pick.i + 1 : 1}
+                     aria-valuetext={pick == null ? "Nothing chosen. Use the arrow keys." : pick.hole != null ? weight_trend_hole_read(pick.hole) : weight_trend_read(rows[pick.i], shown)}
+                     @mount={(me) => { plot = me }}
+                     @contextmenu={(e) => { if busy { e.preventDefault() } }}
+                     @pointerdown={(e) => {
+                         if e.isPrimary && e.button == 0 { g = { id: e.pointerId, x: e.clientX, y: e.clientY, on: false } }
+                     }}
+                     @pointermove={(e) => {
+                         if g != null && e.pointerId == g.id {
+                             if !g.on {
+                                 let dx = abs(e.clientX - g.x)
+                                 let dy = abs(e.clientY - g.y)
+                                 // Up and down is the page's.
+                                 if dy > 6 && dy > dx { g = null }
+                                 if g != null && dx > 6 && dx >= dy {
+                                     plot.setPointerCapture(e.pointerId)
+                                     busy = true
+                                     g = { ...g, on: true }
+                                 }
+                             }
+                             if g != null && g.on { show_it(at_x(e.clientX)) }
+                         }
+                     }}
+                     @pointerup={(e) => {
+                         if g != null && e.pointerId == g.id {
+                             g = null
+                             busy = false
+                             choose(at_x(e.clientX))
+                         }
+                     }}
+                     @pointercancel={(e) => {
+                         if g != null && e.pointerId == g.id {
+                             g = null
+                             busy = false
+                             show_it(pick)
+                         }
+                     }}
+                     @keydown={(e) => {
+                         if e.key == "Escape" && pick != null { choose(null) }
+                         let from = pick != null && pick.i != null ? pick.i : (pick != null ? weight_trend_nearest(rows, pick.hole.from) : -1)
+                         let to = match e.key {
+                             "ArrowRight" => from + 1
+                             "ArrowLeft" => from < 0 ? 0 : from - 1
+                             "Home" => 0
+                             "End" => n - 1
+                             _ => null
+                         }
+                         if to != null {
+                             e.preventDefault()
+                             choose({ i: to < 0 ? 0 : (to >= n ? n - 1 : to), hole: null })
+                         }
+                     }}>
+                    {for t in weight_trend_ticks(lo, hi, shown) => <div.ui-wtrend-grid key={t} style={`top: ${weight_trend_y(weight_trend_kg(t, shown), lo, hi) / 3}%`}><span>{t}</span></div>}
+                    {for h in holes => <div.ui-wtrend-hole key={h.from} style={`left: ${weight_trend_x(h.from, d0, d1) / 10}%; width: ${(weight_trend_x(h.to, d0, d1) - weight_trend_x(h.from, d0, d1)) / 10}%`}>{h.days} days</div>}
+                    {goal_kg != null && <div.ui-wtrend-goal style={`top: ${weight_trend_y(goal_kg, lo, hi) / 3}%`}><span>Goal {weight_trend_show(goal_kg, shown)}</span></div>}
+                    <svg viewBox="0 0 1000 300" preserveAspectRatio="none" aria-hidden="true">
+                        <path.ui-wtrend-dots d={weight_trend_dots(rows, d0, d1, lo, hi)}/>
+                        <path.ui-wtrend-line d={weight_trend_line(rows, d0, d1, lo, hi)}/>
+                    </svg>
+                    <div.ui-wtrend-cross hidden={pick == null && !busy} @mount={(me) => { cross = me }}>
+                        <i.ui-wtrend-pt @mount={(me) => { point = me }}></i>
+                    </div>
+                </div>
+                <div.ui-wtrend-axis aria-hidden="true"><span>{weight_trend_label(rows[0].date)}</span><span>{weight_trend_label(tip.date)}</span></div>
+            </div>
+            <dl.ui-wtrend-stats>
+                <div><dt>Last weigh-in</dt><dd>{weight_trend_show(tip.kg, shown)}</dd></div>
+                <div><dt>A week</dt><dd>{rate != null ? weight_trend_signed(rate, shown) : "Too soon to say"}</dd></div>
+                <div><dt>To goal</dt><dd>{goal_kg != null ? weight_trend_signed(goal_kg - tip.trend, shown) : "No goal"}</dd></div>
+            </dl>
+        </div>}
+        <div.ui-sr><table>
+            <caption>Weigh-ins, with the smoothed trend</caption>
+            <thead><tr><th scope="col">Day</th><th scope="col">Weight</th><th scope="col">Trend</th></tr></thead>
+            <tbody>
+                {for [i, r] in enumerate(rows) => <tr key={r.day}>
+                    <td>{i > 0 && rows[i - 1].run != r.run ? `After ${r.day - rows[i - 1].day} days without one, ` : ""}{weight_trend_label(r.date)}</td>
+                    <td>{weight_trend_show(r.kg, shown)}</td><td>{weight_trend_show(r.trend, shown)}</td>
+                </tr>}
+            </tbody>
+        </table></div>
+    </section>
+}

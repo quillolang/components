@@ -1,0 +1,116 @@
+// TopAppBar: a Material top bar over a screen that scrolls. It goes up out of the way
+// as the content scrolls down and comes back on the way up, so the content has the
+// room while reading, and takes a tint once content passes under it. It stays at the
+// top of the content, and comes back when anything in it takes the focus.
+//
+//   import ui/top_app_bar.qwe use TopAppBar
+//
+//   component Notes() {
+//       state menu = false
+//       <TopAppBar title="Field notes" nav_label="Open menu" on_nav={() => { menu = true }}
+//                  actions={<button aria-label="Search" @click={search}>S</button>}>
+//           <NoteList/>
+//       </TopAppBar>
+//   }
+//
+// children: the screen, which scrolls inside the box. title: the bar's heading.
+// on_nav(): what the button at its start does; no button without it. nav_label: that
+// button's name for screen readers ("Open menu"). nav_icon: "menu" (default) or "back".
+// actions: HTML for its end, such as buttons, which are kept to 44 px each way, so it
+// goes inside one of your components. hide: go on scrolling down (true); false only
+// takes the tint. on_hide(hidden): called as it goes and comes back. scroll_label: the
+// scroller's name for screen readers. The box takes the size of its parent, which
+// needs a height. In a pane 600 px wide or more the bar is 64 px tall, 56 on a phone,
+// and 48 on a phone on its side.
+
+import ui/theme.qwe use ui_cls
+
+let top_app_bar_css = css`
+.ui-topbar { position: relative; display: block; width: 100%; height: 100%; min-height: 0; overflow: hidden; container-type: inline-size; background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.5 var(--ui-font); --ui-topbar-h: 56px; }
+.ui-topbar-bar {
+  position: absolute; inset: 0 0 auto; z-index: 2; display: flex; align-items: center; gap: 4px; box-sizing: border-box; height: calc(var(--ui-topbar-h) + env(safe-area-inset-top));
+  padding: env(safe-area-inset-top) max(4px, env(safe-area-inset-right)) 0 max(4px, env(safe-area-inset-left)); background: var(--ui-bg);
+  transition: transform .2s cubic-bezier(.2, .8, .2, 1), background-color .2s, box-shadow .2s;
+}
+.ui-topbar-hidden { transform: translate3d(0, -100%, 0); }
+.ui-topbar-tinted { background: color-mix(in srgb, var(--ui-accent) 10%, var(--ui-surface)); box-shadow: 0 1px 0 var(--ui-border); }
+.ui-topbar-title { flex: 1; min-width: 0; margin: 0 0 0 8px; overflow: hidden; font-size: 20px; font-weight: 500; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
+.ui-topbar-nav, .ui-topbar-actions button {
+  display: inline-grid; flex: none; place-items: center; min-width: 44px; min-height: 44px; padding: 0; border: 0; border-radius: 50%;
+  background: transparent; color: inherit; font: inherit; cursor: pointer;
+}
+.ui-topbar-nav svg, .ui-topbar-actions svg { width: 24px; height: 24px; }
+.ui-topbar-nav:focus-visible, .ui-topbar-actions button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-topbar-nav:hover, .ui-topbar-actions button:hover { background: var(--ui-subtle); } }
+.ui-topbar-actions { display: flex; flex: none; align-items: center; }
+.ui-topbar-scroll {
+  box-sizing: border-box; height: 100%; padding-top: calc(var(--ui-topbar-h) + env(safe-area-inset-top)); overflow: auto; overscroll-behavior: contain; outline: none;
+}
+.ui-topbar-scroll:focus-visible { box-shadow: inset var(--ui-focus); }
+@container (min-width: 600px) { .ui-topbar-bar, .ui-topbar-scroll { --ui-topbar-h: 64px; } .ui-topbar-bar { padding-inline: 12px; } .ui-topbar-title { font-size: 22px; } }
+/* After the wider pane's: a phone on its side is wide, and short. */
+@media (max-height: 430px) { .ui-topbar-bar, .ui-topbar-scroll { --ui-topbar-h: 48px; } }
+@media (prefers-reduced-motion: reduce) { .ui-topbar-bar { transition: none; } }
+`
+
+// A scroller's place inside what it can reach: the bounce of iOS goes past both ends,
+// and must not read as a turn.
+fn top_app_bar_clamp(y: num, limit: num) -> num {
+    let top = limit > 0 ? limit : 0
+    y < 0 ? 0 : y > top ? top : y
+}
+
+// The next state of a bar, from where it is and where the scroller got to. `anchor` is
+// the furthest point of the present direction: a turn counts from there, and only
+// when it has gone `slop` px, so a finger's wobble does not flicker the bar. Near the
+// top, within the bar's own height, it always shows, as there would be a gap.
+fn top_app_bar_step(hidden: bool, anchor: num, y: num, height: num, slop: num) {
+    if y <= height { return { hidden: false, anchor: y } }
+    if hidden {
+        if y >= anchor { return { hidden: true, anchor: y } }
+        return anchor - y >= slop ? { hidden: false, anchor: y } : { hidden: true, anchor: anchor }
+    }
+    if y <= anchor { return { hidden: false, anchor: y } }
+    y - anchor >= slop ? { hidden: true, anchor: y } : { hidden: false, anchor: anchor }
+}
+
+view TopAppBarIcon(name: str) =
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        {name == "back" ? <path d="M19 12H5m6-6-6 6 6 6"/> : <path d="M4 6h16M4 12h16M4 18h16"/>}
+    </svg>
+
+component TopAppBar(title: str = "", on_nav = null, nav_label: str = "Open menu", nav_icon: str = "menu", actions = null,
+                    hide: bool = true, on_hide = null, scroll_label: str = "Content", class: str? = null, children) {
+    style global top_app_bar_css
+    state hidden = false
+    state anchor = 0
+    state tinted = false
+    state bar = null
+    let show = (on: bool) => {
+        if on == hidden {
+            hidden = !on
+            on_hide && on_hide(!on)
+        }
+    }
+    <div class={ui_cls(["ui-topbar", class])}>
+        <header class={ui_cls(["ui-topbar-bar", hidden && "ui-topbar-hidden", tinted && "ui-topbar-tinted"])}
+                @mount={(el) => { bar = el }}
+                @focusin={() => { show(true) }}>
+            {on_nav != null && <button.ui-topbar-nav type="button" aria-label={nav_label} @click={() => { on_nav() }}><TopAppBarIcon name={nav_icon}/></button>}
+            <h1.ui-topbar-title>{title}</h1>
+            {actions != null && <div.ui-topbar-actions>{actions}</div>}
+        </header>
+        <div.ui-topbar-scroll tabindex="0" role="region" aria-label={scroll_label}
+             @scroll={(e) => {
+                 let y = top_app_bar_clamp(e.scrollTop, e.scrollHeight - e.clientHeight)
+                 tinted = y > 0
+                 if hide {
+                     let next = top_app_bar_step(hidden, anchor, y, bar.offsetHeight, 12)
+                     anchor = next.anchor
+                     show(!next.hidden)
+                 }
+             }}>
+            {children}
+        </div>
+    </div>
+}

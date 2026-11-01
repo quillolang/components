@@ -1,0 +1,522 @@
+// MapSheet: a map with a list of its places in a sheet over it, as a phone's map apps have: each
+// follows the other. Pressing a pin marks its row and scrolls to it; pressing a row moves the
+// map so that its pin stands in the middle of what the sheet leaves showing. Moving the map
+// dims the rows whose pins have gone out of view. The sheet rests at three heights, and
+// dragging it down shows more of the map; a pin pressed stays clear of it. On a tablet, or in
+// any pane 600 px wide or more, the list stands down the left side instead, and the map
+// takes the rest. The map is Leaflet's, on tiles from the network: with no script or no signal
+// the list still works, and it says so.
+//
+//   import ui/map_sheet.qwe use MapSheet
+//
+//   <div style="height: 100dvh">
+//       <MapSheet title="Cafes" places={[{ id: 1, name: "A Brasileira", note: "Cafe, open till 2", lat: 38.7106, lng: -9.1415 }]}
+//                 on_pick={(p) => { chosen = p.id }}/>
+//   </div>
+//
+// It fills the height it is given. places: a list of { id, name, note?, lat, lng (or lon) }. Each
+// pin has the number of its row; a place with no usable position is listed, and has no pin.
+// selected: the id marked, and a new value marks another as a press would. center: [lat, lng]
+// to start at; left out, the map fits every pin into what the sheet leaves. zoom: with
+// center (14). title: the sheet's heading ("Places"). start: "peek", "half" (default) or "full".
+// peek: how tall "peek" is, in pixels (116). label: what screen readers call the map ("Map").
+// tiles, attribution: where the tiles come from (OpenStreetMap's). on_pick(place): a pin or row
+// pressed, inside one of your components. on_detent(name): the sheet came to rest at another stop.
+//
+// The equal of the drag is the handle, a button: a tap goes to the next stop, and ArrowUp and
+// ArrowDown go up and down one. Pins take Tab and Enter, rows are buttons, and + and - zoom.
+//
+// map_sheet_snap, map_sheet_rubber, map_sheet_in_view and map_sheet_aim are the working.
+
+import ui/theme.qwe use ui_cls
+client "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js" use L
+
+let map_sheet_css = css`
+/* set elsewhere: leaflet- (Leaflet's script sets them) */
+.ui-mapsheet { position: relative; isolation: isolate; box-sizing: border-box; height: 100%; min-height: 320px; overflow: hidden; container-type: size; container-name: ui-mapsheet; background: var(--ui-subtle); color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-mapsheet-map { position: absolute; inset: 0; z-index: 0; }
+.ui-mapsheet .leaflet-container { background: var(--ui-subtle); font: 11px/1.4 var(--ui-font); }
+.ui-mapsheet-pin { background: none; border: 0; }
+.ui-mapsheet-pin > span {
+  position: absolute; left: 7px; top: 7px; box-sizing: border-box; display: grid; place-items: center; width: 30px; height: 30px; border: 2px solid #fff; border-radius: 50%; background: var(--ui-accent); color: var(--ui-accent-fg);
+  font: 700 13px/1 var(--ui-font); box-shadow: 0 1px 4px rgb(0 0 0 / .45); transition: transform .12s;
+}
+.ui-mapsheet-pin.ui-mapsheet-on > span { background: var(--ui-fg); color: var(--ui-bg); transform: scale(1.25); }
+.ui-mapsheet-pin:focus-visible { outline: none; }
+.ui-mapsheet-pin:focus-visible > span { box-shadow: var(--ui-focus); }
+.ui-mapsheet-tools { position: absolute; right: max(8px, env(safe-area-inset-right)); top: max(8px, env(safe-area-inset-top)); z-index: 5; display: grid; gap: 6px; }
+.ui-mapsheet-tool {
+  box-sizing: border-box; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg);
+  font: 600 20px/1 var(--ui-font); cursor: pointer; box-shadow: var(--ui-shadow); -webkit-tap-highlight-color: transparent;
+}
+.ui-mapsheet-tool:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-mapsheet-nomap { position: absolute; left: 12px; right: 64px; top: 12px; z-index: 5; margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font-size: 14px; box-shadow: var(--ui-shadow); }
+.ui-mapsheet-sheet {
+  position: absolute; inset: 12px 0 0 0; z-index: 10; display: flex; flex-direction: column; box-sizing: border-box; overflow: hidden; border: 1px solid var(--ui-border); border-bottom: 0; background: var(--ui-surface);
+  border-radius: calc(var(--ui-radius) + 8px) calc(var(--ui-radius) + 8px) 0 0; box-shadow: var(--ui-shadow-lg), 0 160px 0 0 var(--ui-surface); will-change: transform; transform: translateY(var(--ui-mapsheet-y));
+  transition: transform .32s cubic-bezier(.22, 1, .36, 1);
+}
+.ui-mapsheet-grip {
+  display: grid; place-items: center; flex: none; width: 100%; height: 44px; padding: 0; border: 0; background: transparent; cursor: grab; touch-action: none; -webkit-touch-callout: none; user-select: none;
+}
+.ui-mapsheet-grip span { width: 40px; height: 5px; border-radius: 999px; background: var(--ui-strong); }
+.ui-mapsheet-grip:focus-visible { outline: none; }
+.ui-mapsheet-grip:focus-visible span { background: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-mapsheet-head { flex: none; display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-top: -8px; padding: 0 16px 8px; touch-action: none; -webkit-touch-callout: none; user-select: none; }
+.ui-mapsheet-head h2 { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.3; }
+.ui-mapsheet-count { color: var(--ui-muted); font-size: 13px; white-space: nowrap; }
+.ui-mapsheet-body { position: relative; flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 0 8px calc(16px + env(safe-area-inset-bottom) + var(--ui-mapsheet-hide, 0px)); }
+.ui-mapsheet-list { margin: 0; padding: 0; list-style: none; }
+.ui-mapsheet-row {
+  box-sizing: border-box; display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: center; gap: 0 10px; width: 100%; min-height: 56px; padding: 6px 8px; border: 0; border-radius: var(--ui-radius-sm); background: transparent;
+  color: inherit; font: inherit; text-align: left; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-mapsheet-row:focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-mapsheet-row[aria-current="true"] { background: var(--ui-accent-soft); }
+.ui-mapsheet-row[data-seen="no"] { opacity: .55; }
+.ui-mapsheet-num { grid-row: 1 / span 2; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--ui-subtle); font-size: 12px; font-weight: 700; }
+.ui-mapsheet-row[aria-current="true"] .ui-mapsheet-num { background: var(--ui-fg); color: var(--ui-bg); }
+.ui-mapsheet-name { font-weight: 600; overflow-wrap: anywhere; }
+.ui-mapsheet-note { color: var(--ui-muted); font-size: 13px; overflow-wrap: anywhere; }
+.ui-mapsheet-empty { padding: 20px 8px; color: var(--ui-muted); text-align: center; }
+/* With the room, a card down the side, at its full height: nothing to drag. */
+@container ui-mapsheet (min-width: 600px) {
+  .ui-mapsheet-sheet { inset: 12px auto 12px max(12px, env(safe-area-inset-left)); width: 340px; border-bottom: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 8px); box-shadow: var(--ui-shadow-lg); transform: none; transition: none; }
+  .ui-mapsheet-grip { display: none; }
+  .ui-mapsheet-head { margin-top: 0; padding-top: 12px; touch-action: auto; }
+  .ui-mapsheet-body { --ui-mapsheet-hide: 0px; }
+}
+@media (hover: hover) { .ui-mapsheet-row:hover { background: var(--ui-subtle); } }
+@media (prefers-reduced-motion: reduce) { .ui-mapsheet-sheet, .ui-mapsheet-pin > span { transition: none; } }
+`
+
+fn map_sheet_num(x) = (type_of(x) == "int" || type_of(x) == "float" || type_of(x) == "dec") && math.isfinite(float(x))
+
+// { lat, lng } from a pair or a map, or null if it is not a place on Earth.
+fn map_sheet_point(p) {
+    if p == null { return null }
+    let lat = type_of(p) == "list" ? (len(p) > 1 ? p[0] : null) : p.lat
+    let lng = type_of(p) == "list" ? (len(p) > 1 ? p[1] : null) : (p.lng ?? p.lon)
+    if !map_sheet_num(lat) || !map_sheet_num(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180 { return null }
+    { lat: float(lat), lng: float(lng) }
+}
+
+// The places fit for showing: numbered as listed, with a position or null.
+fn map_sheet_rows(places) =
+    (type_of(places) == "list" ? places : []) | filter((p) => type_of(p) == "map") | enumerate()
+        | map((pair) => { id: pair[1].id ?? pair[0], n: pair[0] + 1, place: pair[1], at: map_sheet_point(pair[1]) })
+
+// A finger as it goes: where it began, which axis it took (null until it has moved `slop`
+// pixels) and its last few places, to tell how fast it was going.
+fn map_sheet_track(x: num, y: num, at: num) = { x0: x, y0: y, x: x, y: y, lock: null, samples: [[at, y]] }
+
+fn map_sheet_track_move(track, x: num, y: num, at: num, slop: num = 6) {
+    let dx = abs(x - track.x0)
+    let dy = abs(y - track.y0)
+    let lock = track.lock
+    if lock == null && max([dx, dy]) >= slop { lock = dx > dy ? "x" : "y" }
+    { x0: track.x0, y0: track.y0, x: x, y: y, lock: lock, samples: slice(track.samples, -5, len(track.samples)) + [[at, y]] }
+}
+
+// Pixels a millisecond over the last tenth of a second, more than nothing going down.
+fn map_sheet_speed(track, at: num) {
+    let s = track.samples
+    let last = s[len(s) - 1]
+    if at - last[0] > 120 { return 0 }
+    let recent = s | filter((p) => last[0] - p[0] <= 100)
+    let first = len(recent) > 1 || len(s) < 2 ? recent[0] : s[len(s) - 2]
+    let took = last[0] - first[0]
+    took <= 0 ? 0 : (last[1] - first[1]) / took
+}
+
+// How far something goes when pulled `over` pixels past its end: it keeps moving and never
+// reaches `limit`. It is the curve iOS's scroll views use.
+fn map_sheet_rubber(over: num, limit: num = 90) {
+    if over <= 0 { return 0 }
+    round((1 - 1 / (over * 0.55 / limit + 1)) * limit, 2)
+}
+
+// Which stop a sheet let go at height `h` rests at: a flick goes on to the next stop that way,
+// however short it was; otherwise the stop nearest to where it would have coasted to.
+fn map_sheet_snap(heights, h: num, speed: num) {
+    let count = len(heights)
+    if abs(speed) >= 0.5 {
+        let found = speed > 0 ? range(count) | filter((i) => heights[i] < h) : range(count) | filter((i) => heights[i] > h)
+        if speed > 0 { return len(found) > 0 ? found[len(found) - 1] : 0 }
+        return len(found) > 0 ? found[0] : count - 1
+    }
+    let coast = h - speed * 180
+    let best = 0
+    for i in range(count) {
+        if abs(heights[i] - coast) < abs(heights[best] - coast) { best = i }
+    }
+    best
+}
+
+// Heights of the three stops in a sheet that can be `full` pixels tall.
+fn map_sheet_heights(full: num, peek: num) {
+    let half = round(full / 2)
+    [max([44, min([peek, half])]), half, full]
+}
+
+fn map_sheet_first_y(name: str, peek: int) = name == "full" ? "0px" : (name == "half" ? "50%" : `calc(100% - ${peek}px)`)
+
+// How far the middle of the map must be from a pin's pixel for the pin to stand in the middle
+// of what can be seen: the map's size w, h and the rectangle showing.
+fn map_sheet_aim(w: num, h: num, left: num, top: num, right: num, bottom: num) = { x: w / 2 - (left + right) / 2, y: h / 2 - (top + bottom) / 2 }
+
+// The ids of the rows whose pins lie inside a box of the map.
+fn map_sheet_in_view(rows, north: num, south: num, west: num, east: num) =
+    rows | filter((r) => r.at != null && r.at.lat <= north && r.at.lat >= south && r.at.lng >= west && r.at.lng <= east) | map((r) => r.id)
+
+// Of pins { id, x, y } on the screen, the id of the nearest to a touch. Pins are 44 px to be
+// pressed, so two close together overlap, and the one on top is not the one a finger aimed at.
+fn map_sheet_nearest(points, x: num, y: num) {
+    let best = null
+    let best_d = 0
+    for p in points {
+        let d = (p.x - x) * (p.x - x) + (p.y - y) * (p.y - y)
+        if best == null || d < best_d {
+            best = p.id
+            best_d = d
+        }
+    }
+    best
+}
+
+let map_sheet_stops = ["peek", "half", "full"]
+
+fn map_sheet_stop_label(i: int) = i == 0 ? "Peek" : (i == 1 ? "Half height" : "Full height")
+
+component MapSheet(places = [], selected = null, center = null, zoom: int = 14, title: str = "Places", start: str = "half", peek: int = 116, label: str = "Map",
+                   tiles: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png", attribution: str = "© OpenStreetMap",
+                   on_pick = null, on_detent = null, class: str? = null) {
+    style global map_sheet_css
+    let rows = map_sheet_rows(places)
+    let mapped = rows | filter((r) => r.at != null)
+    state host = null
+    state sheet = null
+    state body = null
+    state leaflet = null
+    state layer = null
+    state marks = []            // { id, pin }: Leaflet's own, to mark one without drawing them all
+    state failed = false
+    state picked = selected
+    state seen_selected = selected
+    state in_view = null        // the ids in sight, null until the map has said
+    state at = index_of(map_sheet_stops, start) ?? 1
+    state heights = []
+    state wide = false
+    state fitted = false
+    state track = null
+    state zone = null           // what the finger started on: "handle", "body", then "drag" once it moves the sheet
+    state from = 0
+    state now_h = 0
+    state moved = false
+    state scrolling = false     // the list has this finger; if it gets to the list's top, the sheet takes it
+
+    let calm = () => js("matchMedia", "(prefers-reduced-motion: reduce)").matches
+    // What the sheet leaves showing, in the map's own pixels.
+    let showing = () => {
+        let box = host.getBoundingClientRect()
+        if wide {
+            let side = sheet.getBoundingClientRect()
+            { left: side.right - box.left, top: 0, right: box.width, bottom: box.height }
+        } else {
+            { left: 0, top: 0, right: box.width, bottom: box.height - now_h }
+        }
+    }
+    let look = () => {
+        if leaflet != null {
+            let s = showing()
+            let a = leaflet.containerPointToLatLng([s.left, s.top])
+            let b = leaflet.containerPointToLatLng([s.right, max([s.top + 1, s.bottom])])
+            in_view = map_sheet_in_view(rows, a.lat, b.lat, a.lng, b.lng)
+        }
+    }
+    let rest = (h: num) => {
+        let full = sheet.offsetHeight
+        now_h = h
+        sheet.style.setProperty("--ui-mapsheet-y", `${full - h}px`)
+        sheet.style.setProperty("--ui-mapsheet-hide", `${full - h}px`)
+        sheet.style.removeProperty("transform")
+        sheet.style.removeProperty("transition")
+    }
+    let aim_at = (id) => {
+        let r = find(mapped, (x) => x.id == id)
+        if leaflet != null && r != null {
+            let s = showing()
+            let size = leaflet.getSize()
+            let off = map_sheet_aim(size.x, size.y, s.left, s.top, s.right, s.bottom)
+            let z = leaflet.getZoom()
+            let p = leaflet.project([r.at.lat, r.at.lng], z)
+            leaflet.panTo(leaflet.unproject([p.x + off.x, p.y + off.y], z), { animate: !calm(), duration: 0.25 })
+        }
+    }
+    let go = (i: int) => {
+        let was = at
+        at = i
+        if heights != [] && !wide { rest(heights[i]) }
+        if was != i {
+            on_detent && on_detent(map_sheet_stops[i])
+            look()
+            if picked != null { aim_at(picked) }
+        }
+    }
+    let measure = () => {
+        wide = host.offsetWidth >= 600
+        if wide {
+            sheet.style.removeProperty("--ui-mapsheet-hide")
+            sheet.style.removeProperty("transform")
+            now_h = 0
+        } else {
+            heights = map_sheet_heights(sheet.offsetHeight, peek)
+            rest(heights[at])
+        }
+    }
+    let show_row = (id) => {
+        let row = body.querySelector(`[data-id="${str(id)}"]`)
+        if row != null { body.scrollTop = row.offsetTop }
+    }
+    // A press, from a pin or a row or the page: each marks the other.
+    let choose = (id, source: str) => {
+        picked = id
+        let r = find(rows, (x) => x.id == id)
+        if source != "list" {
+            if !wide && at == 0 { go(1) }
+            show_row(id)
+        } else {
+            if !wide && at == 2 { go(1) }
+        }
+        aim_at(id)
+        if source != "page" && r != null { on_pick && on_pick(r.place) }
+    }
+    let fit = () => {
+        if leaflet != null && len(mapped) > 0 {
+            let s = showing()
+            let box = host.getBoundingClientRect()
+            leaflet.fitBounds(mapped | map((r) => [r.at.lat, r.at.lng]),
+                              { paddingTopLeft: [s.left + 32, s.top + 32], paddingBottomRight: [box.width - s.right + 32, box.height - s.bottom + 32], maxZoom: 16, animate: false })
+        }
+    }
+    // Places drawn again when the list changes.
+    if leaflet != null && layer != null {
+        layer.clearLayers()
+        marks = mapped | map((r) => {
+            let name = str(r.place.name ?? "A place")
+            let pin = L.marker([r.at.lat, r.at.lng], { title: name, alt: name, keyboard: true, riseOnHover: false,
+                                                       icon: L.divIcon({ className: "ui-mapsheet-pin", html: `<span>${r.n}</span>`, iconSize: [44, 44], iconAnchor: [22, 22] }) })
+            pin.on("click", (e) => {
+                // Leaflet's own containerPoint is the pin's, not the finger's. A key press has
+                // no place at all: it means the pin it was on.
+                let touch = e.originalEvent.type == "click" ? leaflet.mouseEventToContainerPoint(e.originalEvent) : null
+                let spots = touch == null ? [] : marks | map((k) => {
+                    let c = leaflet.latLngToContainerPoint(k.pin.getLatLng())
+                    { id: k.id, x: c.x, y: c.y }
+                })
+                choose(touch == null ? r.id : map_sheet_nearest(spots, touch.x, touch.y) ?? r.id, "map")
+            })
+            layer.addLayer(pin)
+            { id: r.id, pin: pin }
+        })
+    }
+    // Which pin is marked. A class on Leaflet's own element, so the rest stay as they are.
+    for m in marks {
+        let el = m.pin.getElement()
+        if el != null {
+            el.classList.toggle("ui-mapsheet-on", m.id == picked)
+            m.pin.setZIndexOffset(m.id == picked ? 2000 : 0)
+        }
+    }
+    if selected != seen_selected {
+        seen_selected = selected
+        if leaflet != null || selected == null { choose(selected, "page") } else { picked = selected }
+    }
+
+    let decide = (e) => {
+        if zone == "body" {
+            let up = track.y < track.y0
+            let list_owns = up ? at == 2 : body.scrollTop > 0
+            if list_owns {
+                track = null
+                zone = null
+                scrolling = !up
+            } else {
+                zone = "drag"
+            }
+        } else if zone == "handle" {
+            zone = "drag"
+        }
+        if zone == "drag" {
+            moved = true
+            // A touch event has no pointerId.
+            if e.pointerId != null { sheet.setPointerCapture(e.pointerId) }
+            sheet.style.transition = "none"
+        }
+    }
+    let follow = () => {
+        let want = from - (track.y - track.y0)
+        let ceiling = heights[2]
+        let lowest = heights[0]
+        let h = want
+        if want > ceiling { h = ceiling + map_sheet_rubber(want - ceiling) }
+        if want < lowest { h = lowest - map_sheet_rubber(lowest - want) }
+        now_h = h
+        sheet.style.transform = `translateY(${round(sheet.offsetHeight - h, 2)}px)`
+    }
+    let moving = (e) => {
+        if track != null {
+            track = map_sheet_track_move(track, e.clientX, e.clientY, e.timeStamp)
+            if track.lock == "x" && zone != "drag" {
+                track = null
+                zone = null
+            }
+            if track != null && track.lock == "y" {
+                if zone != "drag" { decide(e) }
+                if zone == "drag" { follow() }
+            }
+        }
+    }
+    let ended = (e) => {
+        if track != null && zone == "drag" {
+            let i = map_sheet_snap(heights, now_h, map_sheet_speed(track, e.timeStamp))
+            track = null
+            zone = null
+            go(i)
+        } else {
+            track = null
+            zone = null
+        }
+    }
+    let cancelled = () => {
+        if zone == "drag" { rest(heights[at]) }
+        track = null
+        zone = null
+    }
+    let count = len(mapped)
+    let seen_count = in_view != null ? len(in_view) : count
+    // The first height is on the host, not the sheet: a style={...} on what a finger moves is written
+    // again when the page updates, and takes with it what a drag has set on the element.
+    <div class={ui_cls(["ui-mapsheet", class])} style={`--ui-mapsheet-y: ${map_sheet_first_y(start, peek)}`} @mount={(el) => { host = el }}>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+        <div.ui-mapsheet-map role="region" aria-label={label} @mount={(el) => {
+            let c = map_sheet_point(center)
+            // Quarter zooms, so that fitting the pins does not leave them bunched in a corner.
+            let m = L.map(el, { zoomControl: false, keyboard: true, minZoom: 2, maxZoom: 19, zoomSnap: 0.25, inertia: !calm() })
+            if is_err(m) {
+                failed = true
+                let plain = js_new("ResizeObserver", (_x) => { measure() })
+                plain.observe(el)
+                return () => { plain.disconnect() }
+            }
+            m.attributionControl.setPrefix(false)
+            if c != null { m.setView([c.lat, c.lng], zoom, { animate: false }) } else { m.setView([0, 0], 2, { animate: false }) }
+            L.tileLayer(tiles, { maxZoom: 19, attribution: escape(attribution) }).addTo(m)
+            layer = L.layerGroup().addTo(m)
+            m.on("moveend", () => { look() })
+            let watching = js_new("ResizeObserver", (_x) => {
+                measure()
+                m.invalidateSize({ animate: false })
+                if !fitted {
+                    fitted = true
+                    if c == null { fit() }
+                }
+                if picked != null { aim_at(picked) }
+                look()
+            })
+            watching.observe(el)
+            leaflet = m
+            () => {
+                watching.disconnect()
+                m.remove()
+            }
+        }}></div>
+        {failed && <p.ui-mapsheet-nomap role="status">The map could not load. The list still works.</p>}
+        <div.ui-mapsheet-tools>
+            <button.ui-mapsheet-tool.ui-mapsheet-zoom-in type="button" aria-label="Zoom in" @click={() => { leaflet && leaflet.zoomIn(1, { animate: !calm() }) }}>+</button>
+            <button.ui-mapsheet-tool.ui-mapsheet-zoom-out type="button" aria-label="Zoom out" @click={() => { leaflet && leaflet.zoomOut(1, { animate: !calm() }) }}>-</button>
+            <button.ui-mapsheet-tool.ui-mapsheet-all type="button" aria-label="Show every place" @click={fit}>
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+            </button>
+        </div>
+        <section.ui-mapsheet-sheet aria-label={title}
+                 @mount={(el) => { sheet = el }}
+                 @pointerdown={(e) => {
+                     let t = e.target
+                     let on_handle = t.closest(".ui-mapsheet-grip, .ui-mapsheet-head") != null
+                     let on_body = t.closest(".ui-mapsheet-body") != null
+                     moved = false
+                     // A mouse in the list selects text and its wheel scrolls. A wide pane has no stops.
+                     if !wide && e.button == 0 && (on_handle || (on_body && e.pointerType == "touch")) {
+                         track = map_sheet_track(e.clientX, e.clientY, e.timeStamp)
+                         zone = on_handle ? "handle" : "body"
+                         from = now_h
+                     }
+                 }}
+                 @pointermove={moving}
+                 @pointerup={ended}
+                 @pointercancel={cancelled}
+                 @touchmove={(e) => {
+                     // The list got to its top under a finger going down. The browser is
+                     // scrolling, so no pointer events come, and only a touch event can stop it.
+                     if scrolling && body.scrollTop <= 0 {
+                         let f = e.touches[0]
+                         scrolling = false
+                         track = map_sheet_track(f.clientX, f.clientY, e.timeStamp)
+                         zone = "drag"
+                         from = now_h
+                         moved = true
+                         sheet.style.transition = "none"
+                     }
+                     if track != null && e.touches.length == 1 {
+                         if zone != "drag" || !e.cancelable {
+                             let f = e.touches[0]
+                             track = map_sheet_track_move(track, f.clientX, f.clientY, e.timeStamp)
+                         }
+                         if track.lock == "y" && zone == "body" { decide(e) }
+                         if zone == "drag" {
+                             if e.cancelable { e.preventDefault() } else { follow() }
+                         }
+                     }
+                 }}
+                 @touchend={(e) => {
+                     scrolling = false
+                     if track != null && zone == "drag" && !e.cancelable { ended(e) }
+                 }}>
+            <button.ui-mapsheet-grip type="button" aria-label={`${map_sheet_stop_label(at)}: go to the next size`}
+                    @click={() => {
+                        if !moved { go(at == 2 ? 0 : at + 1) }
+                        moved = false
+                    }}
+                    @keydown={(e) => {
+                        if e.key == "ArrowUp" {
+                            e.preventDefault()
+                            if at < 2 { go(at + 1) }
+                        }
+                        if e.key == "ArrowDown" {
+                            e.preventDefault()
+                            if at > 0 { go(at - 1) }
+                        }
+                    }}><span aria-hidden="true"></span></button>
+            <div.ui-mapsheet-head>
+                <h2>{title}</h2>
+                <span.ui-mapsheet-count>{seen_count} of {count} in view</span>
+            </div>
+            <div.ui-mapsheet-body @mount={(el) => { body = el }}>
+                {len(rows) == 0
+                    ? <p.ui-mapsheet-empty>No places to show.</p>
+                    : <ol.ui-mapsheet-list>
+                          {for r in rows => <li key={r.id}>
+                              <button.ui-mapsheet-row type="button" data-id={str(r.id)} aria-current={picked == r.id ? "true" : null}
+                                      data-seen={in_view != null && r.at != null && !contains(in_view, r.id) ? "no" : null}
+                                      @click={() => { choose(r.id, "list") }}>
+                                  <span.ui-mapsheet-num aria-hidden="true">{r.n}</span>
+                                  <span.ui-mapsheet-name>{r.place.name ?? "A place"}</span>
+                                  <span.ui-mapsheet-note>{r.at == null ? "No position" : (r.place.note ?? "")}</span>
+                              </button>
+                          </li>}
+                      </ol>}
+            </div>
+        </section>
+    </div>
+}

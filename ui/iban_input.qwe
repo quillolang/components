@@ -1,0 +1,244 @@
+// IbanInput: an IBAN field that catches a mistyped account number before money goes to
+// the wrong place. It groups the characters in fours as they are typed, knows each
+// country's length and says how far along it is, checks the mod-97 check digits with
+// big-number arithmetic, and when they fail it looks for the slip: two characters
+// swapped, an O for a 0, one character too many or too few. Pasted text with spaces,
+// hyphens or the word IBAN is fine. It sends the IBAN without spaces.
+//
+//   <IbanInput id="iban" name="iban" label="Account (IBAN)" value="DE89 3704 0044 0532 0130 00"/>
+//   <IbanInput id="payee" name="payee" countries={["DE", "FR", "NL"]} on_change={(r) => { ok = r.valid }}/>
+//
+// id: a prefix for its ids, unique on the page. name: the hidden field that holds the
+// IBAN without spaces, empty unless it is valid. label ("IBAN"), hint, placeholder,
+// required, disabled as for every field. value: the IBAN to start with. countries: the
+// two-letter codes taken, when not all are. class: more classes. on_change(result):
+// inside one of your components, { iban, valid, country } after each change; iban has no
+// spaces, country is the code, or null.
+//
+// iban_input_read(text, countries) is the check, for a program's own use:
+// { status, iban, country, message, at, slip }. status is "empty", "typing" (right so far,
+// and short), "bad" or "ok"; at is where the message points, from 0, in the IBAN without
+// spaces; slip, when one is found, is { kind, at, fixed }, fixed being the valid IBAN it
+// would give. kind is "swap", "lookalike", "extra" or "missing". A wrong digit cannot be
+// placed, as nearly any digit could be changed to pass, so it says what the check digits
+// would have to be instead. iban_input_mod97(text), iban_input_check_digits(iban) and
+// iban_input_group(text) are the arithmetic and the spacing.
+//
+// Mod-97 catches nearly every slip but cannot prove the account exists: only a bank can.
+
+import ui/theme.qwe use ui_cls
+
+let iban_input_css = css`
+.ui-ibaninput { display: grid; gap: 6px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-ibaninput-label { font-size: 13px; font-weight: 500; }
+.ui-ibaninput-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-ibaninput-control { box-sizing: border-box; width: 100%; height: 38px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1 var(--ui-mono); letter-spacing: .02em;
+  font-variant-numeric: tabular-nums; transition: border-color .15s, box-shadow .15s; }
+.ui-ibaninput-control::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-ibaninput-control:hover { border-color: var(--ui-strong); }
+.ui-ibaninput-control:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-ibaninput-control[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-ibaninput-control:disabled { opacity: .55; cursor: not-allowed; }
+.ui-ibaninput-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-ibaninput-out { display: grid; gap: 4px; min-height: 20px; font-size: 13px; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-ibaninput-out p { margin: 0; }
+.ui-ibaninput-good { color: var(--ui-success); }
+.ui-ibaninput-bad { color: var(--ui-danger); }
+.ui-ibaninput-fix { justify-self: start; padding: 0; border: 0; border-radius: 3px; background: none; color: var(--ui-accent); font: 600 13px var(--ui-mono);
+  cursor: pointer; text-align: left; text-decoration: underline; overflow-wrap: anywhere; }
+.ui-ibaninput-fix:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) { .ui-ibaninput-control { transition: none; } }
+`
+
+// The longest IBAN the standard allows, and how much pasted text is looked at.
+let iban_input_longest = 34
+let iban_input_read_limit = 64
+let iban_input_alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+// What a tired eye or a phone's autocorrect swaps: letters in a number's place.
+let iban_input_lookalikes = { O: "0", Q: "0", I: "1", L: "1", Z: "2", S: "5", G: "6", B: "8" }
+// The SWIFT registry's countries, with the length of each one's IBAN.
+let iban_input_countries = { AD: ["Andorra", 24], AE: ["United Arab Emirates", 23], AL: ["Albania", 28], AT: ["Austria", 20], AZ: ["Azerbaijan", 28], BA: ["Bosnia and Herzegovina", 20],
+    BE: ["Belgium", 16], BG: ["Bulgaria", 22], BH: ["Bahrain", 22], BI: ["Burundi", 27], BR: ["Brazil", 29], BY: ["Belarus", 28], CH: ["Switzerland", 21], CR: ["Costa Rica", 22],
+    CY: ["Cyprus", 28], CZ: ["Czechia", 24], DE: ["Germany", 22], DJ: ["Djibouti", 27], DK: ["Denmark", 18], DO: ["Dominican Republic", 28], EE: ["Estonia", 20], EG: ["Egypt", 29],
+    ES: ["Spain", 24], FI: ["Finland", 18], FK: ["Falkland Islands", 18], FO: ["Faroe Islands", 18], FR: ["France", 27], GB: ["United Kingdom", 22], GE: ["Georgia", 22], GI: ["Gibraltar", 23],
+    GL: ["Greenland", 18], GR: ["Greece", 27], GT: ["Guatemala", 28], HN: ["Honduras", 28], HR: ["Croatia", 21], HU: ["Hungary", 28], IE: ["Ireland", 22], IL: ["Israel", 23], IQ: ["Iraq", 23],
+    IS: ["Iceland", 26], IT: ["Italy", 27], JO: ["Jordan", 30], KW: ["Kuwait", 30], KZ: ["Kazakhstan", 20], LB: ["Lebanon", 28], LC: ["Saint Lucia", 32], LI: ["Liechtenstein", 21],
+    LT: ["Lithuania", 20], LU: ["Luxembourg", 20], LV: ["Latvia", 21], LY: ["Libya", 25], MC: ["Monaco", 27], MD: ["Moldova", 24], ME: ["Montenegro", 22], MK: ["North Macedonia", 19],
+    MN: ["Mongolia", 20], MR: ["Mauritania", 27], MT: ["Malta", 31], MU: ["Mauritius", 30], NI: ["Nicaragua", 28], NL: ["Netherlands", 18], NO: ["Norway", 15], OM: ["Oman", 23], PK: ["Pakistan", 24],
+    PL: ["Poland", 28], PS: ["Palestine", 29], PT: ["Portugal", 25], QA: ["Qatar", 29], RO: ["Romania", 24], RS: ["Serbia", 22], RU: ["Russia", 33], SA: ["Saudi Arabia", 24], SC: ["Seychelles", 31],
+    SD: ["Sudan", 18], SE: ["Sweden", 24], SI: ["Slovenia", 19], SK: ["Slovakia", 24], SM: ["San Marino", 27], SO: ["Somalia", 23], ST: ["Sao Tome and Principe", 25], SV: ["El Salvador", 28],
+    TL: ["Timor-Leste", 23], TN: ["Tunisia", 24], TR: ["Turkey", 26], UA: ["Ukraine", 29], VA: ["Vatican City", 22], VG: ["British Virgin Islands", 24], XK: ["Kosovo", 20], YE: ["Yemen", 30] }
+
+// Capitals with the spaces, hyphens and dots out, and the word IBAN in front gone.
+fn iban_input_clean(text) {
+    let s = upper(slice(str(text ?? ""), 0, 200))
+    s = re.replace(s, "[\\s  .-]", "")
+    slice(re.replace(s, "^IBAN:?", ""), 0, iban_input_read_limit)
+}
+
+fn iban_input_group(text: str) {
+    let parts = []
+    let i = 0
+    while i < len(text) {
+        parts = push(parts, slice(text, i, i + 4))
+        i += 4
+    }
+    join(parts, " ")
+}
+
+// The remainder by 97 of the number the text stands for, with A as 10 up to Z as 35, a
+// digit at a time. It is far past any number type, and a remainder never grows.
+fn iban_input_remainder(text: str) {
+    let r = 0
+    for c in text {
+        let v = index_of(iban_input_alphabet, c)
+        if v != null { r = v < 10 ? (r * 10 + v) % 97 : (r * 100 + v) % 97 }
+    }
+    r
+}
+
+// The IBAN's remainder, country and check digits moved to the end: 1 when it is right.
+fn iban_input_mod97(text) {
+    let s = str(text ?? "")
+    iban_input_remainder(slice(s, 4, len(s)) + slice(s, 0, 4))
+}
+
+fn iban_input_valid(iban: str) = iban_input_mod97(iban) == 1
+
+// The check digits the rest of an IBAN calls for.
+fn iban_input_check_digits(iban: str) {
+    let d = 98 - iban_input_remainder(`${slice(iban, 4, len(iban))}${slice(iban, 0, 2)}00`)
+    d < 10 ? `0${d}` : str(d)
+}
+
+// A slip that would make the IBAN valid, or null. It only says "may" to the reader:
+// about 1 in 97 of the changes tried pass by chance. Look-alikes come first as they
+// are the commonest and the most certain.
+fn iban_input_slips(s: str, need: int) {
+    let n = len(s)
+    let chars = split(s, "")
+    if n == need {
+        for i in 2..n {
+            let to = iban_input_lookalikes[chars[i]]
+            if to != null {
+                let fixed = `${slice(s, 0, i)}${to}${slice(s, i + 1, n)}`
+                if iban_input_valid(fixed) { return { kind: "lookalike", at: i, from: chars[i], to, fixed } }
+            }
+        }
+        for i in 2..(n - 1) {
+            if chars[i] != chars[i + 1] {
+                let fixed = `${slice(s, 0, i)}${chars[i + 1]}${chars[i]}${slice(s, i + 2, n)}`
+                if iban_input_valid(fixed) { return { kind: "swap", at: i, fixed } }
+            }
+        }
+    }
+    if n == need + 1 {
+        for i in 2..n {
+            let fixed = slice(s, 0, i) + slice(s, i + 1, n)
+            if iban_input_valid(fixed) { return { kind: "extra", at: i, fixed } }
+        }
+    }
+    if n == need - 1 {
+        // Only the commonest loss is tried: one of a doubled digit, so 0 0 typed as 0.
+        for i in 2..n {
+            let fixed = `${slice(s, 0, i)}${chars[i]}${slice(s, i, n)}`
+            if iban_input_valid(fixed) { return { kind: "missing", at: i, fixed } }
+        }
+    }
+    null
+}
+
+// The whole check: see the opening comment.
+fn iban_input_read(text, countries = null) {
+    let s = iban_input_clean(text)
+    let answer = (status: str, country, message, at, slip) => { status, iban: s, country, message, at, slip }
+    if s == "" { return answer("empty", null, null, null, null) }
+    let odd = re.find(s, "[^A-Z0-9]")
+    if odd != null { return answer("bad", null, `"${odd.text}" cannot be in an IBAN (character ${odd.start + 1}).`, odd.start, null) }
+    let start = re.find(s, "\\d")
+    if start != null && start.start < 2 { return answer("bad", null, `An IBAN starts with two letters, its country (character ${start.start + 1}).`, start.start, null) }
+    if len(s) < 2 { return answer("typing", null, "An IBAN starts with two letters, its country.", null, null) }
+    let code = slice(s, 0, 2)
+    let info = iban_input_countries[code]
+    if info == null { return answer("bad", null, `${code} is not a country with IBANs.`, 0, null) }
+    if countries != null && !contains(countries, code) { return answer("bad", code, `Accounts in ${info[0]} are not taken here.`, 0, null) }
+    let place = info[0]
+    let need = info[1]
+    let n = len(s)
+    let digits = re.find(slice(s, 2, 4), "[^0-9]")
+    let lookalike = digits != null ? iban_input_slips(s, need) : null
+    if digits != null { return answer("bad", code, `Characters 3 and 4 are check digits, not letters (character ${digits.start + 3}).`, digits.start + 2, lookalike) }
+    if n < need { return answer("typing", code, `${place}: ${need} characters, ${n} so far.`, n, iban_input_slips(s, need)) }
+    if n > need {
+        return answer("bad", code, `${place} has ${need} characters: this has ${n - need} too many.`, need, iban_input_slips(s, need))
+    }
+    if iban_input_valid(s) { return answer("ok", code, `Valid IBAN for ${place}.`, null, null) }
+    let slip = iban_input_slips(s, need)
+    let said = slip == null ? `The check digits do not fit. If the rest is right they would be ${iban_input_check_digits(s)}, not ${slice(s, 2, 4)}: look for a wrong character.`
+        : "The check digits do not fit: this looks like a typing slip."
+    answer("bad", code, said, slip != null ? slip.at : null, slip)
+}
+
+// What a slip was, in words.
+fn iban_input_slip_said(slip) {
+    match slip.kind {
+        "lookalike" => `Character ${slip.at + 1} may be a ${slip.to}, not ${slip.from == "O" || slip.from == "I" ? "an" : "a"} ${slip.from}.`
+        "swap" => `Characters ${slip.at + 1} and ${slip.at + 2} may be the wrong way round.`
+        "extra" => `Character ${slip.at + 1} may be extra.`
+        _ => `A digit may be missing near character ${slip.at + 1}.`
+    }
+}
+
+// Where the cursor goes among grouped characters, after `n` of them.
+fn iban_input_caret(n: int) = n + floor((max([n, 1]) - 1) / 4)
+
+component IbanInput(id: str, name: str? = null, label: str = "IBAN", value: str = "", placeholder: str = "DE89 3704 0044 0532 0130 00", hint: str? = null, required: bool = false,
+                    disabled: bool = false, countries = null, on_change = null, class: str? = null) {
+    style global iban_input_css
+    state text = iban_input_group(iban_input_clean(value))
+    state left = false
+    let read = iban_input_read(text, countries)
+    let fault = read.status == "bad"
+    let shown_slip = read.slip != null && (read.status == "bad" || left)
+    let described = ui_cls([hint != null && `${id}-hint`, `${id}-out`])
+    let settle = (fresh: str) => {
+        text = iban_input_group(fresh)
+        if on_change != null {
+            let r = iban_input_read(fresh, countries)
+            on_change({ iban: fresh, valid: r.status == "ok", country: r.country })
+        }
+    }
+    <div class={ui_cls(["ui-ibaninput", class])}>
+        <label.ui-ibaninput-label for={id}>
+            {label}{required && <span.ui-ibaninput-req aria-hidden="true">*</span>}
+        </label>
+        <input.ui-ibaninput-control type="text" id={id} value={text} placeholder={placeholder} required={required} disabled={disabled} inputmode="text"
+               autocomplete="off" autocapitalize="characters" spellcheck="false" aria-invalid={fault ? "true" : null} aria-describedby={described}
+               @input={(e) => {
+                   let el = e.target
+                   let raw = e.value
+                   let at = el.selectionStart ?? len(raw)
+                   let before = len(iban_input_clean(slice(raw, 0, at)))
+                   let fresh = iban_input_clean(raw)
+                   let grouped = iban_input_group(fresh)
+                   settle(fresh)
+                   if grouped != raw {
+                       el.value = grouped
+                       let caret = iban_input_caret(min([before, len(fresh)]))
+                       el.setSelectionRange(caret, caret)
+                   }
+               }}
+               @blur={() => { left = true }}/>
+        {name != null && <input type="hidden" name={name} value={read.status == "ok" ? read.iban : ""}/>}
+        {hint != null && <p.ui-ibaninput-hint id={`${id}-hint`}>{hint}</p>}
+        <div.ui-ibaninput-out id={`${id}-out`} aria-live="polite">
+            {read.status == "ok" ? <p.ui-ibaninput-good>{read.message}</p> : fault ? <p.ui-ibaninput-bad>{read.message}</p> : read.status == "typing" ? <p>{read.message}</p> : null}
+            {shown_slip && <p>{iban_input_slip_said(read.slip)}</p>}
+            {shown_slip && <button.ui-ibaninput-fix type="button" @click={(e) => {
+                settle(read.slip.fixed)
+                e.target.closest(".ui-ibaninput").querySelector("input").focus()
+            }}>Use {iban_input_group(read.slip.fixed)}</button>}
+        </div>
+    </div>
+}

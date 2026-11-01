@@ -1,0 +1,196 @@
+// BarcodeInput: a field for a product code or book number that works out what it was
+// given. From the shape alone it tells EAN-13, EAN-8, UPC-A, ISBN-10 and ISBN-13 apart,
+// checks the check digit, says what the right digit would be with one click to use it,
+// and gives the same code in its other forms: ISBN-10 to ISBN-13 and back, UPC-A to
+// EAN-13 and back. Hyphens and spaces are fine, and it works with a scanner, which only types.
+//
+//   <BarcodeInput id="isbn" name="isbn" label="ISBN" kinds={["isbn10", "isbn13"]} value="0-306-40615-2"/>
+//   <BarcodeInput id="sku" name="sku" label="Product code" on_change={(r) => { ok = r.valid }}/>
+//
+// id: a prefix for its ids, unique on the page. name: the hidden field that holds the
+// code in digits, with no hyphens, empty unless it is valid. label ("Barcode"), hint,
+// placeholder, required, disabled as for every field. value: the code to start with.
+// kinds: which it takes, of "ean13", "ean8", "upca", "isbn10" and "isbn13" (all). class:
+// more classes. on_change(result): inside one of your components, { code, kind, valid }
+// after each change; code in plain digits, kind null while the shape says nothing.
+//
+// By shape: 8 digits are EAN-8, 12 UPC-A, 13 beginning 978 or 979 ISBN-13 and other 13
+// EAN-13, and 9 digits with a digit or X are ISBN-10. A code one digit short of a shape
+// (7, 9 or 11 digits; 12 beginning 978 or 979 whose UPC-A check fails) is taken as
+// lacking its check digit, which it gives. A 979 ISBN has no ISBN-10.
+//
+// barcode_input_read(text, kinds) is the check, for a program's own use: { status, kind,
+// label, code, valid, expected, fixed, message, at, others }. status is "empty", "typing",
+// "bad" or "ok"; expected the right check digit; fixed the code with it in place; at
+// where the message points, from 0, in the code without hyphens; others the code in other
+// forms, as { kind, label, code }. barcode_input_ean_digit(digits) and
+// barcode_input_isbn10_digit(digits) work out a check digit from the digits before it,
+// and barcode_input_to_isbn13(isbn10) converts.
+
+import ui/theme.qwe use ui_cls
+
+let barcode_input_css = css`
+.ui-barcodein { display: grid; gap: 6px; min-width: 0; font: 14px/1.45 var(--ui-font); color: var(--ui-fg); }
+.ui-barcodein-label { font-size: 13px; font-weight: 500; }
+.ui-barcodein-req { margin-left: 2px; color: var(--ui-danger); }
+.ui-barcodein-control { box-sizing: border-box; width: 100%; height: 38px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1 var(--ui-mono); font-variant-numeric: tabular-nums;
+  transition: border-color .15s, box-shadow .15s; }
+.ui-barcodein-control::placeholder { color: var(--ui-muted); opacity: 1; }
+.ui-barcodein-control:hover { border-color: var(--ui-strong); }
+.ui-barcodein-control:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-barcodein-control[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-barcodein-control:disabled { opacity: .55; cursor: not-allowed; }
+.ui-barcodein-hint { margin: 0; font-size: 13px; color: var(--ui-muted); }
+.ui-barcodein-out { display: grid; gap: 4px; min-height: 20px; font-size: 13px; color: var(--ui-muted); overflow-wrap: anywhere; }
+.ui-barcodein-out p { margin: 0; }
+.ui-barcodein-good { color: var(--ui-success); }
+.ui-barcodein-bad { color: var(--ui-danger); }
+.ui-barcodein-digits { font-family: var(--ui-mono); color: var(--ui-fg); }
+.ui-barcodein-digits mark { border-radius: 2px; background: var(--ui-danger-soft); color: var(--ui-danger); font-weight: 700; }
+.ui-barcodein-others { display: grid; gap: 2px; margin: 0; }
+.ui-barcodein-others div { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+.ui-barcodein-others dt { font-size: 12px; color: var(--ui-muted); }
+.ui-barcodein-others dd { margin: 0; color: var(--ui-fg); font-family: var(--ui-mono); }
+.ui-barcodein-use { padding: 0; border: 0; border-radius: 3px; background: none; color: var(--ui-accent); font: 600 13px var(--ui-font); cursor: pointer; text-align: left;
+  text-decoration: underline; overflow-wrap: anywhere; }
+.ui-barcodein-use:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (prefers-reduced-motion: reduce) { .ui-barcodein-control { transition: none; } }
+`
+
+let barcode_input_limit = 40
+let barcode_input_names = { ean13: "EAN-13", ean8: "EAN-8", upca: "UPC-A", isbn10: "ISBN-10", isbn13: "ISBN-13" }
+let barcode_input_all = ["ean13", "ean8", "upca", "isbn10", "isbn13"]
+
+fn barcode_input_clean(text) = upper(re.replace(slice(str(text ?? ""), 0, 200), "[\\s  ‐‑‒–-]", ""))
+
+// The GS1 check digit: from the right, weights 3, 1, 3, ... on the digits before it.
+fn barcode_input_ean_digit(digits: str) {
+    let total = 0
+    let three = true
+    for c in reverse(digits) {
+        total += int(c) * (three ? 3 : 1)
+        three = !three
+    }
+    str((10 - total % 10) % 10)
+}
+
+// ISBN-10's: weights 10 down to 2, modulo 11, ten written X.
+fn barcode_input_isbn10_digit(digits: str) {
+    let total = 0
+    for [i, c] in enumerate(split(digits, "")) { total += int(c) * (10 - i) }
+    let d = (11 - total % 11) % 11
+    d == 10 ? "X" : str(d)
+}
+
+fn barcode_input_to_isbn13(isbn10: str) {
+    let body = "978" + slice(isbn10, 0, 9)
+    body + barcode_input_ean_digit(body)
+}
+
+fn barcode_input_to_isbn10(isbn13: str) {
+    let body = slice(isbn13, 3, 12)
+    body + barcode_input_isbn10_digit(body)
+}
+
+fn barcode_input_digit_for(kind: str, body: str) = kind == "isbn10" ? barcode_input_isbn10_digit(body) : barcode_input_ean_digit(body)
+
+// A valid code in its other forms.
+fn barcode_input_others(kind: str, code: str) {
+    let other = (k: str, c: str) => { kind: k, label: barcode_input_names[k], code: c }
+    if kind == "isbn10" { return [other("isbn13", barcode_input_to_isbn13(code))] }
+    if kind == "isbn13" { return starts_with(code, "978") ? [other("isbn10", barcode_input_to_isbn10(code))] : [] }
+    if kind == "upca" { return [other("ean13", "0" + code)] }
+    if kind == "ean13" && starts_with(code, "0") { return [other("upca", slice(code, 1, 13))] }
+    []
+}
+
+fn barcode_input_kind(s: str) {
+    let n = len(s)
+    let isbn_start = starts_with(s, "978") || starts_with(s, "979")
+    n == 8 ? "ean8" : n == 10 ? "isbn10" : n == 12 ? "upca" : n == 13 ? (isbn_start ? "isbn13" : "ean13") : null
+}
+
+// A shape one digit short of a whole code: { kind, digit }, or null.
+fn barcode_input_short(s: str) {
+    let n = len(s)
+    let kind = n == 7 ? "ean8" : n == 9 ? "isbn10" : n == 11 ? "upca" : null
+    kind != null ? { kind, digit: barcode_input_digit_for(kind, s) } : null
+}
+
+fn barcode_input_article(name: str) = name == "UPC-A" ? "a" : "an"
+
+// The whole check: see the opening comment.
+fn barcode_input_read(text, kinds: list = barcode_input_all) {
+    let s = barcode_input_clean(text)
+    let answer = (fields) => { status: "bad", kind: null, label: null, code: s, valid: false, expected: null, fixed: null, message: null, at: null, others: [], ...fields }
+    if s == "" { return answer({ status: "empty" }) }
+    if len(s) > barcode_input_limit { return answer({ message: `That is too long for a barcode: ${barcode_input_limit} characters at most.`, at: barcode_input_limit }) }
+    let wrong = re.find(s, "[^0-9X]")
+    if wrong != null { return answer({ message: `"${wrong.text}" is not a digit (character ${wrong.start + 1}).`, at: wrong.start }) }
+    let x = index_of(s, "X")
+    if x != null && !(x == 9 && len(s) == 10) { return answer({ message: `X only ends an ISBN-10 (character ${x + 1}).`, at: x }) }
+    let n = len(s)
+    let kind = barcode_input_kind(s)
+    let short = barcode_input_short(s)
+    if short != null && contains(kinds, short.kind) {
+        let name = barcode_input_names[short.kind]
+        return answer({ status: "typing", kind: short.kind, label: name, expected: short.digit, fixed: s + short.digit, message: `One digit short of ${barcode_input_article(name)} ${name}: its check digit would be ${short.digit}.` })
+    }
+    if kind == null { return answer({ status: "typing", message: `${n} ${n == 1 ? "digit" : "digits"}: a barcode has 8, 12 or 13, an ISBN 10 or 13.` }) }
+    let body = slice(s, 0, n - 1)
+    let given = slice(s, n - 1, n)
+    let expected = barcode_input_digit_for(kind, body)
+    // Twelve digits that start as a book and fail as UPC-A: a book's number, short of its last.
+    if kind == "upca" && given != expected && (starts_with(s, "978") || starts_with(s, "979")) && contains(kinds, "isbn13") {
+        let digit = barcode_input_ean_digit(s)
+        return answer({ status: "typing", kind: "isbn13", label: "ISBN-13", expected: digit, fixed: s + digit, message: `One digit short of an ISBN-13: its check digit would be ${digit}.` })
+    }
+    let name = barcode_input_names[kind]
+    if !contains(kinds, kind) {
+        return answer({ kind, label: name, message: `This field takes ${kinds | map((k) => barcode_input_names[k]) | join(", ")}, and this has the shape of ${barcode_input_article(name)} ${name}.` })
+    }
+    if given != expected {
+        return answer({ kind, label: name, expected, fixed: body + expected, at: n - 1, message: `${name}: the check digit should be ${expected}, not ${given}.` })
+    }
+    answer({ status: "ok", kind, label: name, valid: true, expected, message: `${name}: the check digit is right.`, others: barcode_input_others(kind, s) | filter((o) => contains(kinds, o.kind) || kind == "isbn10") })
+}
+
+component BarcodeInput(id: str, name: str? = null, label: str = "Barcode", value: str = "", placeholder: str = "EAN, UPC or ISBN", hint: str? = null, required: bool = false,
+                       disabled: bool = false, kinds: list = barcode_input_all, on_change = null, class: str? = null) {
+    style global barcode_input_css
+    state text = value
+    let read = barcode_input_read(text, kinds)
+    let fault = read.status == "bad"
+    let described = ui_cls([hint != null && `${id}-hint`, `${id}-out`])
+    let tell = (typed: str) => {
+        let r = barcode_input_read(typed, kinds)
+        on_change && on_change({ code: r.code, kind: r.kind, valid: r.valid })
+    }
+    let use_code = (e, code: str) => {
+        text = code
+        tell(code)
+        e.target.closest(".ui-barcodein").querySelector("input").focus()
+    }
+    <div class={ui_cls(["ui-barcodein", class])}>
+        <label.ui-barcodein-label for={id}>
+            {label}{required && <span.ui-barcodein-req aria-hidden="true">*</span>}
+        </label>
+        <input.ui-barcodein-control type="text" id={id} value={text} placeholder={placeholder} required={required} disabled={disabled} autocomplete="off" spellcheck="false"
+               aria-invalid={fault ? "true" : null} aria-describedby={described} @input={(e) => { text = e.value; tell(e.value) }}/>
+        {name != null && <input type="hidden" name={name} value={read.valid ? read.code : ""}/>}
+        {hint != null && <p.ui-barcodein-hint id={`${id}-hint`}>{hint}</p>}
+        <div.ui-barcodein-out id={`${id}-out`} aria-live="polite">
+            {read.status == "ok" ? <p.ui-barcodein-good>{read.message}</p> : fault ? <p.ui-barcodein-bad>{read.message}</p> : read.status == "typing" ? <p>{read.message}</p> : null}
+            {read.at != null && read.fixed != null && <p.ui-barcodein-digits aria-hidden="true">{slice(read.code, 0, read.at)}<mark>{slice(read.code, read.at, read.at + 1)}</mark></p>}
+            {read.fixed != null && <button.ui-barcodein-use type="button" @click={(e) => { use_code(e, read.fixed) }}>Use {read.fixed}</button>}
+            {len(read.others) > 0 && <dl.ui-barcodein-others>
+                {for o in read.others => <div key={o.kind}>
+                    <dt>{o.label}</dt>
+                    <dd>{o.code}</dd>
+                    <dd><button.ui-barcodein-use type="button" aria-label={`Use ${o.label} ${o.code}`} @click={(e) => { use_code(e, o.code) }}>Use</button></dd>
+                </div>}
+            </dl>}
+        </div>
+    </div>
+}

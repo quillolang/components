@@ -1,0 +1,270 @@
+// GalleryPicker: picks several photos through the system's picker, shows them as
+// thumbnails in the order they will go, and holds them to a count and a size. HEIC photos
+// are refused with a reason, as few browsers can show one and few servers can read one;
+// asking for JPEG, as the default `accept` does, already makes an iPhone convert what it
+// hands over, so the refusal is for files that come by other roads. All the photos are in
+// a real file field, in order, so a plain multipart <form> sends them. Each thumbnail's
+// address is given back when the photo goes and when the component leaves the page, or a
+// long session would hold every picture in memory.
+//
+//   <form method="post" action="/listing" enctype="multipart/form-data">
+//       <GalleryPicker name="photos" limit={8} max_size={5000000}/>
+//       <Button size="lg" type="submit">Publish</Button>
+//   </form>
+//   <GalleryPicker on_change={(list) => { photos = list }}/>
+//
+// name: the file field's name ("photos"). label: what adds them ("Add photos"). limit: the
+// most photos (6). max_size: the most bytes one photo may have (10000000). accept: what
+// the picker offers ("image/jpeg,image/png,image/webp,image/gif"). on_change(photos):
+// inside one of your components, given [{ name, size, type }] in order, after each change.
+//
+// To reorder, drag a photo by its grip, or use Earlier and Later, which are also what the
+// arrow keys do on the grip. A photo dropped short of another stays where it was.
+
+import ui/theme.qwe use ui_cls
+
+let gallery_picker_css = css`
+.ui-gallery-picker { container-type: inline-size; width: 100%; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-gallery-picker-body { display: grid; gap: 12px; }
+.ui-gallery-picker-add {
+  position: relative; display: flex; align-items: center; justify-content: center; min-height: 46px; padding: 0 22px; overflow: hidden;
+  border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg); font: 500 16px/1 var(--ui-font); cursor: pointer;
+}
+.ui-gallery-picker-add input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; font-size: 16px; cursor: pointer; }
+.ui-gallery-picker-add:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-gallery-picker-add:has(input:disabled) { opacity: .55; }
+.ui-gallery-picker-count { margin: 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-gallery-picker-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 0; padding: 0; list-style: none; }
+.ui-gallery-picker-card {
+  position: relative; display: grid; gap: 4px; padding: 4px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  transition: transform .18s ease-out;
+}
+.ui-gallery-picker-card img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; background: var(--ui-subtle); -webkit-user-drag: none; }
+.ui-gallery-picker-card-on { z-index: 2; box-shadow: var(--ui-shadow-lg); transition: none; }
+.ui-gallery-picker-card-target { outline: 2px solid var(--ui-accent); outline-offset: 1px; }
+.ui-gallery-picker-place { position: absolute; left: 8px; top: 8px; min-width: 24px; padding: 1px 6px; border-radius: 999px; background: rgba(0, 0, 0, .6); color: #fff; font: 600 12px/1.5 var(--ui-font); text-align: center; }
+.ui-gallery-picker-grip {
+  position: absolute; right: 4px; top: 4px; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 8px;
+  background: rgba(0, 0, 0, .5); color: #fff; touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ui-gallery-picker-grip svg { width: 20px; height: 20px; }
+.ui-gallery-picker-grip:focus-visible { outline: 2px solid #fff; outline-offset: -3px; }
+.ui-gallery-picker-tools { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2px; }
+.ui-gallery-picker-tools button {
+  display: grid; place-items: center; min-width: 44px; height: 44px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--ui-fg); cursor: pointer;
+}
+.ui-gallery-picker-tools button svg { width: 20px; height: 20px; }
+.ui-gallery-picker-tools button:disabled { opacity: .35; cursor: default; }
+.ui-gallery-picker-tools button:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (hover: hover) { .ui-gallery-picker-tools button:hover:not(:disabled) { background: var(--ui-subtle); } }
+.ui-gallery-picker-refused { display: grid; gap: 6px; margin: 0; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-danger-soft); color: var(--ui-fg); }
+.ui-gallery-picker-refused ul { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-gallery-picker-refused b { overflow-wrap: anywhere; font-weight: 600; }
+.ui-gallery-picker-dismiss { justify-self: start; min-height: 44px; padding: 0 12px; border: 0; background: transparent; color: var(--ui-fg); font: 500 14px/1 var(--ui-font); text-decoration: underline; cursor: pointer; }
+/* A tablet, or a wide pane: more photos to the row. */
+@container (min-width: 440px) { .ui-gallery-picker-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@container (min-width: 720px) { .ui-gallery-picker-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (prefers-reduced-motion: reduce) { .ui-gallery-picker-card { transition: none; } }
+`
+
+// A size in bytes as people read it: 812 B, 340 KB, 1.5 MB.
+fn gallery_picker_size(n: num) -> str {
+    if n < 1024 { return `${n} B` }
+    if n < 1024 * 1024 { return `${round(n / 1024)} KB` }
+    let tenths = round(n * 10 / (1024 * 1024))
+    `${floor(tenths / 10)}${tenths % 10 == 0 ? "" : `.${tenths % 10}`} MB`
+}
+
+// The bytes of "ftyp", and of the brands heic, heix, heim, heis, hevc, hevx, mif1 and msf1.
+let gallery_picker_ftyp = "102 116 121 112"
+let gallery_picker_brands = ["104 101 105 99", "104 101 105 120", "104 101 105 109", "104 101 105 115",
+                             "104 101 118 99", "104 101 118 120", "109 105 102 49", "109 115 102 49"]
+
+// Whether a file is HEIC or HEIF, by its type, its name or its first 12 bytes: bytes 4 to 7
+// spell "ftyp" and 8 to 11 the brand. A file renamed .jpg is still caught by those.
+fn gallery_picker_is_heic(name: str, mime: str, head: list) -> bool {
+    let low = lower(name)
+    if starts_with(lower(mime), "image/hei") || ends_with(low, ".heic") || ends_with(low, ".heif") { return true }
+    if len(head) < 12 { return false }
+    let spell = (a: int, b: int) => join(slice(head, a, b) | map((c) => str(c)), " ")
+    spell(4, 8) == gallery_picker_ftyp && contains(gallery_picker_brands, spell(8, 12))
+}
+
+// Why a file is refused, or null. It goes through in the order a person would want to hear:
+// what it is, then how big, then whether it is here already, then whether there is room.
+fn gallery_picker_why(name: str, mime: str, size: num, head: list, count: int, limit: int, max_size: int, seen: bool) -> str? {
+    if gallery_picker_is_heic(name, mime, head) {
+        return "HEIC photos cannot be used here. Pick it from Photos so the phone converts it, or set Camera, Formats to Most Compatible."
+    }
+    if mime != "" && !starts_with(mime, "image/") { return "That is not a picture." }
+    if size <= 0 { return "That file is empty." }
+    if size > max_size { return `Larger than ${gallery_picker_size(max_size)}: it is ${gallery_picker_size(size)}.` }
+    if seen { return "That photo is here already." }
+    if count >= limit { return `Only ${limit} ${limit == 1 ? "photo" : "photos"} can be added.` }
+    null
+}
+
+// The list with the item at `from` moved to `to`. Bad places give the list as it was.
+fn gallery_picker_move(xs: list, from: int, to: int) -> list {
+    let n = len(xs)
+    if from < 0 || from >= n || to < 0 || to >= n || from == to { return xs }
+    let rest = range(n) | filter((i) => i != from) | map((i) => xs[i])
+    [...slice(rest, 0, to), xs[from], ...slice(rest, to, len(rest))]
+}
+
+// The place a card lands in, dragged by dx, dy from `from`, in a grid of `cols` columns whose
+// cells are w by h, holding n cards. Half a cell is the threshold, by rounding.
+fn gallery_picker_slot(from: int, dx: num, dy: num, cols: int, w: num, h: num, n: int) -> int {
+    if cols < 1 || w <= 0 || h <= 0 || n < 1 { return from }
+    let col = from % cols + round(dx / w)
+    let row = floor(from / cols) + round(dy / h)
+    let c = col < 0 ? 0 : col >= cols ? cols - 1 : col
+    let r = row < 0 ? 0 : row
+    let at = r * cols + c
+    at >= n ? n - 1 : at
+}
+
+component GalleryPicker(name: str = "photos", label: str = "Add photos", limit: int = 6, max_size: int = 10000000,
+                        accept: str = "image/jpeg,image/png,image/webp,image/gif", on_change = null, class: str? = null) {
+    style global gallery_picker_css
+    state items = []            // { id, file, url, name, size, type, stamp }
+    state refused = []          // { name, why }
+    state next_id = 1
+    state carry = null          // the field the form sends
+    state grab = null           // { id, from, x, y, card, moved, to, cols, w, h, pointer }, while a grip is held
+    state working = false
+    let total = items | map((p) => p.size) | sum()
+    let room = len(items) < limit
+    let commit = (next: list) => {
+        items = next
+        let dt = js_new("DataTransfer")
+        for p in next { dt.items.add(p.file) }
+        carry.files = dt.files
+        on_change && on_change(next | map((p) => { name: p.name, size: p.size, type: p.type }))
+    }
+    let pick = (e) => {
+        let chosen = js("Array.from", e.target.files)
+        e.value = ""
+        working = true
+        let next = items
+        let turned = []
+        for file in chosen {
+            let bytes = js("Promise.resolve", file.slice(0, 12).arrayBuffer())
+            let head = is_err(bytes) ? [] : js("Array.from", js_new("Uint8Array", bytes))
+            let seen = any(next, (p) => p.name == file.name && p.size == file.size && p.stamp == file.lastModified)
+            let why = gallery_picker_why(file.name, file.type ?? "", file.size, head, len(next), limit, max_size, seen)
+            if why != null {
+                turned = turned | push({ name: file.name, why })
+            } else {
+                next = next | push({ id: next_id, file, url: js("URL.createObjectURL", file), name: file.name, size: file.size, type: file.type ?? "", stamp: file.lastModified })
+                next_id += 1
+            }
+        }
+        working = false
+        refused = turned
+        if len(next) != len(items) { commit(next) }
+    }
+    let drop = (p) => {
+        if grab != null { return null }     // a second finger, during a drag: `from` would be wrong
+        js("URL.revokeObjectURL", p.url)
+        commit(items | filter((x) => x.id != p.id))
+    }
+    let shift = (from: int, to: int) => { if grab == null { commit(gallery_picker_move(items, from, to)) } }
+    let mark = (at: int?) => {
+        if grab != null {
+            let cards = js("Array.from", grab.card.parentElement.children)
+            for c in cards { c.classList.remove("ui-gallery-picker-card-target") }
+            if at != null && at != grab.from { cards[at].classList.add("ui-gallery-picker-card-target") }
+        }
+    }
+    let end = (keep: bool) => {
+        if grab != null {
+            let g = grab
+            mark(null)
+            g.card.classList.remove("ui-gallery-picker-card-on")
+            g.card.style.transform = ""
+            grab = null
+            if keep && g.moved && g.to != g.from { shift(g.from, g.to) }
+        }
+    }
+    <div class={ui_cls(["ui-gallery-picker", class])} data-state={working ? "working" : "ready"}
+         @mount={(_el) => { () => { for p in items { js("URL.revokeObjectURL", p.url) } } }}>
+        <div.ui-gallery-picker-body>
+            <label.ui-gallery-picker-add>
+                <span>{label}</span>
+                <input type="file" accept={accept} multiple={true} disabled={!room} aria-label={label} @change={pick}/>
+            </label>
+            <p.ui-gallery-picker-count role="status">
+                {len(items)} of {limit}{len(items) > 0 ? `, ${gallery_picker_size(total)}` : ""}{!room ? ". That is all there is room for." : ""}
+            </p>
+            {len(refused) > 0 && <div.ui-gallery-picker-refused role="alert">
+                <ul>{for [i, r] in enumerate(refused) => <li key={i}><b>{r.name}</b>: {r.why}</li>}</ul>
+                <button.ui-gallery-picker-dismiss type="button" @click={() => { refused = [] }}>Dismiss</button>
+            </div>}
+            {len(items) > 0 && <ol.ui-gallery-picker-grid>
+                {for [i, p] in enumerate(items) => <li.ui-gallery-picker-card key={p.id} data-id={str(p.id)} data-name={p.name}>
+                    <img src={p.url} alt={`Photo ${i + 1}: ${p.name}`} draggable="false"/>
+                    <span.ui-gallery-picker-place aria-hidden="true">{i + 1}</span>
+                    <button.ui-gallery-picker-grip type="button" aria-label={`Move photo ${i + 1}. Arrow keys move it.`}
+                            @contextmenu={(e) => { e.preventDefault() }}
+                            @pointerdown={(e) => {
+                                if e.button == 0 {
+                                    let card = e.target.closest("li")
+                                    let r = card.getBoundingClientRect()
+                                    let grid = card.parentElement
+                                    let room_w = grid.getBoundingClientRect().width
+                                    e.target.closest("button").setPointerCapture(e.pointerId)
+                                    grab = { id: p.id, from: i, x: e.clientX, y: e.clientY, card, moved: false, to: i, cols: round(room_w / (r.width + 10)),
+                                             w: r.width + 10, h: r.height + 10, pointer: e.pointerId }
+                                }
+                            }}
+                            @pointermove={(e) => {
+                                if grab != null {
+                                    let dx = e.clientX - grab.x
+                                    let dy = e.clientY - grab.y
+                                    let moved = grab.moved || abs(dx) > 6 || abs(dy) > 6
+                                    if moved {
+                                        grab.card.style.transform = `translate(${round(dx)}px, ${round(dy)}px)`
+                                        grab.card.classList.add("ui-gallery-picker-card-on")
+                                        let to = gallery_picker_slot(grab.from, dx, dy, grab.cols, grab.w, grab.h, len(items))
+                                        if to != grab.to || !grab.moved {
+                                            grab = { ...grab, to, moved: true }
+                                            mark(to)
+                                        }
+                                    }
+                                }
+                            }}
+                            @pointerup={() => { end(true) }}
+                            @pointercancel={() => { end(false) }}
+                            @keydown={(e) => {
+                                let to = match e.key {
+                                    "ArrowLeft" => i - 1
+                                    "ArrowUp" => i - 1
+                                    "ArrowRight" => i + 1
+                                    "ArrowDown" => i + 1
+                                    _ => -1
+                                }
+                                if to >= 0 && to < len(items) {
+                                    e.preventDefault()
+                                    shift(i, to)
+                                }
+                            }}>
+                        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>
+                    </button>
+                    <div.ui-gallery-picker-tools>
+                        <button type="button" aria-label={`Earlier: photo ${i + 1}`} disabled={i == 0} @click={() => { shift(i, i - 1) }}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
+                        </button>
+                        <button type="button" aria-label={`Later: photo ${i + 1}`} disabled={i == len(items) - 1} @click={() => { shift(i, i + 1) }}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+                        </button>
+                        <button type="button" aria-label={`Remove photo ${i + 1}`} @click={() => { drop(p) }}>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                        </button>
+                    </div>
+                </li>}
+            </ol>}
+            <input type="file" name={name} multiple={true} hidden={true} tabindex="-1" aria-hidden="true" @mount={(el) => { carry = el }}/>
+        </div>
+    </div>
+}

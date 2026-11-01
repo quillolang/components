@@ -1,0 +1,381 @@
+// SheetSelect: a select for a phone. Its button opens a sheet from the bottom of the screen
+// (on a wide screen, a panel by the button), with a search box once the list is long,
+// and one choice closes it, or several are ticked and Done keeps them. It is a real field:
+// under the button is a <select>, which a form sends and resets, and which `required` holds to.
+//
+//   <SheetSelect name="country" label="Country" options={["Canada", "Mexico", "Philippines"]} value="Mexico"/>
+//   <SheetSelect name="toppings" label="Toppings" multiple={true} value={["ham"]} options={[{ value: "ham", label: "Ham", hint: "+1.50" }]}
+//                on_change={(picked) => { chosen = picked }}/>
+//
+// options: text or numbers, or { value, label, hint, disabled }. value: the value, or a
+// list of them with multiple, and it replaces the choice when it changes. multiple: many,
+// with Done. label: what it is called, shown on the button. placeholder: what the button says
+// with nothing chosen ("Choose"). search_after: a search box when there are more options than
+// this (8). name, required, disabled, field (the button's id), class as for every
+// field. done_label ("Done"). on_change(value): inside one of your components, given the
+// value, or a list of values with multiple, once chosen.
+//
+// Drag the sheet down by its top to close it: past a third of its height, or flicked, it
+// goes, short of that it comes back. Its Close button, Escape and a tap outside do the same.
+// With multiple, closing any of those ways drops what was ticked; only Done keeps it.
+// The sheet stays above the on-screen keyboard (visualViewport). At 700 px wide and up there
+// is no sheet to drag: it is a panel under the button, or over it where there is no room.
+//
+// sheet_select_options, sheet_select_filter, sheet_select_toggle, sheet_select_summary and
+// sheet_select_release are the logic.
+
+import ui/theme.qwe use ui_cls
+
+let sheet_select_css = css`
+.ui-sheet-select { display: grid; gap: 6px; min-width: 0; font: 15px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-sheet-select-field { position: relative; display: grid; min-width: 0; }
+.ui-sheet-select-native { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; pointer-events: none; font-size: 16px; }
+.ui-sheet-select-open {
+  position: relative; display: flex; align-items: center; gap: 10px; box-sizing: border-box; width: 100%; min-height: 56px; margin: 0; padding: 8px 14px;
+  border: 1px solid var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg);
+  font: inherit; text-align: left; cursor: pointer; touch-action: manipulation;
+}
+.ui-sheet-select-open:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-sheet-select-open:disabled { opacity: .55; cursor: not-allowed; }
+.ui-sheet-select-words { flex: 1; min-width: 0; display: grid; }
+.ui-sheet-select-name { font-size: 12px; font-weight: 500; color: var(--ui-muted); }
+.ui-sheet-select-now { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 16px; }
+.ui-sheet-select-empty { color: var(--ui-muted); }
+.ui-sheet-select-open svg { flex: none; width: 18px; height: 18px; color: var(--ui-muted); }
+.ui-sheet-select-panel {
+  --kb: 0px; box-sizing: border-box; position: fixed; inset: auto 0 var(--kb) 0; width: 100%; max-width: 100%;
+  height: auto; max-height: min(72dvh, calc(100dvh - var(--kb) - 16px)); margin: 0; padding: 0; overflow: hidden;
+  border: 1px solid var(--ui-border); border-bottom: 0; border-radius: calc(var(--ui-radius) + 8px) calc(var(--ui-radius) + 8px) 0 0;
+  background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 15px/1.4 var(--ui-font);
+  transition: transform .24s cubic-bezier(.2, .8, .2, 1); overscroll-behavior: contain;
+}
+.ui-sheet-select-panel[open] { display: flex; flex-direction: column; animation: ui-sheet-select-up .24s cubic-bezier(.2, .8, .2, 1); }
+.ui-sheet-select-panel::backdrop { background: var(--ui-overlay); }
+@keyframes ui-sheet-select-up { from { transform: translateY(100%); } }
+.ui-sheet-select-dragging { transition: none; }
+.ui-sheet-select-head {
+  flex: none; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; padding: 0 8px 6px 18px;
+  touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.ui-sheet-select-grip { grid-column: 1 / -1; justify-self: center; width: 40px; height: 5px; margin: 8px 0 4px; border-radius: 999px; background: var(--ui-strong); }
+.ui-sheet-select-head h2 { margin: 0; font-size: 17px; font-weight: 600; }
+.ui-sheet-select-close {
+  display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm);
+  background: transparent; color: var(--ui-muted); cursor: pointer; touch-action: manipulation;
+}
+.ui-sheet-select-close:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-sheet-select-close svg { width: 20px; height: 20px; }
+.ui-sheet-select-find { flex: none; padding: 0 14px 8px; }
+.ui-sheet-select-find input {
+  box-sizing: border-box; width: 100%; height: 44px; margin: 0; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-bg); color: var(--ui-fg); font: 16px var(--ui-font);
+}
+.ui-sheet-select-find input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-sheet-select-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 8px 8px; -webkit-overflow-scrolling: touch; }
+.ui-sheet-select-item {
+  display: flex; align-items: center; gap: 10px; box-sizing: border-box; width: 100%; min-height: 50px; margin: 0; padding: 8px 10px; border: 0;
+  border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 16px/1.3 var(--ui-font); text-align: left;
+  cursor: pointer; touch-action: pan-y;
+}
+.ui-sheet-select-item:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-sheet-select-item:active { background: var(--ui-subtle); }
+.ui-sheet-select-item[aria-selected="true"] { font-weight: 600; color: var(--ui-accent); }
+.ui-sheet-select-item[aria-disabled="true"] { opacity: .5; cursor: not-allowed; }
+.ui-sheet-select-mark { flex: none; display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; font-size: 15px; }
+.ui-sheet-select-many .ui-sheet-select-mark { border: 1.5px solid var(--ui-strong); }
+.ui-sheet-select-many [aria-selected="true"] .ui-sheet-select-mark { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-sheet-select-item span:nth-child(2) { flex: 1; min-width: 0; }
+.ui-sheet-select-hint { flex: none; font-weight: 400; font-size: 14px; color: var(--ui-muted); }
+.ui-sheet-select-none { margin: 0; padding: 18px 10px; text-align: center; color: var(--ui-muted); }
+.ui-sheet-select-foot {
+  flex: none; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 14px calc(8px + env(safe-area-inset-bottom)); border-top: 1px solid var(--ui-border);
+}
+.ui-sheet-select-count { color: var(--ui-muted); }
+.ui-sheet-select-done {
+  min-height: 46px; padding: 0 22px; border: 0; border-radius: var(--ui-radius); background: var(--ui-accent); color: var(--ui-accent-fg);
+  font: 600 16px var(--ui-font); cursor: pointer; touch-action: manipulation;
+}
+.ui-sheet-select-done:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-sheet-select-safe { flex: none; height: env(safe-area-inset-bottom); }
+@media (hover: hover) {
+  .ui-sheet-select-item:hover { background: var(--ui-subtle); }
+  .ui-sheet-select-close:hover { background: var(--ui-subtle); color: var(--ui-fg); }
+}
+/* A wide screen has room for a panel by the button: no sheet, no grip. */
+@media (min-width: 700px) {
+  .ui-sheet-select-panel {
+    inset: var(--top, auto) auto auto var(--left, 0); width: var(--wide, 360px); max-height: var(--room, 420px);
+    border-bottom: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  }
+  .ui-sheet-select-panel[open] { animation: none; }
+  .ui-sheet-select-panel::backdrop { background: transparent; }
+  .ui-sheet-select-grip { display: none; }
+  .ui-sheet-select-head { padding-top: 6px; cursor: default; touch-action: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-sheet-select-panel { transition: none; }
+  .ui-sheet-select-panel[open] { animation: none; }
+}
+`
+
+// Each option as { value, label, hint, off }, the value always text.
+fn sheet_select_options(options) -> list {
+    if type_of(options) != "list" { return [] }
+    for o in options => type_of(o) == "map"
+        ? { value: str(get(o, "value", "")), label: str(get(o, "label", get(o, "value", ""))), hint: get(o, "hint", null), off: get(o, "disabled", false) == true }
+        : { value: str(o), label: str(o), hint: null, off: false }
+}
+
+// What was given as the value, as a list of texts that are options.
+fn sheet_select_values(value, opts: list) -> list {
+    let given = type_of(value) == "list" ? value | map((v) => str(v)) : value == null ? [] : [str(value)]
+    let known = opts | map((o) => o.value)
+    given | filter((v) => contains(known, v))
+}
+
+// The options whose label or hint hold the search's words, in any order and any case.
+fn sheet_select_filter(opts: list, query: str) -> list {
+    let words = split(lower(trim(query)), " ") | filter((w) => w != "")
+    opts | filter((o) => {
+        let text = lower(`${o.label} ${o.hint ?? ""}`)
+        all(words, (w) => contains(text, w))
+    })
+}
+
+fn sheet_select_toggle(picked: list, v: str) -> list =
+    contains(picked, v) ? picked | filter((x) => x != v) : picked + [v]
+
+// What the button says: the labels in the options' order, the first two and how many more.
+fn sheet_select_summary(opts: list, picked: list) -> str {
+    let names = opts | filter((o) => contains(picked, o.value)) | map((o) => o.label)
+    len(names) <= 2 ? join(names, ", ") : `${join(take(names, 2), ", ")} and ${len(names) - 2} more`
+}
+
+// Whether a drag down closes the sheet at its release: past a third of its height, or a
+// flick of more than half a pixel a millisecond going down.
+fn sheet_select_release(moved: num, height: num, speed: num) -> bool =
+    moved > height / 3 || (moved > 12 && speed > 0.5)
+
+// How far the keyboard covers the page's bottom: on iOS and in Android's Chrome the layout
+// stays and the visual viewport shrinks; where the web view resizes, this is 0.
+fn sheet_select_lift(layout: num, height: num, top: num) -> int = max([0, round(layout - height - top)])
+
+// The panel beside the button on a wide screen, below it, or above where there is no room.
+fn sheet_select_place(r, view_w: num, view_h: num) {
+    let wide = min([max([r.width, 320]), 420])
+    let below = view_h - r.bottom - 16
+    let above = r.top - 16
+    let room = min([max([below, above]), 440])
+    {
+        left: max([8, min([r.left, view_w - wide - 8])]),
+        top: below >= 240 || below >= above ? r.bottom + 6 : r.top - room - 6,
+        wide: wide,
+        room: room,
+    }
+}
+
+component SheetSelect(options: list = [], value = null, multiple: bool = false, label: str = "Choose", placeholder: str = "Choose",
+                      search_after: int = 8, name: str? = null, required: bool = false, disabled: bool = false, field: str? = null,
+                      done_label: str = "Done", on_change = null, class: str? = null) {
+    style global sheet_select_css
+    let opts = sheet_select_options(options)
+    let given = sheet_select_values(value, opts)
+    state picked = given
+    state start = given             // what a form's reset goes back to
+    state seen = given
+    state ticks = given             // the sheet's ticks, until Done
+    state query = ""
+    state panel = null
+    state trigger = null
+    state pull = null               // a drag of the sheet: { y, x, on, t, last, speed }
+    state pulling = false           // apart from `pull`, which changes on each move: only this is in the markup
+    state is_sheet = true           // narrow enough to be a sheet, not a panel
+    state is_open = false
+    state stop_follow = null
+    if given != seen {
+        seen = given
+        picked = given
+        ticks = given
+    }
+    let id = field ?? `sheet-select-${re.replace(lower(label), "[^a-z0-9]+", "-")}`
+    let found = sheet_select_filter(opts, query)
+    let keep = (next: list) => {
+        picked = next
+        on_change && on_change(multiple ? next : (len(next) > 0 ? next[0] : null))
+    }
+    // Where the sheet goes follows the keyboard, the rotation and a split screen.
+    let follow = () => {
+        let win = js("window")
+        let vv = win.visualViewport
+        let tall = win.innerHeight
+        is_sheet = win.innerWidth < 700
+        let lift = vv == null ? 0 : sheet_select_lift(tall, vv.height, vv.offsetTop)
+        panel.style.setProperty("--kb", `${lift}px`)
+        let spot = sheet_select_place(trigger.getBoundingClientRect(), win.innerWidth, tall)
+        panel.style.setProperty("--left", `${spot.left}px`)
+        panel.style.setProperty("--top", `${spot.top}px`)
+        panel.style.setProperty("--wide", `${spot.wide}px`)
+        panel.style.setProperty("--room", `${spot.room}px`)
+    }
+    let show = () => {
+        ticks = picked
+        query = ""
+        is_open = true
+        follow()
+        let win = js("window")
+        let vv = win.visualViewport
+        win.addEventListener("resize", follow)
+        if vv != null {
+            vv.addEventListener("resize", follow)
+            vv.addEventListener("scroll", follow)
+        }
+        stop_follow = () => {
+            win.removeEventListener("resize", follow)
+            if vv != null {
+                vv.removeEventListener("resize", follow)
+                vv.removeEventListener("scroll", follow)
+            }
+        }
+        panel.showModal()
+        // Opening goes to the current choice, not the search box, or the keyboard would
+        // cover the list the person came to read.
+        let on = panel.querySelector("[aria-selected='true']") ?? panel.querySelector(".ui-sheet-select-close")
+        on.focus()
+    }
+    let dismiss = () => { panel.close() }
+    let choose = (o) => {
+        if !o.off {
+            if multiple {
+                ticks = sheet_select_toggle(ticks, o.value)
+            } else {
+                keep([o.value])
+                panel.close()
+            }
+        }
+    }
+    let spring = () => { panel.style.transform = "" }
+    <div class={ui_cls(["ui-sheet-select", multiple && "ui-sheet-select-many", class])}>
+        <div.ui-sheet-select-field>
+            <select.ui-sheet-select-native name={name} multiple={multiple} required={required} disabled={disabled} tabindex="-1" aria-hidden="true"
+                    @mount={(el) => {
+                        let form = el.form
+                        let reset = () => { picked = start }
+                        if form != null { form.addEventListener("reset", reset) }
+                        () => { if form != null { form.removeEventListener("reset", reset) } }
+                    }}>
+                {!multiple && <option value=""></option>}
+                {for o in opts => <option key={o.value} value={o.value} selected={contains(picked, o.value)}>{o.label}</option>}
+            </select>
+            <button.ui-sheet-select-open id={id} type="button" disabled={disabled} aria-haspopup="dialog" aria-expanded={is_open ? "true" : "false"}
+                    @mount={(el) => { trigger = el }} @click={show}>
+                <span.ui-sheet-select-words>
+                    <span.ui-sheet-select-name>{label}{required && " (required)"}</span>
+                    <span class={ui_cls(["ui-sheet-select-now", len(picked) == 0 && "ui-sheet-select-empty"])}>{len(picked) == 0 ? placeholder : sheet_select_summary(opts, picked)}</span>
+                </span>
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 8 5 5 5-5"/></svg>
+            </button>
+        </div>
+        <dialog class={ui_cls(["ui-sheet-select-panel", pulling && "ui-sheet-select-dragging"])} aria-label={label}
+                @mount={(el) => { panel = el }}
+                @close={() => {
+                    is_open = false
+                    pull = null
+                    pulling = false
+                    panel.style.transform = ""
+                    stop_follow && stop_follow()
+                    stop_follow = null
+                }}
+                @click={(e) => { if e.target.tagName == "DIALOG" { dismiss() } }}
+                @keydown={(e) => {
+                    if e.key == "ArrowDown" || e.key == "ArrowUp" {
+                        // First: `js` waits, and after a wait the browser has already scrolled.
+                        e.preventDefault()
+                        let on = e.target
+                        let items = js("Array.from", panel.querySelectorAll(".ui-sheet-select-item"))
+                        // By isSameNode: `==` and `index_of` take any two elements as equal.
+                        let hits = enumerate(items) | filter((p) => p[1].isSameNode(on))
+                        if len(items) > 0 {
+                            let now = len(hits) > 0 ? hits[0][0] : null
+                            let to = now == null ? 0 : e.key == "ArrowDown" ? min([now + 1, len(items) - 1]) : max([now - 1, 0])
+                            items[to].focus()
+                        }
+                    }
+                }}>
+            <div.ui-sheet-select-head
+                 @pointerdown={(e) => {
+                     if e.target.closest("button") == null && e.button == 0 && is_sheet {
+                         pull = { x: e.clientX, y: e.clientY, on: false, t: e.timeStamp, last: e.clientY, speed: 0 }
+                     }
+                 }}
+                 @pointermove={(e) => {
+                     if pull != null {
+                         let dy = e.clientY - pull.y
+                         let dx = e.clientX - pull.x
+                         if !pull.on && abs(dx) > 8 && abs(dx) > abs(dy) {
+                             pull = null        // sideways: not this gesture
+                         } else {
+                             if !pull.on && dy > 8 {
+                                 e.target.closest(".ui-sheet-select-head").setPointerCapture(e.pointerId)
+                                 pull = { ...pull, on: true }
+                                 pulling = true
+                             }
+                             if pull.on {
+                                 panel.style.transform = `translateY(${max([0, dy])}px)`
+                                 let dt = max([1, e.timeStamp - pull.t])
+                                 pull = { ...pull, speed: (e.clientY - pull.last) / dt, t: e.timeStamp, last: e.clientY }
+                             }
+                         }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     if pull != null {
+                         let was = pull
+                         pull = null
+                         pulling = false
+                         let moved = e.clientY - was.y
+                         if was.on && sheet_select_release(moved, panel.offsetHeight, e.timeStamp - was.t > 100 ? 0 : was.speed) {
+                             dismiss()
+                         } else {
+                             spring()
+                         }
+                     }
+                 }}
+                 @pointercancel={() => {
+                     pull = null
+                     pulling = false
+                     spring()
+                 }}>
+                <div.ui-sheet-select-grip aria-hidden="true"></div>
+                <h2>{label}</h2>
+                <button.ui-sheet-select-close type="button" aria-label={`Close ${label}`} @click={dismiss}>
+                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>
+                </button>
+            </div>
+            {len(opts) > search_after && <div.ui-sheet-select-find>
+                <input type="search" aria-label={`Search ${label}`} placeholder="Search" enterkeyhint="search" autocomplete="off"
+                       value={query} @input={(e) => { query = e.value }}/>
+            </div>}
+            <div.ui-sheet-select-list role="listbox" aria-label={label} aria-multiselectable={multiple ? "true" : null}>
+                {for o in found =>
+                    <button.ui-sheet-select-item key={o.value} type="button" role="option" aria-selected={contains(ticks, o.value) ? "true" : "false"}
+                            aria-disabled={o.off ? "true" : null} data-value={o.value} @click={() => { choose(o) }}>
+                        <span.ui-sheet-select-mark aria-hidden="true">{contains(ticks, o.value) ? "✓" : ""}</span>
+                        <span>{o.label}</span>
+                        {o.hint != null && <span.ui-sheet-select-hint>{o.hint}</span>}
+                    </button>}
+                {len(found) == 0 && <p.ui-sheet-select-none role="status">Nothing matches "{query}".</p>}
+            </div>
+            {multiple
+                ? <div.ui-sheet-select-foot>
+                      <span.ui-sheet-select-count role="status">{len(ticks)} chosen</span>
+                      <button.ui-sheet-select-done type="button"
+                              @click={() => {
+                                  keep(ticks)
+                                  panel.close()
+                              }}>{done_label}</button>
+                  </div>
+                : <div.ui-sheet-select-safe aria-hidden="true"></div>}
+        </dialog>
+    </div>
+}

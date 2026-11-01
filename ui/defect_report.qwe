@@ -1,0 +1,407 @@
+// DefectReport: snagging on site. How serious it is, where it is by a tap on the drawing,
+// photos, and a plain summary that can go to whoever needs it, as words, from the phone.
+// The pin says the drawing's grid square and the room it falls in, so "C4, Kitchen" means
+// the same to the person who reads it. With no connection, the report waits and goes later.
+//
+// A tap sets the pin; a finger scrolling the drawing does not. The pin is dragged to move it,
+// or moved with the arrow keys, Shift for bigger steps. Rooms can be chosen from a list,
+// and Middle of the drawing is there for anyone who cannot point, so the drawing never
+// stands between a person and the report.
+//
+//   import ui/defect_report.qwe use DefectReport
+//
+//   <DefectReport reporter="J. Tremblay" job="Block C" on_send={(r) => send(r)} drawings={[
+//       { id: "l2", label: "Level 2", src: "/plans/level2.svg", width: 800, height: 600,
+//         zones: [{ name: "Kitchen", x: 0, y: 0, w: 40, h: 50 }] }]}/>
+//
+// drawings: each { id, label, src, width, height, zones }. zones: rooms, as percentages of
+// the drawing: { name, x, y, w, h }; the smallest around the pin names it. grid: columns and
+// rows of the drawing's grid ([8, 6]). severities: replaces the four levels, each { id,
+// label, hint }. min_photos: how many are needed (1). reporter, job: on the report and
+// the photos' stamps. use_place: asks for a place for photos (true). prefix: starts the
+// reference ("DR"). title ("Report a defect"). id: a prefix for its ids.
+//
+// on_send(report): when Send is pressed, and again when a connection comes back if it could
+// not go; answer false, an error, or a Promise of either to try again later. report: { ref,
+// severity, severity_label, title, detail, drawing, x, y, grid, zone, photos, reporter, job,
+// at, offset, text }. text is the summary, which Share sends by the system's sheet.
+//
+// defect_report_grid(x, y, cols, rows), defect_report_zone(zones, x, y),
+// defect_report_missing(form, min_photos) and defect_report_text(report) are the plain logic.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+import ui/photo_evidence.qwe use PhotoEvidenceAdd, PhotoEvidenceThumbs, photo_evidence_when
+
+let defect_report_css = css`
+.ui-defect { display: grid; gap: 12px; min-width: 0; container-type: inline-size; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-defect h3 { margin: 0; font-size: 18px; }
+.ui-defect h4 { margin: 0; font-size: 15px; }
+.ui-defect-cols { display: grid; gap: 14px; min-width: 0; }
+.ui-defect-col { display: grid; gap: 12px; min-width: 0; align-content: start; }
+.ui-defect-part { display: grid; gap: 6px; min-width: 0; }
+.ui-defect-levels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.ui-defect-level { position: relative; display: grid; align-content: center; min-height: 64px; padding: 6px 10px; border: 2px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); font-weight: 700; cursor: pointer; touch-action: manipulation; }
+.ui-defect-level small { color: var(--ui-muted); font-size: 13px; font-weight: 500; }
+.ui-defect-level input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.ui-defect-level:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-defect-level:has(input:checked) { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-defect-level:has(input[value="critical"]:checked) { border-color: var(--ui-danger); background: var(--ui-danger-soft); }
+.ui-defect-label { display: grid; gap: 2px; min-width: 0; color: var(--ui-muted); font-size: 13px; }
+/* 16 px: anything smaller and iOS zooms the page when the field is touched. */
+.ui-defect-label input, .ui-defect-label textarea, .ui-defect-label select { box-sizing: border-box; width: 100%; min-height: 48px; padding: 8px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 16px/1.4 var(--ui-font); }
+.ui-defect-label input:focus, .ui-defect-label textarea:focus, .ui-defect-label select:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-defect-plans { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; border: 0; }
+.ui-defect-plan { position: relative; display: inline-flex; align-items: center; min-height: 44px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: 999px; background: var(--ui-surface); font-weight: 600; cursor: pointer; }
+.ui-defect-plan input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.ui-defect-plan:has(input:checked) { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-defect-plan:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+/* The page scrolls past the drawing, and so does the drawing when zoomed: a finger that
+   moves is scrolling, and the browser says so with pointercancel. */
+.ui-defect-view { position: relative; overflow: auto; max-height: 62dvh; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: #fff; touch-action: pan-x pan-y; overscroll-behavior: contain; }
+.ui-defect-sheet { position: relative; cursor: crosshair; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.ui-defect-sheet img { display: block; width: 100%; height: auto; pointer-events: none; -webkit-user-drag: none; }
+/* The place is on this wrapper and the drag's transform on the pin inside it. An element
+   with style={...} in its markup has the whole attribute written again on a state change,
+   which would wipe the transform and send a held pin home. */
+.ui-defect-spot { position: absolute; width: 0; height: 0; }
+.ui-defect-pin { position: absolute; left: -22px; top: -44px; display: grid; place-items: end center; width: 44px; height: 44px; padding: 0; border: 0; background: transparent; color: var(--ui-danger); cursor: grab; touch-action: none; transition: transform .18s cubic-bezier(.2, .8, .2, 1); }
+.ui-defect-pin[data-drag] { cursor: grabbing; transition: none; }
+.ui-defect-pin svg { display: block; width: 36px; height: 36px; pointer-events: none; filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .5)); }
+.ui-defect-pin:focus-visible { outline: none; }
+.ui-defect-pin:focus-visible svg { outline: 3px solid var(--ui-accent); outline-offset: 1px; border-radius: 50%; }
+.ui-defect-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ui-defect-where { flex: 1 1 100%; margin: 0; font-weight: 600; }
+.ui-defect-tools > .ui-btn { flex: 1 1 96px; }
+.ui-defect-sum { margin: 0; padding: 10px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font: 14px/1.5 var(--ui-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-defect-said { margin: 0; font-weight: 600; }
+.ui-defect-said:empty { display: none; }
+.ui-defect-open { margin: 0; padding: 0 0 0 18px; color: var(--ui-danger); font-weight: 600; }
+.ui-defect-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-defect-acts > * { flex: 1 1 130px; }
+.ui-defect-note { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); font-size: 14px; }
+@container (min-width: 640px) {
+  .ui-defect-cols { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 20px; align-items: start; }
+  .ui-defect-levels { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (prefers-reduced-motion: reduce) { .ui-defect-pin { transition: none; } }
+`
+
+let defect_report_levels = [
+    { id: "low", label: "Low", hint: "Cosmetic" },
+    { id: "medium", label: "Medium", hint: "Needs fixing" },
+    { id: "high", label: "High", hint: "Stops the work" },
+    { id: "critical", label: "Critical", hint: "Unsafe" },
+]
+
+let defect_report_letters = split("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "")
+
+// A place on the drawing, kept within it.
+fn defect_report_clamp(v) = max([0, min([100, v])])
+
+// Tenths of a percent are finer than a finger, and keep a report's numbers short.
+fn defect_report_tidy(v) = round(defect_report_clamp(v) * 10) / 10
+
+// The drawing's grid square a point is in: C4. A point on the far edge is in the last one.
+fn defect_report_grid(x, y, cols: int, rows: int) -> str {
+    let c = min([cols - 1, floor(defect_report_clamp(x) * cols / 100)])
+    let r = min([rows - 1, floor(defect_report_clamp(y) * rows / 100)])
+    `${defect_report_letters[min([25, c])]}${r + 1}`
+}
+
+// The name of the smallest zone around a point, or null.
+fn defect_report_zone(zones, x, y) {
+    if type_of(zones) != "list" { return null }
+    let num = (v) => type_of(v) == "int" || type_of(v) == "float"
+    let around = zones | filter((z) => type_of(z) == "map" && num(get(z, "x")) && num(get(z, "y")) && num(get(z, "w")) && num(get(z, "h"))
+        && x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h)
+    if len(around) == 0 { return null }
+    str(get(sort_by(around, (z) => z.w * z.h)[0], "name") ?? "")
+}
+
+// What is still missing, in words.
+fn defect_report_missing(form: map, min_photos: int) -> list {
+    let n = len(get(form, "photos") ?? [])
+    (get(form, "severity") == null ? ["How serious it is"] : [])
+        + (trim(str(get(form, "title") ?? "")) == "" ? ["What is wrong"] : [])
+        + (get(form, "pin") == null ? ["Where it is on the drawing"] : [])
+        + (n < min_photos ? [min_photos - n == 1 ? "1 more photo" : `${min_photos - n} more photos`] : [])
+}
+
+// A reference anyone can read over a phone: DR-20261102-1105.
+fn defect_report_ref(prefix: str, at: int, offset: int) -> str {
+    let w = photo_evidence_when(at, offset)
+    `${prefix}-${slice(w, 0, 4)}${slice(w, 5, 7)}${slice(w, 8, 10)}-${slice(w, 11, 13)}${slice(w, 14, 16)}`
+}
+
+// Where it is, in words.
+fn defect_report_where(drawing, pin, grid: str, zone) -> str {
+    let plan = type_of(drawing) == "map" ? get(drawing, "label") : null
+    let parts = [plan, pin != null ? `grid ${grid}` : null, zone] | filter((x) => x != null && x != "")
+    join(parts, ", ")
+}
+
+// The report in words: one fact a line, the serious part first, for reading on a phone.
+fn defect_report_text(r: map) -> str {
+    let line = (label, v) => v != null && str(v) != "" ? [`${label}: ${v}`] : []
+    let top = `${upper(str(r.severity_label ?? "Severity not set"))}: ${trim(str(r.title ?? ""))}`
+    join([top] + line("Where", r.where) + line("Detail", trim(str(r.detail ?? ""))) + line("Photos", len(r.photos) > 0 ? len(r.photos) : null)
+        + line("Job", r.job) + line("By", r.reporter) + line("Ref", r.ref), "\n")
+}
+
+component DefectReport(drawings: list = [], grid: list = [8, 6], severities: list = defect_report_levels, min_photos: int = 1, reporter: str? = null, job: str? = null,
+                       use_place: bool = true, prefix: str = "DR", title: str = "Report a defect", id: str = "ui-defect", on_send = null, class: str? = null) {
+    style global defect_report_css
+    state severity = null
+    state heading = ""
+    state detail = ""
+    state plan = len(drawings) > 0 ? str(get(drawings[0], "id") ?? "") : ""
+    state pin = null         // { x, y } in percent of the drawing
+    state zoom = 1
+    state photos = []
+    state sheet = null
+    state press = null       // a finger down on the drawing: { x, y, id }
+    state drag = null        // a finger on the pin: { sx, sy, id, moved, w, h }
+    state said = ""
+    state tried = false
+    state report = null
+    state sent = false
+    state sending = false
+    state online = true
+    let drawing = drawings | find((d) => type_of(d) == "map" && str(get(d, "id") ?? "") == plan)
+    let cols = len(grid) > 0 && type_of(grid[0]) == "int" && grid[0] > 0 ? grid[0] : 8
+    let rows = len(grid) > 1 && type_of(grid[1]) == "int" && grid[1] > 0 ? grid[1] : 6
+    let square = pin != null ? defect_report_grid(pin.x, pin.y, cols, rows) : ""
+    let zones = drawing != null ? get(drawing, "zones") : null
+    let zone = pin != null ? defect_report_zone(zones, pin.x, pin.y) : null
+    let level = severities | find((s) => get(s, "id") == severity)
+    let where = defect_report_where(drawing, pin, square, zone)
+    let draft = { severity_label: level != null ? get(level, "label") : null, title: heading, detail: detail, where: where, photos: photos, job: job, reporter: reporter, ref: null }
+    let missing = defect_report_missing({ severity: severity, title: heading, pin: pin, photos: photos }, min_photos)
+    let list_zones = type_of(zones) == "list" ? zones | filter((z) => type_of(z) == "map" && get(z, "name") != null) : []
+    let put = (x, y) => {
+        pin = { x: defect_report_tidy(x), y: defect_report_tidy(y) }
+        tried = false
+    }
+    let flush = () => {
+        if report != null && !sent && !sending && online && on_send != null {
+            sending = true
+            let r = js("Promise.resolve", on_send(report))
+            sending = false
+            if r == false || is_err(r) {
+                said = "It could not be sent yet. It is kept here and will be tried again."
+            } else {
+                sent = true
+                said = ""
+            }
+        }
+    }
+    let send = () => {
+        if len(missing) > 0 {
+            tried = true
+            said = ""
+        } else {
+            let at = now()
+            let offset = 0 - js_new("Date").getTimezoneOffset()
+            let ref = defect_report_ref(prefix, at, offset)
+            let parts = set(draft, "ref", ref)
+            report = { ref: ref, severity: severity, severity_label: parts.severity_label, title: trim(heading), detail: trim(detail), drawing: plan, x: pin.x, y: pin.y, grid: square,
+                       zone: zone, where: where, photos: photos, reporter: reporter, job: job, at: at, offset: offset, text: defect_report_text(parts) }
+            said = !online && on_send != null ? "No connection. The report goes when there is one." : ""
+            flush()
+        }
+    }
+    let share = () => {
+        let t = report != null ? report.text : defect_report_text(draft)
+        let w = js("window")
+        let n = js("navigator")
+        if w.quilloNative != null {
+            // iOS answers { shared, to } and Android true, so only a refusal is looked at.
+            let r = js("quilloNative.share", t)
+            if is_err(r) { said = "It could not be shared from here." }
+        } else if n.share != null {
+            let r = js("Promise.resolve", n.share({ text: t }))
+            // A person closing the sheet is not a failure.
+            if is_err(r) && !contains(str(r.error), "cancel") && !contains(str(r.error), "Abort") { said = "It could not be shared from here." }
+        } else if n.clipboard != null {
+            let r = js("Promise.resolve", n.clipboard.writeText(t))
+            said = is_err(r) ? "This browser would not copy it. Select the summary instead." : "Copied."
+        } else {
+            said = "Nothing here can share it. Select the summary instead."
+        }
+    }
+    let again = () => {
+        severity = null
+        heading = ""
+        detail = ""
+        pin = null
+        photos = []
+        report = null
+        sent = false
+        tried = false
+        said = ""
+    }
+    <section class={ui_cls(["ui-defect", class])}
+             @mount={(_el) => {
+                 let w = js("window")
+                 online = js("navigator").onLine != false
+                 let up = (_e = null) => {
+                     online = true
+                     flush()
+                 }
+                 let down = (_e = null) => { online = false }
+                 w.addEventListener("online", up)
+                 w.addEventListener("offline", down)
+                 () => {
+                     w.removeEventListener("online", up)
+                     w.removeEventListener("offline", down)
+                 }
+             }}>
+        <h3>{title}</h3>
+        {!online && <p.ui-defect-note>No connection. The report is kept here and goes when there is one.</p>}
+        <div.ui-defect-cols>
+            <div.ui-defect-col>
+                {len(drawings) > 1 && <fieldset.ui-defect-plans aria-label="Drawing">
+                    {for d in drawings => <label class="ui-defect-plan" key={str(get(d, "id") ?? "")}>
+                        <input type="radio" name={`${id}-plan`} value={str(get(d, "id") ?? "")} checked={plan == str(get(d, "id") ?? "")} disabled={report != null}
+                               @change={() => {
+                                   plan = str(get(d, "id") ?? "")
+                                   pin = null
+                               }}/>
+                        {str(get(d, "label") ?? "")}
+                    </label>}
+                </fieldset>}
+                {drawing != null && <div.ui-defect-part>
+                    <h4>Where is it? Tap the drawing.</h4>
+                    <div.ui-defect-view>
+                        <div.ui-defect-sheet style={`width: ${zoom * 100}%`}
+                             @mount={(el) => { sheet = el }}
+                             @pointerdown={(e) => {
+                                 if report == null && e.target.closest(".ui-defect-pin") == null { press = { x: e.clientX, y: e.clientY, id: e.pointerId } }
+                             }}
+                             @pointerup={(e) => {
+                                 if press != null && e.pointerId == press.id {
+                                     let far = abs(e.clientX - press.x) + abs(e.clientY - press.y)
+                                     press = null
+                                     // A finger that moved was scrolling, or changing its mind.
+                                     if far < 10 {
+                                         let r = sheet.getBoundingClientRect()
+                                         put((e.clientX - r.left) * 100 / r.width, (e.clientY - r.top) * 100 / r.height)
+                                     }
+                                 }
+                             }}
+                             @pointercancel={() => { press = null }}>
+                            <img src={get(drawing, "src")} alt={`Drawing: ${str(get(drawing, "label") ?? "")}`} width={get(drawing, "width")} height={get(drawing, "height")}/>
+                            {pin != null && <span.ui-defect-spot style={`left: ${pin.x}%; top: ${pin.y}%`}>
+                                <button.ui-defect-pin type="button"
+                                    aria-label={`Pin at ${where}. Arrow keys move it, Delete takes it off.`} disabled={report != null}
+                                    @pointerdown={(e) => {
+                                        e.preventDefault()
+                                        e.target.setPointerCapture(e.pointerId)
+                                        let r = sheet.getBoundingClientRect()
+                                        drag = { sx: e.clientX, sy: e.clientY, id: e.pointerId, moved: false, w: r.width, h: r.height }
+                                        e.target.dataset.drag = "1"
+                                    }}
+                                    @pointermove={(e) => {
+                                        if drag != null && e.pointerId == drag.id {
+                                            let dx = e.clientX - drag.sx
+                                            let dy = e.clientY - drag.sy
+                                            if drag.moved || abs(dx) + abs(dy) >= 8 {
+                                                if !drag.moved { drag = set(drag, "moved", true) }
+                                                // Not past the sheet's edges, however far the finger goes.
+                                                let x = max([0 - pin.x * drag.w / 100, min([(100 - pin.x) * drag.w / 100, dx])])
+                                                let y = max([0 - pin.y * drag.h / 100, min([(100 - pin.y) * drag.h / 100, dy])])
+                                                e.target.style.transform = `translate(${x}px, ${y}px)`
+                                            }
+                                        }
+                                    }}
+                                    @pointerup={(e) => {
+                                        if drag != null && e.pointerId == drag.id {
+                                            let g = drag
+                                            drag = null
+                                            let el = e.target
+                                            js("Reflect.deleteProperty", el.dataset, "drag")
+                                            el.style.transform = ""
+                                            if g.moved { put(pin.x + (e.clientX - g.sx) * 100 / g.w, pin.y + (e.clientY - g.sy) * 100 / g.h) }
+                                        }
+                                    }}
+                                    @pointercancel={(e) => {
+                                        // The system took the gesture: the pin goes back to where it was.
+                                        drag = null
+                                        let el = e.target
+                                        js("Reflect.deleteProperty", el.dataset, "drag")
+                                        el.style.transform = ""
+                                    }}
+                                    @keydown={(e) => {
+                                        let step = e.shiftKey ? 5 : 1
+                                        let k = e.key
+                                        if k == "ArrowLeft" || k == "ArrowRight" || k == "ArrowUp" || k == "ArrowDown" || k == "Delete" || k == "Backspace" { e.preventDefault() }
+                                        if k == "ArrowLeft" { put(pin.x - step, pin.y) }
+                                        if k == "ArrowRight" { put(pin.x + step, pin.y) }
+                                        if k == "ArrowUp" { put(pin.x, pin.y - step) }
+                                        if k == "ArrowDown" { put(pin.x, pin.y + step) }
+                                        if k == "Delete" || k == "Backspace" { pin = null }
+                                    }}>
+                                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 22s7-7.2 7-12a7 7 0 1 0-14 0c0 4.800 7 12 7 12Zm0-9a3 3 0 1 1 0-6 3 3 0 0 1 0 6Z"/></svg>
+                                </button>
+                            </span>}
+                        </div>
+                    </div>
+                    <div.ui-defect-tools>
+                        <p.ui-defect-where role="status">{pin != null ? where : "No pin yet."}</p>
+                        <Button size="lg" variant="outline" disabled={zoom <= 1} label="Zoom out" on_click={() => { zoom = max([1, zoom - 1]) }}>−</Button>
+                        <Button size="lg" variant="outline" disabled={zoom >= 3} label="Zoom in" on_click={() => { zoom = min([3, zoom + 1]) }}>+</Button>
+                        {pin == null && <Button size="lg" variant="outline" disabled={report != null} on_click={() => { put(50, 50) }}>Middle of the drawing</Button>}
+                        {pin != null && <Button size="lg" variant="ghost" disabled={report != null} on_click={() => { pin = null }}>Take the pin off</Button>}
+                    </div>
+                    {len(list_zones) > 0 && <label class="ui-defect-label" for={`${id}-room`}>Or choose a room
+                        <select id={`${id}-room`} disabled={report != null} value={zone ?? ""}
+                                @change={(e) => {
+                                    let z = list_zones | find((x) => str(x.name) == e.value)
+                                    if z != null { put(z.x + z.w / 2, z.y + z.h / 2) }
+                                }}>
+                            <option value="">Choose</option>
+                            {for z in list_zones => <option key={str(z.name)} value={str(z.name)}>{str(z.name)}</option>}
+                        </select>
+                    </label>}
+                </div>}
+            </div>
+            <div.ui-defect-col>
+                <div.ui-defect-part>
+                    <h4>How serious?</h4>
+                    <fieldset.ui-defect-levels aria-label="How serious it is">
+                        {for s in severities => <label class="ui-defect-level" key={str(get(s, "id") ?? "")}>
+                            <input type="radio" name={`${id}-severity`} value={str(get(s, "id") ?? "")} checked={severity == get(s, "id")} disabled={report != null}
+                                   @change={() => { severity = get(s, "id") }}/>
+                            {str(get(s, "label") ?? "")}
+                            <small>{str(get(s, "hint") ?? "")}</small>
+                        </label>}
+                    </fieldset>
+                </div>
+                <label class="ui-defect-label" for={`${id}-title`}>What is wrong?
+                    <input id={`${id}-title`} name={`${id}-title`} autocomplete="off" enterkeyhint="next" disabled={report != null} value={heading} @input={(e) => { heading = e.value }}/>
+                </label>
+                <label class="ui-defect-label" for={`${id}-detail`}>More detail, if it helps
+                    <textarea id={`${id}-detail`} name={`${id}-detail`} rows="2" disabled={report != null} value={detail} @input={(e) => { detail = e.value }}></textarea>
+                </label>
+                <div.ui-defect-part>
+                    <PhotoEvidenceAdd label={len(photos) > 0 ? "Add another photo" : "Take photo"} tag={heading} job={job} use_place={use_place} disabled={report != null}
+                                      on_add={(p) => { photos = photos + [p] }}/>
+                    <PhotoEvidenceThumbs photos={photos} on_remove={report == null ? (p) => { photos = photos | filter((x) => x.id != p.id) } : null}/>
+                </div>
+                <div.ui-defect-part>
+                    <h4>{report != null ? (sent ? "Sent" : (on_send != null ? "Waiting to send" : "Finished")) : "Summary"}</h4>
+                    <pre.ui-defect-sum>{report != null ? report.text : defect_report_text(draft)}</pre>
+                </div>
+                {tried && len(missing) > 0 && <ul.ui-defect-open role="alert">{for m in missing => <li key={m}>{m}</li>}</ul>}
+                <p.ui-defect-said role="status">{said}</p>
+                <div.ui-defect-acts>
+                    {report == null && <Button size="lg" on_click={send}>Send report</Button>}
+                    {report != null && on_send != null && !sent && online && <Button size="lg" variant="outline" loading={sending} on_click={flush}>Try again</Button>}
+                    <Button size="lg" variant="outline" on_click={share}>Share</Button>
+                    {report != null && <Button size="lg" variant="outline" on_click={again}>Report another</Button>}
+                </div>
+            </div>
+        </div>
+    </section>
+}

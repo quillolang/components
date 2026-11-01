@@ -1,0 +1,461 @@
+// QueryBuilder: builds a filter from nested AND/OR groups of rules, with the
+// operators each field's type allows. It shows the filter as JSON and as parametrised
+// SQL, whose values are always `?` parameters and never in the text, and with sample
+// rows, how many match as it changes. A rule that is not finished is marked, says
+// what it lacks, and stays out of the output until it is.
+//
+//   <QueryBuilder id="people" table="people" rows={sample} fields={[
+//       { key: "name", label: "Name", type: "text" },
+//       { key: "age", label: "Age", type: "number" },
+//       { key: "joined", label: "Joined", type: "date" },
+//       { key: "active", label: "Active", type: "boolean" },
+//       { key: "plan", label: "Plan", type: "enum", options: ["free", "pro"] },
+//   ]} on_change={(q) => { where = q.where; params = q.params }}/>
+//
+// id: a prefix for its ids, unique on the page. fields: { key, label?, type?, options? },
+// or keys; type text (the default), number, date, boolean or enum (with options);
+// column: the SQL column, the key by default. value: where it starts, a filter as it
+// gives them: { and: [...] } or { or: [...] } of { field, op, value, to? } and of groups.
+// rows: sample rows to count (none: no count); limit: the most counted (5,000). table:
+// shows SELECT * FROM it, else only the WHERE part. max_depth: how deep groups nest
+// (4). max_rules: the most rules (50). title: the heading ("Filter"). name: a hidden
+// field with the filter as JSON, so a plain <form> sends it. on_change(query): inside
+// one of your components, after each change, given { filter, where, params, count };
+// where is "" with no finished rule. class: more classes for its outer element.
+//
+// Text compares without regard to case, in the samples and in SQL (LOWER on the column,
+// which SQLite does for ASCII only). A null or empty value matches only "is empty":
+// "is not" and "does not contain" skip it, as SQL's NULL does, so the count and the
+// query agree. Numbers are decimals, which JSON writes as text so nothing rounds them.
+//
+// query_builder_sql(node, fields), query_builder_filter(node, fields) and
+// query_builder_test(row, node, fields) are the logic, for a program.
+
+import ui/theme.qwe use ui_cls
+
+let query_builder_css = css`
+.ui-qbuild { display: grid; gap: 12px; min-width: 0; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-qbuild .ui-qbuild-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-qbuild-group { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-qbuild-group .ui-qbuild-group { background: var(--ui-subtle); }
+.ui-qbuild-group .ui-qbuild-group .ui-qbuild-group { background: var(--ui-surface); }
+.ui-qbuild-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.ui-qbuild-kids { display: grid; gap: 8px; margin: 0; padding: 0 0 0 10px; border-left: 2px solid var(--ui-border); list-style: none; }
+.ui-qbuild-kids:empty { display: none; }
+.ui-qbuild-rule { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.ui-qbuild-bad select, .ui-qbuild-bad input[type="text"], .ui-qbuild-bad input[type="date"] { border-color: var(--ui-danger); }
+.ui-qbuild select, .ui-qbuild-input { box-sizing: border-box; max-width: 100%; height: 32px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); }
+.ui-qbuild-input { width: 150px; }
+.ui-qbuild select:focus-visible, .ui-qbuild-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-qbuild-and { color: var(--ui-muted); font-size: 13px; }
+.ui-qbuild-pick { display: inline-flex; flex-wrap: wrap; gap: 2px 10px; }
+.ui-qbuild-pick label { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; cursor: pointer; }
+.ui-qbuild-pick input { margin: 0; accent-color: var(--ui-accent); }
+.ui-qbuild-pick input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-qbuild-btn { height: 32px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 13px var(--ui-font); white-space: nowrap; cursor: pointer; }
+.ui-qbuild-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-qbuild-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-qbuild-btn:disabled { opacity: .5; cursor: not-allowed; }
+.ui-qbuild-why { flex-basis: 100%; margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-qbuild-count { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-qbuild-note { margin: 0; color: var(--ui-warning); font-size: 13px; }
+.ui-qbuild-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 10px; min-width: 0; }
+.ui-qbuild-pane { display: grid; align-content: start; gap: 4px; min-width: 0; margin: 0; }
+.ui-qbuild-pane figcaption { color: var(--ui-muted); font-size: 12px; font-weight: 600; }
+.ui-qbuild-pane pre { max-height: 240px; margin: 0; padding: 10px 12px; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-subtle); font: 12px/1.5 var(--ui-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ui-qbuild-pane pre:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+`
+
+let query_builder_op_names = {
+    eq: "is", ne: "is not", contains: "contains", not_contains: "does not contain", starts: "starts with", ends: "ends with",
+    in: "is one of", gt: "is over", gte: "is at least", lt: "is under", lte: "is at most", between: "is between",
+    before: "is before", after: "is after", yes: "is yes", no: "is no", empty: "is empty", filled: "is not empty",
+}
+
+// The operators of a field type, in the order offered.
+fn query_builder_ops(type: str) -> list = match type {
+    "number" => ["eq", "ne", "gt", "gte", "lt", "lte", "between", "empty", "filled"]
+    "date" => ["eq", "ne", "before", "after", "between", "empty", "filled"]
+    "boolean" => ["yes", "no", "empty", "filled"]
+    "enum" => ["eq", "ne", "in", "empty", "filled"]
+    _ => ["contains", "not_contains", "eq", "ne", "starts", "ends", "in", "empty", "filled"]
+}
+
+// Whether an operator needs no value, one, or a pair.
+fn query_builder_arity(op: str) -> int = contains(["yes", "no", "empty", "filled"], op) ? 0 : (op == "between" ? 2 : 1)
+
+// The fields as maps.
+fn query_builder_fields(fields) -> list {
+    let given = type_of(fields) == "list" ? fields : []
+    given | filter((f) => type_of(f) == "str" || (type_of(f) == "map" && f.key != null)) | map((f) => {
+        let m = type_of(f) == "str" ? { key: f } : f
+        let key = str(m.key)
+        { key, label: m.label ?? key, type: contains(["text", "number", "date", "boolean", "enum"], m.type) ? m.type : "text",
+          options: m.options ?? [], column: m.column ?? key }
+    })
+}
+
+fn query_builder_field(fields: list, key: str) = find(fields, (f) => f.key == key)
+
+// ---- The tree ---------------------------------------------------------------
+// A group is { id, op ("and" or "or"), kids }, a rule { id, field, op, value, to }. Ids
+// are the rows' keys, so an input keeps its focus while the tree around it changes.
+
+fn query_builder_is_group(n: map) -> bool = n.kids != null
+
+fn query_builder_rule(id: int, fields: list) -> map {
+    let f = fields[0]
+    { id, field: f.key, op: query_builder_ops(f.type)[0], value: "", to: "" }
+}
+
+// Node `id` changed by `change`, wherever it is.
+fn query_builder_update(n: map, id: int, change) -> map {
+    if n.id == id { return change(n) }
+    query_builder_is_group(n) ? { ...n, kids: n.kids | map((k) => query_builder_update(k, id, change)) } : n
+}
+
+fn query_builder_remove(n: map, id: int) -> map =
+    !query_builder_is_group(n) ? n : { ...n, kids: n.kids | filter((k) => k.id != id) | map((k) => query_builder_remove(k, id)) }
+
+fn query_builder_rules(n: map) -> int =
+    !query_builder_is_group(n) ? 1 : sum(n.kids | map(query_builder_rules))
+
+// A filter (as query_builder_filter gives it) as a tree, ids from `next`: { node, next }.
+fn query_builder_load(v, next: int, deep: int = 0) -> map {
+    if type_of(v) != "map" || deep > 8 { return { node: null, next } }
+    let list = v.and ?? v.or
+    if type_of(list) == "list" {
+        let walked = reduce(list, { kids: [], next: next + 1 }, (acc, x) => {
+            let got = query_builder_load(x, acc.next, deep + 1)
+            { kids: got.node != null ? push(acc.kids, got.node) : acc.kids, next: got.next }
+        })
+        return { node: { id: next, op: v.or != null ? "or" : "and", kids: walked.kids }, next: walked.next }
+    }
+    if v.field == null { return { node: null, next } }
+    let plain = (x) => type_of(x) == "list" ? join(x, ", ") : str(x ?? "")
+    { node: { id: next, field: str(v.field), op: str(v.op ?? "eq"), value: type_of(v.value) == "list" && contains(["in"], v.op) ? plain(v.value) : plain(v.value), to: plain(v.to) }, next: next + 1 }
+}
+
+// ---- Reading values -----------------------------------------------------------
+
+// A number as a decimal, or null, from text or a row's value.
+fn query_builder_num(v) {
+    let t = type_of(v)
+    if t == "dec" { return v }
+    if t == "int" || t == "float" {
+        let d = dec(v)
+        return is_err(d) ? null : d
+    }
+    if t != "str" || !re.test(trim(v), "^[-+]?(\\d+\\.?\\d*|\\.\\d+)$") { return null }
+    let d = dec(trim(v))
+    is_err(d) ? null : d
+}
+
+// What a list-taking rule was given: the items of "a, b, c".
+fn query_builder_items(text: str) -> list = split(text, ",") | map((s) => trim(s)) | filter((s) => s != "")
+
+// What is wrong with a rule, or null.
+fn query_builder_check(r: map, fields: list) -> str? {
+    let f = query_builder_field(fields, r.field)
+    if f == null { return `There is no field ${r.field}.` }
+    if !contains(query_builder_ops(f.type), r.op) { return `${f.label} has no operator "${r.op}".` }
+    let n = query_builder_arity(r.op)
+    if n == 0 { return null }
+    let a = trim(str(r.value))
+    let b = trim(str(r.to))
+    if a == "" || (n == 2 && b == "") { return n == 2 ? `${f.label} needs both ends of the range.` : `${f.label} needs a value.` }
+    if r.op == "in" && len(query_builder_items(a)) == 0 { return `${f.label} needs at least one value.` }
+    match f.type {
+        "number" => {
+            let x = query_builder_num(a)
+            let y = n == 2 ? query_builder_num(b) : x
+            if x == null { return `${f.label}: "${a}" is not a number.` }
+            if y == null { return `${f.label}: "${b}" is not a number.` }
+            x > y ? `${f.label}: the range runs backwards, ${a} to ${b}.` : null
+        }
+        "date" => {
+            if !date.valid(a, "date") { return `${f.label}: "${a}" is not a date.` }
+            if n == 2 && !date.valid(b, "date") { return `${f.label}: "${b}" is not a date.` }
+            n == 2 && a > b ? `${f.label}: the range runs backwards, ${a} to ${b}.` : null
+        }
+        _ => null
+    }
+}
+
+// Every unfinished rule: { id: why }.
+fn query_builder_problems(n: map, fields: list) -> map {
+    if !query_builder_is_group(n) {
+        let why = query_builder_check(n, fields)
+        return why != null ? set({}, str(n.id), why) : {}
+    }
+    reduce(n.kids, {}, (m, k) => merge(m, query_builder_problems(k, fields)))
+}
+
+// The tree with unfinished rules and empty groups taken out, or null when none is left.
+fn query_builder_finished(n: map, fields: list) {
+    if !query_builder_is_group(n) { return query_builder_check(n, fields) == null ? n : null }
+    let kids = n.kids | map((k) => query_builder_finished(k, fields)) | filter((k) => k != null)
+    len(kids) == 0 ? null : { ...n, kids }
+}
+
+// A rule's value typed for its field.
+fn query_builder_value(r: map, f: map) {
+    match f.type {
+        "number" => query_builder_num(trim(str(r.value)))
+        "boolean" => null
+        _ => r.op == "in" ? query_builder_items(str(r.value)) : trim(str(r.value))
+    }
+}
+
+// ---- Output --------------------------------------------------------------------
+
+// The finished tree as a filter: { and: [...] } and { or: [...] } of { field, op, value, to? }.
+fn query_builder_filter(n: map?, fields: list) {
+    if n == null { return null }
+    if query_builder_is_group(n) { return set({}, n.op, n.kids | map((k) => query_builder_filter(k, fields))) }
+    let f = query_builder_field(fields, n.field)
+    let arity = query_builder_arity(n.op)
+    let base = { field: n.field, op: n.op }
+    arity == 0 ? base
+        : (arity == 2 ? { ...base, value: query_builder_value(n, f), to: f.type == "number" ? query_builder_num(trim(str(n.to))) : trim(str(n.to)) }
+        : { ...base, value: query_builder_value(n, f) })
+}
+
+fn query_builder_name(column: str) -> str = `"${replace(str(column), "\"", "\"\"")}"`
+
+// Text for LIKE: its own % and _ taken literally, by the ESCAPE in the query.
+fn query_builder_like(s: str) -> str = replace(replace(replace(s, "\\", "\\\\"), "%", "\\%"), "_", "\\_")
+
+// A rule as SQL: { sql, params }. Values go only in params.
+fn query_builder_rule_sql(r: map, f: map) -> map {
+    let c = query_builder_name(f.column)
+    let text = f.type == "text"
+    let low = text ? `LOWER(${c})` : c
+    let v = query_builder_value(r, f)
+    let side = (x) => text ? lower(x) : x
+    let like = (s: str, pattern: str) => { sql: `${s} ? ESCAPE '\\'`, params: [pattern] }
+    let esc = text ? query_builder_like(lower(str(v))) : ""
+    match r.op {
+        "eq" => { sql: `${low} = ?`, params: [side(v)] }
+        "ne" => { sql: `${low} <> ?`, params: [side(v)] }
+        "gt" | "after" => { sql: `${c} > ?`, params: [v] }
+        "gte" => { sql: `${c} >= ?`, params: [v] }
+        "lt" | "before" => { sql: `${c} < ?`, params: [v] }
+        "lte" => { sql: `${c} <= ?`, params: [v] }
+        "between" => { sql: `${c} BETWEEN ? AND ?`, params: [v, f.type == "number" ? query_builder_num(trim(str(r.to))) : trim(str(r.to))] }
+        "contains" => like(`${low} LIKE`, `%${esc}%`)
+        "not_contains" => like(`${low} NOT LIKE`, `%${esc}%`)
+        "starts" => like(`${low} LIKE`, `${esc}%`)
+        "ends" => like(`${low} LIKE`, `%${esc}`)
+        "in" => { sql: `${low} IN (${join(v | map((_x) => "?"), ", ")})`, params: v | map(side) }
+        "yes" => { sql: `${c} = ?`, params: [true] }
+        "no" => { sql: `${c} = ?`, params: [false] }
+        "empty" => { sql: text || f.type == "enum" ? `(${c} IS NULL OR ${c} = '')` : `${c} IS NULL`, params: [] }
+        _ => { sql: text || f.type == "enum" ? `(${c} IS NOT NULL AND ${c} <> '')` : `${c} IS NOT NULL`, params: [] }
+    }
+}
+
+// The finished tree as a WHERE clause: { where, params }. A group inside a group
+// keeps its brackets; a group of one needs none.
+fn query_builder_sql(n: map?, fields: list, top: bool = true) -> map {
+    if n == null { return { where: "", params: [] } }
+    if !query_builder_is_group(n) {
+        let r = query_builder_rule_sql(n, query_builder_field(fields, n.field))
+        return { where: r.sql, params: r.params }
+    }
+    let parts = n.kids | map((k) => query_builder_sql(k, fields, false))
+    let joined = join(parts | map((p) => p.where), n.op == "or" ? " OR " : " AND ")
+    { where: top || len(parts) == 1 ? joined : `(${joined})`, params: flatten(parts | map((p) => p.params)) }
+}
+
+// Whether a row's value passes a rule. Written to answer as the SQL above would.
+fn query_builder_passes(cell, r: map, f: map) -> bool {
+    let blank = cell == null || (type_of(cell) == "str" && trim(cell) == "")
+    if r.op == "empty" { return blank }
+    if r.op == "filled" { return !blank }
+    if blank { return false }
+    let v = query_builder_value(r, f)
+    if f.type == "boolean" {
+        let on = cell == true || cell == 1 || (type_of(cell) == "str" && contains(["true", "yes", "1"], lower(trim(cell))))
+        return r.op == "yes" ? on : !on
+    }
+    if f.type == "number" {
+        let x = query_builder_num(cell)
+        if x == null { return false }
+        return match r.op {
+            "eq" => x == v
+            "ne" => x != v
+            "gt" => x > v
+            "gte" => x >= v
+            "lt" => x < v
+            "lte" => x <= v
+            _ => x >= v && x <= query_builder_num(trim(str(r.to)))
+        }
+    }
+    if type_of(cell) != "str" && f.type == "date" { return false }
+    let raw = type_of(cell) == "str" ? trim(cell) : str(cell)
+    if f.type == "date" {
+        let d = slice(raw, 0, 10)
+        return match r.op {
+            "eq" => d == v
+            "ne" => d != v
+            "before" => d < v
+            "after" => d > v
+            _ => d >= v && d <= trim(str(r.to))
+        }
+    }
+    let s = f.type == "text" ? lower(raw) : raw
+    let want = r.op == "in" ? null : (f.type == "text" ? lower(v) : v)
+    match r.op {
+        "eq" => s == want
+        "ne" => s != want
+        "in" => contains(v | map((x) => f.type == "text" ? lower(x) : x), s)
+        "contains" => contains(s, want)
+        "not_contains" => !contains(s, want)
+        "starts" => starts_with(s, want)
+        _ => ends_with(s, want)
+    }
+}
+
+// Whether a row passes the finished tree.
+fn query_builder_test(row, n: map?, fields: list) -> bool {
+    if n == null { return true }
+    if query_builder_is_group(n) {
+        let hit = (k) => query_builder_test(row, k, fields)
+        return n.op == "or" ? any(n.kids, hit) : all(n.kids, hit)
+    }
+    let f = query_builder_field(fields, n.field)
+    query_builder_passes(type_of(row) == "map" ? get(row, f.key) : null, n, f)
+}
+
+// The parameters as a reader sees them: text in quotes, numbers bare.
+fn query_builder_show_param(p) -> str = type_of(p) == "dec" ? str(p) : json.stringify(p)
+
+// ---- Markup --------------------------------------------------------------------
+
+component QueryBuilderRule(rule: map, fields: list, id: str, why: str?, on_patch, on_remove) {
+    style global query_builder_css
+    let f = query_builder_field(fields, rule.field) ?? fields[0]
+    let n = query_builder_arity(rule.op)
+    let base = `${id}-rule-${rule.id}`
+    let picked = query_builder_items(str(rule.value))
+    let field_changed = (key: str) => {
+        let g = query_builder_field(fields, key)
+        let keep = contains(query_builder_ops(g.type), rule.op) && g.type == f.type
+        on_patch(rule.id, { field: key, op: keep ? rule.op : query_builder_ops(g.type)[0], value: "", to: "" })
+    }
+    <div class={ui_cls(["ui-qbuild-rule", why != null && "ui-qbuild-bad"])} data-rule={rule.id}>
+        <select id={`${base}-field`} aria-label="Field" @change={(e) => { field_changed(e.value) }}>
+            {for x in fields => <option key={x.key} value={x.key} selected={x.key == rule.field}>{x.label}</option>}
+        </select>
+        <select id={`${base}-op`} aria-label="Operator" @change={(e) => { on_patch(rule.id, { op: e.value }) }}>
+            {for o in query_builder_ops(f.type) => <option key={o} value={o} selected={o == rule.op}>{get(query_builder_op_names, o)}</option>}
+        </select>
+        {n > 0 && (f.type == "enum" && rule.op != "in"
+            ? <select id={`${base}-value`} aria-label="Value" @change={(e) => { on_patch(rule.id, { value: e.value }) }}>
+                  <option value="" selected={rule.value == ""}>Choose</option>
+                  {for o in f.options => <option key={str(o)} value={str(o)} selected={str(o) == rule.value}>{str(o)}</option>}
+              </select>
+            : (f.type == "enum"
+                ? <span.ui-qbuild-pick role="group" aria-label="Values">
+                      {for o in f.options => <label key={str(o)}>
+                          <input type="checkbox" checked={contains(picked, str(o))}
+                                 @change={(e) => { on_patch(rule.id, { value: join(e.checked ? push(picked, str(o)) : remove(picked, str(o)), ", ") }) }}/> {str(o)}
+                      </label>}
+                  </span>
+                : <input.ui-qbuild-input id={`${base}-value`} type={f.type == "date" ? "date" : "text"} aria-label={rule.op == "in" ? "Values, with commas between" : (n == 2 ? "From" : "Value")}
+                         inputmode={f.type == "number" ? "decimal" : null} autocomplete="off" aria-invalid={why != null ? "true" : null}
+                         aria-describedby={why != null ? `${base}-why` : null} value={rule.value} @input={(e) => { on_patch(rule.id, { value: e.value }) }}/>))}
+        {n == 2 && <span.ui-qbuild-and>and</span>}
+        {n == 2 && <input.ui-qbuild-input id={`${base}-to`} type={f.type == "date" ? "date" : "text"} aria-label="To" inputmode={f.type == "number" ? "decimal" : null}
+                          autocomplete="off" value={rule.to} @input={(e) => { on_patch(rule.id, { to: e.value }) }}/>}
+        <button.ui-qbuild-btn type="button" aria-label="Remove this rule" @click={() => { on_remove(rule.id) }}>Remove</button>
+        {why != null && <p.ui-qbuild-why id={`${base}-why`}>{why}</p>}
+    </div>
+}
+
+component QueryBuilderGroup(node: map, fields: list, id: str, depth: int, max_depth: int, full: bool, problems: map,
+                            on_op, on_add, on_patch, on_remove) {
+    style global query_builder_css
+    <fieldset.ui-qbuild-group data-group={node.id}>
+        <legend.ui-sr>{depth == 0 ? "All rules" : `Group at depth ${depth}`}</legend>
+        <div.ui-qbuild-head>
+            <select id={`${id}-group-${node.id}`} aria-label="How the rules combine" @change={(e) => { on_op(node.id, e.value) }}>
+                <option value="and" selected={node.op == "and"}>All of these (AND)</option>
+                <option value="or" selected={node.op == "or"}>Any of these (OR)</option>
+            </select>
+            <button.ui-qbuild-btn type="button" disabled={full} @click={() => { on_add(node.id, false) }}>Add rule</button>
+            <button.ui-qbuild-btn type="button" disabled={full || depth >= max_depth} @click={() => { on_add(node.id, true) }}>Add group</button>
+            {depth > 0 && <button.ui-qbuild-btn type="button" aria-label="Remove this group" @click={() => { on_remove(node.id) }}>Remove group</button>}
+        </div>
+        <ul.ui-qbuild-kids>
+            {for k in node.kids => <li key={k.id}>
+                {query_builder_is_group(k)
+                    ? <QueryBuilderGroup node={k} {fields} {id} depth={depth + 1} {max_depth} {full} {problems} {on_op} {on_add} {on_patch} {on_remove}/>
+                    : <QueryBuilderRule rule={k} {fields} {id} why={get(problems, str(k.id))} {on_patch} {on_remove}/>}
+            </li>}
+        </ul>
+    </fieldset>
+}
+
+component QueryBuilder(id: str, fields = [], value = null, rows = null, limit: int = 5000, table: str? = null, max_depth: int = 4, max_rules: int = 50,
+                       title: str = "Filter", name: str? = null, on_change = null, class: str? = null) {
+    style global query_builder_css
+    let defs = query_builder_fields(fields)
+    let start = query_builder_load(value, 1)
+    state tree = start.node != null && query_builder_is_group(start.node) ? start.node
+        : { id: 1, op: "and", kids: start.node != null ? [start.node] : [] }
+    state next = start.next + 1
+    let problems = query_builder_problems(tree, defs)
+    let open_n = len(problems)
+    let done = query_builder_finished(tree, defs)
+    let q = query_builder_sql(done, defs)
+    let filter_map = query_builder_filter(done, defs) ?? {}
+    let filter_text = json.stringify(filter_map, true)
+    let sample = type_of(rows) == "list" ? take(rows, limit) : null
+    let matches = sample != null ? len(sample | filter((r) => query_builder_test(r, done, defs))) : null
+    let full = query_builder_rules(tree) >= max_rules
+    let tell = () => {
+        on_change && on_change({ filter: filter_map, where: q.where, params: q.params, count: matches })
+    }
+    let change = (t: map) => {
+        tree = t
+        tell()
+    }
+    let on_op = (nid: int, op: str) => { change(query_builder_update(tree, nid, (n) => { ...n, op })) }
+    let on_patch = (nid: int, part: map) => { change(query_builder_update(tree, nid, (n) => { ...n, ...part })) }
+    let on_remove = (nid: int) => { change(query_builder_remove(tree, nid)) }
+    let on_add = (nid: int, group: bool) => {
+        let rule = query_builder_rule(group ? next + 1 : next, defs)
+        let kid = group ? { id: next, op: "and", kids: [rule] } : rule
+        next += 2
+        change(query_builder_update(tree, nid, (n) => { ...n, kids: push(n.kids, kid) }))
+    }
+    let sql_text = q.where == "" ? (table != null ? `SELECT * FROM ${query_builder_name(table)}` : "No conditions yet")
+        : (table != null ? `SELECT * FROM ${query_builder_name(table)}\nWHERE ${q.where}` : q.where)
+    <section class={ui_cls(["ui-qbuild", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-qbuild-title id={`${id}-title`}>{title}</h3>
+        {len(defs) == 0 && <p.ui-qbuild-note role="alert">There are no fields to filter by.</p>}
+        {len(defs) > 0 && <QueryBuilderGroup node={tree} fields={defs} {id} depth={0} {max_depth} {full} {problems} {on_op} {on_add} {on_patch} {on_remove}/>}
+        {full && <p.ui-qbuild-note>{`A filter holds at most ${max_rules} rules.`}</p>}
+        {open_n > 0 && <p.ui-qbuild-note>{`${open_n} unfinished rule${open_n == 1 ? " is" : "s are"} left out below.`}</p>}
+        {matches != null && <p.ui-qbuild-count aria-live="polite">{`${matches} of ${len(sample)} sample rows match`}</p>}
+        {sample != null && len(rows) > limit && <p.ui-qbuild-note>{`Only the first ${format_number(limit, "en-US", 0)} of ${format_number(len(rows), "en-US", 0)} rows are counted.`}</p>}
+        <div.ui-qbuild-out>
+            <figure.ui-qbuild-pane>
+                <figcaption>SQL</figcaption>
+                <pre tabindex="0" id={`${id}-sql`}>{sql_text}</pre>
+                <figcaption>Parameters</figcaption>
+                <pre tabindex="0" id={`${id}-params`}>{`[${join(q.params | map(query_builder_show_param), ", ")}]`}</pre>
+            </figure>
+            <figure.ui-qbuild-pane>
+                <figcaption>JSON filter</figcaption>
+                <pre tabindex="0" id={`${id}-json`}>{filter_text}</pre>
+            </figure>
+        </div>
+        {name != null && <input type="hidden" {name} value={json.stringify(filter_map)}/>}
+    </section>
+}

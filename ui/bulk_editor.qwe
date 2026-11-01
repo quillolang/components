@@ -1,0 +1,428 @@
+// BulkEditor: changes many rows at once. Rows are picked by checkbox or by a filter,
+// then one change is applied to one column: set a value, find and replace, add a
+// prefix or a suffix, or adjust a number. Before anything changes it shows each
+// affected row's before and after, and says which rows it must skip and why. Apply
+// changes them; Undo and Redo walk back and forth through what was applied.
+//
+//   <BulkEditor id="products" rows={products} id_key="sku" columns={[
+//       { key: "name", label: "Name" },
+//       { key: "price", label: "Price", type: "number" },
+//       { key: "status", label: "Status" },
+//   ]} on_apply={(changes) => { save(changes) }}/>
+//
+// id: a prefix for its ids, unique on the page. rows: a list of maps; anything else is
+// counted and left out. columns: keys or { key, label?, type?, editable? }, type
+// "number" holding a column to numbers, editable false keeping it out of the change
+// (left out, every key of the rows). id_key: the key that names a row ("id"; where
+// that is missing or repeated, rows go by their place). limit: the most rows shown
+// (200); the rest are still picked and changed. preview: the most rows the preview
+// lists (50). title: the heading ("Bulk edit"). name: a hidden field with the rows as
+// JSON, so a plain <form> sends them. on_apply(changes): inside one of your components,
+// after each Apply, Undo and Redo, given what it just did, each { id, key, before,
+// after }. class: more classes for its outer element.
+//
+// A filter is text found in any column, or the column chosen, without regard to case;
+// or a comparison: >10, <=2.50, =0. Adjust adds, subtracts, multiplies or raises by a
+// percentage, in exact decimals. Adding keeps every digit; multiplying and percentages
+// round half up to the value's own decimals, at least two, so 0.07 + 10% is 0.08. A
+// value stays the kind it was: an int while the answer is whole, text as text. A
+// value that is no number is skipped, and said to be. Ctrl+Z and Ctrl+Shift+Z work too,
+// away from a text box, which keeps its own.
+//
+// bulk_editor_edit(value, op, type), bulk_editor_plan(entries, ids, key, op, type) and
+// bulk_editor_commit(entries, changes) are the logic, for a program.
+
+import ui/theme.qwe use ui_cls
+
+let bulk_editor_css = css`
+.ui-bulked { display: grid; gap: 12px; min-width: 0; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-bulked .ui-bulked-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-bulked-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 10px; min-width: 0; }
+.ui-bulked-field { display: grid; gap: 3px; min-width: 0; }
+.ui-bulked-field label { font-size: 12px; font-weight: 500; color: var(--ui-muted); }
+.ui-bulked select, .ui-bulked-input { box-sizing: border-box; max-width: 100%; height: 32px; padding: 0 8px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); }
+.ui-bulked-input { width: 160px; }
+.ui-bulked select:focus-visible, .ui-bulked-input:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-bulked-input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-bulked-case { display: inline-flex; align-items: center; gap: 6px; height: 32px; font-size: 13px; cursor: pointer; }
+.ui-bulked input[type="checkbox"] { margin: 0; accent-color: var(--ui-accent); }
+.ui-bulked input[type="checkbox"]:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-bulked-btn { height: 32px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 13px var(--ui-font); white-space: nowrap; cursor: pointer; }
+.ui-bulked-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-bulked-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-bulked-btn:disabled { opacity: .5; cursor: not-allowed; }
+.ui-bulked-go { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); font-weight: 600; }
+.ui-bulked-go:hover:not(:disabled) { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-bulked-sum { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-bulked-note { margin: 0; color: var(--ui-warning); font-size: 13px; }
+.ui-bulked-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-bulked-empty { margin: 0; padding: 20px; border: 1px dashed var(--ui-strong); border-radius: var(--ui-radius-sm); color: var(--ui-muted); text-align: center; }
+.ui-bulked-scroll { max-height: 340px; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-bulked-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-bulked table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-bulked th, .ui-bulked td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--ui-border); overflow-wrap: anywhere; }
+.ui-bulked thead th { position: sticky; top: 0; z-index: 1; background: var(--ui-subtle); font-weight: 600; white-space: nowrap; }
+.ui-bulked tbody tr:last-child th, .ui-bulked tbody tr:last-child td { border-bottom: 0; }
+.ui-bulked-on { background: var(--ui-accent-soft); }
+.ui-bulked del { color: var(--ui-danger); }
+.ui-bulked ins { color: var(--ui-success); text-decoration: none; font-weight: 600; }
+.ui-bulked-blank { color: var(--ui-muted); font-style: italic; }
+.ui-bulked-said { color: var(--ui-muted); font-size: 13px; }
+`
+
+let bulk_editor_ops = [
+    { id: "set", name: "Set to" }, { id: "replace", name: "Find and replace" }, { id: "prefix", name: "Add a prefix" },
+    { id: "suffix", name: "Add a suffix" }, { id: "adjust", name: "Adjust a number" },
+]
+let bulk_editor_hows = [
+    { id: "add", name: "Add" }, { id: "sub", name: "Subtract" }, { id: "mul", name: "Multiply by" }, { id: "pct", name: "Raise by %" },
+]
+
+// A value as text.
+fn bulk_editor_text(v) -> str = match type_of(v) {
+    "null" => ""
+    "str" => v
+    "list" | "map" => json.stringify(v)
+    "float" => {
+        let d = dec(v)
+        is_err(d) ? str(v) : str(d)
+    }
+    _ => str(v)
+}
+
+// A number or numeric text as a decimal, or null. Past 20 digits it is no number
+// here: arithmetic on it could overflow, and that would stop the page.
+fn bulk_editor_num(v) {
+    let t = type_of(v)
+    if t == "bool" || t == "null" || t == "list" || t == "map" { return null }
+    let s = trim(bulk_editor_text(v))
+    if len(s) > 32 || !re.test(s, "^[-+]?(\\d+\\.?\\d*|\\.\\d+)$") { return null }
+    let d = dec(s)
+    is_err(d) || len(str(floor(abs(d)))) > 20 ? null : d
+}
+
+// The decimals a value is written with.
+fn bulk_editor_places(v) -> int {
+    let s = trim(bulk_editor_text(v))
+    let at = index_of(s, ".")
+    at == null ? 0 : len(s) - at - 1
+}
+
+// A decimal in the kind of the value it replaces.
+fn bulk_editor_like(old, d) = match type_of(old) {
+    "int" => d == floor(d) ? int(d) : d
+    "float" => float(d)
+    "str" => str(d)
+    _ => d
+}
+
+// Text escaped for a regular expression, so that what is searched for is only text.
+fn bulk_editor_escape(s: str) -> str = re.replace(s, "[\\\\^$.*+?()\\[\\]{}|]", (m) => `\\${m.text}`)
+
+// What is wrong with the change itself, or null.
+fn bulk_editor_op_error(op: map) -> str? {
+    if op.kind == "replace" && op.find == "" { return "Write the text to find." }
+    if op.kind == "adjust" {
+        if trim(op.arg) == "" { return "Write the amount." }
+        if bulk_editor_num(op.arg) == null { return `"${trim(op.arg)}" is not a number.` }
+    }
+    if (op.kind == "prefix" || op.kind == "suffix") && op.arg == "" { return `Write the ${op.kind}.` }
+    null
+}
+
+// One value after the change: { value }, or { skip } saying why it cannot change.
+// op: { kind, arg, find, how, match_case }. type: the column's, or null.
+fn bulk_editor_edit(v, op: map, type: str? = null) -> map {
+    let number = type == "number"
+    let text = bulk_editor_text(v)
+    match op.kind {
+        "set" => {
+            if trim(op.arg) == "" && number { return { value: null } }
+            let d = bulk_editor_num(op.arg)
+            if number && d == null { return { skip: `"${op.arg}" is not a number` } }
+            let t = type_of(v)
+            { value: d != null && (t == "int" || t == "float" || t == "dec") ? bulk_editor_like(v, d) : (d != null && number ? d : op.arg) }
+        }
+        "replace" => {
+            let out = op.match_case ? replace(text, op.find, op.with)
+                : re.replace(text, bulk_editor_escape(op.find), (m) => op.with, "i")
+            let d = bulk_editor_num(out)
+            let t = type_of(v)
+            if number && d == null { return { skip: `"${out}" would not be a number` } }
+            { value: out == text ? v : (d != null && (t == "int" || t == "float" || t == "dec") ? bulk_editor_like(v, d) : out) }
+        }
+        "prefix" | "suffix" => {
+            let out = op.kind == "prefix" ? op.arg + text : text + op.arg
+            if number && bulk_editor_num(out) == null { return { skip: `"${out}" would not be a number` } }
+            let t = type_of(v)
+            let d = bulk_editor_num(out)
+            { value: d != null && (t == "int" || t == "float" || t == "dec") ? bulk_editor_like(v, d) : out }
+        }
+        _ => {
+            let d = bulk_editor_num(v)
+            let n = bulk_editor_num(op.arg)
+            if v == null || (type_of(v) == "str" && trim(v) == "") { return { skip: "is empty" } }
+            if d == null { return { skip: `"${len(text) > 30 ? slice(text, 0, 30) + "…" : text}" is not a number` } }
+            let digits = (x) => len(str(floor(abs(x))))
+            if (op.how == "mul" || op.how == "pct") && digits(d) + digits(n) > 26 { return { skip: "would be too large" } }
+            let keep = max([bulk_editor_places(v), 2])
+            let out = match op.how {
+                "add" => d + n
+                "sub" => d - n
+                "mul" => round(d * n, keep, "half_up")
+                _ => round(d + d * n / 100, keep, "half_up")
+            }
+            { value: bulk_editor_like(v, out) }
+        }
+    }
+}
+
+// The rows, each { id, row }: by id_key while that is unique, else by place.
+fn bulk_editor_entries(rows, id_key: str) -> list {
+    let maps = (type_of(rows) == "list" ? rows : []) | filter((r) => type_of(r) == "map")
+    let ids = maps | map((r) => get(r, id_key))
+    let usable = all(ids, (x) => x != null) && len(unique(ids | map((x) => str(x)))) == len(ids)
+    for [i, r] in enumerate(maps) => { id: usable ? get(r, id_key) : i, row: r }
+}
+
+// Whether a row passes a filter. See the opening comment for what one can say.
+fn bulk_editor_passes(row: map, keys_in: list, text: str) -> bool {
+    let t = trim(text)
+    if t == "" { return true }
+    let cmp = re.find(t, "^(>=|<=|>|<|=)\\s*(-?\\d+(?:\\.\\d+)?)$")
+    if cmp != null {
+        let n = dec(cmp.groups[1])
+        return any(keys_in, (k) => {
+            let d = bulk_editor_num(get(row, k))
+            d != null && !is_err(n) && match cmp.groups[0] {
+                ">=" => d >= n
+                "<=" => d <= n
+                ">" => d > n
+                "<" => d < n
+                _ => d == n
+            }
+        })
+    }
+    let low = lower(t)
+    any(keys_in, (k) => contains(lower(bulk_editor_text(get(row, k))), low))
+}
+
+// What a change would do: { changes, same, skipped }, for the entries whose id is in ids.
+// A row it would leave as it is goes in `same`, so the preview shows only real changes.
+fn bulk_editor_plan(entries: list, ids: list, key: str, op: map, type: str? = null) -> map {
+    let wanted = reduce(ids, {}, (m, x) => set(m, str(x), true))
+    let results = entries | filter((e) => has(wanted, str(e.id))) | map((e) => {
+        let before = get(e.row, key)
+        { id: e.id, before, got: bulk_editor_edit(before, op, type) }
+    })
+    let done = results | filter((r) => r.got.skip == null)
+    let moved = done | filter((r) => r.got.value != r.before || type_of(r.got.value) != type_of(r.before))
+    {
+        changes: moved | map((r) => { id: r.id, key, before: r.before, after: r.got.value }),
+        same: len(done) - len(moved),
+        skipped: results | filter((r) => r.got.skip != null) | map((r) => { id: r.id, why: r.got.skip }),
+    }
+}
+
+// The entries with the changes made.
+fn bulk_editor_commit(entries: list, changes: list) -> list {
+    let by_id = reduce(changes, {}, (m, c) => set(m, str(c.id), push(get(m, str(c.id)) ?? [], c)))
+    entries | map((e) => {
+        let mine = get(by_id, str(e.id))
+        mine == null ? e : { ...e, row: reduce(mine, e.row, (r, c) => set(r, c.key, c.after)) }
+    })
+}
+
+// The changes that undo these.
+fn bulk_editor_reverse(changes: list) -> list =
+    changes | map((c) => { ...c, before: c.after, after: c.before })
+
+component BulkEditor(id: str, rows = [], columns: list? = null, id_key: str = "id", limit: int = 200, preview: int = 50, title: str = "Bulk edit",
+                     name: str? = null, on_apply = null, class: str? = null) {
+    style global bulk_editor_css
+    let start = bulk_editor_entries(rows, id_key)
+    let given = type_of(rows) == "list" ? len(rows) : 0
+    let cols = (columns ?? unique(flatten(take(start, 2000) | map((e) => keys(e.row))))) | map((c) => {
+        let m = type_of(c) == "map" ? c : { key: c }
+        { key: str(m.key), label: m.label ?? str(m.key), type: m.type, editable: m.editable != false && str(m.key) != id_key }
+    })
+    let changeable = cols | filter((c) => c.editable)
+    state entries = start
+    state picked = []
+    state look = ""
+    state look_in = ""
+    state col = len(changeable) > 0 ? changeable[0].key : ""
+    state kind = "set"
+    state arg = ""
+    state find_text = ""
+    state with_text = ""
+    state how = "add"
+    state match_case = false
+    state past = []
+    state ahead = []
+    state said = ""
+    state head = null
+    let search_keys = look_in != "" ? [look_in] : cols | map((c) => c.key)
+    let found = entries | filter((e) => bulk_editor_passes(e.row, search_keys, look))
+    let shown = take(found, limit)
+    let found_ids = found | map((e) => e.id)
+    let chosen = find(cols, (c) => c.key == col)
+    let op = { kind, arg, find: find_text, with: with_text, how, match_case }
+    let op_bad = bulk_editor_op_error(op)
+    let plan = op_bad != null || chosen == null || len(picked) == 0 ? { changes: [], same: 0, skipped: [] } : bulk_editor_plan(entries, picked, col, op, chosen.type)
+    let shown_changes = take(plan.changes, preview)
+    let label_of = (rid) => {
+        let e = find(entries, (x) => x.id == rid)
+        let first_col = len(cols) > 0 ? cols[0].key : null
+        first_col == null || e == null ? str(rid) : (filled(bulk_editor_text(get(e.row, first_col))) ?? str(rid))
+    }
+    let some_on = len(shown) > 0 && any(shown, (e) => contains(picked, e.id))
+    let all_on = len(shown) > 0 && all(shown, (e) => contains(picked, e.id))
+    if head != null { head.indeterminate = some_on && !all_on }
+    let run = (changes: list, message: str) => {
+        entries = bulk_editor_commit(entries, changes)
+        said = message
+        on_apply && on_apply(changes)
+    }
+    let apply = () => {
+        let n = len(plan.changes)
+        if n > 0 {
+            past = push(past, plan.changes)
+            ahead = []
+            run(plan.changes, `Changed ${n} row${n == 1 ? "" : "s"}.`)
+        }
+    }
+    let undo = () => {
+        if len(past) > 0 {
+            let last_one = past[-1]
+            past = take(past, len(past) - 1)
+            ahead = push(ahead, last_one)
+            run(bulk_editor_reverse(last_one), `Undid the change to ${len(last_one)} row${len(last_one) == 1 ? "" : "s"}.`)
+        }
+    }
+    let redo = () => {
+        if len(ahead) > 0 {
+            let next = ahead[-1]
+            ahead = take(ahead, len(ahead) - 1)
+            past = push(past, next)
+            run(next, `Redid the change to ${len(next)} row${len(next) == 1 ? "" : "s"}.`)
+        }
+    }
+    let toggle = (rid, on: bool) => { picked = on ? push(remove(picked, rid), rid) : remove(picked, rid) }
+    let show = (v) => (v == null || v == "") ? <span.ui-bulked-blank>empty</span> : bulk_editor_text(v)
+    <section class={ui_cls(["ui-bulked", class])} aria-labelledby={`${id}-title`}
+             @keydown={(e) => {
+                 let typing = e.target.tagName == "TEXTAREA" || (e.target.tagName == "INPUT" && e.target.type != "checkbox")
+                 if (e.ctrlKey || e.metaKey) && !typing {
+                     if e.key == "z" || e.key == "Z" {
+                         e.preventDefault()
+                         if e.shiftKey { redo() } else { undo() }
+                     } else if e.key == "y" {
+                         e.preventDefault()
+                         redo()
+                     }
+                 }
+             }}>
+        <h3.ui-bulked-title id={`${id}-title`}>{title}</h3>
+        {given > len(entries) && <p.ui-bulked-note>{`${given - len(entries)} item${given - len(entries) == 1 ? " is" : "s are"} not a record, and left out.`}</p>}
+        {len(entries) == 0 && <p.ui-bulked-empty>No rows to edit.</p>}
+        {len(entries) > 0 && <div.ui-bulked-bar>
+            <div.ui-bulked-field>
+                <label for={`${id}-look`}>Filter</label>
+                <input.ui-bulked-input type="search" id={`${id}-look`} placeholder="Text, or >10" autocomplete="off" value={look} @input={(e) => { look = e.value }}/>
+            </div>
+            <div.ui-bulked-field>
+                <label for={`${id}-look-in`}>In</label>
+                <select id={`${id}-look-in`} @change={(e) => { look_in = e.value }}>
+                    <option value="" selected={look_in == ""}>Any column</option>
+                    {for c in cols => <option key={c.key} value={c.key} selected={look_in == c.key}>{c.label}</option>}
+                </select>
+            </div>
+            <button.ui-bulked-btn type="button" disabled={len(found) == 0} @click={() => { picked = unique(picked + found_ids) }}>{`Select ${len(found)} matching`}</button>
+            <button.ui-bulked-btn type="button" disabled={len(picked) == 0} @click={() => { picked = [] }}>Clear selection</button>
+        </div>}
+        {len(entries) > 0 && <p.ui-bulked-sum aria-live="polite">{`${len(picked)} of ${len(entries)} rows selected${look != "" ? `, ${len(found)} match the filter` : ""}`}</p>}
+        {len(entries) > 0 && <div.ui-bulked-scroll tabindex="0" role="region" aria-label="Rows">
+            <table>
+                <thead>
+                    <tr>
+                        <th scope="col"><input type="checkbox" id={`${id}-all`} aria-label="Select all rows shown" checked={all_on} @mount={(el) => { head = el }}
+                                               @change={(e) => { let ids = shown | map((x) => x.id); picked = e.checked ? unique(picked + ids) : picked | filter((p) => !contains(ids, p)) }}/></th>
+                        {for c in cols => <th key={c.key} scope="col">{c.label}</th>}
+                    </tr>
+                </thead>
+                <tbody>
+                    {for e in shown => {
+                        let rid = e.id
+                        <tr key={str(rid)} data-row={str(rid)} class={contains(picked, rid) && "ui-bulked-on"}>
+                            <th scope="row"><input type="checkbox" aria-label={`Select ${label_of(rid)}`} checked={contains(picked, rid)} @change={(ev) => { toggle(rid, ev.checked) }}/></th>
+                            {for c in cols => <td key={c.key} data-key={c.key}>{bulk_editor_text(get(e.row, c.key))}</td>}
+                        </tr>
+                    }}
+                </tbody>
+            </table>
+        </div>}
+        {len(found) > limit && <p.ui-bulked-sum>{`The table shows the first ${limit} of ${len(found)} rows; all ${len(found)} can be selected.`}</p>}
+        {len(entries) > 0 && len(changeable) > 0 && <div.ui-bulked-bar>
+            <div.ui-bulked-field>
+                <label for={`${id}-col`}>Column</label>
+                <select id={`${id}-col`} @change={(e) => { col = e.value }}>
+                    {for c in changeable => <option key={c.key} value={c.key} selected={col == c.key}>{c.label}</option>}
+                </select>
+            </div>
+            <div.ui-bulked-field>
+                <label for={`${id}-kind`}>Change</label>
+                <select id={`${id}-kind`} @change={(e) => { kind = e.value }}>
+                    {for o in bulk_editor_ops => <option key={o.id} value={o.id} selected={kind == o.id}>{o.name}</option>}
+                </select>
+            </div>
+            {kind == "adjust" && <div.ui-bulked-field>
+                <label for={`${id}-how`}>How</label>
+                <select id={`${id}-how`} @change={(e) => { how = e.value }}>
+                    {for o in bulk_editor_hows => <option key={o.id} value={o.id} selected={how == o.id}>{o.name}</option>}
+                </select>
+            </div>}
+            {kind == "replace" && <div.ui-bulked-field>
+                <label for={`${id}-find`}>Find</label>
+                <input.ui-bulked-input type="text" id={`${id}-find`} autocomplete="off" value={find_text} @input={(e) => { find_text = e.value }}/>
+            </div>}
+            {kind == "replace" && <div.ui-bulked-field>
+                <label for={`${id}-with`}>Replace with</label>
+                <input.ui-bulked-input type="text" id={`${id}-with`} autocomplete="off" value={with_text} @input={(e) => { with_text = e.value }}/>
+            </div>}
+            {kind == "replace" && <label.ui-bulked-case><input type="checkbox" id={`${id}-case`} checked={match_case} @change={(e) => { match_case = e.checked }}/> Match case</label>}
+            {kind != "replace" && <div.ui-bulked-field>
+                <label for={`${id}-arg`}>{kind == "set" ? "Value" : (kind == "adjust" ? "Amount" : "Text")}</label>
+                <input.ui-bulked-input type="text" id={`${id}-arg`} autocomplete="off" inputmode={kind == "adjust" ? "decimal" : null} aria-invalid={op_bad != null && arg != "" ? "true" : null}
+                                       value={arg} @input={(e) => { arg = e.value }}/>
+            </div>}
+        </div>}
+        {op_bad != null && (kind != "set") && len(picked) > 0 && <p.ui-bulked-error role="alert">{op_bad}</p>}
+        {len(picked) > 0 && op_bad == null && <p.ui-bulked-sum aria-live="polite">
+            {`${len(plan.changes)} row${len(plan.changes) == 1 ? "" : "s"} would change${plan.same > 0 ? `, ${plan.same} stay as they are` : ""}${len(plan.skipped) > 0 ? `, ${len(plan.skipped)} skipped` : ""}`}
+        </p>}
+        {len(plan.skipped) > 0 && <p.ui-bulked-note>{`Skipped: ${join(take(plan.skipped, 5) | map((s) => `${label_of(s.id)} ${s.why}`), "; ")}${len(plan.skipped) > 5 ? `; and ${len(plan.skipped) - 5} more` : ""}.`}</p>}
+        {len(shown_changes) > 0 && <div.ui-bulked-scroll tabindex="0" role="region" aria-label="Preview of the change">
+            <table>
+                <thead><tr><th scope="col">Row</th><th scope="col">Before</th><th scope="col">After</th></tr></thead>
+                <tbody>
+                    {for c in shown_changes => <tr key={str(c.id)} data-change={str(c.id)}>
+                        <th scope="row">{label_of(c.id)}</th>
+                        <td><del>{show(c.before)}</del></td>
+                        <td><ins>{show(c.after)}</ins></td>
+                    </tr>}
+                </tbody>
+            </table>
+        </div>}
+        {len(plan.changes) > len(shown_changes) && <p.ui-bulked-sum>{`The preview shows the first ${len(shown_changes)} of ${len(plan.changes)} rows.`}</p>}
+        {len(entries) > 0 && <div.ui-bulked-bar>
+            <button.ui-bulked-btn.ui-bulked-go type="button" disabled={len(plan.changes) == 0} @click={apply}>{`Apply to ${len(plan.changes)} row${len(plan.changes) == 1 ? "" : "s"}`}</button>
+            <button.ui-bulked-btn type="button" disabled={len(past) == 0} @click={undo}>Undo</button>
+            <button.ui-bulked-btn type="button" disabled={len(ahead) == 0} @click={redo}>Redo</button>
+            <span.ui-bulked-said role="status">{said}</span>
+        </div>}
+        {name != null && <input type="hidden" {name} value={json.stringify(entries | map((e) => e.row))}/>}
+    </section>
+}

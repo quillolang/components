@@ -1,0 +1,461 @@
+// FolderBrowser: folders and files on a phone. Tapping a folder goes in, the breadcrumbs say
+// where one is and go back any number of steps, and the Back button goes up one, each folder
+// remembering how far it was scrolled. The button on a row opens a sheet with Rename and
+// Move: rename says at once what is wrong with a name, and move walks the folders, refusing
+// a folder into itself or a name that is taken. The sheet is the browser's <dialog>, so focus
+// stays in it and Escape closes it; its handle drags it away, and has a Close beside it, and
+// it stands above the keyboard. On a tablet a tree of every folder stands beside the
+// list, and the sheet is a box in the middle of the screen.
+//
+//   component Drive() {
+//       <FolderBrowser items={files} root_name="My files" on_open={(f) => { show(f) }}
+//                      on_rename={(id, name) => { rename(id, name) }}
+//                      on_move={(id, parent) => { move(id, parent) }}/>
+//   }
+//
+// items: each { id, name, parent?, kind?, size?, note? }: parent the id of its folder, none or
+// one unknown meaning the top. kind "folder", or anything else for a file, and any item that is
+// another's parent is a folder. size: bytes. note: a line under the name. Followed when
+// it changes. root_name: what the top is called ("Files"). start: the id of a folder to start in.
+// label: its name for screen readers. empty_text: what an empty folder says. class.
+// on_open(item): inside one of your components, a file was tapped. on_folder(id): another
+// folder is showing, "" being the top. on_rename(id, name), on_move(id, parent): done here at
+// once, and put back with a message if the function gives false or an error; one that
+// waits is waited for. A name may be up to 120 characters, without / or \.
+
+import ui/theme.qwe use ui_cls
+
+let folder_browser_css = css`
+.ui-folder-browser { container-type: inline-size; display: flex; flex-direction: column; height: 100%; min-height: 0; color: var(--ui-fg); font: 15px/1.35 var(--ui-font); background: var(--ui-bg); }
+.ui-folder-browser-frame { display: flex; flex: 1; min-height: 0; }
+.ui-folder-browser-tree { display: none; }
+.ui-folder-browser-main { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
+.ui-folder-browser-bar { display: flex; flex: none; align-items: center; gap: 2px; min-height: 48px; padding: env(safe-area-inset-top) 4px 0; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-folder-browser-back { display: flex; flex: none; align-items: center; justify-content: center; gap: 2px; min-width: 44px; min-height: 44px; padding: 0 6px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-accent); font: 500 15px/1 var(--ui-font); cursor: pointer; }
+.ui-folder-browser-back:disabled { color: var(--ui-strong); cursor: default; }
+.ui-folder-browser-back svg { width: 22px; height: 22px; }
+.ui-folder-browser-crumbs { flex: 1; min-width: 0; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
+.ui-folder-browser-crumbs::-webkit-scrollbar { display: none; }
+.ui-folder-browser-crumbs ol { display: flex; align-items: center; width: max-content; margin: 0; padding: 0; list-style: none; }
+.ui-folder-browser-crumbs li { display: flex; align-items: center; }
+.ui-folder-browser-crumbs li + li::before { content: "/"; color: var(--ui-strong); }
+.ui-folder-browser-crumb { min-width: 44px; min-height: 44px; max-width: 180px; padding: 0 8px; overflow: hidden; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-accent); font: 500 14px/1 var(--ui-font); text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.ui-folder-browser-crumb[aria-current="page"] { color: var(--ui-fg); font-weight: 600; }
+.ui-folder-browser-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-bottom: env(safe-area-inset-bottom); outline: none; }
+.ui-folder-browser-list { margin: 0; padding: 0; list-style: none; }
+.ui-folder-browser-row { display: flex; align-items: center; border-bottom: 1px solid var(--ui-border); background: var(--ui-surface); }
+.ui-folder-browser-go { display: flex; flex: 1; align-items: center; gap: 12px; min-width: 0; min-height: 60px; padding: 6px 4px 6px 14px; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.ui-folder-browser-icon { flex: none; width: 26px; height: 26px; color: var(--ui-muted); }
+.ui-folder-browser-go[data-kind="folder"] .ui-folder-browser-icon { color: var(--ui-accent); }
+.ui-folder-browser-text { flex: 1; min-width: 0; }
+.ui-folder-browser-name { display: block; overflow: hidden; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.ui-folder-browser-note { display: block; overflow: hidden; color: var(--ui-muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.ui-folder-browser-more { display: grid; flex: none; place-items: center; width: 48px; height: 48px; padding: 0; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: pointer; }
+.ui-folder-browser-more svg { width: 22px; height: 22px; }
+.ui-folder-browser-none { padding: 40px 16px; color: var(--ui-muted); text-align: center; }
+.ui-folder-browser-say { flex: none; margin: 0; padding: 6px 14px; background: var(--ui-subtle); color: var(--ui-muted); font-size: 13px; }
+.ui-folder-browser-say[data-bad] { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-folder-browser-say:empty { display: none; }
+.ui-folder-browser-sheet { box-sizing: border-box; inset: auto 0 var(--ui-folder-browser-kb, 0px) 0; width: min(100vw, 640px); max-width: 100vw; max-height: 86dvh; margin: 0 auto; padding: 0 0 max(12px, env(safe-area-inset-bottom)); overflow: hidden; border: 1px solid var(--ui-border); border-bottom: 0; border-radius: calc(var(--ui-radius) + 6px) calc(var(--ui-radius) + 6px) 0 0; background: var(--ui-surface); color: var(--ui-fg); box-shadow: var(--ui-shadow-lg); font: 15px/1.4 var(--ui-font); transition: transform .22s cubic-bezier(.2, .8, .2, 1); }
+.ui-folder-browser-sheet[open] { display: flex; flex-direction: column; animation: ui-folder-browser-up .24s cubic-bezier(.2, .8, .2, 1); }
+.ui-folder-browser-sheet::backdrop { background: var(--ui-overlay); }
+@keyframes ui-folder-browser-up { from { transform: translateY(100%); } }
+.ui-folder-browser-dragging { transition: none; }
+.ui-folder-browser-sheethead { display: flex; flex: none; align-items: center; gap: 4px; padding: 0 6px 0 16px; touch-action: none; user-select: none; -webkit-user-select: none; }
+.ui-folder-browser-grip { display: grid; flex: none; place-items: center; width: 100%; height: 44px; margin-bottom: -16px; padding: 0; border: 0; background: transparent; cursor: grab; touch-action: none; }
+.ui-folder-browser-grip span { width: 40px; height: 5px; border-radius: 999px; background: var(--ui-strong); }
+.ui-folder-browser-sheethead h2 { flex: 1; min-width: 0; margin: 0; overflow: hidden; font-size: 17px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ui-folder-browser-close { display: grid; flex: none; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); cursor: pointer; }
+.ui-folder-browser-close svg { width: 18px; height: 18px; }
+.ui-folder-browser-part { display: grid; flex: 1; gap: 10px; min-height: 0; padding: 8px 16px 4px; overflow-y: auto; overscroll-behavior: contain; }
+.ui-folder-browser-part[hidden] { display: none; }
+.ui-folder-browser-action { display: flex; align-items: center; width: 100%; min-height: 52px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 15px/1 var(--ui-font); text-align: left; cursor: pointer; }
+.ui-folder-browser-field { box-sizing: border-box; width: 100%; min-height: 46px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-bg); color: var(--ui-fg); font: 16px/1.2 var(--ui-font); }
+.ui-folder-browser-field[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-folder-browser-why { min-height: 18px; margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-folder-browser-do { min-height: 46px; padding: 0 16px; border: 0; border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg); font: 600 15px/1 var(--ui-font); cursor: pointer; }
+.ui-folder-browser-do:disabled { background: var(--ui-subtle); color: var(--ui-muted); cursor: default; }
+.ui-folder-browser-where { display: flex; align-items: center; gap: 4px; min-height: 44px; }
+.ui-folder-browser-where span { flex: 1; min-width: 0; overflow: hidden; color: var(--ui-muted); font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.ui-folder-browser-folders { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.ui-folder-browser-none-small { margin: 0; padding: 10px 2px; color: var(--ui-muted); }
+.ui-folder-browser :is(.ui-folder-browser-back, .ui-folder-browser-crumb, .ui-folder-browser-go, .ui-folder-browser-more, .ui-folder-browser-grip, .ui-folder-browser-close, .ui-folder-browser-action, .ui-folder-browser-do, .ui-folder-browser-branch):focus-visible { outline: none; box-shadow: inset var(--ui-focus); }
+.ui-folder-browser-field:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+/* A tablet shows the whole tree beside the folder, and the sheet stands in the middle. */
+@container (min-width: 640px) {
+  .ui-folder-browser-tree { display: block; flex: 0 0 min(34%, 300px); overflow-y: auto; overscroll-behavior: contain; padding: 8px 6px; border-right: 1px solid var(--ui-border); background: var(--ui-subtle); }
+  .ui-folder-browser-tree ul { margin: 0; padding: 0; list-style: none; }
+  .ui-folder-browser-branch { display: flex; align-items: center; width: 100%; min-height: 44px; padding: 0 8px 0 calc(8px + var(--depth, 0) * 16px); overflow: hidden; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-fg); font: 500 14px/1.2 var(--ui-font); text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  .ui-folder-browser-branch[aria-current="true"] { background: var(--ui-accent-soft); color: var(--ui-accent); }
+  .ui-folder-browser-sheet { inset: 0; width: 440px; max-height: 70dvh; height: fit-content; margin: auto; border-bottom: 1px solid var(--ui-border); border-radius: calc(var(--ui-radius) + 6px); }
+  .ui-folder-browser-grip { display: none; }
+  .ui-folder-browser-sheethead { padding-top: 8px; }
+}
+@media (hover: hover) {
+  .ui-folder-browser-go:hover, .ui-folder-browser-more:hover, .ui-folder-browser-action:hover, .ui-folder-browser-branch:hover { background: var(--ui-subtle); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-folder-browser-sheet { transition: none; }
+  .ui-folder-browser-sheet[open] { animation: none; }
+}
+`
+
+// Items as they are shown, each id once; a parent unknown is the top, "" being its id.
+fn folder_browser_clean(items) -> list {
+    if type_of(items) != "list" { return [] }
+    let named = items | filter((i) => type_of(i) == "map" && get(i, "id") != null && get(i, "name") != null && trim(str(i.name)) != "")
+    let ids = named | map((i) => str(i.id))
+    let parents = named | map((i) => get(i, "parent") != null ? str(i.parent) : "")
+    enumerate(named) | filter((p) => index_of(ids, ids[p[0]]) == p[0]) | map((p) => {
+        let id = ids[p[0]]
+        let up = parents[p[0]]
+        let s = get(p[1], "size")
+        ({ ...p[1], id, name: str(p[1].name), parent: up != id && contains(ids, up) ? up : "", folder: get(p[1], "kind") == "folder" || contains(parents, id),
+           size: (type_of(s) == "int" || type_of(s) == "float") && s >= 0 ? s : null })
+    })
+}
+
+// A folder's rows: folders first, then by name in any case.
+fn folder_browser_children(rows: list, id: str) -> list {
+    let inside = rows | filter((r) => r.parent == id)
+    sort_by(inside, (r) => `${r.folder ? "0" : "1"}${lower(r.name)}`)
+}
+
+// The folders from the top to id, not counting the top; a loop in the data ends it.
+fn folder_browser_path(rows: list, id: str) -> list {
+    let out = []
+    let at = id
+    let steps = 0
+    while at != "" && steps < 64 {
+        let here = find(rows, (r) => r.id == at)
+        if here == null || contains(out | map((x) => x.id), at) { return out }
+        out = [here] + out
+        at = here.parent
+        steps += 1
+    }
+    out
+}
+
+// Whether `id` is `to` or a folder holding it.
+fn folder_browser_holds(rows: list, id: str, to: str) -> bool {
+    to == id || contains(folder_browser_path(rows, to) | map((x) => x.id), id)
+}
+
+// What is wrong with a name in folder `parent`, or "".
+fn folder_browser_name_problem(rows: list, name: str, parent: str, self: str) -> str {
+    let n = trim(name)
+    if n == "" { return "A name cannot be empty." }
+    if len(n) > 120 { return "A name can be 120 characters at most." }
+    if contains(n, "/") || contains(n, "\\") { return "A name cannot have / or \\ in it." }
+    if n == "." || n == ".." { return "That name is kept for the system." }
+    let taken = rows | filter((r) => r.parent == parent && r.id != self && lower(r.name) == lower(n))
+    len(taken) > 0 ? `${taken[0].folder ? "A folder" : "A file"} here already has that name.` : ""
+}
+
+// Why an item cannot go to folder `to`, or "".
+fn folder_browser_move_problem(rows: list, item, to: str) -> str {
+    if item == null { return "Nothing to move." }
+    if item.folder && folder_browser_holds(rows, item.id, to) { return "A folder cannot go inside itself." }
+    if item.parent == to { return "It is already here." }
+    let taken = rows | filter((r) => r.parent == to && lower(r.name) == lower(item.name))
+    len(taken) > 0 ? "Something here already has that name." : ""
+}
+
+// Every folder with its depth, top first, for the tree. Folders in a loop never hang from the top.
+fn folder_browser_tree(rows: list, id: str, depth: int) -> list {
+    if depth > 32 { return [] }
+    let folders = folder_browser_children(rows, id) | filter((r) => r.folder)
+    folders | map((f) => [{ id: f.id, name: f.name, depth }] + folder_browser_tree(rows, f.id, depth + 1)) | flatten
+}
+
+// How much a size is, in the units people read.
+fn folder_browser_size(b: num) -> str {
+    if b < 1024 { return `${int(b)} B` }
+    if b < 1048576 { return `${round(b / 1024)} KB` }
+    if b < 1073741824 { return `${round(b / 104857.6) / 10} MB` }
+    `${round(b / 107374182.4) / 10} GB`
+}
+
+// The line under a name.
+fn folder_browser_note(rows: list, r) -> str {
+    if get(r, "note") != null { return str(r.note) }
+    if r.folder {
+        let n = len(rows | filter((x) => x.parent == r.id))
+        return n == 0 ? "Empty" : n == 1 ? "1 item" : `${n} items`
+    }
+    r.size != null ? folder_browser_size(r.size) : ""
+}
+
+// How many characters before the extension, so a rename can leave it unselected.
+fn folder_browser_stem(r) -> str {
+    let at = re.find(r.name, "\\.[^.]{1,12}$")
+    !r.folder && at != null && at.start > 0 ? slice(r.name, 0, at.start) : r.name
+}
+
+// Whether a drag down at speed v, by dy of a sheet h tall, dismisses it.
+fn folder_browser_goes(dy: num, v: num, h: num) -> bool {
+    if v >= 0.5 && dy >= 24 { return true }
+    if v <= -0.3 { return false }
+    dy >= h * 0.33
+}
+
+component FolderBrowser(items = [], root_name: str = "Files", start: str = "", label: str = "Files", empty_text: str = "This folder is empty.",
+                        on_open = null, on_folder = null, on_rename = null, on_move = null, class: str? = null) {
+    style global folder_browser_css
+    state rows = folder_browser_clean(items)
+    state cwd = start != "" && len(rows | filter((r) => r.id == start && r.folder)) > 0 ? start : ""
+    state places = {}        // how far each folder was scrolled
+    state mode = ""          // "", "actions", "rename", "move"
+    state target = ""
+    state draft = ""
+    state why = ""
+    state move_at = ""
+    state said = ""
+    state bad = false
+    state g = null
+    state root = null
+    state dlg = null
+    state scroller = null
+    state crumbs = null
+    rows = folder_browser_clean(items)
+    let path = folder_browser_path(rows, cwd)
+    let here = folder_browser_children(rows, cwd)
+    let up = len(path) > 0 ? path[len(path) - 1].parent : ""
+    let tree = folder_browser_tree(rows, "", 1)
+    let item = target != "" ? find(rows, (r) => r.id == target) : null
+    let move_folders = folder_browser_children(rows, move_at) | filter((r) => r.folder && r.id != target)
+    let move_path = folder_browser_path(rows, move_at)
+    let move_why = mode == "move" ? folder_browser_move_problem(rows, item, move_at) : ""
+    let move_name = move_at == "" ? root_name : len(move_path) > 0 ? move_path[len(move_path) - 1].name : root_name
+    let go = (id: str) => {
+        places = set(places, cwd, scroller.scrollTop)
+        cwd = id
+        said = ""
+        bad = false
+        let back_to = get(places, id, 0)
+        on_folder && on_folder(id)
+        js("requestAnimationFrame", (_t = null) => {
+            scroller.scrollTop = back_to
+            crumbs.scrollLeft = crumbs.scrollWidth
+        })
+    }
+    let tell = (text: str, wrong: bool) => {
+        said = text
+        bad = wrong
+    }
+    let save_name = () => {
+        let name = trim(draft)
+        let was = rows
+        let id = target
+        let problem = folder_browser_name_problem(rows, name, item.parent, id)
+        if problem != "" {
+            why = problem
+        } else {
+            rows = rows | map((r) => r.id == id ? { ...r, name } : r)
+            dlg.close()
+            tell(`Renamed to ${name}.`, false)
+            if on_rename != null {
+                let r = js("Promise.resolve", on_rename(id, name))
+                if is_err(r) || r == false {
+                    rows = was
+                    tell("That could not be renamed.", true)
+                }
+            }
+        }
+    }
+    let save_move = () => {
+        let was = rows
+        let id = target
+        let to = move_at
+        let there = move_name
+        if folder_browser_move_problem(rows, item, to) == "" {
+            rows = rows | map((r) => r.id == id ? { ...r, parent: to } : r)
+            dlg.close()
+            tell(`Moved to ${there}.`, false)
+            if on_move != null {
+                let r = js("Promise.resolve", on_move(id, to))
+                if is_err(r) || r == false {
+                    rows = was
+                    tell("That could not be moved.", true)
+                }
+            }
+        }
+    }
+    <div class={ui_cls(["ui-folder-browser", class])}
+         @mount={(me) => {
+             root = me
+             dlg = me.querySelector("dialog")
+             scroller = me.querySelector(".ui-folder-browser-scroll")
+             crumbs = me.querySelector(".ui-folder-browser-crumbs")
+             crumbs.scrollLeft = crumbs.scrollWidth
+             let win = js("window")
+             let v = win.visualViewport
+             if v != null {
+                 let fit = (_e = null) => {
+                     let gap = max([0, win.innerHeight - v.height - v.offsetTop])
+                     dlg.style.setProperty("--ui-folder-browser-kb", `${gap}px`)
+                 }
+                 v.addEventListener("resize", fit)
+                 v.addEventListener("scroll", fit)
+                 return () => {
+                     v.removeEventListener("resize", fit)
+                     v.removeEventListener("scroll", fit)
+                 }
+             }
+         }}>
+        <div.ui-folder-browser-frame>
+            <nav.ui-folder-browser-tree aria-label="All folders">
+                <ul>
+                    <li><button.ui-folder-browser-branch type="button" aria-current={cwd == "" ? "true" : "false"} @click={() => { go("") }}>{root_name}</button></li>
+                    {for f in tree => <li key={f.id}><button.ui-folder-browser-branch type="button" style={`--depth: ${f.depth}`} aria-current={cwd == f.id ? "true" : "false"} @click={() => { go(f.id) }}>{f.name}</button></li>}
+                </ul>
+            </nav>
+            <div.ui-folder-browser-main>
+                <div.ui-folder-browser-bar>
+                    <button.ui-folder-browser-back type="button" aria-label="Back" disabled={cwd == "" ? true : null} @click={() => { go(up) }}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
+                    </button>
+                    <nav.ui-folder-browser-crumbs aria-label="Where you are">
+                        <ol>
+                            <li><button.ui-folder-browser-crumb type="button" aria-current={cwd == "" ? "page" : null} @click={() => { go("") }}>{root_name}</button></li>
+                            {for f in path => <li key={f.id}><button.ui-folder-browser-crumb type="button" aria-current={f.id == cwd ? "page" : null} @click={() => { go(f.id) }}>{f.name}</button></li>}
+                        </ol>
+                    </nav>
+                </div>
+                <div.ui-folder-browser-scroll tabindex="-1">
+                    {len(here) == 0 && <p.ui-folder-browser-none>{empty_text}</p>}
+                    <ul.ui-folder-browser-list aria-label={label}>
+                        {for r in here => <li.ui-folder-browser-row key={r.id} data-id={r.id}>
+                            <button.ui-folder-browser-go type="button" data-kind={r.folder ? "folder" : "file"}
+                                    @click={() => {
+                                        if r.folder { go(r.id) } else { on_open && on_open(r) }
+                                    }}>
+                                {r.folder ? <svg.ui-folder-browser-icon viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4h4l2 2.5h7A2.5 2.5 0 0 1 21 9v8.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/></svg>
+                                    : <svg.ui-folder-browser-icon viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l5 5v13H6zM14 3v5h5"/></svg>}
+                                <span.ui-folder-browser-text>
+                                    <span.ui-folder-browser-name>{r.name}</span>
+                                    <span.ui-folder-browser-note>{folder_browser_note(rows, r)}</span>
+                                </span>
+                            </button>
+                            <button.ui-folder-browser-more type="button" aria-haspopup="dialog" aria-label={`Actions for ${r.name}`}
+                                    @click={() => {
+                                        target = r.id
+                                        mode = "actions"
+                                        why = ""
+                                        dlg.showModal()
+                                    }}>
+                                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="19" cy="12" r="1.9"/></svg>
+                            </button>
+                        </li>}
+                    </ul>
+                </div>
+                <p.ui-folder-browser-say role="status" data-bad={bad ? "" : null}>{said}</p>
+            </div>
+        </div>
+        <dialog.ui-folder-browser-sheet aria-label={mode == "move" ? "Move" : mode == "rename" ? "Rename" : "Actions"}
+                @close={() => {
+                    mode = ""
+                    target = ""
+                    dlg.style.transform = ""
+                }}
+                @click={(e) => { if e.target.tagName == "DIALOG" { dlg.close() } }}
+                @pointerdown={(e) => {
+                    let on_top = e.target.closest(".ui-folder-browser-grip") != null
+                    g = on_top && e.isPrimary ? { pid: e.pointerId, y: e.clientY, at: 0, last: e.clientY, t: e.timeStamp, v: 0, on: false } : null
+                }}
+                @pointermove={(e) => {
+                    if g != null && e.pointerId == g.pid {
+                        let dy = max([0, e.clientY - g.y])
+                        if !g.on && dy >= 6 {
+                            e.target.setPointerCapture(e.pointerId)
+                            dlg.classList.add("ui-folder-browser-dragging")
+                            g = { ...g, on: true }
+                        }
+                        if g.on {
+                            dlg.style.transform = `translateY(${dy}px)`
+                            let dt = e.timeStamp - g.t
+                            g = dt >= 16 ? { ...g, at: dy, last: e.clientY, t: e.timeStamp, v: (e.clientY - g.last) / dt } : { ...g, at: dy }
+                        }
+                    }
+                }}
+                @pointerup={(e) => {
+                    if g != null && e.pointerId == g.pid {
+                        let was = g
+                        g = null
+                        if was.on {
+                            dlg.classList.remove("ui-folder-browser-dragging")
+                            let v = e.timeStamp - was.t > 80 ? 0 : was.v
+                            if folder_browser_goes(was.at, v, dlg.offsetHeight) { dlg.close() } else { dlg.style.transform = "" }
+                        }
+                    }
+                }}
+                @pointercancel={(e) => {
+                    if g != null && e.pointerId == g.pid {
+                        g = null
+                        dlg.classList.remove("ui-folder-browser-dragging")
+                        dlg.style.transform = ""
+                    }
+                }}>
+            <button.ui-folder-browser-grip type="button" tabindex="-1" aria-hidden="true"><span></span></button>
+            <div.ui-folder-browser-sheethead>
+                <h2>{item != null ? (mode == "rename" ? `Rename ${item.name}` : mode == "move" ? `Move ${item.name}` : item.name) : ""}</h2>
+                <button.ui-folder-browser-close type="button" aria-label="Close" @click={() => { dlg.close() }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div.ui-folder-browser-part hidden={mode == "actions" ? null : "true"}>
+                <button.ui-folder-browser-action type="button"
+                        @click={(e) => {
+                            let form = dlg.querySelector("form")
+                            let box = form.querySelector("input")
+                            let name = item.name
+                            let keep = folder_browser_stem(item)
+                            mode = "rename"
+                            draft = name
+                            why = ""
+                            // In the tap itself: iOS raises the keyboard for no later focus.
+                            form.hidden = false
+                            box.value = name
+                            box.focus()
+                            let units = js_new("String", keep).length
+                            box.setSelectionRange(0, units)
+                        }}>Rename</button>
+                <button.ui-folder-browser-action type="button" @click={() => {
+                    mode = "move"
+                    move_at = item.parent
+                }}>Move</button>
+            </div>
+            <form.ui-folder-browser-part hidden={mode == "rename" ? null : "true"} autocomplete="off"
+                  @submit={(e) => {
+                      e.preventDefault()
+                      save_name()
+                  }}>
+                <input.ui-folder-browser-field type="text" value={draft} aria-label="New name" aria-invalid={why != "" ? "true" : null} enterkeyhint="done" autocapitalize="off" spellcheck="false"
+                       @input={(e) => {
+                           let v = e.value
+                           draft = v
+                           why = item != null ? folder_browser_name_problem(rows, v, item.parent, item.id) : ""
+                       }}/>
+                <p.ui-folder-browser-why role="alert">{why}</p>
+                <button.ui-folder-browser-do type="submit" disabled={why != "" ? true : null}>Save name</button>
+            </form>
+            <div.ui-folder-browser-part hidden={mode == "move" ? null : "true"}>
+                <div.ui-folder-browser-where>
+                    <button.ui-folder-browser-back type="button" aria-label="Up one folder" disabled={move_at == "" ? true : null}
+                            @click={() => {
+                                move_at = len(move_path) > 0 ? move_path[len(move_path) - 1].parent : ""
+                            }}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
+                    </button>
+                    <span>{move_name}</span>
+                </div>
+                {len(move_folders) == 0 && <p.ui-folder-browser-none-small>No folders here.</p>}
+                <ul.ui-folder-browser-folders>
+                    {for f in move_folders => <li key={f.id}><button.ui-folder-browser-action type="button" @click={() => { move_at = f.id }}>{f.name}</button></li>}
+                </ul>
+                <p.ui-folder-browser-why role="alert">{move_why}</p>
+                <button.ui-folder-browser-do type="button" disabled={move_why != "" ? true : null} @click={save_move}>Move to {move_name}</button>
+            </div>
+        </dialog>
+    </div>
+}

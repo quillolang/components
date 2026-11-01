@@ -1,0 +1,267 @@
+// TournamentBracket: a single-elimination draw from a list of seeds. Seeds are placed
+// so that the best meet last (1 plays 8, 4 plays 5, 2 plays 7, 3 plays 6, and so on
+// for any size). A field that is not a power of two gets byes, which go to the top
+// seeds and carry them through. Clicking a name makes it the winner and moves it on;
+// clicking it again undoes that. Changing a result clears every later result that
+// rested on it, along the path to the final, and says which.
+//
+//   <TournamentBracket entrants={["Ada", "Bo", "Cy", "Di", "Ed"]}/>
+//   <TournamentBracket entrants={teams} results={{ "0-1": 4 }} on_change={(b) => { champion = b.champion }}/>
+//
+// entrants: the names in seed order, best first, a list or a line each in text (a
+// number and a dot in front is dropped, so a pasted ranking works). The list can be
+// edited: a new name keeps the results, another number of entrants clears them.
+// results: results to start with, a map from a match, "<round>-<place>" counting from
+// 0, to the winner's seed. title: the heading ("Bracket"). id: a prefix for its ids
+// ("tournament-bracket"), unique on the page. The fields are named entrants and
+// results (the map as JSON), so a form around it sends them; name: a prefix for those.
+// on_change(b): inside one of your components, given { results, champion, decided,
+// matches } after each change, champion null until the final is decided.
+//
+// tournament_bracket_plan(names, results) gives the whole draw, for a program's own use:
+// { rounds, champion, byes, decided, matches }, each round { name, matches }, each match
+// { slot, number, a, b, winner, bye, a_from, b_from } with seeds (0 is a bye, null not
+// known yet). tournament_bracket_choose(results, round, place, seed, rounds) sets a
+// result and gives { results, cleared }. The draw takes 128 entrants, and says so.
+
+import ui/theme.qwe use ui_cls
+
+let tournament_bracket_css = css`
+.ui-tourney { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; padding: 20px 22px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-tourney .ui-tourney-title { display: block; margin: 0; font-size: 16px; font-weight: 650; }
+.ui-tourney-field { display: grid; gap: 5px; max-width: 420px; font-size: 13px; font-weight: 500; }
+.ui-tourney textarea { box-sizing: border-box; width: 100%; min-height: 100px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.5 var(--ui-font); resize: vertical; }
+.ui-tourney textarea:focus-visible { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-tourney-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-tourney-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-tourney-status { margin: 0; padding: 8px 12px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-weight: 600; }
+.ui-tourney-board { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(170px, 1fr); gap: 16px; overflow-x: auto; padding-bottom: 6px; }
+.ui-tourney-board:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-tourney-round { display: flex; flex-direction: column; min-width: 0; }
+.ui-tourney .ui-tourney-round-name { margin: 0 0 8px; font-size: 13px; font-weight: 650; color: var(--ui-muted); }
+.ui-tourney-matches { display: flex; flex: 1; flex-direction: column; justify-content: space-around; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.ui-tourney-match { display: grid; overflow: hidden; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-tourney-bye { border-style: dashed; }
+.ui-tourney-label { padding: 2px 8px; color: var(--ui-muted); font-size: 11px; background: var(--ui-subtle); }
+.ui-tourney-seat { display: flex; align-items: center; gap: 6px; min-width: 0; min-height: 32px; padding: 4px 8px; border: 0; border-top: 1px solid var(--ui-border); background: none; color: var(--ui-fg);
+  font: 14px var(--ui-font); text-align: left; }
+button.ui-tourney-seat { cursor: pointer; }
+button.ui-tourney-seat:hover:not(:disabled) { background: var(--ui-accent-soft); }
+button.ui-tourney-seat:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--ui-accent); }
+.ui-tourney-seat:disabled { color: var(--ui-muted); cursor: default; }
+.ui-tourney-seat[aria-pressed="true"] { background: var(--ui-accent-soft); font-weight: 650; }
+.ui-tourney-seed { flex: none; min-width: 16px; color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-tourney-who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-tourney-tick { flex: none; margin-left: auto; color: var(--ui-accent); }
+`
+
+let tournament_bracket_most = 128
+
+fn tournament_bracket_size(n: int) {
+    let size = 1
+    while size < n { size = size + size }
+    size
+}
+
+// Seeds by place in the first round: each doubling pairs a seed with its mirror, so
+// the sum in a match is always size + 1 and the top two can meet only in the final.
+fn tournament_bracket_order(size: int) {
+    let order = [1]
+    let now = 1
+    while now < size {
+        now = now + now
+        let was = order
+        order = was | map((s) => [s, now + 1 - s]) | flatten()
+    }
+    order
+}
+
+fn tournament_bracket_round_name(r: int, rounds: int) {
+    let left = rounds - r
+    left == 1 ? "Final" : left == 2 ? "Semifinals" : left == 3 ? "Quarterfinals" : `Round ${r + 1}`
+}
+
+fn tournament_bracket_rounds(n: int) {
+    let size = tournament_bracket_size(n)
+    let rounds = 0
+    let s = 1
+    while s < size {
+        s = s + s
+        rounds += 1
+    }
+    rounds
+}
+
+// The whole draw for these names and results. Only a result between the two
+// who are really in a match counts, so an old one for another pairing has no effect.
+fn tournament_bracket_plan(names: list, results) {
+    let n = len(names)
+    let picks = results ?? {}
+    let rounds_n = tournament_bracket_rounds(n)
+    if n < 2 { return { rounds: [], champion: n == 1 ? 1 : null, byes: 0, decided: 0, matches: 0 } }
+    let size = tournament_bracket_size(n)
+    let order = tournament_bracket_order(size)
+    let number = 0
+    let decided = 0
+    let matches = 0
+    let rounds = []
+    let last_round = []
+    for r in 0..rounds_n {
+        let count = int(size / pow(2, r + 1))
+        let row = []
+        for m in 0..count {
+            let slot = `${r}-${m}`
+            let a = r == 0 ? (order[m * 2] > n ? 0 : order[m * 2]) : last_round[m * 2].winner
+            let b = r == 0 ? (order[m * 2 + 1] > n ? 0 : order[m * 2 + 1]) : last_round[m * 2 + 1].winner
+            let bye = a == 0 || b == 0
+            let pick = get(picks, slot, null)
+            let winner = bye ? (a == 0 ? b : a) : (a != null && b != null && (pick == a || pick == b) ? pick : null)
+            if !bye {
+                number += 1
+                matches += 1
+                if winner != null { decided += 1 }
+            }
+            let a_from = r == 0 ? null : last_round[m * 2].number
+            let b_from = r == 0 ? null : last_round[m * 2 + 1].number
+            row = row | push({ slot, round: r, at: m, number: bye ? 0 : number, a, b, winner, bye, a_from, b_from })
+        }
+        rounds = rounds | push({ name: tournament_bracket_round_name(r, rounds_n), matches: row })
+        last_round = row
+    }
+    { rounds, champion: last(rounds).matches[0].winner, byes: size - n, decided, matches }
+}
+
+// Sets a result, or takes it away if it is the same again, and clears each later match
+// on the way to the final: whoever won those beat someone who may no longer be there.
+fn tournament_bracket_choose(results, round_at: int, at: int, seed: int, rounds: int) {
+    let slot = `${round_at}-${at}`
+    let had = get(results, slot, null)
+    let out = had == seed ? remove(results, slot) : set(results, slot, seed)
+    let cleared = []
+    let m = at
+    let r = round_at + 1
+    while r < rounds {
+        m = int(floor(m / 2))
+        let next = `${r}-${m}`
+        if has(out, next) {
+            out = remove(out, next)
+            cleared = cleared | push({ round: r, at: m })
+        }
+        r += 1
+    }
+    { results: out, cleared }
+}
+
+// Names as typed: { names, problems }.
+fn tournament_bracket_read(text: str) {
+    let lines = split(replace(text, "\r", ""), "\n") | map((l) => trim(re.replace(l, "^\\s*\\d+[.)]\\s+", ""))) | filter((l) => l != "")
+    let names = []
+    let problems = []
+    for l in lines {
+        if any(names, (x) => lower(x) == lower(l)) {
+            problems = problems | push(`${slice(l, 0, 40)} is on the list twice; the first place counts.`)
+        } else {
+            names = names | push(slice(l, 0, 60))
+        }
+    }
+    if len(names) > tournament_bracket_most {
+        problems = problems | push(`Only the first ${tournament_bracket_most} entrants are drawn: ${len(names) - tournament_bracket_most} left out.`)
+        names = names | take(tournament_bracket_most)
+    }
+    { names, problems }
+}
+
+fn tournament_bracket_text(given) = type_of(given) == "list" ? join(given | map((x) => str(x)), "\n") : str(given ?? "")
+
+fn tournament_bracket_name(names: list, seed) = seed == null || seed == 0 ? "" : names[seed - 1]
+
+// What the last click did, in words.
+fn tournament_bracket_said(names: list, plan, seed: int, undone: bool, cleared: list) {
+    let rounds_n = len(plan.rounds)
+    let who = tournament_bracket_name(names, seed)
+    let later = cleared | map((c) => tournament_bracket_round_name(c.round, rounds_n))
+    let gone = len(cleared) == 0 ? "" : ` Cleared ${len(cleared) == 1 ? "1 later result" : `${len(cleared)} later results`}: ${join(later, ", ")}.`
+    `${undone ? `${who}'s win is undone.` : `${who} moves on.`}${gone}`
+}
+
+component TournamentBracket(entrants = [], results = null, title: str = "Bracket", id: str = "tournament-bracket", name: str? = null,
+                            on_change = null, class: str? = null) {
+    style global tournament_bracket_css
+    state text = tournament_bracket_text(entrants)
+    state picks = results ?? {}
+    state said = ""
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let read = tournament_bracket_read(text)
+    let names = read.names
+    let plan = tournament_bracket_plan(names, picks)
+    let champion = tournament_bracket_name(names, plan.champion)
+    let status = champion != "" ? `Champion: ${champion}` : len(names) == 0 ? "Add entrants to make the draw." : `${plan.decided} of ${plan.matches} matches decided`
+    let kept = reduce(plan.rounds, {}, (m, r) => reduce(r.matches, m, (k, x) => !x.bye && x.winner != null ? set(k, x.slot, x.winner) : k))
+    let tell = (p) => {
+        if on_change != null {
+            let now = tournament_bracket_plan(tournament_bracket_read(text).names, p)
+            on_change({ results: p, champion: tournament_bracket_name(tournament_bracket_read(text).names, now.champion), decided: now.decided, matches: now.matches })
+        }
+    }
+    let click = (x, seed: int) => {
+        let undone = get(picks, x.slot, null) == seed
+        let c = tournament_bracket_choose(picks, x.round, x.at, seed, len(plan.rounds))
+        picks = c.results
+        said = tournament_bracket_said(names, plan, seed, undone, c.cleared)
+        tell(c.results)
+    }
+    let edit = (value_: str) => {
+        let before = len(tournament_bracket_read(text).names)
+        text = value_
+        if len(tournament_bracket_read(value_).names) != before {
+            let had = len(picks) > 0
+            picks = {}
+            said = had ? "The number of entrants changed, so the results were cleared." : ""
+        }
+        tell(picks)
+    }
+    let seat_text = (x, seed, from) => seed == 0 ? "Bye" : seed != null ? tournament_bracket_name(names, seed) : from != null && from > 0 ? `Winner of match ${from}` : "To be decided"
+    let label_of = (x, seed) => seed == null || seed == 0 ? seat_text(x, seed, null) : `${tournament_bracket_name(names, seed)} wins match ${x.number}`
+    let seat = (x, seed, from) => {
+        let open = !x.bye && x.a != null && x.b != null
+        let on = seed != null && seed != 0 && x.winner == seed && !x.bye
+        <button type="button" class="ui-tourney-seat" disabled={!open} aria-pressed={open ? (on ? "true" : "false") : null}
+                aria-label={open ? label_of(x, seed) : null} @click={() => { click(x, seed) }}>
+            <span.ui-tourney-seed>{seed == null || seed == 0 ? "" : str(seed)}</span>
+            <span.ui-tourney-who>{seat_text(x, seed, from)}</span>
+            {on && <span.ui-tourney-tick aria-hidden="true">✓</span>}
+        </button>
+    }
+    <section class={ui_cls(["ui-tourney", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-tourney-title id={`${id}-title`}>{title}</h3>
+        <label.ui-tourney-field>
+            Entrants in seed order, one a line
+            <textarea id={`${id}-entrants`} name={named("entrants")} value={text} rows="4" spellcheck="false" @input={(e) => { edit(e.value) }}></textarea>
+        </label>
+        <input type="hidden" name={named("results")} value={json.stringify(kept)}/>
+        {for p in read.problems => <p.ui-tourney-error role="alert">{p}</p>}
+        <p.ui-tourney-status aria-live="polite">{status}</p>
+        {plan.byes > 0 && <p.ui-tourney-note>{plan.byes == 1 ? "The top seed has a bye in the first round." : `The top ${plan.byes} seeds have byes in the first round.`}</p>}
+        {said != "" && <p.ui-tourney-note role="status">{said}</p>}
+        {len(plan.rounds) > 0 && <div.ui-tourney-board tabindex="0" role="group" aria-label="The draw, by round">
+            {for r in plan.rounds {
+                let round_name = r.name
+                <div.ui-tourney-round key={round_name}>
+                    <h4.ui-tourney-round-name>{round_name}</h4>
+                    <ul.ui-tourney-matches>
+                        {for x in r.matches {
+                            let slot = x.slot
+                            <li key={slot} class={ui_cls(["ui-tourney-match", x.bye && "ui-tourney-bye"])}>
+                                <span.ui-tourney-label>{x.bye ? "Bye" : `Match ${x.number}`}</span>
+                                {seat(x, x.a, x.a_from)}
+                                {seat(x, x.b, x.b_from)}
+                            </li>
+                        }}
+                    </ul>
+                </div>
+            }}
+        </div>}
+    </section>
+}

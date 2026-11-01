@@ -1,0 +1,356 @@
+// OfflineQueue: what a person did while offline, held and shown as waiting, then sent in
+// order, one at a time, when the connection is back. Each action shows how it went; one that
+// fails says why and has a Retry and a Remove. It keeps nothing but plain data: a file goes
+// through PendingUploads.
+//
+//   import ui/offline_queue.qwe use OfflineQueue
+//
+//   // Add by giving it a new action in `actions`; `send` does the work.
+//   component Outbox(saved = []) {
+//       state todo = []
+//       <div>
+//           <button @click={() => { todo = todo | push({ id: uuid(), title: "Book room 4", data: { room: 4 } }) }}>Book</button>
+//           <OfflineQueue actions={todo} saved={saved} send={(a) => book(a.id, a.data)} on_change={(list) => { keep_outbox(list) }}/>
+//       </div>
+//   }
+//
+//   // What lasts. In a browser, leave out `saved`: it keeps itself in localStorage. In a
+//   // phone app that comes back empty each launch, because the app's port changes, so give
+//   // it `saved` and keep what on_change gives in SQLite, which the app's own server holds:
+//   server fn keep_outbox(list) { db.exec("insert or replace into outbox (id, list) values (1, ?)", json.stringify(list)) }
+//   route GET / { <Outbox saved={load_outbox()}/> }
+//
+// actions: new actions, each { id, title, detail, data }: id (text, unique), title (what the
+// row says), detail (a smaller line), data (anything JSON, for `send`). The list may grow
+// or be replaced: an id seen before is not added again. saved: the list on_change last gave,
+// from the program's own storage; given (even empty), localStorage is left alone.
+// send(action): sends one, and may wait. Anything but these three counts as sent: false
+// (refused), { ok: false, error: "why" } (refused, with the reason shown), an error value
+// (not reached, as a `server fn` gives with no connection). A refused action waits for
+// Retry or Remove; one not reached is tried again when the connection returns.
+// on_change(list): called after every change, with what is still to send (without the sent
+// rows). on_sent(action), on_failed(action, why). online: true or false to say for yourself;
+// null (the default) follows the browser. keep_order: true holds everything after a failed
+// action, as later ones often lean on it; false lets the rest go on. wait_ms: how long an
+// answer may take before it counts as not reached (30000). id: for its elements, and the
+// name it is stored under, with store in its place if given. title: the heading. class:
+// more classes.
+//
+// An action is marked as being sent before `send` is called. If the app dies then, nobody
+// knows whether it arrived, so it is sent again next time: make `send` safe to repeat. `id`
+// stays the same each try, so `idempotent(a.id, ...)` in the server fn does that.
+//
+// offline_queue_next(queue, strict) picks the next to send, offline_queue_outcome(answer) reads
+// an answer, and offline_queue_restore(list) is what a kept list becomes after a restart.
+
+import ui/theme.qwe use ui_cls
+
+let offline_queue_css = css`
+.ui-offq { position: relative; container-type: inline-size; display: grid; gap: 10px; min-width: 0; color: var(--ui-fg); font: 15px/1.4 var(--ui-font); }
+.ui-offq-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.ui-offq-title { flex: 1 1 auto; margin: 0; font-size: 16px; font-weight: 600; }
+.ui-offq-net { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; background: var(--ui-success-soft); color: var(--ui-success); font-size: 13px; font-weight: 500; }
+.ui-offq-net::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.ui-offq-net[data-on="false"] { background: var(--ui-warning-soft); color: var(--ui-warning); }
+.ui-offq-said { margin: 0; color: var(--ui-muted); font-size: 14px; }
+.ui-offq-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ui-offq-row { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 4px 10px; padding: 10px 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-offq-row[data-status="failed"] { border-color: color-mix(in srgb, var(--ui-danger) 45%, var(--ui-border)); }
+.ui-offq-row[data-status="sent"] { background: var(--ui-subtle); }
+.ui-offq-place { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; background: var(--ui-subtle); color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-offq-row[data-status="sending"] .ui-offq-place { background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-offq-row[data-status="sent"] .ui-offq-place { background: var(--ui-success-soft); color: var(--ui-success); }
+.ui-offq-row[data-status="failed"] .ui-offq-place { background: var(--ui-danger-soft); color: var(--ui-danger); }
+.ui-offq-text { display: grid; gap: 1px; min-width: 0; }
+.ui-offq-name { overflow-wrap: anywhere; font-weight: 500; }
+.ui-offq-detail { overflow-wrap: anywhere; color: var(--ui-muted); font-size: 13px; }
+.ui-offq-state { color: var(--ui-muted); font-size: 13px; }
+.ui-offq-row[data-status="failed"] .ui-offq-state { color: var(--ui-danger); }
+.ui-offq-row[data-status="sent"] .ui-offq-state { color: var(--ui-success); }
+.ui-offq-acts { grid-column: 2; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.ui-offq-btn { min-width: 76px; min-height: 44px; padding: 0 14px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 14px/1 var(--ui-font); cursor: pointer; touch-action: manipulation; }
+.ui-offq-go { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); }
+.ui-offq-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-offq-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.ui-offq-lasts { flex: 1 1 200px; margin: 0; color: var(--ui-muted); font-size: 13px; }
+@media (hover: hover) { .ui-offq-btn:hover { border-color: var(--ui-strong); background: var(--ui-subtle); } .ui-offq-go:hover { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); } }
+@container (min-width: 560px) {
+  .ui-offq-row { grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; }
+  .ui-offq-acts { grid-column: 3; grid-row: 1; margin-top: 0; }
+}
+`
+
+// One action as the queue holds it, or null when it cannot be one.
+fn offline_queue_item(a) {
+    if type_of(a) != "map" || (type_of(a.id) != "str" && type_of(a.id) != "int") || str(a.id) == "" { return null }
+    { id: str(a.id), title: type_of(a.title) == "str" ? a.title : str(a.id), detail: type_of(a.detail) == "str" ? a.detail : null, data: a.data,
+      status: "pending", tries: type_of(a.tries) == "int" ? a.tries : 0, why: null, reached: true }
+}
+
+// The actions that can be held, each id once.
+fn offline_queue_clean(actions) -> list {
+    if type_of(actions) != "list" { return [] }
+    let good = actions | map(offline_queue_item) | filter((a) => a != null)
+    let ids = good | map((a) => a.id)
+    good | enumerate | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// A kept list after a restart: what was sent is gone, a refusal stays one, and what was on
+// its way is sent again, since nobody knows whether it arrived.
+fn offline_queue_restore(list) -> list {
+    if type_of(list) != "list" { return [] }
+    let was = list | filter((a) => type_of(a) == "map" && a.status != "sent")
+    let clean = offline_queue_clean(was)
+    let ids = was | map((a) => str(a.id ?? ""))
+    clean | map((a) => {
+        let old = was[index_of(ids, a.id)]
+        old.status == "failed" ? { ...a, status: "failed", why: type_of(old.why) == "str" ? old.why : "It did not go.", reached: old.reached != false } : a
+    })
+}
+
+// What it starts with, on the server and in the browser alike.
+fn offline_queue_start(saved, actions) -> list {
+    let kept = offline_queue_restore(saved)
+    let ids = kept | map((a) => a.id)
+    kept + (offline_queue_clean(actions) | filter((a) => !contains(ids, a.id)))
+}
+
+// The actions given that it has not met.
+fn offline_queue_new(known: list, actions) -> list =
+    offline_queue_clean(actions) | filter((a) => !contains(known, a.id))
+
+// The next to send. strict: nothing goes past a failed one.
+fn offline_queue_next(queue: list, strict: bool) {
+    for a in queue {
+        if a.status == "pending" { return a }
+        if strict && a.status == "failed" { return null }
+    }
+    null
+}
+
+// What an answer from `send` means.
+fn offline_queue_outcome(r) -> map {
+    if is_err(r) { return { sent: false, reached: false, why: "Could not reach the server." } }
+    if r == false { return { sent: false, reached: true, why: "The server refused this." } }
+    if type_of(r) == "map" && r.ok == false {
+        return { sent: false, reached: true, why: type_of(r.error) == "str" && r.error != "" ? r.error : "The server refused this." }
+    }
+    { sent: true, reached: true, why: null }
+}
+
+// One changed, the rest as they are.
+fn offline_queue_patch(queue: list, id: str, change: map) -> list =
+    queue | map((a) => a.id == id ? { ...a, ...change } : a)
+
+// What goes to storage and to on_change.
+fn offline_queue_kept(queue: list) -> list = queue | filter((a) => a.status != "sent")
+
+fn offline_queue_plural(n: int) -> str = n == 1 ? "1 action" : `${n} actions`
+
+// The line that says where things stand.
+fn offline_queue_summary(queue: list, on: bool, strict: bool) -> str {
+    let waiting = queue | filter((a) => a.status == "pending")
+    let failed = queue | filter((a) => a.status == "failed")
+    let sending = queue | find((a) => a.status == "sending")
+    let n = len(waiting)
+    if len(queue) == 0 { return "Nothing is waiting." }
+    if sending != null { return `Sending ${sending.title}.` }
+    if !on {
+        if n + len(failed) == 0 { return "You are offline. Nothing is waiting." }
+        return `You are offline. ${offline_queue_plural(n + len(failed))} will go in order when you are back.`
+    }
+    if len(failed) > 0 {
+        return strict && n > 0 ? `${failed[0].title} did not go, so ${offline_queue_plural(n)} after it ${n == 1 ? "is" : "are"} held.`
+                               : `${offline_queue_plural(len(failed))} did not go.`
+    }
+    n > 0 ? `${offline_queue_plural(n)} waiting.` : "Everything has been sent."
+}
+
+// The words on a row, given whether a failed row stands before it.
+fn offline_queue_word(a: map, held: bool, on: bool) -> str = match a.status {
+    "sending" => "Sending"
+    "sent" => "Sent"
+    "failed" => a.why ?? "It did not go."
+    _ => held ? "Held until the one before it goes" : (on ? "Next" : "Waiting")
+}
+
+// The rows to show: each with its place among those to send and its words.
+fn offline_queue_rows(queue: list, on: bool, strict: bool) -> list {
+    let first_bad = index_of(queue | map((a) => a.status), "failed")
+    let done = len(queue | filter((a) => a.status == "sent"))
+    queue | enumerate | map((p) => {
+        let a = p[1]
+        { ...a, place: p[0] - done + 1, word: offline_queue_word(a, strict && first_bad != null && p[0] > first_bad, on) }
+    })
+}
+
+// What it can promise about staying, in the words a person would use.
+fn offline_queue_lasts(place, keeper: bool) -> str {
+    if place == null { return "" }
+    if keeper { return place == "app" ? "Kept on this phone, even if the app closes." : "Kept by this program, even if this page closes." }
+    match place {
+        "app" => "Kept until the app closes. What is still here then is lost."
+        "blocked" => "This browser is blocking storage, so these last only while this page is open."
+        _ => "Kept in this browser through a reload. Clearing its data loses them."
+    }
+}
+
+component OfflineQueue(id: str = "offline-queue", store: str? = null, actions = [], saved = null, send = null, on_change = null, on_sent = null,
+                       on_failed = null, online: bool? = null, keep_order: bool = true, wait_ms: int = 30000, title: str = "Waiting to send", class: str? = null) {
+    style global offline_queue_css
+    let slot = `ui-offline-queue:${store ?? id}`
+    let keeper = type_of(saved) == "list"
+    state queue = offline_queue_start(saved, actions)
+    state known = offline_queue_start(saved, actions) | map((a) => a.id)
+    state net = true
+    state busy = false
+    state place = null
+    state wake = false
+    state fresh_in = false
+    state was_on = true
+    let on = online ?? net
+    let rows = offline_queue_rows(queue, on, keep_order)
+    let failed = len(queue | filter((a) => a.status == "failed"))
+    let sent = len(queue | filter((a) => a.status == "sent"))
+    // A new action in the prop: taken at once, and sent by the tick below if it can be.
+    if len(offline_queue_new(known, actions)) > 0 {
+        let fresh = offline_queue_new(known, actions)
+        known = known + (fresh | map((a) => a.id))
+        queue = queue + fresh
+        fresh_in = true
+        wake = true
+    }
+    // Back online, by the browser's word or the prop's. What was not reached goes back in
+    // line; a refusal waits for a person.
+    if on != was_on {
+        was_on = on
+        if on {
+            queue = queue | map((a) => a.status == "failed" && a.reached == false ? { ...a, status: "pending", why: null } : a)
+            wake = true
+        }
+    }
+    let keep = () => {
+        if !keeper && place != null {
+            let text = json.stringify(offline_queue_kept(queue))
+            let wrote = js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.setItem", slot, text) ?? true) }))
+            if is_err(wrote) { place = "blocked" }
+        }
+        on_change && on_change(offline_queue_kept(queue))
+    }
+    // Waits for `send` or for wait_ms, whichever is first; a throw or a rejection is an
+    // error value, so nothing here stops the run.
+    let call = (a) => {
+        js("Promise.resolve", js_new("Promise", (done) => {
+            js("AbortSignal.timeout", wait_ms).addEventListener("abort", (_e = null) => { done(err("no answer")) })
+            js("Promise.resolve", send(a)).then(done, (_e = null) => { done(err("failed")) })
+        }))
+    }
+    // One at a time, reading the queue afresh each round, so what is added, retried or
+    // removed meanwhile counts.
+    let run = () => {
+        if !busy && send != null {
+            busy = true
+            let go = true
+            while go {
+                let next = offline_queue_next(queue, keep_order)
+                if next == null || !(online ?? net) {
+                    go = false
+                } else {
+                    queue = offline_queue_patch(queue, next.id, { status: "sending", tries: next.tries + 1, why: null })
+                    keep()
+                    let plain = { id: next.id, title: next.title, detail: next.detail, data: next.data, tries: next.tries + 1 }
+                    let answer = call(plain)
+                    let out = offline_queue_outcome(answer)
+                    if out.sent {
+                        queue = offline_queue_patch(queue, next.id, { status: "sent" })
+                        on_sent && on_sent(plain)
+                    } else if !out.reached && js("navigator.onLine") == false {
+                        // The connection went: not this action's fault, so it waits its turn.
+                        queue = offline_queue_patch(queue, next.id, { status: "pending" })
+                        net = false
+                        go = false
+                    } else {
+                        queue = offline_queue_patch(queue, next.id, { status: "failed", why: out.why, reached: out.reached })
+                        on_failed && on_failed(plain, out.why)
+                    }
+                    keep()
+                }
+            }
+            busy = false
+        }
+    }
+    if wake {
+        every(40, () => {
+            wake = false
+            if fresh_in {
+                fresh_in = false
+                keep()
+            }
+            run()
+        })
+    }
+    let retry = (a) => {
+        queue = offline_queue_patch(queue, a.id, { status: "pending", why: null })
+        keep()
+        wake = true
+    }
+    let forget = (a) => {
+        queue = queue | filter((q) => q.id != a.id)
+        keep()
+        wake = true
+    }
+    <section class={ui_cls(["ui-offq", class])} id={id} aria-label={title}
+             @mount={(_el) => {
+                 let w = js("window")
+                 let kept = keeper ? null : js("Promise.resolve", js_new("Promise", (done) => { done(js("localStorage.getItem", slot)) }))
+                 let blocked = is_err(kept)
+                 let app = w.quilloNative != null
+                 if !keeper && !blocked && type_of(kept) == "str" {
+                     let list = offline_queue_restore(json.parse(kept))
+                     let ids = queue | map((a) => a.id)
+                     let extra = list | filter((a) => !contains(ids, a.id))
+                     known = known + (extra | map((a) => a.id))
+                     queue = extra + queue
+                 }
+                 place = app ? "app" : (blocked ? "blocked" : "browser")
+                 net = js("navigator.onLine") != false
+                 let went = (_e = null) => { net = false }
+                 let came = (_e = null) => { net = true }
+                 w.addEventListener("offline", went)
+                 w.addEventListener("online", came)
+                 wake = true
+                 () => {
+                     w.removeEventListener("offline", went)
+                     w.removeEventListener("online", came)
+                 }
+             }}>
+        <div.ui-offq-head>
+            <h3.ui-offq-title>{title}</h3>
+            <span.ui-offq-net data-on={on ? "true" : "false"}>{on ? "Online" : "Offline"}</span>
+        </div>
+        <p.ui-offq-said role="status">{offline_queue_summary(queue, on, keep_order)}</p>
+        <ol.ui-offq-list>
+            {for r in rows => <li.ui-offq-row key={r.id} data-id={r.id} data-status={r.status}>
+                <span.ui-offq-place aria-hidden="true">{r.status == "sent" ? "✓" : (r.status == "failed" ? "!" : str(r.place))}</span>
+                <div.ui-offq-text>
+                    <span.ui-offq-name>{r.title}</span>
+                    {r.detail != null && <span.ui-offq-detail>{r.detail}</span>}
+                    <span.ui-offq-state>{r.word}</span>
+                </div>
+                {r.status != "sending" && r.status != "sent" && <div.ui-offq-acts>
+                    {r.status == "failed" && <button.ui-offq-btn.ui-offq-go type="button" aria-label={`Retry ${r.title}`} @click={() => { retry(r) }}>Retry</button>}
+                    <button.ui-offq-btn type="button" aria-label={`Remove ${r.title}`} @click={() => { forget(r) }}>Remove</button>
+                </div>}
+            </li>}
+        </ol>
+        <div.ui-offq-foot>
+            <p.ui-offq-lasts>{offline_queue_lasts(place, keeper)}</p>
+            {failed > 1 && <button.ui-offq-btn type="button" @click={() => {
+                queue = queue | map((a) => a.status == "failed" ? { ...a, status: "pending", why: null } : a)
+                keep()
+                wake = true
+            }}>Retry all</button>}
+            {sent > 0 && <button.ui-offq-btn type="button" @click={() => { queue = offline_queue_kept(queue) }}>Clear sent</button>}
+        </div>
+    </section>
+}

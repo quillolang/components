@@ -1,0 +1,229 @@
+// AppTabBar: the tabs along the bottom of a phone app, with the screens they switch
+// between. Each tab keeps its place: its screen stays built, scrolled where it was,
+// with what was typed in it. Pressing the tab showing takes its screen back to the top.
+// Tabs carry badges, the bar stands clear of the home indicator, and it goes while the
+// on-screen keyboard is up, so it never rides on top of it. In a pane 600 px wide or
+// more it becomes a rail down the side, which stays for the keyboard.
+//
+//   import ui/app_tab_bar.qwe use AppTabBar
+//
+//   component App() {
+//       state unread = 3
+//       <AppTabBar tabs={[
+//                      { id: "home", label: "Home", icon: "M3 11 12 3l9 8M5 9.5V21h14V9.5" },
+//                      { id: "inbox", label: "Inbox", icon: "M4 4h16v16H4zM4 13h5l1.5 2h3L15 13h5", badge: unread },
+//                  ]}
+//                  panel={(id) => id == "home" ? <Home/> : <Inbox/>}/>
+//   }
+//
+// tabs: { id, label, icon, badge? }, three to five of them on a phone. icon: an SVG path
+// (24x24, stroked) when it starts with "M", else a character. badge: a count (0 or none
+// shows nothing, and past 99 it says 99+), or true for a plain dot. panel(id): gives
+// the screen of a tab, called the first time that tab is opened, and once only, as a
+// screen stays built; so a change to a badge costs a screen nothing. It is a function,
+// so AppTabBar goes inside one of your components.
+// current: the tab showing (the first if it is no tab's id); a later change to it moves
+// to that tab. on_change(id): called when someone moves to another tab.
+// on_retap(id): called when the tab showing is pressed again. label: what screen
+// readers call the tabs ("Main"). id: a prefix for the elements' ids, unique on the page.
+// The box takes the size of its parent, which needs a height. The arrow keys, Home
+// and End move between tabs.
+//
+// iOS and Chrome's own default leave the page's height alone and shrink only what is
+// visible; a web view that resizes makes the page shorter. Either counts as the
+// keyboard, as long as a field that takes text has the focus; zooming does not.
+
+import ui/theme.qwe use ui_cls
+
+let app_tab_bar_css = css`
+.ui-apptabs { display: block; width: 100%; height: 100%; min-height: 0; container-type: inline-size; background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.5 var(--ui-font); }
+.ui-apptabs-in { display: flex; flex-direction: column; width: 100%; height: 100%; }
+.ui-apptabs-screens { position: relative; flex: 1; min-width: 0; min-height: 0; }
+/* Hidden by visibility, as display: none loses a scroller's place on some engines. */
+.ui-apptabs-panel { position: absolute; inset: 0; overflow: auto; overscroll-behavior: contain; visibility: hidden; outline: none; }
+.ui-apptabs-panel-on { visibility: visible; }
+/* Literal markup in the branch: with a bare call there, each change to what the test reads would build the screen again. */
+.ui-apptabs-built { display: contents; }
+.ui-apptabs-bar {
+  display: flex; flex: none; justify-content: space-around; box-sizing: border-box; width: 100%;
+  padding: 4px max(4px, env(safe-area-inset-right)) max(4px, env(safe-area-inset-bottom)) max(4px, env(safe-area-inset-left));
+  border-top: 1px solid var(--ui-border); background: var(--ui-surface);
+}
+.ui-apptabs-kb .ui-apptabs-bar { display: none; }
+.ui-apptabs-tab {
+  position: relative; display: flex; flex: 1 1 0; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 44px; min-height: 48px; max-width: 140px;
+  padding: 4px 2px; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); font: 500 11px/1.2 var(--ui-font); cursor: pointer;
+  -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+}
+.ui-apptabs-tab[aria-selected="true"] { color: var(--ui-accent); }
+.ui-apptabs-tab:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-apptabs-icon { position: relative; display: inline-grid; place-items: center; width: 26px; height: 26px; font-size: 20px; line-height: 1; }
+.ui-apptabs-icon svg { width: 24px; height: 24px; }
+.ui-apptabs-badge {
+  position: absolute; top: -3px; inset-inline-start: 62%; box-sizing: border-box; min-width: 16px; padding: 0 4px; border-radius: 999px; background: var(--ui-danger); color: #fff;
+  font: 700 10px/16px var(--ui-font); text-align: center;
+}
+.ui-apptabs-dot { top: 0; min-width: 9px; height: 9px; padding: 0; }
+.ui-apptabs-text { position: relative; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (hover: hover) { .ui-apptabs-tab:hover { color: var(--ui-fg); } .ui-apptabs-tab[aria-selected="true"]:hover { color: var(--ui-accent); } }
+@container (min-width: 600px) {
+  .ui-apptabs-in { flex-direction: row; }
+  .ui-apptabs-bar {
+    order: -1; flex-direction: column; justify-content: flex-start; gap: 4px; width: calc(84px + env(safe-area-inset-left)); height: 100%; overflow-y: auto;
+    padding: max(12px, env(safe-area-inset-top)) 6px max(12px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left)); border-top: 0; border-inline-end: 1px solid var(--ui-border);
+  }
+  .ui-apptabs-tab { flex: none; min-height: 60px; max-width: none; font-size: 12px; }
+  /* A rail is beside the keyboard, not on it, and going would move everything sideways. */
+  .ui-apptabs-kb .ui-apptabs-bar { display: flex; }
+}
+`
+
+// The tabs that can be used: bad rows and a second use of an id are dropped, not fatal.
+fn app_tab_bar_rows(tabs: list) -> list {
+    let rows = take(tabs, 40) | filter((t) => type_of(t) == "map" && get(t, "id") != null)
+    let ids = rows | map((t) => t.id)
+    enumerate(rows) | filter((p) => index_of(ids, p[1].id) == p[0]) | map((p) => p[1])
+}
+
+// The tab to show first.
+fn app_tab_bar_start(rows: list, wanted) {
+    if len(rows) == 0 { return null }
+    any(rows, (t) => t.id == wanted) ? wanted : rows[0].id
+}
+
+// What a badge shows: "" for nothing, "dot" for a plain mark, else its text.
+fn app_tab_bar_badge(badge) -> str {
+    if badge == null || badge == false || badge == 0 { return "" }
+    if badge == true { return "dot" }
+    let kind = type_of(badge)
+    if kind == "int" || kind == "float" { return badge < 0 ? "" : badge > 99 ? "99+" : str(badge) }
+    str(badge)
+}
+
+// What a screen reader hears of a badge.
+fn app_tab_bar_badge_words(shown: str) -> str = shown == "" ? "" : shown == "dot" ? ", new items" : `, ${shown} new`
+
+// Does this element take text from a keyboard? Only then can a shorter screen be one.
+fn app_tab_bar_takes_text(tag: str, kind: str, editable: bool) -> bool {
+    if editable || tag == "TEXTAREA" { return true }
+    tag == "INPUT" && !contains(["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"], kind)
+}
+
+// Is the keyboard up? tallest: the page's height with nothing in the way. height: its
+// height now. seen: the height left on screen, and scale, its zoom, as zooming in
+// shrinks that too. A browser's bars come and go by far less than 120 px.
+fn app_tab_bar_keyboard(tallest: num, height: num, seen: num, scale: num, typing: bool) -> bool {
+    if !typing || scale > 1.01 { return false }
+    (tallest - height) + (height - seen) > 120
+}
+
+view AppTabBarIcon(icon = "") =
+    type_of(icon) == "str" && starts_with(icon, "M") && len(icon) > 2
+        ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={icon}/></svg>
+        : <span aria-hidden="true">{icon}</span>
+
+component AppTabBar(tabs: list = [], panel = null, current: str? = null, on_change = null, on_retap = null, label: str = "Main",
+                    id: str = "ui-apptabs", class: str? = null) {
+    style global app_tab_bar_css
+    let rows = app_tab_bar_rows(tabs)
+    let ids = rows | map((t) => t.id)
+    state showing = app_tab_bar_start(app_tab_bar_rows(tabs), current)
+    state seen = [app_tab_bar_start(app_tab_bar_rows(tabs), current)]
+    state asked = current
+    state typing_up = false     // the keyboard is up
+    state tallest = 0
+    state wide_at = 0           // the page's width that `tallest` was measured at: rotation starts again
+    state win = null
+    let open_tab = (to) => {
+        showing = to
+        if !contains(seen, to) { seen = seen + [to] }
+    }
+    if current != asked {
+        asked = current
+        if contains(ids, current) && current != showing { open_tab(current) }
+    }
+    let press = (to) => {
+        if to == showing {
+            let el = win.document.getElementById(`${id}-panel-${to}`)
+            if el != null {
+                let still = win.matchMedia("(prefers-reduced-motion: reduce)").matches
+                el.scrollTo({ top: 0, behavior: still ? "auto" : "smooth" })
+            }
+            on_retap && on_retap(to)
+        } else {
+            open_tab(to)
+            on_change && on_change(to)
+        }
+    }
+    <div class={ui_cls(["ui-apptabs", class])}
+         @mount={(el) => {
+             win = js("window")
+             let doc = win.document
+             let vv = win.visualViewport
+             let check = () => {
+                 let w = win.innerWidth
+                 let h = win.innerHeight
+                 if w != wide_at {
+                     wide_at = w
+                     tallest = h
+                 }
+                 if h > tallest { tallest = h }
+                 let on = doc.activeElement
+                 let typing = on != null && app_tab_bar_takes_text(on.tagName, str(on.type ?? ""), on.isContentEditable == true)
+                 typing_up = app_tab_bar_keyboard(tallest, h, vv != null ? vv.height : h, vv != null ? vv.scale : 1, typing)
+             }
+             check()
+             win.addEventListener("resize", check)
+             doc.addEventListener("focusin", check)
+             doc.addEventListener("focusout", check)
+             if vv != null { vv.addEventListener("resize", check) }
+             () => {
+                 win.removeEventListener("resize", check)
+                 doc.removeEventListener("focusin", check)
+                 doc.removeEventListener("focusout", check)
+                 if vv != null { vv.removeEventListener("resize", check) }
+             }
+         }}>
+        <div class={ui_cls(["ui-apptabs-in", typing_up && "ui-apptabs-kb"])}>
+            <div.ui-apptabs-screens>
+                {for t in ids => <div key={t} id={`${id}-panel-${t}`} class={ui_cls(["ui-apptabs-panel", t == showing && "ui-apptabs-panel-on"])}
+                        role="tabpanel" aria-labelledby={`${id}-tab-${t}`} tabindex="0" inert={t == showing ? null : ""}>
+                    {contains(seen, t) && <div.ui-apptabs-built>{panel != null ? panel(t) : null}</div>}
+                </div>}
+            </div>
+            <div.ui-apptabs-bar role="tablist" aria-label={label}
+                 @keydown={(e) => {
+                     let n = len(ids)
+                     let at = index_of(ids, showing) ?? 0
+                     let to = match e.key {
+                         "ArrowRight" => (at + 1) % n
+                         "ArrowDown" => (at + 1) % n
+                         "ArrowLeft" => (at + n - 1) % n
+                         "ArrowUp" => (at + n - 1) % n
+                         "Home" => 0
+                         "End" => n - 1
+                         _ => null
+                     }
+                     if to != null {
+                         e.preventDefault()
+                         press(ids[to])
+                         win.document.getElementById(`${id}-tab-${ids[to]}`).focus()
+                     }
+                 }}>
+                {for t in rows => <AppTabBarTab key={t.id} tab={t} prefix={id} on={t.id == showing} on_press={press}/>}
+            </div>
+        </div>
+    </div>
+}
+
+view AppTabBarTab(tab, prefix: str, on: bool, on_press) {
+    let shown = app_tab_bar_badge(get(tab, "badge"))
+    <button.ui-apptabs-tab type="button" role="tab" id={`${prefix}-tab-${tab.id}`} aria-selected={on ? "true" : "false"} aria-controls={`${prefix}-panel-${tab.id}`}
+            tabindex={on ? "0" : "-1"} @click={() => { on_press(tab.id) }}>
+        <span.ui-apptabs-icon>
+            <AppTabBarIcon icon={get(tab, "icon", "")}/>
+            {shown != "" && <span class={shown == "dot" ? "ui-apptabs-badge ui-apptabs-dot" : "ui-apptabs-badge"} aria-hidden="true">{shown == "dot" ? "" : shown}</span>}
+        </span>
+        <span.ui-apptabs-text>{get(tab, "label", "")}<span.ui-sr>{app_tab_bar_badge_words(shown)}</span></span>
+    </button>
+}

@@ -1,0 +1,262 @@
+// PhoneShell: the frame of a whole app: a header, one scrolling area, and a tab bar, as
+// one fixed-height screen. Only the middle scrolls; the page behind it cannot, so nothing
+// bounces and no pull shows the browser. Safe areas and the on-screen keyboard are
+// handled here, once: the screen shrinks to what the keyboard leaves on both systems, the
+// field in use stays in view, and the tab bar steps aside while typing. Each tab, and
+// each screen in it, keeps its own scroll position, and pressing the tab you are on goes
+// to the top. Where there is room, a tablet or a phone on its side, the tab bar becomes a
+// rail down the side. It looks at its own width, so Split View gets the right one.
+//
+//   <PhoneShell title="Orders" tab={tab} tabs={[
+//       { id: "home", label: "Home", icon: "M3 11 12 3l9 8M5 9.5V21h14V9.5" },
+//       { id: "inbox", label: "Inbox", icon: "M4 4h16v16H4zM4 13h5l1.5 2h3L15 13h5", badge: 3 },
+//   ]} on_tab={(id) => { tab = id }}>
+//       {tab == "home" ? <Home/> : <Inbox/>}
+//   </PhoneShell>
+//
+// title, subtitle: the header's words. tabs: a list of { id, label, icon, badge?, href? }.
+// icon: a character, or an SVG path (24x24, stroked) starting with "M". badge: a count,
+// shown as 99+ past 99, or true for a dot. href: a link, for separate pages, which needs
+// no script; tab then comes from the server. tab: the id showing (the first by default).
+// screen: a name for what is showing inside the tab, so that a list and the detail opened
+// from it keep a scroll each. back: show a back button. back_label ("Back"). actions: HTML
+// at the header's end, inside one of your components. label: what screen readers call
+// the tabs ("Main"). id, class: for the outer element. children: what scrolls.
+// on_tab(id), on_again(id), on_back(): inside one of your components. on_again: the tab
+// showing was pressed, after going to the top.
+//
+// It sits fixed over the window. Inside a frame with a transform, as in DevicePreview, it
+// is held to the frame and leaves the page alone. Needs viewport-fit=cover in the
+// page's viewport meta for the safe areas. A long press, a swipe between tabs and a
+// pull to refresh are not part of it.
+
+import ui/theme.qwe use ui_cls
+import ui/keyboard_avoider.qwe use keyboard_avoider_lift, keyboard_avoider_height, keyboard_avoider_shift, keyboard_avoider_field
+
+let phone_shell_css = css`
+html.ui-phone-shell-locked, html.ui-phone-shell-locked body { overflow: hidden; overscroll-behavior: none; }
+/* Moved by hand as the keyboard comes and goes, so it has no style attribute in its markup: one would be written again on any change. */
+.ui-phone-shell { position: fixed; inset: 0; z-index: 20; container-type: inline-size; box-sizing: border-box; overflow: hidden; overscroll-behavior: none; background: var(--ui-bg); color: var(--ui-fg); font: 15px/1.45 var(--ui-font); }
+.ui-phone-shell-frame { display: grid; grid-template: "head" auto "main" minmax(0, 1fr) "tabs" auto / minmax(0, 1fr); height: 100%; min-height: 0; }
+.ui-phone-shell-head {
+  grid-area: head; display: flex; align-items: center; gap: 4px; box-sizing: content-box; min-height: 52px; min-width: 0;
+  padding: var(--ui-safe-top, env(safe-area-inset-top, 0px)) max(8px, var(--ui-safe-right, env(safe-area-inset-right, 0px))) 0 max(8px, var(--ui-safe-left, env(safe-area-inset-left, 0px)));
+  border-bottom: 1px solid transparent; background: var(--ui-surface); transition: border-color .15s;
+}
+.ui-phone-shell-scrolled { border-bottom-color: var(--ui-border); }
+.ui-phone-shell-back {
+  display: inline-grid; place-items: center; flex: none; width: 44px; height: 44px; padding: 0; border: 0; border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-accent); cursor: pointer;
+}
+.ui-phone-shell-back:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-phone-shell-back svg { width: 24px; height: 24px; }
+.ui-phone-shell-words { flex: 1; min-width: 0; padding: 0 8px; }
+.ui-phone-shell-words h1 { margin: 0; overflow: hidden; font-size: 18px; font-weight: 650; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
+.ui-phone-shell-words p { margin: 0; overflow: hidden; color: var(--ui-muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.ui-phone-shell-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+.ui-phone-shell-scroll {
+  grid-area: main; box-sizing: border-box; min-height: 0; min-width: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+  padding: 0 var(--ui-safe-right, env(safe-area-inset-right, 0px)) 0 var(--ui-safe-left, env(safe-area-inset-left, 0px));
+}
+.ui-phone-shell-scroll:focus { outline: none; }
+.ui-phone-shell-tabs {
+  grid-area: tabs; display: flex; justify-content: space-around; gap: 2px; min-width: 0;
+  padding: 4px max(4px, var(--ui-safe-right, env(safe-area-inset-right, 0px))) max(4px, var(--ui-safe-bottom, env(safe-area-inset-bottom, 0px))) max(4px, var(--ui-safe-left, env(safe-area-inset-left, 0px)));
+  border-top: 1px solid var(--ui-border); background: var(--ui-surface);
+}
+.ui-phone-shell-typing .ui-phone-shell-tabs { display: none; }
+.ui-phone-shell-tab {
+  position: relative; display: flex; flex: 1 1 0; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 44px; max-width: 120px; min-height: 50px; padding: 4px 2px; border: 0;
+  border-radius: var(--ui-radius-sm); background: transparent; color: var(--ui-muted); font: 500 11px/1.2 var(--ui-font); text-decoration: none; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ui-phone-shell-tab:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-phone-shell-tab[aria-current="page"] { color: var(--ui-accent); }
+.ui-phone-shell-icon { position: relative; display: inline-grid; place-items: center; width: 28px; height: 26px; font-size: 20px; line-height: 1; }
+.ui-phone-shell-icon svg { width: 24px; height: 24px; }
+.ui-phone-shell-badge { position: absolute; left: 60%; top: -4px; min-width: 16px; padding: 0 4px; box-sizing: border-box; border-radius: 999px; background: var(--ui-danger); color: #fff; font-size: 10px; font-weight: 700; line-height: 16px; text-align: center; }
+.ui-phone-shell-dot { width: 10px; min-width: 0; height: 10px; padding: 0; top: -1px; }
+.ui-phone-shell-text { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@container (min-width: 700px) {
+  .ui-phone-shell-frame { grid-template: "tabs head" auto "tabs main" minmax(0, 1fr) / auto minmax(0, 1fr); }
+  .ui-phone-shell-tabs, .ui-phone-shell-typing .ui-phone-shell-tabs {
+    display: flex; flex-direction: column; justify-content: flex-start; gap: 6px; width: 84px; box-sizing: content-box; overflow-y: auto;
+    padding: max(10px, var(--ui-safe-top, env(safe-area-inset-top, 0px))) 6px max(10px, var(--ui-safe-bottom, env(safe-area-inset-bottom, 0px))) max(6px, var(--ui-safe-left, env(safe-area-inset-left, 0px)));
+    border-top: 0; border-right: 1px solid var(--ui-border);
+  }
+  .ui-phone-shell-tab { flex: none; max-width: none; min-height: 60px; font-size: 12px; }
+  .ui-phone-shell-tab[aria-current="page"] { background: var(--ui-accent-soft); }
+  .ui-phone-shell-railed .ui-phone-shell-head { padding-left: 12px; }
+  .ui-phone-shell-railed .ui-phone-shell-scroll { padding-left: 0; padding-bottom: var(--ui-safe-bottom, env(safe-area-inset-bottom, 0px)); }
+}
+@media (hover: hover) { .ui-phone-shell-tab:hover { color: var(--ui-fg); } }
+@media (prefers-reduced-motion: reduce) { .ui-phone-shell-head { transition: none; } }
+`
+
+// What a badge shows: null for none, "" for a dot, a count capped at 99+.
+fn phone_shell_badge(n) {
+    if n == true { return "" }
+    if type_of(n) != "int" || n <= 0 { return null }
+    n > 99 ? "99+" : str(n)
+}
+
+fn phone_shell_words(n) -> str {
+    if n == true { return ", new items" }
+    type_of(n) == "int" && n > 0 ? `, ${n} new` : ""
+}
+
+fn phone_shell_first(tabs) {
+    type_of(tabs) == "list" && len(tabs) > 0 ? tabs[0].id : null
+}
+
+// Where a scroll position is kept: prefixed, as tab ids are data.
+fn phone_shell_place(tab, screen) -> str = `k${str(tab)}/${str(screen ?? "")}`
+
+fn phone_shell_body(t, count) = [
+    <span.ui-phone-shell-icon aria-hidden="true">
+        {starts_with(str(t.icon), "M") && len(str(t.icon)) > 2
+            ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d={t.icon}/></svg>
+            : t.icon}
+        {count != null && <span class={ui_cls(["ui-phone-shell-badge", count == "" && "ui-phone-shell-dot"])}>{count}</span>}
+    </span>,
+    <span.ui-phone-shell-text>{t.label}<span.ui-sr>{phone_shell_words(get(t, "badge"))}</span></span>,
+]
+
+component PhoneShell(title: str = "", subtitle: str? = null, tabs: list = [], tab = null, screen: str? = null, back: bool = false, back_label: str = "Back",
+                     actions = null, label: str = "Main", id: str? = null, class: str? = null, on_tab = null, on_again = null, on_back = null, children) {
+    style global phone_shell_css
+    state cur = tab ?? phone_shell_first(tabs)
+    state last_tab = tab
+    state scroller = null
+    state win = null
+    state typing = false
+    state scrolled = false
+    state tall = 0
+    state wide = 0
+    state field = null
+    state tops = {}
+    state at_place = phone_shell_place(tab ?? phone_shell_first(tabs), screen)
+    state hold = null
+    state count = 0
+    state host = null
+    if tab != last_tab {
+        last_tab = tab
+        if tab != null { cur = tab }
+    }
+    let place = phone_shell_place(cur, screen)
+    if place != at_place {
+        at_place = place
+        hold = get(tops, place, 0)
+        count = 0
+    }
+    // Set until it holds, as the new content is drawn after this.
+    if hold != null {
+        every(16, () => {
+            if scroller != null {
+                scroller.scrollTop = hold
+                count += 1
+                if count > 30 || (count >= 3 && abs(scroller.scrollTop - hold) <= 1) { hold = null }
+            }
+        })
+    }
+    let reveal = () => {
+        if field != null && scroller != null && scroller.contains(field) {
+            // A wait lets the bar go first, which changes the room.
+            js("Promise.resolve")
+            if field != null {
+                let box = scroller.getBoundingClientRect()
+                let r = field.getBoundingClientRect()
+                let by = keyboard_avoider_shift(r.top, r.bottom, box.top + 12, box.bottom - 12)
+                if by != 0 { scroller.scrollTop = scroller.scrollTop + by }
+            }
+        }
+    }
+    let read = () => {
+        let vp = win.visualViewport
+        if win.innerWidth != wide {
+            wide = win.innerWidth
+            tall = 0
+        }
+        tall = max([tall, win.innerHeight])
+        // A pinch is left alone: the whole screen is being looked at closer.
+        if vp.scale <= 1.01 {
+            let height = keyboard_avoider_height(tall, vp.height, vp.scale)
+            let lift = keyboard_avoider_lift(win.innerHeight, vp.height, vp.offsetTop, vp.scale)
+            let moved = lift > 0 || vp.offsetTop > 0
+            host.style.bottom = moved ? "auto" : ""
+            host.style.height = moved ? `${vp.height}px` : ""
+            host.style.transform = vp.offsetTop > 0 ? `translateY(${vp.offsetTop}px)` : ""
+            typing = height > 0
+            if height > 0 { reveal() }
+        }
+    }
+    let press = (t) => {
+        if t.id == cur {
+            let still = win.matchMedia("(prefers-reduced-motion: reduce)").matches
+            scroller.scrollTo({ top: 0, behavior: still ? "auto" : "smooth" })
+            on_again && on_again(t.id)
+        } else {
+            cur = t.id
+            on_tab && on_tab(t.id)
+        }
+    }
+    <div class={ui_cls(["ui-phone-shell", typing && "ui-phone-shell-typing", len(tabs) > 0 && "ui-phone-shell-railed", class])} id={id}
+         @mount={(el) => {
+             let w = js("window")
+             let doc = w.document
+             let vp = w.visualViewport
+             win = w
+             host = el
+             scroller = el.querySelector(".ui-phone-shell-scroll")
+             wide = w.innerWidth
+             tall = w.innerHeight
+             // Only over the whole window: in a frame the page behind must go on scrolling.
+             let r = el.getBoundingClientRect()
+             let whole = abs(r.width - w.innerWidth) <= 1 && abs(r.height - w.innerHeight) <= 1
+             if whole { doc.documentElement.classList.add("ui-phone-shell-locked") }
+             if vp != null {
+                 vp.addEventListener("resize", read)
+                 vp.addEventListener("scroll", read)
+             }
+             () => {
+                 if vp != null {
+                     vp.removeEventListener("resize", read)
+                     vp.removeEventListener("scroll", read)
+                 }
+                 if whole { doc.documentElement.classList.remove("ui-phone-shell-locked") }
+             }
+         }}
+         @focusin={(e) => {
+             if keyboard_avoider_field(e.target) {
+                 field = e.target
+                 if typing { reveal() }
+             }
+         }}
+         @focusout={() => { field = null }}>
+        <div.ui-phone-shell-frame>
+            <header class={ui_cls(["ui-phone-shell-head", scrolled && "ui-phone-shell-scrolled"])}>
+                {back && <button.ui-phone-shell-back type="button" aria-label={back_label} @click={() => { on_back && on_back() }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+                </button>}
+                <div.ui-phone-shell-words>
+                    <h1>{title}</h1>
+                    {subtitle != null && <p>{subtitle}</p>}
+                </div>
+                <div.ui-phone-shell-actions>{actions}</div>
+            </header>
+            <main.ui-phone-shell-scroll tabindex="-1"
+                  @pointerdown={() => { hold = null }}
+                  @scroll={(e) => {
+                      let top = e.scrollTop
+                      if hold == null { tops = set(tops, at_place, top) }
+                      let on = top > 2
+                      if on != scrolled { scrolled = on }
+                  }}>
+                {children}
+            </main>
+            {len(tabs) > 0 && <nav.ui-phone-shell-tabs aria-label={label}>
+                {for t in tabs => get(t, "href") != null
+                    ? <a.ui-phone-shell-tab key={t.id} href={t.href} aria-current={t.id == cur ? "page" : null}>{phone_shell_body(t, phone_shell_badge(get(t, "badge")))}</a>
+                    : <button.ui-phone-shell-tab key={t.id} type="button" aria-current={t.id == cur ? "page" : null} @click={() => { press(t) }}>{phone_shell_body(t, phone_shell_badge(get(t, "badge")))}</button>}
+            </nav>}
+        </div>
+    </div>
+}

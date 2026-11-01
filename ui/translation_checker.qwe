@@ -1,0 +1,299 @@
+// TranslationChecker: source strings and their translations side by side, checked the way
+// a reviewer would. It finds strings that are missing, unchanged or too long, placeholders
+// that do not match ({name}, %s, %1$d, {{x}}, ${x}), HTML tags that do not match or do
+// not close, and spaces that differ at the ends or inside, and gives each language's
+// completeness. Nested keys are read as dotted ones; keys only a translation has are
+// listed. Filters show one kind of problem. Bad JSON is reported, by box and in words.
+//
+//   <TranslationChecker source={en} translations={{ fr: fr, de: de }} source_locale="en"/>
+//   <TranslationChecker source={en} translations={all} keep={["Quillo", "OK"]} on_change={(r) => { ready = r.locales }}/>
+//
+// source: the strings, a map, nested or not. translations: a map from each locale to its
+// strings. A plain map of strings is one translation. Both start in boxes as JSON, so
+// they can be pasted over; source_name ("source") and translations_name ("translations")
+// are the boxes' names, so a plain <form> sends them. source_locale: what the source
+// column is called ("en"). keep: words that stay the same in every language: a string
+// that is one of them is not "unchanged". stretch: how many times the source's length
+// a translation may be (1.5), and slack: how many characters any string may grow by
+// whatever its length (10), as short labels grow the most. id: a prefix for its ids
+// ("translation-checker"), unique on the page. rows: the boxes' height in lines (6).
+// limit: the most strings read (5000); past it, it reads the first and says so. show: the
+// most rows in the table (300), the rest counted. on_change(result): inside one of your
+// components, given the map below as it changes. class: more classes for its outer element.
+//
+// translation_checker_of(source, translations, keep, stretch, slack, limit) is the check,
+// for a program's own use: { total, capped, locales }, each locale being { locale, total,
+// translated, percent, problems, counts, extra, rows }, rows { key, source, target,
+// issues } and an issue { kind, message }. percent is to one decimal, translated strings
+// over all of them, 100 only when none is missing. The kinds are "missing", "unchanged",
+// "overlong", "placeholder", "html" and "space". translation_checker_placeholders(text),
+// translation_checker_tags(text) and translation_checker_flatten(value) are its parts.
+
+import ui/theme.qwe use ui_cls
+import ui/readability_meter.qwe use readability_meter_one
+
+let translation_checker_css = css`
+.ui-translation-checker { display: grid; gap: 14px; min-width: 0; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-translation-checker-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px 14px; min-width: 0; }
+.ui-translation-checker-field { display: grid; align-content: start; gap: 4px; min-width: 0; }
+.ui-translation-checker-field label, .ui-translation-checker-filter label { font-size: 13px; font-weight: 500; }
+.ui-translation-checker-field textarea { box-sizing: border-box; display: block; width: 100%; min-width: 0; padding: 8px 10px; resize: vertical; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 13px/1.5 var(--ui-mono); }
+.ui-translation-checker-field textarea:hover { border-color: var(--ui-strong); }
+.ui-translation-checker-field textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-translation-checker-said { margin: 0; font-weight: 600; }
+.ui-translation-checker-note { margin: 0; color: var(--ui-muted); font-size: 13px; overflow-wrap: anywhere; }
+.ui-translation-checker-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+.ui-translation-checker-locales { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; min-width: 0; }
+.ui-translation-checker-locale { display: grid; gap: 4px; padding: 8px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: inherit; text-align: left; cursor: pointer; }
+.ui-translation-checker-locale:hover { border-color: var(--ui-strong); }
+.ui-translation-checker-locale:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-translation-checker-locale[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); }
+.ui-translation-checker-locale b { font-weight: 600; }
+.ui-translation-checker-locale small { color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-translation-checker-bar { height: 6px; overflow: hidden; border-radius: 3px; background: var(--ui-border); }
+.ui-translation-checker-bar span { display: block; height: 100%; border-radius: 3px; background: var(--ui-success); }
+.ui-translation-checker-filter { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.ui-translation-checker-filter select { box-sizing: border-box; height: 32px; padding: 0 6px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 13px var(--ui-font); }
+.ui-translation-checker-filter select:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-translation-checker-scroll { min-width: 0; max-height: 520px; overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); }
+.ui-translation-checker-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-translation-checker-table { width: 100%; min-width: 620px; border-collapse: collapse; }
+.ui-translation-checker-table th { position: sticky; top: 0; padding: 6px 10px; border-bottom: 1px solid var(--ui-strong); background: var(--ui-subtle); color: var(--ui-muted); font-size: 12px; font-weight: 500; text-align: left; }
+.ui-translation-checker-table td { padding: 6px 10px; border-bottom: 1px solid var(--ui-border); vertical-align: top; overflow-wrap: anywhere; white-space: pre-wrap; }
+.ui-translation-checker-key { font: 12px/1.5 var(--ui-mono); color: var(--ui-muted); }
+.ui-translation-checker-none { color: var(--ui-muted); font-style: italic; }
+.ui-translation-checker-issues { display: grid; gap: 3px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-translation-checker-issue-missing { color: var(--ui-danger); }
+.ui-translation-checker-issue-placeholder, .ui-translation-checker-issue-html { color: var(--ui-danger); }
+.ui-translation-checker-issue-unchanged, .ui-translation-checker-issue-overlong, .ui-translation-checker-issue-space { color: var(--ui-warning); }
+.ui-translation-checker-fine { color: var(--ui-success); font-size: 13px; }
+`
+
+let translation_checker_kinds = [["missing", "Missing"], ["unchanged", "Unchanged"], ["overlong", "Too long"], ["placeholder", "Placeholders"], ["html", "HTML tags"], ["space", "Spaces"]]
+
+// Nested strings as [key, text] pairs with dotted keys, in order. Pairs and not a map:
+// keys are data here, and "constructor" is one a program may well have. A number or a
+// yes/no is its text; null counts as no text.
+fn translation_checker_flatten(value, prefix: str = "", depth: int = 0) -> list {
+    let kind = type_of(value)
+    if depth > 40 { return [] }
+    if kind == "map" {
+        return flatten(keys(value) | map((k) => translation_checker_flatten(get(value, k, null), prefix == "" ? k : `${prefix}.${k}`, depth + 1)))
+    }
+    if kind == "list" {
+        return flatten(enumerate(value) | map((p) => translation_checker_flatten(p[1], prefix == "" ? str(p[0]) : `${prefix}.${p[0]}`, depth + 1)))
+    }
+    if prefix == "" { return [] }
+    [[prefix, kind == "null" ? "" : kind == "str" ? value : str(value)]]
+}
+
+// Each placeholder of a text, as it is written, with spaces in {{ x }} closed up. "%%" is
+// a percent sign and "{" alone is text; ICU's {n, plural, ...} counts as {n}.
+fn translation_checker_placeholders(text: str) -> list {
+    let found = re.find_all(text, "%%|\\{\\{\\s{0,9}[\\w.-]{1,100}\\s{0,9}\\}\\}|\\{[\\w.-]{1,100}(?:,[^{}]{0,200}(?:\\{[^{}]{0,200}\\}[^{}]{0,200}){0,20})?\\}|\\$\\{\\w{1,100}\\}|%\\([\\w.-]{1,100}\\)[sdif]|%(?:[0-9]{1,3}\\$)?[-+0#]{0,4}[0-9]{0,4}(?:\\.[0-9]{1,4})?[sdifgxXcu@]")
+    found | filter((m) => m.text != "%%") | map((m) => re.replace(re.replace(m.text, "\\s", ""), "^\\{([\\w.-]+),.*\\}$", "{$1}"))
+}
+
+// A text's tags: { name, kind }, kind "open", "close" or "self". br, img and the like are "self".
+fn translation_checker_tags(text: str) -> list {
+    let lone = ["br", "hr", "img", "input", "meta", "link", "wbr"]
+    re.find_all(text, "<(/?)([a-zA-Z][a-zA-Z0-9-]{0,40})(?:\\s[^<>]{0,500})?(/?)>") | map((m) => {
+        let name = lower(m.groups[1])
+        { name, kind: m.groups[0] == "/" ? "close" : (m.groups[2] == "/" || contains(lone, name)) ? "self" : "open" }
+    })
+}
+
+// The first tag left open or closed out of turn, in words; null when they nest.
+fn translation_checker_unbalanced(tags: list) {
+    let open = []
+    for t in tags {
+        if t.kind == "open" { open = push(open, t.name) }
+        if t.kind == "close" {
+            if len(open) == 0 || last(open) != t.name { return `</${t.name}> closes nothing open.` }
+            open = take(open, len(open) - 1)
+        }
+    }
+    len(open) > 0 ? `<${last(open)}> is never closed.` : null
+}
+
+// What one list has more of than another, as a list.
+fn translation_checker_over(a: list, b: list) -> list {
+    let extra = reduce(b, a, (left, x) => {
+        let at = index_of(left, x)
+        at == null ? left : take(left, at) + drop(left, at + 1)
+    })
+    unique(extra)
+}
+
+// A placeholder that counts by place, not by name: %s and %d, whose order means something.
+fn translation_checker_by_place(p: str) -> bool = re.test(p, "^%[-+0#0-9.]*[a-zA-Z@]$")
+
+fn translation_checker_placeholder_issues(src: str, dst: str) -> list {
+    let a = translation_checker_placeholders(src)
+    let b = translation_checker_placeholders(dst)
+    let lost = translation_checker_over(a, b)
+    let added = translation_checker_over(b, a)
+    let issue = (message: str) => { kind: "placeholder", message }
+    let moved = len(lost) == 0 && len(added) == 0 && (a | filter(translation_checker_by_place)) != (b | filter(translation_checker_by_place))
+    [...(len(lost) > 0 ? [issue(`Placeholder missing: ${join(lost, ", ")}.`)] : []), ...(len(added) > 0 ? [issue(`Placeholder not in the source: ${join(added, ", ")}.`)] : []),
+     ...(moved ? [issue("Placeholders that count by place are in another order: number them, as %1$s.")] : [])]
+}
+
+fn translation_checker_html_issues(src: str, dst: str) -> list {
+    let names = (tags: list) => tags | map((t) => t.kind == "close" ? `</${t.name}>` : `<${t.name}>`)
+    let a = translation_checker_tags(src)
+    let b = translation_checker_tags(dst)
+    let lost = translation_checker_over(names(a), names(b))
+    let added = translation_checker_over(names(b), names(a))
+    let broken = len(lost) == 0 && len(added) == 0 ? translation_checker_unbalanced(b) : null
+    let issue = (message: str) => { kind: "html", message }
+    [...(len(lost) > 0 ? [issue(`Tag missing: ${join(lost, ", ")}.`)] : []), ...(len(added) > 0 ? [issue(`Tag not in the source: ${join(added, ", ")}.`)] : []), ...(broken != null ? [issue(broken)] : [])]
+}
+
+fn translation_checker_space_issues(src: str, dst: str) -> list {
+    let issue = (message: str) => { kind: "space", message }
+    let lead = (s: str) => re.test(s, "^\\s")
+    let tail = (s: str) => re.test(s, "\\s$")
+    let breaks = (s: str) => len(split(s, "\n")) - 1
+    [...(lead(src) != lead(dst) ? [issue(lead(src) ? "The space at the start is gone." : "A space was added at the start.")] : []),
+     ...(tail(src) != tail(dst) ? [issue(tail(src) ? "The space at the end is gone." : "A space was added at the end.")] : []),
+     ...(contains(dst, "  ") && !contains(src, "  ") ? [issue("Two spaces in a row.")] : []),
+     ...(breaks(src) != breaks(dst) ? [issue(`${breaks(dst)} line breaks where the source has ${breaks(src)}.`)] : [])]
+}
+
+// Everything wrong with one translation of one string.
+fn translation_checker_issues(src: str, dst: str?, keep: list, stretch, slack) -> list {
+    if trim(src) == "" { return [] }
+    if dst == null || trim(dst) == "" { return [{ kind: "missing", message: "No translation." }] }
+    let n = len(src)
+    let m = len(dst)
+    // Two letters together make it words, and \\w knows only ASCII: so, what is no mark or digit.
+    let same = dst == src && re.test(src, "[^\\s0-9.,:;!?…'\"()\\[\\]{}<>/\\\\|@#$%^&*+=~_-]{2}") && !contains(keep, trim(src))
+    let room = n * stretch + slack
+    let long = m > room
+    [...(same ? [{ kind: "unchanged", message: "The same as the source." }] : []),
+     ...(long ? [{ kind: "overlong", message: `${m} characters for ${n}: ${readability_meter_one(m / n)} times as long.` }] : []),
+     ...translation_checker_placeholder_issues(src, dst), ...translation_checker_html_issues(src, dst), ...translation_checker_space_issues(src, dst)]
+}
+
+// A share to one decimal, 100 kept for all.
+fn translation_checker_percent(n: int, total: int) {
+    if total == 0 || n == total { return 100 }
+    floor(n * 1000 / total) / 10
+}
+
+// One locale's results (see the top of the file).
+fn translation_checker_locale(locale: str, pairs: list, strings, keep: list, stretch, slack) {
+    let flat = translation_checker_flatten(strings)
+    let found = group_by(flat, (p) => p[0])
+    let known = group_by(pairs, (p) => p[0])
+    let rows = pairs | map((p) => {
+        let hit = get(found, p[0], null)
+        let target = hit == null ? null : hit[0][1]
+        { key: p[0], source: p[1], target, issues: translation_checker_issues(p[1], target, keep, stretch, slack) }
+    })
+    let extra = flat | map((p) => p[0]) | filter((k) => !has(known, k))
+    let wanted = rows | filter((r) => trim(r.source) != "")
+    let lacking = count(wanted, (r) => any(r.issues, (i) => i.kind == "missing"))
+    let all_issues = flatten(rows | map((r) => r.issues))
+    let total = len(wanted)
+    { locale, total, translated: total - lacking, percent: translation_checker_percent(total - lacking, total), problems: count(rows, (r) => len(r.issues) > 0),
+      counts: translation_checker_kinds | map((k) => { kind: k[0], label: k[1], n: count(all_issues, (i) => i.kind == k[0]) }), extra, rows }
+}
+
+// The check (see the top of the file).
+fn translation_checker_of(source, translations, keep: list = [], stretch = 1.5, slack = 10, limit: int = 5000) {
+    let flat = translation_checker_flatten(source)
+    let capped = len(flat) > limit
+    let pairs = capped ? take(flat, limit) : flat
+    let vals = values(translations ?? {})
+    // A map of strings is one translation, not a map of locales.
+    let by_locale = len(vals) > 0 && all(vals, (v) => type_of(v) == "map") ? translations : { translation: translations ?? {} }
+    { total: len(pairs), capped, locales: keys(by_locale) | map((l) => translation_checker_locale(l, pairs, get(by_locale, l, {}), keep, stretch, slack)) }
+}
+
+// A box's JSON: { value, error }, the error in words.
+fn translation_checker_read(text: str, what: str) {
+    if trim(text) == "" { return { value: {}, error: null } }
+    let v = json.parse(text)
+    if is_err(v) { return { value: null, error: `The ${what} box is not valid JSON.` } }
+    if type_of(v) != "map" { return { value: null, error: `The ${what} box must hold a map of keys and strings, not a ${type_of(v) == "list" ? "list" : "single value"}.` } }
+    { value: v, error: null }
+}
+
+component TranslationChecker(source = null, translations = null, source_locale: str = "en", keep: list = [], stretch = 1.5, slack = 10, source_name: str = "source", translations_name: str = "translations",
+                             id: str = "translation-checker", rows: int = 6, limit: int = 5000, show: int = 300, on_change = null, class: str? = null) {
+    style global translation_checker_css
+    state src_text = source == null ? "" : json.stringify(source, true)
+    state dst_text = translations == null ? "" : json.stringify(translations, true)
+    state chosen = ""
+    state filter_by = "problems"
+    let read_src = translation_checker_read(src_text, "source")
+    let read_dst = translation_checker_read(dst_text, "translations")
+    let bad = filled(read_src.error ?? "") ?? filled(read_dst.error ?? "")
+    let r = bad != null ? { total: 0, capped: false, locales: [] } : translation_checker_of(read_src.value, read_dst.value, keep, stretch, slack, limit)
+    let names = r.locales | map((l) => l.locale)
+    let on = contains(names, chosen) ? first(r.locales | filter((l) => l.locale == chosen)) : first(r.locales)
+    let shown_rows = on == null ? [] : on.rows | filter((x) => filter_by == "all" || (filter_by == "problems" ? len(x.issues) > 0 : any(x.issues, (i) => i.kind == filter_by)))
+    let blank = trim(src_text) == "" && trim(dst_text) == ""
+    let said = blank ? "Paste the source strings and their translations as JSON."
+        : bad != null ? bad
+        : r.total == 0 ? "The source has no strings."
+        : on == null ? "There are no translations."
+        : `${on.locale}: ${readability_meter_one(on.percent)}% translated, ${on.problems} ${on.problems == 1 ? "string" : "strings"} with problems.`
+    let tell = (at_src: str, at_dst: str) => {
+        if on_change != null {
+            let a = translation_checker_read(at_src, "source")
+            let b = translation_checker_read(at_dst, "translations")
+            if a.error == null && b.error == null { on_change(translation_checker_of(a.value, b.value, keep, stretch, slack, limit)) }
+        }
+    }
+    <section class={ui_cls(["ui-translation-checker", class])} aria-labelledby={`${id}-said`}>
+        <div.ui-translation-checker-fields>
+            <div.ui-translation-checker-field>
+                <label for={`${id}-source`}>Source strings</label>
+                <textarea id={`${id}-source`} name={source_name} rows={rows} value={src_text} spellcheck="false" aria-invalid={read_src.error != null ? "true" : null} @input={(e) => { src_text = e.value; tell(e.value, dst_text) }}></textarea>
+            </div>
+            <div.ui-translation-checker-field>
+                <label for={`${id}-translations`}>Translations</label>
+                <textarea id={`${id}-translations`} name={translations_name} rows={rows} value={dst_text} spellcheck="false" aria-invalid={read_dst.error != null ? "true" : null} @input={(e) => { dst_text = e.value; tell(src_text, e.value) }}></textarea>
+            </div>
+        </div>
+        <p class={bad != null ? "ui-translation-checker-error" : "ui-translation-checker-said"} id={`${id}-said`} aria-live="polite" role={bad != null ? "alert" : null}>{said}</p>
+        {r.capped && <p.ui-translation-checker-note>Only the first {format_number(limit, "en-US", 0)} strings were read.</p>}
+        {len(r.locales) > 0 && r.total > 0 && <div.ui-translation-checker-locales>
+            {for l in r.locales => <button.ui-translation-checker-locale key={l.locale} type="button" aria-pressed={on != null && on.locale == l.locale ? "true" : "false"} @click={() => { chosen = l.locale }}>
+                <b>{l.locale}</b>
+                <div.ui-translation-checker-bar aria-hidden="true"><span style={`width: ${l.percent}%`}></span></div>
+                <small>{readability_meter_one(l.percent)}%, {l.translated} of {l.total}</small>
+            </button>}
+        </div>}
+        {on != null && r.total > 0 && <div.ui-translation-checker-filter>
+            <label for={`${id}-filter`}>Show</label>
+            <select id={`${id}-filter`} @change={(e) => { filter_by = e.value }}>
+                <option value="problems" selected={filter_by == "problems"}>Strings with problems ({on.problems})</option>
+                <option value="all" selected={filter_by == "all"}>All strings ({on.total})</option>
+                {for k in on.counts => <option key={k.kind} value={k.kind} selected={filter_by == k.kind}>{k.label} ({k.n})</option>}
+            </select>
+        </div>}
+        {on != null && len(on.extra) > 0 && <p.ui-translation-checker-note id={`${id}-extra`}>Only in {on.locale}, not in the source: {join(take(on.extra, 20), ", ")}{len(on.extra) > 20 ? ` and ${len(on.extra) - 20} more` : ""}.</p>}
+        {on != null && r.total > 0 && (len(shown_rows) == 0
+            ? <p.ui-translation-checker-note id={`${id}-empty`}>{filter_by == "problems" ? `No problems in ${on.locale}.` : "No strings to show."}</p>
+            : <div.ui-translation-checker-scroll tabindex="0" role="group" aria-label={`Strings in ${on.locale}`}>
+                <table.ui-translation-checker-table id={`${id}-table`}>
+                    <thead><tr><th scope="col">Key</th><th scope="col">{source_locale}</th><th scope="col">{on.locale}</th><th scope="col">Problems</th></tr></thead>
+                    <tbody>
+                        {for x in take(shown_rows, show) => <tr key={x.key}>
+                            <td.ui-translation-checker-key>{x.key}</td>
+                            <td dir="auto">{x.source}</td>
+                            <td dir="auto">{x.target == null ? <span.ui-translation-checker-none>none</span> : x.target}</td>
+                            <td>{len(x.issues) == 0 ? <span.ui-translation-checker-fine>Fine</span>
+                                : <ul.ui-translation-checker-issues>{for [i, s] in enumerate(x.issues) => <li key={i} class={`ui-translation-checker-issue-${s.kind}`}>{s.message}</li>}</ul>}</td>
+                        </tr>}
+                    </tbody>
+                </table>
+            </div>)}
+        {len(shown_rows) > show && <p.ui-translation-checker-note>And {len(shown_rows) - show} more.</p>}
+    </section>
+}

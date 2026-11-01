@@ -1,0 +1,242 @@
+// RecordMerger: merges two or more versions of one record, field by field. Fields
+// where every version agrees settle themselves; the rest are conflicts, marked, each
+// with a choice of value. One click takes the newest, the first non-empty or the
+// longest value for every conflict, and each can still be changed by hand. The merged
+// record is shown as it forms, and Merge hands it over once nothing is left open.
+//
+//   <RecordMerger id="contact" records={[crm_row, billing_row, signup_row]} date_key="updated"
+//                 label_key="source" on_merge={(record) => { save(record) }}/>
+//
+// id: a prefix for its ids, unique on the page. records: the versions, maps (anything
+// else is left out, and it says so; the first 20 count). fields: which keys, keys or
+// { key, label } (left out, every key the versions have, first seen first, without
+// date_key and label_key). date_key: the key of a version's date or date-time (ISO text; "updated"),
+// which says what is newest; a version without one counts as oldest, and among equals
+// the later in the list is the newer. label_key: the key that names a version, else
+// "Version 1", ... title: the heading ("Merge records"). name: a prefix for the hidden
+// fields (`<name>_<key>`, each merged value as text, so a plain <form> sends the
+// record; the key alone when left out). on_merge(record): inside one of your
+// components, given the merged record, its values as they came. class: more classes
+// for its outer element.
+//
+// Empty means null, blank text, or an empty list or map. A value is compared whole, so
+// "Ada" and "ada" conflict, and so do a value and an empty one. Merge stays shut while
+// a conflict is open, and an empty choice is a choice.
+//
+// record_merger_rows(versions, names), record_merger_order(versions),
+// record_merger_pick(strategy, values, order) and record_merger_merged(rows, picks)
+// are the logic, for a program.
+
+import ui/theme.qwe use ui_cls
+
+let record_merger_css = css`
+.ui-rmerge { display: grid; gap: 12px; min-width: 0; color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-rmerge .ui-rmerge-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-rmerge-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.ui-rmerge-bar span { color: var(--ui-muted); font-size: 13px; }
+.ui-rmerge-btn { height: 32px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface);
+  color: var(--ui-fg); font: 500 13px var(--ui-font); cursor: pointer; }
+.ui-rmerge-btn:hover:not(:disabled) { border-color: var(--ui-strong); background: var(--ui-subtle); }
+.ui-rmerge-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-rmerge-btn:disabled { opacity: .5; cursor: not-allowed; }
+.ui-rmerge-btn[aria-pressed="true"] { border-color: var(--ui-accent); background: var(--ui-accent-soft); color: var(--ui-accent); }
+.ui-rmerge-go { border-color: var(--ui-accent); background: var(--ui-accent); color: var(--ui-accent-fg); font-weight: 600; }
+.ui-rmerge-go:hover:not(:disabled) { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 88%, var(--ui-fg)); }
+.ui-rmerge-sum { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-rmerge-note { margin: 0; color: var(--ui-warning); font-size: 13px; }
+.ui-rmerge-empty { margin: 0; padding: 20px; border: 1px dashed var(--ui-strong); border-radius: var(--ui-radius-sm); color: var(--ui-muted); text-align: center; }
+.ui-rmerge-scroll { overflow: auto; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); }
+.ui-rmerge-scroll:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-rmerge table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-rmerge th, .ui-rmerge td { padding: 7px 10px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--ui-border); overflow-wrap: anywhere; }
+.ui-rmerge tbody tr:last-child th, .ui-rmerge tbody tr:last-child td { border-bottom: 0; }
+.ui-rmerge thead th { background: var(--ui-subtle); font-weight: 600; white-space: nowrap; }
+.ui-rmerge thead small { display: block; color: var(--ui-muted); font-weight: 400; }
+.ui-rmerge-conflict th { box-shadow: inset 3px 0 0 var(--ui-warning); }
+.ui-rmerge-open { background: var(--ui-warning-soft); }
+.ui-rmerge-flag { display: block; color: var(--ui-warning); font-size: 11px; font-weight: 600; }
+.ui-rmerge-same { color: var(--ui-muted); }
+.ui-rmerge-opt { display: flex; align-items: flex-start; gap: 6px; cursor: pointer; }
+.ui-rmerge-opt input { flex: none; margin: 2px 0 0; accent-color: var(--ui-accent); }
+.ui-rmerge-opt input:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-rmerge-blank { color: var(--ui-muted); font-style: italic; }
+.ui-rmerge-out { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); gap: 3px 14px; margin: 0; padding: 10px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); font-size: 13px; }
+.ui-rmerge-out dt { color: var(--ui-muted); }
+.ui-rmerge-out dd { margin: 0; overflow-wrap: anywhere; font-weight: 500; }
+.ui-rmerge-end { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.ui-rmerge-said { color: var(--ui-muted); font-size: 13px; }
+`
+
+let record_merger_strategies = [
+    { id: "newest", name: "Newest" },
+    { id: "non_empty", name: "Non-empty" },
+    { id: "longest", name: "Longest" },
+]
+
+fn record_merger_empty(v) -> bool {
+    let t = type_of(v)
+    t == "null" || (t == "str" && trim(v) == "") || ((t == "list" || t == "map") && len(v) == 0)
+}
+
+// A value as one line of text.
+fn record_merger_text(v) -> str = match type_of(v) {
+    "null" => ""
+    "str" => v
+    "int" | "float" | "dec" | "bool" => str(v)
+    _ => json.stringify(v)
+}
+
+// The moment text names, as milliseconds, or null: an ISO date or date-time, with T or
+// a space; with no offset it counts as UTC, as a database writes them.
+fn record_merger_stamp(v) {
+    if type_of(v) != "str" { return null }
+    let s = trim(v)
+    let m = re.find(s, "^(\\d{4}-\\d{2}-\\d{2})[T ](\\d{2}:\\d{2})(:\\d{2}(?:\\.\\d+)?)?(Z|[+-]\\d{2}:\\d{2})?$")
+    let d = date.parse(m != null ? `${m.groups[0]}T${m.groups[1]}${m.groups[2] ?? ":00"}${m.groups[3] ?? "Z"}` : s)
+    is_err(d) ? null : date.ms(d)
+}
+
+// The versions: { at (place among them), label, stamp, row }.
+fn record_merger_versions(records, date_key: str, label_key: str?) -> list {
+    let rows = take((type_of(records) == "list" ? records : []) | filter((r) => type_of(r) == "map"), 20)
+    for [i, r] in enumerate(rows) => {
+        let named = label_key != null ? get(r, label_key) : null
+        { at: i, label: named != null ? record_merger_text(named) : `Version ${i + 1}`, stamp: record_merger_stamp(get(r, date_key)), when: get(r, date_key), row: r }
+    }
+}
+
+// The fields to merge: { key, label }.
+fn record_merger_names(versions: list, fields: list?, date_key: str, label_key: str?) -> list {
+    if fields != null {
+        return fields | map((f) => type_of(f) == "map" ? { key: str(f.key), label: f.label ?? str(f.key) } : { key: str(f), label: str(f) })
+    }
+    let found = unique(flatten(versions | map((v) => keys(v.row))))
+    found | filter((k) => k != date_key && k != label_key) | map((k) => { key: k, label: k })
+}
+
+// The places of the versions, newest first: by date, then later in the list first.
+fn record_merger_order(versions: list) -> list {
+    let dated = versions | filter((v) => v.stamp != null)
+    let plain = versions | filter((v) => v.stamp == null)
+    let newest = reverse(sort_by(dated, (v) => v.stamp)) | map((v) => v.at)
+    newest + (reverse(plain) | map((v) => v.at))
+}
+
+// Each field: { key, label, vals (one for each version), settled }. Empties count as
+// the same empty, so null and "" do not make a conflict.
+fn record_merger_rows(versions: list, names: list) -> list =
+    names | map((n) => {
+        let vals = versions | map((v) => get(v.row, n.key))
+        let plain = vals | map((v) => record_merger_empty(v) ? null : v)
+        { key: n.key, label: n.label, vals, settled: len(unique(plain)) == 1 }
+    })
+
+// Which version a strategy takes for a conflict.
+fn record_merger_pick(strategy: str, vals: list, order: list) -> int {
+    match strategy {
+        "non_empty" => find(order, (i) => !record_merger_empty(vals[i])) ?? order[0]
+        "longest" => reduce(order, order[0], (best, i) => len(record_merger_text(vals[i])) > len(record_merger_text(vals[best])) ? i : best)
+        _ => order[0]
+    }
+}
+
+// A strategy over every conflict: { key: version }.
+fn record_merger_apply(strategy: str, rows: list, order: list) -> map =
+    reduce(rows | filter((r) => !r.settled), {}, (m, r) => set(m, r.key, record_merger_pick(strategy, r.vals, order)))
+
+// The merged record and what is open: { record, open (keys with no choice) }. A settled
+// field takes its first filled value.
+fn record_merger_merged(rows: list, picks: map) -> map {
+    let open = rows | filter((r) => !r.settled && !has(picks, r.key)) | map((r) => r.key)
+    let record = reduce(rows | filter((r) => !contains(open, r.key)), {}, (m, r) => {
+        let v = r.settled ? (find(r.vals, (x) => !record_merger_empty(x)) ?? r.vals[0]) : r.vals[get(picks, r.key)]
+        set(m, r.key, v)
+    })
+    { record, open }
+}
+
+component RecordMerger(id: str, records = [], fields: list? = null, date_key: str = "updated", label_key: str? = null,
+                       title: str = "Merge records", name: str? = null, on_merge = null, class: str? = null) {
+    style global record_merger_css
+    state picks = {}
+    state used = ""
+    state said = ""
+    let versions = record_merger_versions(records, date_key, label_key)
+    let names = record_merger_names(versions, fields, date_key, label_key)
+    let rows = record_merger_rows(versions, names)
+    let order = record_merger_order(versions)
+    let merged = record_merger_merged(rows, picks)
+    let conflicts = rows | filter((r) => !r.settled)
+    let open_n = len(merged.open)
+    let bad_n = type_of(records) == "list" ? len(records | filter((r) => type_of(r) != "map")) : 0
+    let extra = type_of(records) == "list" ? max([0, len(records) - bad_n - 20]) : 0
+    let dated = any(versions, (v) => v.stamp != null)
+    let enough = len(versions) >= 2
+    let show = (v) => record_merger_empty(v) ? <span.ui-rmerge-blank>empty</span> : record_merger_text(v)
+    let form_key = (k: str) => name != null ? `${name}_${k}` : k
+    let strategy = (s: str) => {
+        picks = record_merger_apply(s, rows, order)
+        used = s
+        said = ""
+    }
+    let run = () => {
+        if open_n == 0 && enough {
+            on_merge && on_merge(merged.record)
+            said = `Merged ${len(versions)} versions into one record.`
+        }
+    }
+    <section class={ui_cls(["ui-rmerge", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-rmerge-title id={`${id}-title`}>{title}</h3>
+        {bad_n > 0 && <p.ui-rmerge-note>{`${bad_n} item${bad_n == 1 ? " is" : "s are"} not a record, and left out.`}</p>}
+        {extra > 0 && <p.ui-rmerge-note>{`Only the first 20 versions are compared; ${extra} more left out.`}</p>}
+        {!enough && <p.ui-rmerge-empty role="status">{len(versions) == 1 ? "Only one version: there is nothing to merge." : "No versions to merge."}</p>}
+        {enough && <div.ui-rmerge-bar role="group" aria-label="Choose for every conflict">
+            <span>Take for every conflict:</span>
+            {for s in record_merger_strategies => <button.ui-rmerge-btn key={s.id} type="button" data-strategy={s.id} aria-pressed={used == s.id ? "true" : "false"}
+                    disabled={len(conflicts) == 0} @click={() => { strategy(s.id) }}>{s.name}</button>}
+            <button.ui-rmerge-btn type="button" disabled={len(picks) == 0} @click={() => { picks = {}; used = ""; said = "" }}>Clear</button>
+        </div>}
+        {enough && !dated && len(conflicts) > 0 && <p.ui-rmerge-sum>{`No version has a date in ${date_key}, so the last in the list counts as the newest.`}</p>}
+        {enough && <p.ui-rmerge-sum aria-live="polite">
+            {`${len(rows) - len(conflicts)} field${len(rows) - len(conflicts) == 1 ? "" : "s"} settled, ${len(conflicts)} conflict${len(conflicts) == 1 ? "" : "s"}, ${open_n} open`}
+        </p>}
+        {enough && <div.ui-rmerge-scroll tabindex="0" role="region" aria-label="Fields of each version">
+            <table>
+                <thead>
+                    <tr>
+                        <th scope="col">Field</th>
+                        {for v in versions => <th key={v.at} scope="col">{v.label}{v.when != null && <small>{record_merger_text(v.when)}</small>}</th>}
+                    </tr>
+                </thead>
+                <tbody>
+                    {for r in rows => {
+                        let open = !r.settled && !has(picks, r.key)
+                        <tr key={r.key} data-key={r.key} class={ui_cls([!r.settled && "ui-rmerge-conflict", open && "ui-rmerge-open"])}>
+                            <th scope="row">{r.label}{!r.settled && <span.ui-rmerge-flag>{open ? "Conflict: choose one" : "Conflict"}</span>}</th>
+                            {r.settled
+                                ? <td.ui-rmerge-same colspan={str(len(versions))}>{show(find(r.vals, (x) => !record_merger_empty(x)) ?? null)}</td>
+                                : (for [i, x] in enumerate(r.vals) => <td key={i}>
+                                      <label.ui-rmerge-opt>
+                                          <input type="radio" name={`${id}-pick-${r.key}`} value={str(i)} checked={get(picks, r.key) == i}
+                                                 @change={() => { picks = set(picks, r.key, i); used = ""; said = "" }}/>
+                                          <span>{show(x)}</span>
+                                      </label>
+                                  </td>)}
+                        </tr>
+                    }}
+                </tbody>
+            </table>
+        </div>}
+        {enough && <dl.ui-rmerge-out aria-label="Merged record" aria-live="polite">
+            {for r in rows => {
+                let there = has(merged.record, r.key)
+                [<dt key={`k-${r.key}`}>{r.label}</dt>, <dd key={`v-${r.key}`} data-key={r.key}>{there ? show(get(merged.record, r.key)) : <span.ui-rmerge-blank>not chosen</span>}</dd>]
+            }}
+        </dl>}
+        {enough && <div.ui-rmerge-end>
+            <button.ui-rmerge-btn.ui-rmerge-go type="button" disabled={open_n > 0} @click={run}>Merge</button>
+            <span.ui-rmerge-said role="status">{open_n > 0 ? `Choose a value for ${open_n} more field${open_n == 1 ? "" : "s"}.` : said}</span>
+        </div>}
+        {for r in rows => <input key={r.key} type="hidden" name={form_key(r.key)} value={record_merger_text(get(merged.record, r.key))}/>}
+    </section>
+}

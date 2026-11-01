@@ -1,0 +1,355 @@
+// SeoAudit: a post checked against what search engines look for, as it is typed. Give it
+// the title, description, slug and body (HTML or Markdown, worked out from the text) and
+// a focus keyword: it reads the headings, images and links out of the body and gives a
+// score out of 100, each failed check with what is wrong and how to fix it, and the
+// counts it found. A keyword is matched by whole words, in any case; without one its
+// checks are left out of the score, not failed. Headings and images inside comments,
+// scripts and code blocks do not count.
+//
+//   <SeoAudit title={post.title} description={post.summary} slug={post.slug} body={post.html} keyword="cold brew"
+//             base_url="https://blog.example.com/"/>
+//   <SeoAudit on_change={(r) => { score = r.score }}/>
+//
+// title, description, slug, body, keyword: what the fields start with. They are real
+// fields named those, so a plain <form> sends them; name: a prefix for the names ("post"
+// names them post_title, ...). base_url: the site's address, so that a link to it
+// counts as internal; left out, only relative links do. format: "auto" (the default),
+// "html" or "markdown". rows: the body's height in lines (8). id: a prefix for its ids
+// ("seo-audit"), unique on the page. limit: the most characters of the body read
+// (100000); past it, it reads the start and says so. on_change(result): inside one of
+// your components, given the map below as it is typed. class: more classes for its
+// outer element.
+//
+// seo_audit_of(fields, base_url, format, limit) is the audit, for a program's own use,
+// fields being a map of the five: { score, passed, failed, checks, doc, capped }, where
+// score is a whole number, passed and failed list { id, label, ok, points, detail,
+// fix } and doc is what was read: { format, headings, images, links, words, intro }.
+// seo_audit_read(body, format) gives the doc alone. The limits, in characters: title 30
+// to 60, description 70 to 160, slug 60; 300 words, and a keyword 0.5% to 3% of them.
+
+import ui/theme.qwe use ui_cls
+import ui/readability_meter.qwe use readability_meter_one, readability_meter_words
+
+let seo_audit_css = css`
+.ui-seo-audit { display: grid; gap: 14px; min-width: 0; max-width: 760px; font: 14px/1.5 var(--ui-font); color: var(--ui-fg); }
+.ui-seo-audit-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 14px; min-width: 0; }
+.ui-seo-audit-field { display: grid; align-content: start; gap: 4px; min-width: 0; }
+.ui-seo-audit-wide { grid-column: 1 / -1; }
+.ui-seo-audit-field label { font-size: 13px; font-weight: 500; }
+.ui-seo-audit-field input, .ui-seo-audit-field textarea { box-sizing: border-box; display: block; width: 100%; min-width: 0; padding: 8px 10px; border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); resize: vertical; }
+.ui-seo-audit-field textarea { font: 13px/1.5 var(--ui-mono); }
+.ui-seo-audit-field input:hover, .ui-seo-audit-field textarea:hover { border-color: var(--ui-strong); }
+.ui-seo-audit-field input:focus, .ui-seo-audit-field textarea:focus { outline: none; border-color: var(--ui-accent); box-shadow: var(--ui-focus); }
+.ui-seo-audit-count { color: var(--ui-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ui-seo-audit-result { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; padding: 12px 14px; border-radius: var(--ui-radius-sm); background: var(--ui-subtle); --k: var(--ui-muted); }
+.ui-seo-audit-good { --k: var(--ui-success); }
+.ui-seo-audit-fair { --k: var(--ui-warning); }
+.ui-seo-audit-poor { --k: var(--ui-danger); }
+.ui-seo-audit-score { font-size: 30px; font-weight: 700; line-height: 1.1; color: var(--k); font-variant-numeric: tabular-nums; }
+.ui-seo-audit-said { flex: 1 1 200px; margin: 0; font-weight: 600; }
+.ui-seo-audit-note { margin: 0; color: var(--ui-muted); font-size: 13px; }
+.ui-seo-audit-counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 10px; margin: 0; }
+.ui-seo-audit-counts dt { color: var(--ui-muted); font-size: 12px; }
+.ui-seo-audit-counts dd { margin: 0; font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ui-seo-audit-checks { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ui-seo-audit-checks li { display: grid; gap: 1px; padding: 8px 10px; border-left: 3px solid var(--ui-danger); border-radius: var(--ui-radius-sm); background: var(--ui-surface); overflow-wrap: anywhere; }
+.ui-seo-audit-passed .ui-seo-audit-checks li { border-left-color: var(--ui-success); }
+.ui-seo-audit-checks b { font-weight: 600; }
+.ui-seo-audit-checks small { color: var(--ui-muted); font-size: 13px; }
+.ui-seo-audit-passed summary { cursor: pointer; font-weight: 600; }
+.ui-seo-audit-passed summary:focus-visible { outline: none; box-shadow: var(--ui-focus); border-radius: var(--ui-radius-sm); }
+.ui-seo-audit-passed[open] summary { margin-bottom: 6px; }
+`
+
+// An attribute's value out of a tag's attributes, null when it has none.
+fn seo_audit_attr(attrs: str, name: str) {
+    let m = re.find(attrs, `(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, "i")
+    if m == null { return null }
+    m.groups[0] ?? m.groups[1] ?? m.groups[2] ?? ""
+}
+
+// Text out of markup: tags gone, the usual entities back, spaces closed up.
+fn seo_audit_plain(html: str) -> str {
+    let t = re.replace(html, "<[^<>]*>", " ")
+    let named = [["&nbsp;", " "], ["&lt;", "<"], ["&gt;", ">"], ["&quot;", "\""], ["&#39;", "'"], ["&apos;", "'"], ["&amp;", "&"]]
+    trim(re.replace(reduce(named, t, (s, e) => replace(s, e[0], e[1])), "\\s+", " "))
+}
+
+// Images and links written as tags, in HTML or inside Markdown. Quoted values may hold
+// a `>`; the counts keep a body of open quotes from taking the browser's patterns minutes.
+fn seo_audit_tags(html: str) {
+    let quoted = "((?:[^<>\"']|\"[^\"]{0,1000}\"|'[^']{0,1000}')*)"
+    { images: re.find_all(html, `<img\\b${quoted}>`, "i") | map((m) => { src: seo_audit_attr(m.groups[0], "src") ?? "", alt: seo_audit_attr(m.groups[0], "alt") }),
+      links: re.find_all(html, `<a\\b${quoted}>`, "i") | map((m) => seo_audit_attr(m.groups[0], "href")) | filter((h) => h != null) }
+}
+
+// HTML without what is not on the page: comments, scripts, styles and code. Done by a walk
+// over their tags, as an open one a pattern looks for the end of costs the rest of the
+// text each time. One left open hides the rest, as it does in a browser.
+fn seo_audit_shown(html: str, chars: list) -> str {
+    let marks = re.find_all(html, "<!--|-->|</?(?:script|style|noscript|template|pre|code)\\b[^<>]*>", "i")
+    let inside = ""
+    let from = 0
+    let pieces = for m in marks {
+        let name = re.replace(lower(m.text), "^</?|[\\s>/][\\s\\S]*$", "")
+        if inside == "" && (m.text == "<!--" || !starts_with(m.text, "</") && m.text != "-->") {
+            inside = m.text == "<!--" ? "-->" : `</${name}`
+            let piece = join(slice(chars, from, m.start), "")
+            from = len(chars)
+            piece
+        } else if inside != "" && (inside == "-->" ? m.text == "-->" : starts_with(lower(m.text), inside)) {
+            inside = ""
+            from = m.end
+            " "
+        } else { "" }
+    }
+    join(pieces, " ") + (from < len(chars) ? join(slice(chars, from, len(chars)), "") : "")
+}
+
+// The headings of HTML: each opening tag with the next closing one.
+fn seo_audit_html_headings(html: str, chars: list) -> list {
+    let tags = re.find_all(html, "</?h[1-6](?:\\s[^<>]*)?>", "i")
+    let pairs = zip(tags, drop(tags, 1)) | filter((p) => !starts_with(p[0].text, "</") && starts_with(p[1].text, "</"))
+    pairs | map((p) => { level: int(p[0].text[2]), text: seo_audit_plain(join(slice(chars, p[0].end, p[1].start), "")) })
+}
+
+// What matters in an HTML body.
+fn seo_audit_read_html(body: str) {
+    let html = seo_audit_shown(body, split(body, ""))
+    let chars = split(html, "")
+    let parts = seo_audit_tags(html)
+    let para = re.find_all(html, "</?p(?:\\s[^<>]*)?>", "i")
+    let text = seo_audit_plain(html)
+    let intro = len(para) == 0 ? text : seo_audit_plain(join(slice(chars, para[0].end, len(para) > 1 ? para[1].start : len(chars)), ""))
+    { format: "html", headings: seo_audit_html_headings(html, chars), images: parts.images, links: parts.links, text, intro }
+}
+
+// A Markdown heading's text, without the #s that may close it.
+fn seo_audit_unhash(t: str) -> str {
+    let chars = split(trim(t), "")
+    let n = len(chars)
+    while n > 0 && chars[n - 1] == "#" { n -= 1 }
+    trim(join(take(chars, n), ""))
+}
+
+// What matters in a Markdown body, line by line, as headings are a matter of lines
+// and of what is fenced off around them.
+fn seo_audit_read_markdown(body: str) {
+    let lines = split(replace(body, "\r\n", "\n"), "\n")
+    let fence = ""
+    let kept = for line in lines {
+        let t = trim(line)
+        if fence != "" {
+            if starts_with(t, fence) { fence = "" }
+            ""
+        } else if starts_with(t, "```") || starts_with(t, "~~~") {
+            fence = slice(t, 0, 3)
+            ""
+        } else { line }
+    }
+    let n = len(kept)
+    let found = for i in range(0, n) {
+        let line = kept[i]
+        let atx = re.find(line, "^ {0,3}(#{1,6})[ \\t]+(.*)$")
+        let next = i + 1 < n ? kept[i + 1] : ""
+        if atx != null { { level: len(atx.groups[0]), text: seo_audit_unhash(atx.groups[1]), at: i } }
+        else if trim(line) != "" && re.test(next, "^ {0,3}=+[ \\t]*$") { { level: 1, text: trim(line), at: i } }
+        else if trim(line) != "" && re.test(next, "^ {0,3}-{2,}[ \\t]*$") && !re.test(line, "^ {0,3}[-*>]") { { level: 2, text: trim(line), at: i } }
+        else { null }
+    }
+    let headings = found | filter((h) => h != null)
+    let heading_lines = reduce(headings, {}, (m, h) => set(m, h.at, true))
+    let prose = join(range(0, n) | filter((i) => !has(heading_lines, i)) | map((i) => kept[i]), "\n")
+    // Code spans go first, so that a link written in one is not counted. The counts are
+    // as in seo_audit_tags: a body of brackets is not to take minutes.
+    let clean = re.replace(prose, "`[^`\\n]*`", " ")
+    let target = "\\(\\s{0,9}<?([^)\\s>]{0,1000})>?(?:\\s[^)\\n]{0,300})?\\)"
+    let label = "\\[([^\\]\\n]{0,300})\\]"
+    // Markdown cannot say an image is only decoration, so an empty description is none.
+    let images = re.find_all(clean, `!${label}${target}`) | map((m) => { src: m.groups[1], alt: filled(trim(m.groups[0])) })
+    let no_images = re.replace(clean, `!${label}${target}`, " ")
+    let links = re.find_all(no_images, `${label}${target}`) | map((m) => m.groups[1])
+    let words_of = re.replace(no_images, `${label}${target}`, "$1")
+    let bare = re.find_all(re.replace(no_images, `${label}${target}`, " "), "<(https?://[^>\\s]+)>|(?:^|\\s)(https?://[^\\s<>)]+)") | map((m) => re.replace(m.groups[0] ?? m.groups[1], "[.,;:!?]{1,9}$", ""))
+    let tags = seo_audit_tags(clean)
+    let titles = headings | map((h) => h.text) | join(" ")
+    let text = seo_audit_plain(titles + " " + re.replace(words_of, "^[ \\t]{0,40}(?:[-*+>=]+|[0-9]+\\.)|[*_~]{1,3}", " ", "m"))
+    let paragraphs = re.split(trim(words_of), "\\n\\s*\\n")
+    { format: "markdown", headings: headings | map((h) => { level: h.level, text: re.replace(h.text, "[*_`]", "") }), images: images + tags.images, links: links + bare + tags.links, text,
+      intro: seo_audit_plain(paragraphs[0] ?? "") }
+}
+
+// What a body holds: { format, headings, images, links, words, intro, text }. A body with
+// tags in it is HTML, and "auto" looks for them.
+fn seo_audit_read(body: str, format: str = "auto") {
+    let as_html = format == "html" || (format != "markdown" && re.test(body, "<(?:!doctype|html|body|article|section|div|p|h[1-6]|ul|ol|table)\\b[^<>]*>", "i"))
+    let doc = as_html ? seo_audit_read_html(body) : seo_audit_read_markdown(body)
+    { ...doc, words: len(readability_meter_words(doc.text)) }
+}
+
+// The host of an absolute address, without "www.", in small letters; null for any other.
+fn seo_audit_host(url: str) {
+    let m = re.find(trim(url), "^(?:https?:)?//([^/:?#]+)", "i")
+    m == null ? null : re.replace(lower(m.groups[0]), "^www\\.", "")
+}
+
+// What a link is: "internal", "external", or "other" (a place on the page, mail, a phone).
+fn seo_audit_link_kind(href: str, base_host) -> str {
+    let h = trim(href)
+    if h == "" || starts_with(h, "#") || re.test(h, "^[a-z][a-z0-9+.-]*:", "i") && !re.test(h, "^https?:", "i") { return "other" }
+    let host = seo_audit_host(h)
+    if host == null { return "internal" }
+    base_host != null && host == base_host ? "internal" : "external"
+}
+
+// A text's words in small letters between spaces, so a keyword is found by whole words.
+fn seo_audit_said(text: str) -> str =
+    ` ${readability_meter_words(replace(text, "’", "'")) | map((w) => lower(w.text)) | join(" ")} `
+
+fn seo_audit_says(text: str, keyword: str) -> bool = contains(seo_audit_said(text), seo_audit_said(keyword))
+
+// How many times a keyword comes, by whole words. Spaces are doubled so that two
+// neighbours do not share the one between them.
+fn seo_audit_times(text: str, keyword: str) -> int =
+    len(split(replace(seo_audit_said(text), " ", "  "), ` ${replace(trim(seo_audit_said(keyword)), " ", "  ")} `)) - 1
+
+// Where a slug falls short, a sentence; null when it is fine.
+fn seo_audit_slug_fault(slug: str) {
+    let s = re.replace(trim(slug), "^/+|/+$", "")
+    if s == "" { return "There is no slug." }
+    if len(s) > 60 { return `It has ${len(s)} characters, over 60.` }
+    if re.test(s, "[A-Z]") { return "It has capital letters." }
+    if contains(s, "_") { return "It has underscores." }
+    if re.test(s, "\\s") { return "It has spaces." }
+    if !re.test(s, "^[a-z0-9/-]+$") { return "It has characters other than letters, numbers and hyphens." }
+    if contains(s, "--") || re.test(s, "^-|-$") { return "It has stray hyphens." }
+    null
+}
+
+// The first place the headings skip a level, a sentence; null when none does.
+fn seo_audit_order_fault(headings: list) {
+    let pairs = zip(headings, drop(headings, 1)) | filter((p) => p[1].level > p[0].level + 1)
+    if len(pairs) == 0 { return null }
+    let p = pairs[0]
+    `"${p[1].text}" is an H${p[1].level} after an H${p[0].level}.`
+}
+
+fn seo_audit_count(n: int, one: str, many: str) -> str = n == 1 ? `1 ${one}` : `${n} ${many}`
+
+// The audit (see the top of the file).
+fn seo_audit_of(fields, base_url: str? = null, format: str = "auto", limit: int = 100000) {
+    let title = trim(fields.title ?? "")
+    let description = trim(fields.description ?? "")
+    let slug = trim(fields.slug ?? "")
+    let keyword = trim(fields.keyword ?? "")
+    let raw = fields.body ?? ""
+    let capped = len(raw) > limit
+    let doc = seo_audit_read(capped ? slice(raw, 0, limit) : raw, format)
+    let base_host = base_url == null ? null : seo_audit_host(base_url)
+    let kinds = doc.links | map((h) => seo_audit_link_kind(h, base_host))
+    let internal = count(kinds, (k) => k == "internal")
+    let external = count(kinds, (k) => k == "external")
+    let h1s = count(doc.headings, (h) => h.level == 1)
+    let no_alt = doc.images | filter((i) => i.alt == null)
+    let order = seo_audit_order_fault(doc.headings)
+    let slug_fault = seo_audit_slug_fault(slug)
+    let tl = len(title)
+    let dl = len(description)
+    let check = (id: str, label: str, points: int, ok: bool, detail: str, fix: str) => { id, label, ok, points, detail, fix }
+    let base = [
+        check("title", "Title length", 15, tl >= 30 && tl <= 60, `${tl} characters.`, tl < 30 ? "Say more: aim for 30 to 60 characters." : "Shorten it to 60 characters or fewer, or search engines will cut it."),
+        check("description", "Description length", 10, dl >= 70 && dl <= 160, `${dl} characters.`, dl < 70 ? "Write a full sentence or two: 70 to 160 characters." : "Shorten it to 160 characters or fewer, or search engines will cut it."),
+        check("slug", "Slug", 5, slug_fault == null, slug_fault ?? "Short, in small letters, with hyphens.", "Use small letters, numbers and hyphens, in 60 characters or fewer."),
+        check("h1", "One main heading", 10, h1s == 1, seo_audit_count(h1s, "H1", "H1s") + " found.", h1s == 0 ? "Add one H1 to say what the page is about." : "Keep one H1 and make the others H2."),
+        check("order", "Heading order", 10, order == null, order ?? "No level is skipped.", "Go down one level at a time: H2 under H1, H3 under H2."),
+        check("alt", "Image descriptions", 10, len(no_alt) == 0, len(doc.images) == 0 ? "No images." : len(no_alt) == 0 ? `All ${seo_audit_count(len(doc.images), "image has", "images have")} alt text.`
+            : `${seo_audit_count(len(no_alt), "image has", "images have")} no alt text: ${join(take(no_alt, 3) | map((i) => i.src == "" ? "(no address)" : i.src), ", ")}.`, "Describe each image in its alt text."),
+        check("internal", "Internal links", 5, internal > 0, seo_audit_count(internal, "internal link", "internal links") + ".", "Link to a related page of your own site."),
+        check("external", "External links", 5, external > 0, seo_audit_count(external, "external link", "external links") + ".", "Link to a source that backs up what you say."),
+        check("length", "Body length", 5, doc.words >= 300, seo_audit_count(doc.words, "word", "words") + ".", "Write at least 300 words: thin pages rank poorly."),
+    ]
+    let density = doc.words == 0 ? 0 : seo_audit_times(doc.text, keyword) * len(readability_meter_words(keyword)) * 100 / doc.words
+    // A slug's hyphens stand for spaces, where a hyphen in a word holds it together.
+    let in_slug = seo_audit_says(replace(replace(slug, "-", " "), "/", " "), keyword)
+    let keyed = keyword == "" ? [] : [
+        check("keyword-title", "Keyword in the title", 10, seo_audit_says(title, keyword), seo_audit_says(title, keyword) ? "Found." : "Not found.", `Put "${keyword}" in the title, near the start.`),
+        check("keyword-description", "Keyword in the description", 5, seo_audit_says(description, keyword), seo_audit_says(description, keyword) ? "Found." : "Not found.", `Say "${keyword}" in the description.`),
+        check("keyword-slug", "Keyword in the slug", 5, in_slug, in_slug ? "Found." : "Not found.", `Put "${keyword}" in the slug, with hyphens.`),
+        check("keyword-intro", "Keyword in the first paragraph", 5, seo_audit_says(doc.intro, keyword), seo_audit_says(doc.intro, keyword) ? "Found." : "Not found.", `Say "${keyword}" in the first paragraph.`),
+        check("keyword-heading", "Keyword in a heading", 5, any(doc.headings, (h) => seo_audit_says(h.text, keyword)), any(doc.headings, (h) => seo_audit_says(h.text, keyword)) ? "Found." : "Not found.", `Use "${keyword}" in a heading.`),
+        check("keyword-density", "Keyword share of the text", 5, density >= 0.5 && density <= 3, `${readability_meter_one(density)}% of the words.`,
+              density > 3 ? "Use it less: over 3% reads as stuffing." : "Use it a little more: aim for 0.5% to 3%."),
+    ]
+    let checks = base + keyed
+    let possible = checks | map((c) => c.points) | sum()
+    let earned = checks | filter((c) => c.ok) | map((c) => c.points) | sum()
+    { score: round(earned * 100 / possible), passed: checks | filter((c) => c.ok), failed: checks | filter((c) => !c.ok), checks, doc, capped, internal, external, keyworded: keyword != "" }
+}
+
+component SeoAudit(title: str = "", description: str = "", slug: str = "", body: str = "", keyword: str = "", name: str? = null, base_url: str? = null, format: str = "auto",
+                   rows: int = 8, id: str = "seo-audit", limit: int = 100000, on_change = null, class: str? = null) {
+    style global seo_audit_css
+    state t = title
+    state d = description
+    state s = slug
+    state b = body
+    state k = keyword
+    let named = (n: str) => name != null ? `${name}_${n}` : n
+    let fields = (at_t: str, at_d: str, at_s: str, at_b: str, at_k: str) => { title: at_t, description: at_d, slug: at_s, body: at_b, keyword: at_k }
+    let r = seo_audit_of(fields(t, d, s, b, k), base_url, format, limit)
+    let blank = trim(t + d + s + b + k) == ""
+    let tone = r.score >= 80 ? "good" : r.score >= 50 ? "fair" : "poor"
+    let said = blank ? "Fill in the fields to audit the page."
+        : len(r.failed) == 0 ? "Every check passed."
+        : `${len(r.passed)} of ${len(r.checks)} checks passed, ${seo_audit_count(len(r.failed), "to fix", "to fix")}.`
+    let tell = () => { on_change && on_change(seo_audit_of(fields(t, d, s, b, k), base_url, format, limit)) }
+    <section class={ui_cls(["ui-seo-audit", class])} aria-labelledby={`${id}-said`}>
+        <div.ui-seo-audit-fields>
+            <div.ui-seo-audit-field.ui-seo-audit-wide>
+                <label for={`${id}-title`}>Title</label>
+                <input type="text" id={`${id}-title`} name={named("title")} value={t} autocomplete="off" @input={(e) => { t = e.value; tell() }}/>
+                <span.ui-seo-audit-count>{len(trim(t))} of 60 characters</span>
+            </div>
+            <div.ui-seo-audit-field.ui-seo-audit-wide>
+                <label for={`${id}-description`}>Description</label>
+                <textarea id={`${id}-description`} name={named("description")} rows="2" value={d} @input={(e) => { d = e.value; tell() }}></textarea>
+                <span.ui-seo-audit-count>{len(trim(d))} of 160 characters</span>
+            </div>
+            <div.ui-seo-audit-field>
+                <label for={`${id}-slug`}>Slug</label>
+                <input type="text" id={`${id}-slug`} name={named("slug")} value={s} autocomplete="off" @input={(e) => { s = e.value; tell() }}/>
+            </div>
+            <div.ui-seo-audit-field>
+                <label for={`${id}-keyword`}>Focus keyword</label>
+                <input type="text" id={`${id}-keyword`} name={named("keyword")} value={k} autocomplete="off" @input={(e) => { k = e.value; tell() }}/>
+            </div>
+            <div.ui-seo-audit-field.ui-seo-audit-wide>
+                <label for={`${id}-body`}>Body, in HTML or Markdown</label>
+                <textarea id={`${id}-body`} name={named("body")} rows={rows} value={b} spellcheck="false" @input={(e) => { b = e.value; tell() }}></textarea>
+            </div>
+        </div>
+        <div class={ui_cls(["ui-seo-audit-result", !blank && `ui-seo-audit-${tone}`])}>
+            {!blank && <span.ui-seo-audit-score aria-hidden="true">{r.score}</span>}
+            <p.ui-seo-audit-said id={`${id}-said`} aria-live="polite">{blank ? said : `Score ${r.score} of 100. ${said}`}</p>
+        </div>
+        {!blank && <p.ui-seo-audit-note>Read as {r.doc.format == "html" ? "HTML" : "Markdown"}.{r.keyworded ? "" : " Give a focus keyword to check where it is used."}</p>}
+        {r.capped && <p.ui-seo-audit-note>Only the first {format_number(limit, "en-US", 0)} characters of the body were read.</p>}
+        {!blank && <dl.ui-seo-audit-counts>
+            <div><dt>Words</dt><dd>{r.doc.words}</dd></div>
+            <div><dt>Headings</dt><dd>{len(r.doc.headings)}</dd></div>
+            <div><dt>Images</dt><dd>{len(r.doc.images)}</dd></div>
+            <div><dt>Internal links</dt><dd>{r.internal}</dd></div>
+            <div><dt>External links</dt><dd>{r.external}</dd></div>
+        </dl>}
+        {!blank && len(r.failed) > 0 && <ul.ui-seo-audit-checks id={`${id}-failed`}>
+            {for c in r.failed => <li key={c.id}><b>{c.label}</b><span>{c.detail}</span><small>{c.fix}</small></li>}
+        </ul>}
+        {!blank && len(r.passed) > 0 && <details.ui-seo-audit-passed>
+            <summary>Passed ({len(r.passed)})</summary>
+            <ul.ui-seo-audit-checks>
+                {for c in r.passed => <li key={c.id}><b>{c.label}</b><span>{c.detail}</span></li>}
+            </ul>
+        </details>}
+    </section>
+}

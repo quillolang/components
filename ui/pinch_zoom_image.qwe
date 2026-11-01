@@ -1,0 +1,288 @@
+// PinchZoomImage: an image to look into. Two fingers zoom about the point between them,
+// a double tap zooms in on that spot and a second one back out, and once zoomed one finger
+// moves it about, as far as its edges. Past the limits it gives a little and comes back.
+// Buttons do the same for anyone without a free hand, and the keys + - 0 and the arrows
+// work when it has focus. At its normal size a finger scrolls the page as ever. In a
+// wide container the buttons stand beside the image instead of under it.
+//
+//   <PinchZoomImage src="/plans/floor-2.png" alt="Second floor plan" height="60dvh" limit={6}/>
+//
+// src, alt: the image. height: its box, as CSS ("320px"). limit: how far it zooms, as a
+// multiple (4). step: how much a button or key zooms (0.5). double: where a double tap
+// goes (2.5). label: what screen readers call the box. on_zoom(scale): inside one of your
+// components, called with each new scale once a gesture has settled. class.
+
+import ui/theme.qwe use ui_cls
+
+let pinch_zoom_image_css = css`
+.ui-pinch-zoom { position: relative; display: grid; gap: 8px; container-type: inline-size; color: var(--ui-fg); font: 14px/1.4 var(--ui-font); }
+.ui-pinch-zoom-inner { display: grid; gap: 8px; }
+/* pan-y: at its normal size a finger scrolls the page; zoomed, every finger is the image's. */
+.ui-pinch-zoom-stage { position: relative; overflow: hidden; display: grid; place-items: center; border-radius: var(--ui-radius); background: var(--ui-subtle); touch-action: pan-y;
+  outline: none; -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
+.ui-pinch-zoom-stage:focus-visible { box-shadow: var(--ui-focus); }
+.ui-pinch-zoom-in { touch-action: none; cursor: grab; }
+.ui-pinch-zoom-img { display: block; width: 100%; height: 100%; object-fit: contain; pointer-events: none; -webkit-user-drag: none; transform-origin: 50% 50%;
+  transition: transform .22s cubic-bezier(.2, .8, .2, 1); will-change: transform; }
+.ui-pinch-zoom-live .ui-pinch-zoom-img { transition: none; }
+.ui-pinch-zoom-bad { padding: 16px; color: var(--ui-muted); text-align: center; }
+.ui-pinch-zoom-bar { display: flex; align-items: center; justify-content: center; gap: 6px; }
+.ui-pinch-zoom-btn { display: grid; place-items: center; min-width: 46px; min-height: 46px; padding: 0 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm);
+  background: var(--ui-surface); color: var(--ui-fg); font: 500 15px/1 var(--ui-font); cursor: pointer; }
+.ui-pinch-zoom-btn[aria-disabled="true"] { color: var(--ui-muted); opacity: .55; cursor: default; }
+.ui-pinch-zoom-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-pinch-zoom-level { min-width: 52px; color: var(--ui-muted); font-variant-numeric: tabular-nums; text-align: center; }
+@media (hover: hover) { .ui-pinch-zoom-btn:not([aria-disabled="true"]):hover { background: var(--ui-subtle); } }
+@container (min-width: 520px) {
+  .ui-pinch-zoom-inner { grid-template-columns: minmax(0, 1fr) auto; }
+  .ui-pinch-zoom-bar { flex-direction: column; align-items: stretch; justify-content: flex-start; }
+}
+@media (prefers-reduced-motion: reduce) { .ui-pinch-zoom-img { transition: none; } }
+`
+
+fn pinch_zoom_image_clamp(v: num, lo: num, hi: num) -> num {
+    max([lo, min([v, hi])])
+}
+
+// A scale past the limits gives a quarter of what the fingers ask.
+fn pinch_zoom_image_stretch(s: num, lo: num, hi: num) -> num {
+    if s > hi { return hi + (s - hi) * 0.25 }
+    if s < lo { return lo - (lo - s) * 0.25 }
+    s
+}
+
+// A pan past the edge gives 30% of it.
+fn pinch_zoom_image_pull(p: num, edge: num) -> num {
+    if abs(p) <= edge { return p }
+    (p > 0 ? 1 : -1) * (edge + (abs(p) - edge) * 0.3)
+}
+
+// The size the picture itself shows at in a box: contain leaves bars, and a pan stops at the picture's
+// edge, not the box's. [box width, box height] when the image has not said its size.
+fn pinch_zoom_image_fit(nw: num, nh: num, w: num, h: num) -> list {
+    if nw <= 0 || nh <= 0 || w <= 0 || h <= 0 { return [w, h] }
+    let by = min([w / nw, h / nh])
+    [nw * by, nh * by]
+}
+
+// How far the picture of length c can move each way at scale s in a box of length box.
+fn pinch_zoom_image_edge(s: num, c: num, box: num) -> num {
+    max([0, (s * c - box) / 2])
+}
+
+// Where the picture must go for what is at f to stay at f, as the scale goes from s0 to s1.
+fn pinch_zoom_image_focus(f: num, p: num, s0: num, s1: num) -> num {
+    f - (f - p) * s1 / s0
+}
+
+// A view brought within its limits. Very close to the normal size is the normal size.
+fn pinch_zoom_image_settle(v, hi: num, cw: num, ch: num, w: num, h: num) {
+    let s = pinch_zoom_image_clamp(v.s, 1, hi)
+    if s < 1.01 { return { s: 1, x: 0, y: 0 } }
+    let ex = pinch_zoom_image_edge(s, cw, w)
+    let ey = pinch_zoom_image_edge(s, ch, h)
+    { s: round(s, 3), x: round(pinch_zoom_image_clamp(v.x, -ex, ex), 2), y: round(pinch_zoom_image_clamp(v.y, -ey, ey), 2) }
+}
+
+// How much further a pan goes after the finger has left: nothing from a slow one.
+fn pinch_zoom_image_carry(v: num) -> num {
+    abs(v) < 0.3 ? 0 : v * 140
+}
+
+fn pinch_zoom_image_gap(a, b) -> num {
+    math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y))
+}
+
+component PinchZoomImage(src: str = "", alt: str = "", height: str = "320px", limit: num = 4, step: num = 0.5, double: num = 2.5,
+                         label: str = "Zoomable image", on_zoom = null, class: str? = null) {
+    style global pinch_zoom_image_css
+    let hi = max([1, limit])
+    state stage = null
+    state img = null
+    state zoom = 1           // the settled scale, for what shows it
+    state live = false       // fingers on it: no easing
+    state broken = false
+    state spot = { s: 1, x: 0, y: 0 }     // where it is now, moved in handlers
+    state down = []          // the pointers on it: { id, x, y }
+    state g = null           // what the fingers started from
+    state tap = null         // a press that may be a tap: { t, x, y }
+    state last = null        // the tap before it
+    let paint = (v) => {
+        spot = v
+        img.style.transform = v.s == 1 && v.x == 0 && v.y == 0 ? "" : `translate(${round(v.x, 2)}px, ${round(v.y, 2)}px) scale(${round(v.s, 3)})`
+    }
+    let sized = () => {
+        let w = stage.clientWidth
+        let h = stage.clientHeight
+        let fit = pinch_zoom_image_fit(img.naturalWidth, img.naturalHeight, w, h)
+        { w, h, cw: fit[0], ch: fit[1] }
+    }
+    let settle = (v) => {
+        let b = sized()
+        let to = pinch_zoom_image_settle(v, hi, b.cw, b.ch, b.w, b.h)
+        paint(to)
+        if to.s != zoom {
+            zoom = to.s
+            on_zoom && on_zoom(to.s)
+        }
+    }
+    // The point of the box a pointer is at, from its middle.
+    let at = (e) => {
+        let r = stage.getBoundingClientRect()
+        { x: e.clientX - r.left - r.width / 2, y: e.clientY - r.top - r.height / 2 }
+    }
+    let zoom_to = (s: num, f) => {
+        let to = pinch_zoom_image_clamp(s, 1, hi)
+        settle({ s: to, x: pinch_zoom_image_focus(f.x, spot.x, spot.s, to), y: pinch_zoom_image_focus(f.y, spot.y, spot.s, to) })
+    }
+    let middle = () => { { x: 0, y: 0 } }
+    let start_pan = (p) => { g = { kind: "pan", x: p.x, y: p.y, vx: spot.x, vy: spot.y, moved: 0, s: { x: p.x, y: p.y, at: 0, vx: 0, vy: 0 } } }
+    let start_pinch = () => {
+        let a = down[0]
+        let b = down[1]
+        g = { kind: "pinch", gap: max([1, pinch_zoom_image_gap(a, b)]), s0: spot.s, vx: spot.x, vy: spot.y, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 }
+    }
+    let moved_pinch = () => {
+        let a = down[0]
+        let b = down[1]
+        let want = g.s0 * pinch_zoom_image_gap(a, b) / g.gap
+        let s = pinch_zoom_image_stretch(want, 1, hi)
+        let fx = (a.x + b.x) / 2
+        let fy = (a.y + b.y) / 2
+        paint({ s, x: fx - (g.mx - g.vx) * s / g.s0, y: fy - (g.my - g.vy) * s / g.s0 })
+    }
+    let moved_pan = (p, now: num) => {
+        let b = sized()
+        let ex = pinch_zoom_image_edge(spot.s, b.cw, b.w)
+        let ey = pinch_zoom_image_edge(spot.s, b.ch, b.h)
+        paint({ s: spot.s, x: pinch_zoom_image_pull(g.vx + p.x - g.x, ex), y: pinch_zoom_image_pull(g.vy + p.y - g.y, ey) })
+        let dt = now - g.s.at
+        g = { ...g, moved: now, s: dt < 32 ? g.s : { x: p.x, y: p.y, at: now, vx: (p.x - g.s.x) / dt, vy: (p.y - g.s.y) / dt } }
+    }
+    let lifted = (e) => {
+        let was = g
+        let fresh = was != null && was.kind == "pan" && e.timeStamp - was.moved <= 80
+        down = down | filter((d) => d.id != e.pointerId)
+        if len(down) == 1 && spot.s > 1 { start_pan(down[0]) }
+        if len(down) == 0 {
+            g = null
+            live = false
+            // A pan let go at speed carries on a little, and stops at the edge.
+            settle(fresh ? { ...spot, x: spot.x + pinch_zoom_image_carry(was.s.vx), y: spot.y + pinch_zoom_image_carry(was.s.vy) } : spot)
+        }
+    }
+    let can_in = zoom < hi && !broken
+    let can_out = zoom > 1
+    <div class={ui_cls(["ui-pinch-zoom", class])}>
+        <div.ui-pinch-zoom-inner>
+            <div class={ui_cls(["ui-pinch-zoom-stage", zoom > 1 && "ui-pinch-zoom-in", live && "ui-pinch-zoom-live"])} style={`height: ${height}`}
+                 tabindex="0" role="group" aria-label={label}
+                 @mount={(me) => {
+                     stage = me
+                     // touch-action is read when a finger lands, so a second finger at the normal size, under
+                     // pan-y, would go to the page's scroll or zoom. Only a touchmove can still say no.
+                     let guard = (e) => { if e.cancelable && (e.touches.length > 1 || spot.s > 1) { e.preventDefault() } }
+                     let block = (e) => { e.preventDefault() }    // Safari's own pinch, past touch-action
+                     let wheel = (e) => {
+                         // A trackpad's pinch reads as a wheel with Ctrl down.
+                         if e.ctrlKey && !broken {
+                             e.preventDefault()
+                             zoom_to(spot.s * math.exp(-e.deltaY * 0.01), at(e))
+                         }
+                     }
+                     me.addEventListener("touchmove", guard, { passive: false })
+                     me.addEventListener("gesturestart", block, { passive: false })
+                     me.addEventListener("wheel", wheel, { passive: false })
+                     // A turned phone changes the box, and with it how far the picture may go.
+                     let watcher = js_new("ResizeObserver", (_a = null) => { if img != null && spot.s > 1 { settle(spot) } })
+                     watcher.observe(me)
+                     () => {
+                         watcher.disconnect()
+                         me.removeEventListener("touchmove", guard)
+                         me.removeEventListener("gesturestart", block)
+                         me.removeEventListener("wheel", wheel)
+                     }
+                 }}
+                 @keydown={(e) => {
+                     let k = broken ? "" : e.key
+                     if k == "+" || k == "=" { e.preventDefault(); zoom_to(spot.s + step, middle()) }
+                     if k == "-" { e.preventDefault(); zoom_to(spot.s - step, middle()) }
+                     if k == "0" { e.preventDefault(); settle({ s: 1, x: 0, y: 0 }) }
+                     if spot.s > 1 {
+                         let by = match k {
+                             "ArrowLeft" => [40, 0]
+                             "ArrowRight" => [-40, 0]
+                             "ArrowUp" => [0, 40]
+                             "ArrowDown" => [0, -40]
+                             _ => null
+                         }
+                         if by != null {
+                             e.preventDefault()
+                             settle({ ...spot, x: spot.x + by[0], y: spot.y + by[1] })
+                         }
+                     }
+                 }}
+                 @pointerdown={(e) => {
+                     if e.button == 0 && !broken {
+                         let p = at(e)
+                         down = down + [{ id: e.pointerId, x: p.x, y: p.y }]
+                         stage.setPointerCapture(e.pointerId)
+                         if len(down) == 1 {
+                             tap = { t: e.timeStamp, x: p.x, y: p.y }
+                             if spot.s > 1 {
+                                 live = true
+                                 start_pan(p)
+                             } else {
+                                 g = null
+                             }
+                         }
+                         if len(down) == 2 {
+                             tap = null
+                             live = true
+                             start_pinch()
+                         }
+                     }
+                 }}
+                 @pointermove={(e) => {
+                     if contains(down | map((d) => d.id), e.pointerId) {
+                         let p = at(e)
+                         down = down | map((d) => d.id == e.pointerId ? { id: d.id, x: p.x, y: p.y } : d)
+                         if tap != null && abs(p.x - tap.x) + abs(p.y - tap.y) > 10 { tap = null }
+                         if g != null && len(down) == 2 && g.kind == "pinch" { moved_pinch() }
+                         if g != null && len(down) == 1 && g.kind == "pan" { moved_pan(p, e.timeStamp) }
+                     }
+                 }}
+                 @pointerup={(e) => {
+                     let p = at(e)
+                     let quick = tap != null && e.timeStamp - tap.t < 300
+                     let twice = quick && last != null && e.timeStamp - last.t < 320 && abs(p.x - last.x) + abs(p.y - last.y) < 30
+                     lifted(e)
+                     if quick { last = twice ? null : { t: e.timeStamp, x: p.x, y: p.y } }
+                     tap = null
+                     if twice { if spot.s > 1 { settle({ s: 1, x: 0, y: 0 }) } else { zoom_to(double, p) } }
+                 }}
+                 @pointercancel={(e) => {
+                     tap = null
+                     lifted(e)
+                 }}>
+                {broken
+                    ? <p.ui-pinch-zoom-bad>This image could not be loaded.</p>
+                    : <img.ui-pinch-zoom-img src={src} alt={alt} draggable="false" @error={() => { broken = true }}
+                           @mount={(me) => {
+                               img = me
+                               // @error never runs for an image that failed before the component started, or has no address.
+                               if me.complete && me.naturalWidth == 0 { broken = true }
+                           }}/>}
+            </div>
+            <div.ui-pinch-zoom-bar role="group" aria-label="Zoom">
+                <button.ui-pinch-zoom-btn.ui-pinch-zoom-out type="button" aria-label="Zoom out" aria-disabled={can_out ? null : "true"}
+                        @click={() => { if can_out { zoom_to(spot.s - step, middle()) } }}>−</button>
+                <span.ui-pinch-zoom-level role="status">{round(zoom * 100)}%</span>
+                <button.ui-pinch-zoom-btn.ui-pinch-zoom-more type="button" aria-label="Zoom in" aria-disabled={can_in ? null : "true"}
+                        @click={() => { if can_in { zoom_to(spot.s + step, middle()) } }}>+</button>
+                <button.ui-pinch-zoom-btn.ui-pinch-zoom-reset type="button" aria-disabled={can_out ? null : "true"}
+                        @click={() => { if can_out { settle({ s: 1, x: 0, y: 0 }) } }}>Reset</button>
+            </div>
+        </div>
+    </div>
+}

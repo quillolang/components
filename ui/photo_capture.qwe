@@ -1,0 +1,203 @@
+// PhotoCapture: takes a photo through the phone's own camera, by the file input with
+// `capture`, shows it, and offers a retake. The picture is made smaller on the phone
+// before anything is sent, and turned the way the phone was held: a phone writes a photo
+// sideways with a note in its EXIF saying so, and the new JPEG is drawn upright and carries
+// no EXIF at all, so neither a sideways picture nor the place it was taken goes up. The
+// result stays in the file input, so a plain multipart <form> sends a real, small file.
+//
+//   <form method="post" action="/receipt" enctype="multipart/form-data">
+//       <PhotoCapture name="receipt" label="Photograph the receipt" max_side={1200} required={true}/>
+//       <Button size="lg" type="submit">Send</Button>
+//   </form>
+//   <PhotoCapture name="badge" facing="user" on_change={(p) => { photo = p }}/>
+//
+// name: the file field's name ("photo"). label: the button's text ("Take a photo");
+// retake_label ("Retake"), remove_label ("Remove"). facing: "environment" (the back
+// camera, default) or "user" (the front). A computer has no such camera and offers a file.
+// max_side: the longest side of the result, in pixels (1600). quality: the JPEG's quality,
+// 0 to 1 (0.85). hint, error, required, disabled and field (the input's id) as for every
+// field. on_change(photo): inside one of your components, given { name, size, type, width,
+// height, from_width, from_height, from_size } when a photo is ready, or null when it is
+// taken away.
+//
+// Needs Button: `import ui/button.qwe use Button` for the Remove button.
+
+import ui/theme.qwe use ui_cls
+import ui/button.qwe use Button
+
+let photo_capture_css = css`
+.ui-photo-capture { container-type: inline-size; width: 100%; font: 14px/1.4 var(--ui-font); color: var(--ui-fg); }
+.ui-photo-capture-body { display: grid; gap: 10px; }
+.ui-photo-capture-frame {
+  position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 4 / 3; max-height: 60dvh; width: 100%;
+  border: 1px dashed var(--ui-border); border-radius: var(--ui-radius); background: var(--ui-subtle); color: var(--ui-muted); text-align: center;
+}
+.ui-photo-capture-frame img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.ui-photo-capture-ready .ui-photo-capture-frame { border-style: solid; }
+.ui-photo-capture-frame svg { width: 36px; height: 36px; }
+.ui-photo-capture-side { display: grid; gap: 8px; align-content: start; }
+.ui-photo-capture-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+.ui-photo-capture-take {
+  position: relative; flex: 1 1 auto; display: inline-flex; align-items: center; justify-content: center; min-height: 46px; padding: 0 22px; overflow: hidden;
+  border-radius: var(--ui-radius-sm); background: var(--ui-accent); color: var(--ui-accent-fg); font: 500 16px/1 var(--ui-font); cursor: pointer;
+}
+.ui-photo-capture-ready .ui-photo-capture-take { background: var(--ui-accent-soft); color: var(--ui-accent); }
+/* The input itself covers the button: a tap lands on the real field, and it keeps its size for a finger. */
+.ui-photo-capture-take input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; font-size: 16px; cursor: pointer; }
+.ui-photo-capture-take:has(input:focus-visible) { box-shadow: var(--ui-focus); }
+.ui-photo-capture-take:has(input:disabled) { opacity: .55; }
+.ui-photo-capture-meta, .ui-photo-capture-hint { margin: 0; color: var(--ui-muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.ui-photo-capture-error { margin: 0; color: var(--ui-danger); font-size: 13px; }
+/* A tablet, or a wide pane: the picture beside its buttons, not a phone's column stretched. */
+@container (min-width: 440px) {
+  .ui-photo-capture-body { grid-template-columns: minmax(0, 1fr) 180px; align-items: start; gap: 16px; }
+  .ui-photo-capture-bar { flex-direction: column; }
+  .ui-photo-capture-take { flex: none; }
+}
+`
+
+// The size a picture of w by h takes so that its longer side is at most limit, keeping its
+// shape; never larger than it was, and never a side of 0. Bad sizes give { w: 0, h: 0 }.
+fn photo_capture_fit(w: num, h: num, limit: num) -> map {
+    if w <= 0 || h <= 0 || limit <= 0 { return { w: 0, h: 0 } }
+    let longest = w > h ? w : h
+    let k = longest > limit ? limit / longest : 1
+    let nw = round(w * k)
+    let nh = round(h * k)
+    { w: nw < 1 ? 1 : nw, h: nh < 1 ? 1 : nh }
+}
+
+// A size in bytes as people read it: 812 B, 340 KB, 1.5 MB.
+fn photo_capture_size(n: num) -> str {
+    if n < 1024 { return `${n} B` }
+    if n < 1024 * 1024 { return `${round(n / 1024)} KB` }
+    let tenths = round(n * 10 / (1024 * 1024))
+    `${floor(tenths / 10)}${tenths % 10 == 0 ? "" : `.${tenths % 10}`} MB`
+}
+
+// What a file may not be, or null: a file picked on a computer can be anything.
+fn photo_capture_refuse(mime: str, size: num) -> str? {
+    if size <= 0 { return "That file is empty." }
+    if mime != "" && !starts_with(mime, "image/") { return "That is not a picture. Take a photo, or choose an image file." }
+    null
+}
+
+component PhotoCapture(name: str = "photo", label: str = "Take a photo", retake_label: str = "Retake", remove_label: str = "Remove",
+                       facing: str = "environment", max_side: int = 1600, quality: num = 0.85, hint: str? = null, error: str? = null,
+                       required: bool = false, disabled: bool = false, field: str? = null, on_change = null, class: str? = null) {
+    style global photo_capture_css
+    state status = "empty"      // empty, working, ready
+    state preview = ""
+    state info = null
+    state problem = ""
+    state input = null
+    state turn = 0              // a second photo picked while the first is being made wins
+    let id = field ?? `photo-capture-${name}`
+    let shown_error = problem != "" ? problem : error
+    let free = () => {
+        if preview != "" {
+            js("URL.revokeObjectURL", preview)
+            preview = ""
+        }
+    }
+    let clear = () => {
+        turn += 1
+        free()
+        input.value = ""
+        info = null
+        problem = ""
+        status = "empty"
+        on_change && on_change(null)
+    }
+    let refuse = (why: str) => {
+        free()
+        input.value = ""
+        if info != null { on_change && on_change(null) }
+        info = null
+        problem = why
+        status = "empty"
+    }
+    let shoot = (e) => {
+        let file = e.target.files[0]
+        if file == null { return null }
+        turn += 1
+        let mine = turn
+        let why = photo_capture_refuse(file.type ?? "", file.size)
+        if why != null {
+            refuse(why)
+            return null
+        }
+        problem = ""
+        status = "working"
+        let raw = js("URL.createObjectURL", file)
+        let img = js_new("Image")
+        img.src = raw
+        // An <img> applies the EXIF orientation before anything reads it: its natural size
+        // is the upright one, and drawing it draws it upright. Nothing else turns it.
+        // js() is what waits: a method's Promise goes straight on, unwaited.
+        let opened = js("Promise.resolve", img.decode())
+        if mine != turn {
+            js("URL.revokeObjectURL", raw)
+            return null
+        }
+        if is_err(opened) || img.naturalWidth == 0 {
+            js("URL.revokeObjectURL", raw)
+            refuse("This picture could not be read. Take it again, or choose a JPEG or PNG.")
+            return null
+        }
+        let box = photo_capture_fit(img.naturalWidth, img.naturalHeight, max_side)
+        let canvas = js("document.createElement", "canvas")
+        canvas.width = box.w
+        canvas.height = box.h
+        let ctx = canvas.getContext("2d")
+        ctx.imageSmoothingQuality = "high"
+        ctx.fillStyle = "#fff"      // a JPEG has no transparency, and a PNG's would turn black
+        ctx.fillRect(0, 0, box.w, box.h)
+        ctx.drawImage(img, 0, 0, box.w, box.h)
+        let blob = js("Promise.resolve", js_new("Promise", (done) => { canvas.toBlob((b) => { done(b) }, "image/jpeg", quality) }))
+        js("URL.revokeObjectURL", raw)
+        if mine != turn { return null }
+        if blob == null || is_err(blob) {
+            refuse("This phone could not make the picture smaller. Try again.")
+            return null
+        }
+        let out = js_new("File", [blob], "photo.jpg", { type: "image/jpeg" })
+        let dt = js_new("DataTransfer")
+        dt.items.add(out)
+        input.files = dt.files
+        free()
+        preview = js("URL.createObjectURL", out)
+        info = { name: "photo.jpg", size: out.size, type: "image/jpeg", width: box.w, height: box.h,
+                 from_width: img.naturalWidth, from_height: img.naturalHeight, from_size: file.size }
+        status = "ready"
+        on_change && on_change(info)
+    }
+    <div class={ui_cls(["ui-photo-capture", status == "ready" && "ui-photo-capture-ready", class])} data-state={status}
+         @mount={(_el) => { () => { free() } }}>
+        <div.ui-photo-capture-body>
+            <div.ui-photo-capture-frame>
+                {status == "ready"
+                    ? <img src={preview} alt={`The photo: ${info.width} by ${info.height} pixels`}/>
+                    : <span role="status">{status == "working" ? "Making the picture smaller…" : "No photo yet"}</span>}
+            </div>
+            <div.ui-photo-capture-side>
+                <div.ui-photo-capture-bar>
+                    <label.ui-photo-capture-take>
+                        <span>{status == "ready" ? retake_label : label}</span>
+                        <input type="file" id={id} name={name} accept="image/*" capture={facing} required={required} disabled={disabled}
+                               aria-label={status == "ready" ? retake_label : label}
+                               aria-invalid={shown_error != null ? "true" : null}
+                               @mount={(el) => { input = el }} @change={shoot}/>
+                    </label>
+                    {status == "ready" && <Button size="lg" variant="outline" tone="neutral" on_click={clear}>{remove_label}</Button>}
+                </div>
+                {status == "ready" && <p.ui-photo-capture-meta>
+                    {info.width} × {info.height}, {photo_capture_size(info.size)}
+                    {info.size < info.from_size ? `, from ${photo_capture_size(info.from_size)}` : ""}
+                </p>}
+                {hint != null && <p.ui-photo-capture-hint>{hint}</p>}
+                {shown_error != null && <p.ui-photo-capture-error role="alert">{shown_error}</p>}
+            </div>
+        </div>
+    </div>
+}

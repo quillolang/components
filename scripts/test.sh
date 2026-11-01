@@ -15,10 +15,18 @@ scripts/build.sh --check
 node tests/classes.mjs
 "$quillo" check gallery.qwe
 
+# A port in use would test whatever already answers there, and say it passed.
+for p in "$port" "$cdp"; do
+    if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$p/"; then
+        echo "test: port $p is in use" >&2
+        exit 1
+    fi
+done
+
 "$quillo" run gallery.qwe --port "$port" --log off &
 server=$!
 profile=$(mktemp -d)
-"$chrome" --headless=new --remote-debugging-port="$cdp" --user-data-dir="$profile" --no-first-run about:blank >/dev/null 2>&1 &
+"$chrome" --headless=new --remote-debugging-port="$cdp" --user-data-dir="$profile" --no-first-run --use-fake-device-for-media-stream --use-fake-ui-for-media-stream about:blank >/dev/null 2>&1 &
 browser=$!
 trap 'kill $server $browser 2>/dev/null; sleep 0.5; rm -rf "$profile" 2>/dev/null || true' EXIT
 i=0

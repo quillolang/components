@@ -1,0 +1,327 @@
+// TimezoneOverlap: when is everyone at work? Each city is a row across one day, its
+// working hours marked in its own local time, and the band where all of them overlap is
+// found and shown across every row. A meeting window sits on the day: drag it, or
+// use the arrow keys, and it says what that hour means in each city: local time, which
+// day there, and whether it is work, early, evening or night. Rows are built from
+// instants, so half-hour offsets and days of 23 or 25 hours are right, and it says so.
+//
+//   <TimezoneOverlap day="2026-11-02" cities={[
+//       { city: "Lisbon", zone: "Europe/Lisbon" },
+//       { city: "New York", zone: "America/New_York" },
+//       { city: "Mumbai", zone: "Asia/Kolkata", from: "10:00", to: "18:30" }]}/>
+//
+// cities: a list of { city, zone, from?, to? }. zone: an IANA name or an offset ("+05:30");
+// from, to: working hours there (day_start and day_end when left out; "22:00" to "06:00"
+// runs past midnight). The first city's day is the one shown. day: the date
+// ("YYYY-MM-DD"). day_start, day_end: working hours for cities that do not say ("09:00",
+// "17:00"). minutes: the meeting's length (60). step: minutes the window moves by (15).
+// title: the heading. id: a prefix for its ids, unique on the page. name: the field a
+// form gets the window's start in, as a date-time ("meeting"). on_change(window): inside
+// one of your components, after the window moves, with { start, end, cities }, start
+// and end being date-times and each city { city, local, day, state }.
+//
+// Left and Right move the window by `step`, Page Up and Page Down by an hour, Home and End
+// to the ends of the day, and O puts it on the overlap.
+//
+// timezone_overlap_plan(cities, day, day_start, day_end) is the logic, for a program's
+// own use: { start, end, hours, rows, bands, best, changes }, in milliseconds. A row has
+// `spans`, its working time; bands are where all overlap, longest first; best is the
+// time most cities are at work when none is shared; changes names the cities whose
+// clocks change that day. timezone_overlap_meaning(row, ms) says what a moment means.
+// A zone must be on TimezonePicker's list or an offset: Quillo cannot ask whether a zone
+// exists, and an unknown one stops the page, so anything else gets a message instead.
+
+import ui/theme.qwe use ui_cls
+import ui/timezone_picker.qwe use timezone_picker_zones
+
+let timezone_overlap_css = css`
+.ui-tz-overlap { display: grid; gap: 12px; min-width: 0; padding: 18px 20px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius);
+  background: var(--ui-surface); color: var(--ui-fg); font: 14px/1.45 var(--ui-font); }
+.ui-tz-overlap .ui-tz-overlap-title { margin: 0; font-size: 16px; font-weight: 650; }
+.ui-tz-overlap-problems { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; color: var(--ui-danger); font-size: 13px; }
+.ui-tz-overlap-sum { margin: 0; font-weight: 600; }
+.ui-tz-overlap-note { margin: 0; padding: 6px 10px; border-radius: var(--ui-radius-sm); background: var(--ui-warning-soft); color: var(--ui-warning); font-size: 13px; }
+.ui-tz-overlap-plot { display: grid; grid-template-columns: minmax(84px, 130px) minmax(0, 1fr); gap: 10px; min-width: 0; }
+.ui-tz-overlap-names, .ui-tz-overlap-rows { display: grid; gap: 4px; min-width: 0; }
+.ui-tz-overlap-rows { position: relative; user-select: none; touch-action: none; }
+.ui-tz-overlap-city { height: 30px; min-width: 0; font-size: 13px; font-weight: 600; line-height: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-tz-overlap-city small { display: block; color: var(--ui-muted); font-size: 11px; font-weight: 400; }
+.ui-tz-overlap-track { position: relative; height: 30px; overflow: hidden; border-radius: 4px; background: var(--ui-subtle); }
+.ui-tz-overlap-work { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb, var(--ui-accent) 30%, var(--ui-surface)); }
+.ui-tz-overlap-hour { position: absolute; top: 8px; color: var(--ui-muted); font-size: 10px; font-variant-numeric: tabular-nums; pointer-events: none; }
+.ui-tz-overlap-band { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb, var(--ui-success) 26%, transparent); border-inline: 1px solid var(--ui-success); pointer-events: none; }
+.ui-tz-overlap-window { position: absolute; top: -2px; bottom: -2px; z-index: 1; box-sizing: border-box; border: 2px solid var(--ui-accent); border-radius: 4px; background: color-mix(in srgb, var(--ui-accent) 14%, transparent); cursor: grab; touch-action: none; }
+.ui-tz-overlap-window:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.ui-tz-overlap-means { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.ui-tz-overlap-mean { display: grid; gap: 1px; padding: 6px 10px; border-left: 3px solid var(--ui-strong); background: var(--ui-subtle); border-radius: 0 var(--ui-radius-sm) var(--ui-radius-sm) 0; }
+.ui-tz-overlap-mean b { font-variant-numeric: tabular-nums; }
+.ui-tz-overlap-at-work { border-left-color: var(--ui-success); }
+.ui-tz-overlap-at-early, .ui-tz-overlap-at-evening { border-left-color: var(--ui-warning); }
+.ui-tz-overlap-at-night { border-left-color: var(--ui-danger); }
+.ui-tz-overlap-btn { justify-self: start; padding: 5px 10px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-sm); background: var(--ui-surface); color: var(--ui-fg); font: 500 12px/1.2 var(--ui-font); cursor: pointer; }
+.ui-tz-overlap-btn:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+@media (max-width: 480px) { .ui-tz-overlap-hour { display: none; } }
+`
+
+let timezone_overlap_minute = 60000
+let timezone_overlap_hour = 3600000
+
+// See the note at the top of the file.
+fn timezone_overlap_zone_ok(z) -> bool {
+    if type_of(z) != "str" { return false }
+    if contains(timezone_picker_zones, z) { return true }
+    let m = re.find(z, "^[+-](\\d{2}):(\\d{2})$")
+    m != null && int(m.groups[0]) <= 14 && int(m.groups[1]) <= 59
+}
+
+// "HH:MM" as it may safely go to date.at, or null.
+fn timezone_overlap_time(t) {
+    if type_of(t) != "str" { return null }
+    let m = re.find(trim(t), "^(\\d{1,2}):(\\d{2})$")
+    if m == null { return null }
+    let h = int(m.groups[0])
+    if h > 23 || int(m.groups[1]) > 59 { return null }
+    `${h < 10 ? "0" : ""}${h}:${m.groups[1]}`
+}
+
+// The cities that can be used, and what is wrong with the rest, by name.
+fn timezone_overlap_read(cities, day_start: str, day_end: str) -> map {
+    let good = []
+    let problems = []
+    for [i, c] in enumerate(type_of(cities) == "list" ? cities : []) {
+        let m = type_of(c) == "map" ? c : {}
+        let name = filled(trim(str(m.city ?? ""))) ?? `City ${i + 1}`
+        let from = timezone_overlap_time(m.from ?? day_start)
+        let to = timezone_overlap_time(m.to ?? day_end)
+        if !timezone_overlap_zone_ok(m.zone) {
+            problems = problems | push(`${name}: the time zone "${slice(str(m.zone ?? ""), 0, 40)}" is not known.`)
+        } else if from == null || to == null {
+            problems = problems | push(`${name}: working hours must be times, like 09:00.`)
+        } else if from == to {
+            problems = problems | push(`${name}: working hours start and end at the same time.`)
+        } else {
+            good = good | push({ city: name, zone: m.zone, from, to })
+        }
+    }
+    { cities: good, problems }
+}
+
+// Where two lists of spans overlap: both must be sorted and apart.
+fn timezone_overlap_cross(a: list, b: list) -> list {
+    let out = []
+    for x in a {
+        for y in b {
+            let s = max([x.start, y.start])
+            let e = min([x.end, y.end])
+            if e > s { out = out | push({ start: s, end: e }) }
+        }
+    }
+    out
+}
+
+// The city's working time inside [start, end): its working days from the day before to
+// the day after, so a night shift or a far-off zone is not missed. A date.at at each
+// end means a clock change shortens or lengthens the day it falls in.
+fn timezone_overlap_spans(c: map, day: str, start: int, end: int) -> list {
+    let out = []
+    for shift in -2..3 {
+        let d = date.add_days(day, shift)
+        let s = date.ms(date.at(d, c.from, c.zone))
+        let e = date.ms(date.at(c.to > c.from ? d : date.add_days(d, 1), c.to, c.zone))
+        let a = max([s, start])
+        let b = min([e, end])
+        if b > a { out = out | push({ start: a, end: b }) }
+    }
+    out
+}
+
+// An offset as minutes east of UTC: "+05:30" is 330, "Z" is 0.
+fn timezone_overlap_offset(t: str) -> int {
+    if ends_with(t, "Z") { return 0 }
+    let o = slice(t, -6, len(t))
+    let sign = starts_with(o, "-") ? -1 : 1
+    sign * (int(slice(o, 1, 3)) * 60 + int(slice(o, 4, 6)))
+}
+
+// See the top of the file.
+fn timezone_overlap_plan(cities: list, day: str) -> map {
+    let home = cities[0].zone
+    let start = date.ms(date.at(day, "00:00", home))
+    let end = date.ms(date.at(date.add_days(day, 1), "00:00", home))
+    let rows = cities | map((c) => merge(c, { spans: timezone_overlap_spans(c, day, start, end) }))
+    let bands = rows | map((r) => r.spans) | reduce([{ start, end }], (acc, s) => timezone_overlap_cross(acc, s))
+    let longest = sort_by(bands, (b) => b.start - b.end)
+    // No band: walk the day in quarter hours for the longest time most are at work.
+    let best = null
+    if len(bands) == 0 {
+        let t = start
+        let at = null
+        while t < end {
+            let there = rows | filter((r) => any(r.spans, (s) => s.start <= t && t < s.end)) | map((r) => r.city)
+            if at != null && at.who == there {
+                at = merge(at, { end: t + 900000 })
+            } else {
+                at = { start: t, end: t + 900000, who: there }
+            }
+            if best == null || len(at.who) > len(best.who) || (len(at.who) == len(best.who) && at.end - at.start > best.end - best.start) { best = at }
+            t += 900000
+        }
+    }
+    let changes = cities | filter((c) => timezone_overlap_offset(date.from_ms(start, c.zone)) != timezone_overlap_offset(date.from_ms(end, c.zone)))
+        | map((c) => {
+            let a = timezone_overlap_offset(date.from_ms(start, c.zone))
+            let b = timezone_overlap_offset(date.from_ms(end, c.zone))
+            { city: c.city, minutes: b - a }
+        })
+    { start, end, hours: (end - start) / timezone_overlap_hour, rows, bands: longest, best, changes }
+}
+
+// What a moment means in a row: { local, day, state, off }. Day is "same day", "next day"
+// or "day before" against the row of the first city.
+fn timezone_overlap_meaning(row: map, ms: int, day: str) -> map {
+    let t = date.from_ms(ms, row.zone)
+    let d = date.date_in(t, row.zone)
+    let p = date.parts(t)
+    let working = any(row.spans, (s) => s.start <= ms && ms < s.end)
+    let state = working ? "work" : (p.hour >= 22 || p.hour < 6 ? "night" : (p.hour < 12 ? "early" : "evening"))
+    let words = { work: "at work", early: "before work", evening: "after work", night: "night" }
+    let span = date.days_between(day, d)
+    { local: date.format(t, "HH:mm"), date: d, day: span == 0 ? "same day" : (span == 1 ? "next day" : (span == -1 ? "day before" : date.format(d, "ddd D MMM"))),
+      state, word: get(words, state) }
+}
+
+// A moment on the first city's clock, by which the row and the window read.
+fn timezone_overlap_clock(ms: int, zone: str) -> str = date.format(date.from_ms(ms, zone), "HH:mm")
+
+// A length: 330 is "5 h 30 min".
+fn timezone_overlap_long(ms: int) -> str {
+    let m = floor(ms / timezone_overlap_minute)
+    let h = floor(m / 60)
+    let rest = m % 60
+    h == 0 ? `${rest} min` : (rest == 0 ? `${h} h` : `${h} h ${rest} min`)
+}
+
+// A position as a percent of the day, to two places, the same on server and browser.
+fn timezone_overlap_pct(ms: int, plan: map) -> str {
+    let p = floor((ms - plan.start) * 10000 / (plan.end - plan.start)) / 100
+    `${p}%`
+}
+
+// A length as a percent of the day.
+fn timezone_overlap_wide(ms: int, plan: map) -> str {
+    let p = ceil(ms * 10000 / (plan.end - plan.start)) / 100
+    `${p}%`
+}
+
+// A clock change, as it reads.
+fn timezone_overlap_change(c: map) -> str {
+    let m = abs(c.minutes)
+    let hours = m == 60 ? "an hour" : timezone_overlap_long(m * timezone_overlap_minute)
+    `${c.city}: clocks go ${c.minutes > 0 ? "forward" : "back"} ${hours} today.`
+}
+
+// The moments each row labels, every four hours from the start of the first city's day:
+// a row writes its own local time there, so a row at +5:30 reads 05:30, 09:30.
+fn timezone_overlap_marks(plan: map) -> list {
+    let step = 4 * timezone_overlap_hour
+    range(ceil((plan.end - plan.start) / step)) | map((i) => plan.start + i * step)
+}
+
+component TimezoneOverlap(cities: list = [], day: str = "", day_start: str = "09:00", day_end: str = "17:00", minutes: int = 60, step: int = 15,
+                          title: str = "Time zone overlap", id: str = "timezone-overlap", name: str = "meeting", on_change = null, class: str? = null) {
+    style global timezone_overlap_css
+    let read = timezone_overlap_read(cities, day_start, day_end)
+    let good_day = type_of(day) == "str" && date.valid(day, "date") && day >= "1000-01-08" && day <= "9000-12-23"
+    let ready = good_day && len(read.cities) > 0
+    let plan = ready ? timezone_overlap_plan(read.cities, day) : null
+    let length = max([min([minutes, 720]), 5]) * timezone_overlap_minute
+    let nudge = max([step, 1]) * timezone_overlap_minute
+    let first_at = plan == null ? 0 : (len(plan.bands) > 0 ? plan.bands[0].start : (plan.best != null ? plan.best.start : plan.start))
+    state at = first_at
+    state dragging = false
+    state grab = 0
+    let means = () => plan.rows | map((r) => merge(timezone_overlap_meaning(r, at, day), { city: r.city }))
+    let tell = () => {
+        on_change && on_change({ start: date.from_ms(at, read.cities[0].zone), end: date.from_ms(at + length, read.cities[0].zone), cities: means() | map((m) => ({ city: m.city, local: m.local, day: m.day, state: m.state })) })
+    }
+    let put = (ms: int) => {
+        let last_start = plan.end - length
+        let snapped = plan.start + floor((ms - plan.start + floor(nudge / 2)) / nudge) * nudge
+        let next = min([max([snapped, plan.start]), last_start])
+        if next != at {
+            at = next
+            tell()
+        }
+    }
+    let spot = (e) => {
+        let r = e.target.closest(".ui-tz-overlap-rows").getBoundingClientRect()
+        plan.start + (e.clientX - r.left) / r.width * (plan.end - plan.start)
+    }
+    let keys = (e) => {
+        let to = match e.key {
+            "ArrowRight" => at + nudge
+            "ArrowLeft" => at - nudge
+            "PageUp" => at + timezone_overlap_hour
+            "PageDown" => at - timezone_overlap_hour
+            "Home" => plan.start
+            "End" => plan.end - length
+            "o" | "O" => first_at
+            _ => null
+        }
+        if to != null {
+            e.preventDefault()
+            put(to)
+        }
+    }
+    let band_total = plan == null ? 0 : plan.bands | map((b) => b.end - b.start) | sum()
+    let home = plan != null ? read.cities[0].zone : "UTC"
+    let window_text = plan == null ? "" : `${timezone_overlap_clock(at, home)} to ${timezone_overlap_clock(at + length, home)}`
+    <section class={ui_cls(["ui-tz-overlap", class])} aria-labelledby={`${id}-title`}>
+        <h3.ui-tz-overlap-title id={`${id}-title`}>{title}{good_day ? `, ${date.format(day, "ddd D MMM YYYY")}` : ""}</h3>
+        {plan != null && <input type="hidden" name={name} value={date.from_ms(at, home)}/>}
+        {!good_day && <p.ui-tz-overlap-problems role="alert">"{slice(str(day), 0, 30)}" is not a date.</p>}
+        {len(read.problems) > 0 && <ul.ui-tz-overlap-problems role="alert">{for p in take(read.problems, 6) => <li key={p}>{p}</li>}</ul>}
+        {plan == null && good_day && <p.ui-tz-overlap-sum>Add a city to compare.</p>}
+        {plan != null && <p.ui-tz-overlap-sum aria-live="polite">
+            {len(plan.bands) > 0
+                ? `All at work for ${timezone_overlap_long(band_total)}: ${plan.bands | map((b) => `${timezone_overlap_clock(b.start, home)} to ${timezone_overlap_clock(b.end, home)}`) | join(", ")}, ${read.cities[0].city} time.`
+                : `No overlap. Most at work: ${len(plan.best.who)} of ${len(plan.rows)}, ${timezone_overlap_clock(plan.best.start, home)} to ${timezone_overlap_clock(plan.best.end, home)}, ${read.cities[0].city} time${len(plan.best.who) > 0 ? ` (${join(plan.best.who, ", ")})` : ""}.`}
+        </p>}
+        {plan != null && plan.hours != 24 && <p.ui-tz-overlap-note>{read.cities[0].city}'s day has {plan.hours} hours.</p>}
+        {plan != null && len(plan.changes) > 0 && <p.ui-tz-overlap-note>{plan.changes | map((c) => timezone_overlap_change(c)) | join(" ")}</p>}
+        {plan != null && <div.ui-tz-overlap-plot>
+            <div.ui-tz-overlap-names aria-hidden="true">
+                {for r in plan.rows => <div.ui-tz-overlap-city key={r.city}>{r.city}<small>{r.from} to {r.to}</small></div>}
+            </div>
+            <div.ui-tz-overlap-rows @pointerdown={(e) => { if e.button == 0 { put(floor(spot(e) - floor(length / 2))) } }}>
+                {for r in plan.rows => <div.ui-tz-overlap-track key={r.city} data-city={r.city}>
+                    {for s in r.spans => <span.ui-tz-overlap-work key={s.start} style={`left: ${timezone_overlap_pct(s.start, plan)}; width: ${timezone_overlap_wide(s.end - s.start, plan)}`}></span>}
+                    {for m in timezone_overlap_marks(plan) => <span.ui-tz-overlap-hour key={m} style={`left: ${timezone_overlap_pct(m, plan)}`}>{timezone_overlap_clock(m, r.zone)}</span>}
+                </div>}
+                {for b in plan.bands => <span.ui-tz-overlap-band key={b.start} style={`left: ${timezone_overlap_pct(b.start, plan)}; width: ${timezone_overlap_wide(b.end - b.start, plan)}`}></span>}
+                <div.ui-tz-overlap-window id={`${id}-window`} role="slider" tabindex="0" aria-label="Meeting time" aria-valuemin="0" aria-valuemax={floor((plan.end - plan.start - length) / timezone_overlap_minute)}
+                     aria-valuenow={floor((at - plan.start) / timezone_overlap_minute)} aria-valuetext={window_text} style={`left: ${timezone_overlap_pct(at, plan)}; width: ${timezone_overlap_wide(length, plan)}`}
+                     @keydown={keys}
+                     @pointerdown={(e) => {
+                         if e.button == 0 {
+                             e.preventDefault()
+                             e.stopPropagation()
+                             e.target.focus()
+                             e.target.setPointerCapture(e.pointerId)
+                             dragging = true
+                             grab = spot(e) - at
+                         }
+                     }}
+                     @pointermove={(e) => { if dragging { put(floor(spot(e) - grab)) } }}
+                     @pointerup={(e) => { dragging = false }} @pointercancel={(e) => { dragging = false }}></div>
+            </div>
+        </div>}
+        {plan != null && <ul.ui-tz-overlap-means aria-live="polite" aria-label={`What ${window_text} means in each city`}>
+            {for m in means() => <li key={m.city} data-city={m.city} class={`ui-tz-overlap-mean ui-tz-overlap-at-${m.state}`}>
+                <b>{m.city}: {m.local}</b>
+                <span>{m.day}, {m.word}</span>
+            </li>}
+        </ul>}
+        {plan != null && len(plan.bands) > 0 && <button.ui-tz-overlap-btn type="button" @click={() => { put(first_at) }}>Back to the overlap</button>}
+    </section>
+}

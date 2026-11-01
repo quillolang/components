@@ -1,0 +1,213 @@
+// KeyboardAvoider: keeps the field in use in view above the on-screen keyboard, on both
+// systems, and hands everything back when the keyboard goes. Wrap a form, or anything
+// with fields in it, inside what scrolls.
+//
+// The two systems do this differently. On iOS, and in Android's Chrome, the page stays
+// its full height and the keyboard only shrinks the visual viewport, so the keyboard
+// covers the end of the page and there is nothing below to scroll to: it adds that room
+// and scrolls. In the Android app the web view itself is made shorter, and there it only
+// scrolls. Either way the field stops `gap` pixels clear of the keyboard and of the top
+// of what scrolls, moving between fields moves with them, and turning the phone with
+// the keyboard open keeps the field in view. Zooming with two fingers also shrinks the
+// visual viewport, and is not taken for a keyboard.
+//
+// On closing, the room is taken away and the scroller goes back to where it stood,
+// unless the person has scrolled it themselves meanwhile.
+//
+//   <div class="form-screen">   <!-- overflow: auto, with a height -->
+//       <KeyboardAvoider on_change={(k) => { lifted = k.open }}>
+//           <Field label="Name"> ... </Field>
+//           <Field label="Note"> ... </Field>
+//       </KeyboardAvoider>
+//   </div>
+//
+// gap: pixels to keep around the field (16). scroll_back: go back to the old position on
+// closing (true). id, class: for the outer element.
+// on_change({ open, height }): inside one of your components, on opening, closing, and
+// each new height. height is the keyboard's in pixels, 0 when closed, on both systems.
+// While open, --ui-keyboard-height is set on the outer element, for a bar of your own.
+//
+// Nothing happens where there is no on-screen keyboard or no visualViewport.
+
+import ui/theme.qwe use ui_cls
+
+let keyboard_avoider_css = css`
+.ui-keyboard-avoider { box-sizing: border-box; min-width: 0; }
+`
+
+// How much of the layout's height the keyboard covers. A pinch makes the visual viewport
+// smaller by the zoom and moves it about, so what it says is put back to screen size.
+fn keyboard_avoider_lift(inner, height, top, scale) {
+    if scale > 1.01 { return max([0, round(inner - height * scale)]) }
+    max([0, round(inner - height - top)])
+}
+
+// The keyboard's height. tall is the tallest the window has been at this width, as the
+// Android app's window shrinks with the keyboard and so says nothing by itself.
+fn keyboard_avoider_height(tall, height, scale) {
+    let seen = scale > 1.01 ? height * scale : height
+    let gone = round(tall - seen)
+    gone > 120 ? gone : 0
+}
+
+// How far to scroll so that a box from top to bottom lies between least and most: its
+// start, when it is taller than the room.
+fn keyboard_avoider_shift(top, bottom, least, most) {
+    if most <= least { return 0 }
+    if bottom - top > most - least { return top - least }
+    if bottom > most { return bottom - most }
+    if top < least { return top - least }
+    0
+}
+
+// Whether an element brings up the keyboard.
+fn keyboard_avoider_field(el) -> bool {
+    if el == null { return false }
+    let tag = el.tagName
+    if el.readOnly == true || el.disabled == true { return false }
+    if tag == "TEXTAREA" || tag == "SELECT" { return true }
+    if tag == "INPUT" {
+        return !contains(["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"], lower(str(el.type)))
+    }
+    el.isContentEditable == true
+}
+
+// What scrolls this element: the nearest box that may, else the page.
+fn keyboard_avoider_scroller(win, el) {
+    let at = el.parentElement
+    let page = win.document.scrollingElement
+    while at != null {
+        if at.isSameNode(page) || at.tagName == "BODY" { return page }
+        let o = win.getComputedStyle(at).overflowY
+        if o == "auto" || o == "scroll" { return at }
+        at = at.parentElement
+    }
+    page
+}
+
+component KeyboardAvoider(gap = 16, scroll_back: bool = true, id: str? = null, class: str? = null, on_change = null, children) {
+    style global keyboard_avoider_css
+    state win = null
+    state box = null
+    state field = null
+    state open = false
+    state tall = 0
+    state wide = 0
+    state seen = 0
+    state told = 0
+    state was = null
+    state unfollow = null
+    let say = (h) => {
+        if h != told {
+            told = h
+            on_change && on_change({ open, height: h })
+        }
+    }
+    let reveal = () => {
+        if field != null {
+            let vp = win.visualViewport
+            let s = keyboard_avoider_scroller(win, field)
+            let page = s.isSameNode(win.document.scrollingElement)
+            let r = field.getBoundingClientRect()
+            let edge = page ? { top: 0, bottom: win.innerHeight } : s.getBoundingClientRect()
+            let by = keyboard_avoider_shift(r.top, r.bottom, max([edge.top, vp.offsetTop]) + gap,
+                                            min([edge.bottom, vp.offsetTop + vp.height]) - gap)
+            if by != 0 { s.scrollTop = s.scrollTop + by }
+            if was != null { was = set(was, "ours", s.scrollTop) }
+        }
+    }
+    let stop = () => {
+        if unfollow != null {
+            unfollow()
+            unfollow = null
+        }
+    }
+    let hand_back = () => {
+        open = false
+        // Read before the room goes, which can pull the scroller up by itself.
+        let untouched = was != null && abs(was.el.scrollTop - was.ours) <= 4
+        box.style.paddingBottom = ""
+        box.style.removeProperty("--ui-keyboard-height")
+        if scroll_back && untouched { was.el.scrollTop = was.top }
+        was = null
+        say(0)
+        if field == null { stop() }
+    }
+    let read = () => {
+        let vp = win.visualViewport
+        // Turned: the old tallest means nothing at the new width.
+        if win.innerWidth != wide {
+            wide = win.innerWidth
+            tall = 0
+        }
+        tall = max([tall, win.innerHeight])
+        let height = keyboard_avoider_height(tall, vp.height, vp.scale)
+        if height > 0 {
+            open = true
+            let lift = keyboard_avoider_lift(win.innerHeight, vp.height, vp.offsetTop, vp.scale)
+            box.style.paddingBottom = lift > 0 ? `${lift}px` : ""
+            box.style.setProperty("--ui-keyboard-height", `${height}px`)
+            seen = vp.height
+            reveal()
+            say(height)
+        } else {
+            // Not closed by a keyboard that only looks gone after a turn: closing makes more room.
+            if open && vp.height > seen + 80 {
+                hand_back()
+            } else {
+                if open {
+                    seen = vp.height
+                    reveal()
+                }
+            }
+        }
+    }
+    let follow = () => {
+        if unfollow == null {
+            let vp = win.visualViewport
+            if vp != null {
+                vp.addEventListener("resize", read)
+                vp.addEventListener("scroll", read)
+                unfollow = () => {
+                    vp.removeEventListener("resize", read)
+                    vp.removeEventListener("scroll", read)
+                }
+            }
+        }
+    }
+    let use_field = (el) => {
+        field = el
+        // Noted here, ahead of the browser's own scroll to a field it was given.
+        if !open {
+            let s = keyboard_avoider_scroller(win, el)
+            was = { el: s, top: s.scrollTop, ours: s.scrollTop }
+        }
+        follow()
+        if unfollow != null { read() }
+    }
+    <div class={ui_cls(["ui-keyboard-avoider", class])} id={id}
+         @mount={(el) => {
+             let w = js("window")
+             win = w
+             box = el
+             wide = w.innerWidth
+             tall = w.innerHeight
+             // A field already in use when this started.
+             let now = w.document.activeElement
+             if now != null && el.contains(now) && keyboard_avoider_field(now) { use_field(now) }
+             () => { stop() }
+         }}
+         @focusin={(e) => {
+             if win != null && keyboard_avoider_field(e.target) { use_field(e.target) }
+         }}
+         @focusout={(e) => {
+             let next = e.relatedTarget
+             if next == null || !box.contains(next) || !keyboard_avoider_field(next) {
+                 field = null
+                 // With no keyboard up there is nothing to wait for; with one, its closing hands back.
+                 if !open { stop() }
+             }
+         }}>
+        {children}
+    </div>
+}
