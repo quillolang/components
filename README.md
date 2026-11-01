@@ -230,13 +230,13 @@ then the kit several times over (renamed) as a stand-in for a large app:
 <!-- bench -->
 | Components in one program | `quillo check` | Start-up | Memory, running | A page |
 |---|---|---|---|---|
-| 0 | 0.01 s | 0.03 s | 12 MB | 0.3 ms |
-| 100 | 0.03 s | 0.08 s | 36 MB | 0.2 ms |
-| 250 | 0.08 s | 0.21 s | 85 MB | 0.3 ms |
-| 456 | 0.14 s | 0.36 s | 143 MB | 0.3 ms |
-| 1824 | 0.59 s | 1.64 s | 546 MB | 0.2 ms |
+| 0 | 0.01 s | 0.01 s | 13 MB | 0.3 ms |
+| 100 | 0.07 s | 0.14 s | 70 MB | 0.2 ms |
+| 250 | 0.16 s | 0.32 s | 118 MB | 0.2 ms |
+| 744 | 0.42 s | 1.09 s | 372 MB | 0.2 ms |
+| 2976 | 1.89 s | 6.58 s | 1443 MB | 0.2 ms |
 
-quillo 0.5.0 (2cd134f, 2026-10-28), Apple M5, 16 GB, darwin arm64, 2026-10-28.
+quillo 0.6.0 (378e64b, 2026-11-01), Apple M5, 16 GB, darwin arm64, 2026-11-01.
 <!-- /bench -->
 
 - **Visitors pay only for what a page shows.** A page carries the components it shows and
