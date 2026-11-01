@@ -1,10 +1,21 @@
 // mobile
 await wait(200);
-await cdp("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" });
+const main = $("#water-tracker-main");
+const kept = () => $("#water-tracker-kept").textContent;
+// What was kept had no day, so it took the phone's: today, here. The dates below count from it.
+const today = new Date(), here = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+const first = JSON.parse(kept()).day;
+if (first !== here) return "the phone's today: " + kept() + ", here " + here;
+const [y, m, d] = first.split("-").map(Number);
+const day = (n) => new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
 const realNow = Date.now;
-// 2026-11-01 at 23:59:50 in Tokyo is 14:59:50 UTC, which is still 2026-11-01 in London and in Tokyo alike.
-let clock = Date.UTC(2026, 10, 1, 14, 59, 50);
+// First a moment that is that day both here and in Tokyo, so a look while the zone changes clears nothing.
+const off = -today.getTimezoneOffset() * 60000, tokyo = 9 * 3600000, whole = 24 * 3600000;
+let clock = Date.UTC(y, m - 1, d) + (Math.max(-off, -tokyo) + Math.min(whole - off, whole - tokyo)) / 2;
 Date.now = () => clock;
+await cdp("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" });
+// 23:59:50 in Tokyo is 14:59:50 UTC, the same day.
+clock = Date.UTC(y, m - 1, d, 14, 59, 50);
 const calls = [];
 window.quilloNative = { haptic: (k) => { calls.push(k); return Promise.resolve(true); } };
 const done = async (why) => {
@@ -15,7 +26,6 @@ const done = async (why) => {
     return why;
 };
 
-const main = $("#water-tracker-main");
 const glass = main.querySelector(".ui-water-glass");
 const total = () => main.querySelector(".ui-water-total").textContent;
 const note = () => main.querySelector(".ui-water-note").textContent;
@@ -23,7 +33,6 @@ const fill = () => main.querySelector(".ui-water-fill").style.transform;
 const pct = () => main.querySelector(".ui-water-pct").textContent;
 const undo = () => main.querySelector(".ui-water-undo");
 const adds = () => [...main.querySelectorAll(".ui-water-add")];
-const kept = () => $("#water-tracker-kept").textContent;
 const told = () => $("#water-tracker-told").textContent;
 
 // Kept: 750 of 2000, 37.5%, shown from what was saved.
@@ -40,7 +49,7 @@ await tap(glass);
 if (total() !== "1 L of 2 L") return done("tap: " + total());
 if (fill() !== "translateY(50%)") return done("half full: " + fill());
 if (calls.join() !== "light") return done("felt: " + calls);
-if (kept() !== '{"day":"2026-11-01","entries":[250,500,250]}') return done("kept: " + kept());
+if (kept() !== `{"day":"${day(0)}","entries":[250,500,250]}`) return done("kept: " + kept());
 if (main.querySelector(".ui-sr").textContent !== "Added 250 ml. 1 L today.") return done("told: " + main.querySelector(".ui-sr").textContent);
 
 // Undo takes back the last, and again.
@@ -83,13 +92,13 @@ clock += 11000;
 await wait(1300);
 if (total() !== "0 ml of 2 L") return done("midnight in Tokyo should clear it: " + total());
 if (note() !== "A new day. The last one came to 2.6 L.") return done("says so: " + note());
-if (told() !== "reset 2026-11-01 8 (1)") return done("on_reset: " + told());
-if (kept() !== '{"day":"2026-11-02","entries":[]}') return done("kept: " + kept());
+if (told() !== `reset ${day(0)} 8 (1)`) return done("on_reset: " + told());
+if (kept() !== `{"day":"${day(1)}","entries":[]}`) return done("kept: " + kept());
 // Told once.
 await wait(1200);
-if (told() !== "reset 2026-11-01 8 (1)") return done("once: " + told());
+if (told() !== `reset ${day(0)} 8 (1)`) return done("once: " + told());
 
-// The day is the phone's: flying to Los Angeles it is 2026-11-01 there, earlier than kept. Nothing is cleared.
+// The day is the phone's: flying to Los Angeles it is the first day there, earlier than kept. Nothing is cleared.
 await tap(adds()[0]);
 await cdp("Emulation.setTimezoneOverride", { timezoneId: "America/Los_Angeles" });
 clock += 3600000;
@@ -97,14 +106,14 @@ document.dispatchEvent(new Event("visibilitychange"));
 await wait(100);
 if (total() !== "150 ml of 2 L") return done("flying west clears nothing: " + total());
 await tap(adds()[0]);
-if (kept() !== '{"day":"2026-11-02","entries":[150,150]}') return done("still that day: " + kept());
+if (kept() !== `{"day":"${day(1)}","entries":[150,150]}`) return done("still that day: " + kept());
 // Coming back after a long sleep clears it on sight, and a tap in the same moment adds to the new day.
 clock += 2 * 24 * 3600000;
 await tap(adds()[1]);
 await wait(50);
 if (total() !== "250 ml of 2 L") return done("the first tap of a new day starts it: " + total());
-// 16:00 UTC on the 3rd is 08:00 there.
-if (kept() !== '{"day":"2026-11-03","entries":[250]}') return done("that day: " + kept());
+// 16:00 UTC on the third day is morning there.
+if (kept() !== `{"day":"${day(2)}","entries":[250]}`) return done("that day: " + kept());
 await cdp("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" });
 
 // Ounces, with no litres. Kept in localStorage, under its key. An empty glass shows no water at all.
@@ -140,7 +149,7 @@ if (felt.join() !== "12") return done("vibrate: " + felt);
 Object.defineProperty(navigator, "vibrate", { value: undefined, configurable: true });
 await tap(glass);
 delete navigator.vibrate;
-// Back in Tokyo it is the 4th, so the 3rd's 250 went with the last look: two taps on a new day.
+// Back in Tokyo it is the fourth day, so the third's 250 went with the last look: two taps on a new day.
 if (total() !== "500 ml of 2 L") return done("no vibration stops nothing: " + total());
 
 // Beside the glass in a wide box, under it in a narrow one.
