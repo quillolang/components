@@ -17,7 +17,8 @@ node tests/classes.mjs
 
 # A port in use would test whatever already answers there, and say it passed.
 for p in "$port" "$cdp"; do
-    if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$p/"; then
+    # A connection is enough: a hung process holding the port answers nothing, and would still win it.
+    if nc -z 127.0.0.1 "$p" 2>/dev/null; then
         echo "test: port $p is in use" >&2
         exit 1
     fi
