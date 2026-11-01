@@ -9,10 +9,12 @@ if (items() !== 5) return "the list does not start at 5";
 btn.click(); await wait(150);
 btn = live.querySelector("button");
 if (!btn.disabled || btn.getAttribute("aria-busy") !== "true" || !btn.querySelector(".ui-btn-spin") || !btn.textContent.includes("Loading…")) return "loading does not disable, spin and say Loading…";
-await wait(800);
+// The demo's server fn sleeps 400 ms: wait for the answer, not a fixed time, as a busy machine is slower.
+const until = async (ok) => { for (let i = 0; i < 50 && !ok(); i++) await wait(100); };
+await until(() => items() === 11);
 btn = live.querySelector("button");
 if (items() !== 11 || btn.disabled || says(btn) !== "Show 6 more") return `after one load: ${items()} items, "${says(btn)}"`;
-btn.click(); await wait(1000);
+btn.click(); await until(() => items() === 17);
 if (items() !== 17 || live.querySelector("button") || live.querySelector(".ui-load-more-button-done")?.textContent !== "That's all") return "once all are shown it does not say That's all";
 if (!link || link.getAttribute("href") !== "#load_more_button" || says(link) !== "Load more 24 left") return `the link says "${link && says(link)}"`;
 if (!hosts[2].querySelector("button[disabled] .ui-btn-spin")) return "loading={true} alone does not spin";
