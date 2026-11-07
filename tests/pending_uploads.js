@@ -133,7 +133,8 @@ const mark3 = log();
 pick(kept.querySelector('.ui-pendup-row input[type="file"]'), [file("scan.pdf", 3000, 5)]);
 if (!(await until(() => kept.querySelector(".ui-pendup-row").dataset.status === "done"))) return "the right file goes on: " + kept.querySelector(".ui-pendup-row").dataset.status;
 if (log().slice(mark3.length) !== ", scan.pdf 1024-2048 (1024), scan.pdf 2048-3000 last (952)") return "from where it was: " + log().slice(mark3.length);
-if ($("#pendup-kept-said").textContent !== "Would keep: false .") return "on_change at the end: " + $("#pendup-kept-said").textContent;
+// The note comes a moment after the row: the row is set, then IndexedDB is cleared, then on_change.
+if (!(await until(() => $("#pendup-kept-said").textContent === "Would keep: false ."))) return "on_change at the end: " + $("#pendup-kept-said").textContent;
 if (localStorage.getItem("ui-pending-uploads:pendup-kept") !== null) return "saved leaves localStorage alone";
 
 // A reload, with a file part way: the list from localStorage, the file from IndexedDB.
