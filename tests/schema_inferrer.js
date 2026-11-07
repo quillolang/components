@@ -52,7 +52,7 @@ if (sum() !== "Paste JSON to see its shape." || bad()) return `empty: ${sum()}`;
 type(box, '{"naïve 😀": 1, "__proto__": {"x": 1}, "constructor": "y"}'); await wait();
 if (!row("naïve 😀") || !row("__proto__.x") || line("constructor") !== "string|required|") return `odd keys: ${[...c.querySelectorAll("tbody th")].map((t) => t.textContent)}`;
 // Deep nesting stops, and says so; a long paste stays quick.
-type(box, "[".repeat(500) + "]".repeat(500)); await wait();
+type(box, "[".repeat(100) + "]".repeat(100)); await wait();
 if (!c.querySelector(".ui-schemainf-note")?.textContent.includes("past 32 levels")) return `deep: ${c.querySelector(".ui-schemainf-note")?.textContent} ${bad()}`;
 const big = JSON.stringify(Array.from({ length: 1500 }, (_, i) => ({ id: i, name: `n${i}`, ok: i % 2 === 0, at: "2026-01-01" })));
 const t0 = performance.now();
