@@ -43,7 +43,8 @@ if (fig.querySelector(".ui-iline-y span:last-child").textContent === "3k") retur
 items[0].click(); await wait();
 if (fig.querySelectorAll(".ui-iline-line").length !== 3) return "the legend does not show Web again";
 // Dragging zooms.
-pe("pointerdown", 10 / 59); pe("pointermove", 20 / 59); await wait(50);
+pe("pointerdown", 10 / 59); await wait(); // a task apart, as a real pointer always is (Q-800)
+pe("pointermove", 20 / 59); await wait(50);
 if (!fig.querySelector(".ui-iline-pick")) return "dragging shows no selection";
 pe("pointerup", 20 / 59); await wait();
 const xs = [...fig.querySelectorAll(".ui-iline-x span")].map((s) => s.textContent);
