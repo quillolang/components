@@ -1,3 +1,4 @@
+// alone: its server calls queue behind the whole gallery's, and it times their answers
 const dlg = $("dialog.ui-search-overlay"), input = document.getElementById("search-demo-input"), note = () => $(".demo-note").textContent;
 const opts = () => [...dlg.querySelectorAll("[role=option]")], titles = () => opts().map((o) => o.querySelector(".ui-search-overlay-title").textContent);
 const trig = $$(".ui-search-overlay-trigger")[0];

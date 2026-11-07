@@ -1,3 +1,4 @@
+// alone: its server calls queue behind the whole gallery's, and it times their answers
 const host = $(".ui-chat-widget"), bubble = $(".ui-chat-widget-bubble"), panel = $(".ui-chat-widget-panel");
 const msgs = () => [...panel.querySelectorAll(".ui-chat-widget-msg:not(:has(.ui-chat-widget-typing))")], last = () => msgs().at(-1);
 if (!host || !bubble || bubble.getAttribute("aria-expanded") !== "false" || bubble.getAttribute("aria-label") !== "Support" || !panel.hidden) return "it does not start as a closed, named bubble";

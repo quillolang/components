@@ -1,3 +1,4 @@
+// alone: its server calls queue behind the whole gallery's, and it times their answers
 const cb = $("#cb-country");
 const hidden = $("input[type=hidden][name=country]");
 const pop = cb.parentElement.querySelector(".ui-combobox-pop");
